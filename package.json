@@ -1,0 +1,34 @@
+{
+  "name": "pdf-editor-pro-v2",
+  "version": "2.0.0",
+  "description": "Professional PDF Editor with real content stream editing",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "keywords": [
+    "pdf",
+    "editor",
+    "wasm"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@quasar/vite-plugin": "^1.10.0",
+    "@vitejs/plugin-vue": "^6.0.4",
+    "sass-embedded": "^1.98.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  },
+  "dependencies": {
+    "@quasar/extras": "^1.17.0",
+    "mupdf": "^1.27.0",
+    "pdfjs-dist": "^5.5.207",
+    "pinia": "^3.0.4",
+    "quasar": "^2.18.6",
+    "vue": "^3.5.30",
+    "vue-router": "^4.6.4"
+  }
+}
