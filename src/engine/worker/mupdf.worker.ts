@@ -83,6 +83,16 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      case 'addText': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const addResult = addTextToPage(
+          req.data.pageIndex, req.data.x, req.data.y,
+          req.data.text, req.data.fontSize, req.data.fontName, req.data.color
+        )
+        respond({ id: req.id, type: 'success', data: addResult })
+        break
+      }
+
       case 'debugFonts': {
         if (!pdfDoc) throw new Error('No document loaded')
         const debugInfo = debugPageFonts(req.data.pageIndex)
@@ -482,6 +492,122 @@ function encodeTextForFont(
 // ==========================================
 // TEXT REPLACEMENT — FONT-AWARE
 // ==========================================
+
+/**
+ * Add new text at a given position on a page.
+ * Uses standard PDF fonts (Helvetica, Times-Roman, Courier) which are always available.
+ */
+function addTextToPage(
+  pageIndex: number,
+  x: number,
+  y: number,
+  text: string,
+  fontSize: number,
+  fontName: string,
+  color?: [number, number, number]
+): { success: boolean; error?: string } {
+  if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
+
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+
+    // 1. Ensure the standard font is in page Resources
+    const fontRefName = ensureStandardFont(pageObj, fontName)
+
+    // 2. Read existing content stream
+    const existingStream = readContentStream(pageIndex)
+
+    // 3. Build new BT block
+    const r = color?.[0] ?? 0
+    const g = color?.[1] ?? 0
+    const b = color?.[2] ?? 0
+    const escaped = escapePdfString(text)
+
+    const newBlock = `\nBT\n${r} ${g} ${b} rg\n/${fontRefName} ${fontSize} Tf\n1 0 0 1 ${x.toFixed(2)} ${y.toFixed(2)} Tm\n(${escaped}) Tj\nET\n`
+
+    // 4. Append to content stream
+    const combined = existingStream + newBlock
+    const streamBytes = new Uint8Array(combined.length)
+    for (let i = 0; i < combined.length; i++) {
+      streamBytes[i] = combined.charCodeAt(i) & 0xFF
+    }
+
+    // 5. Write back
+    const contents = pageObj.get('Contents')
+    if (contents.isArray()) {
+      const newStreamObj = pdfDoc.addStream(streamBytes, {})
+      pageObj.put('Contents', newStreamObj)
+    } else if (contents.isStream()) {
+      contents.writeStream(streamBytes)
+    } else {
+      const newStreamObj = pdfDoc.addStream(streamBytes, {})
+      pageObj.put('Contents', newStreamObj)
+    }
+
+    page.destroy()
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Ensure a standard PDF font (Helvetica, Times-Roman, Courier) is registered
+ * in the page's Resources/Font dictionary. Returns the font reference name (e.g. "F10").
+ */
+function ensureStandardFont(pageObj: any, fontName: string): string {
+  let resources = pageObj.get('Resources')
+  if (!resources || resources.toString() === 'null') {
+    resources = pdfDoc.newDictionary()
+    pageObj.put('Resources', resources)
+  }
+  resources = resources.resolve()
+
+  let fontDict = resources.get('Font')
+  if (!fontDict || fontDict.toString() === 'null') {
+    fontDict = pdfDoc.newDictionary()
+    resources.put('Font', fontDict)
+  }
+  fontDict = fontDict.resolve()
+
+  // Check existing font references for our target font
+  const existingRefs = new Set<string>()
+  for (let i = 1; i <= 99; i++) {
+    const ref = `F${i}`
+    try {
+      const val = fontDict.get(ref)
+      if (val && val.toString() !== 'null') {
+        existingRefs.add(ref)
+        const resolved = val.resolve()
+        const baseFont = resolved.get('BaseFont')
+        if (baseFont) {
+          const baseFontStr = baseFont.asName?.() || baseFont.toString() || ''
+          if (baseFontStr.includes(fontName)) {
+            return ref // Already registered
+          }
+        }
+      }
+    } catch (_) { /* skip */ }
+  }
+
+  // Create new font reference
+  let newRefNum = 1
+  while (existingRefs.has(`F${newRefNum}`)) newRefNum++
+  const newRef = `F${newRefNum}`
+
+  // Create Type1 font dictionary for a standard PDF font
+  const newFontDict = pdfDoc.newDictionary()
+  newFontDict.put('Type', pdfDoc.newName('Font'))
+  newFontDict.put('Subtype', pdfDoc.newName('Type1'))
+  newFontDict.put('BaseFont', pdfDoc.newName(fontName))
+  newFontDict.put('Encoding', pdfDoc.newName('WinAnsiEncoding'))
+
+  const fontIndirect = pdfDoc.addObject(newFontDict)
+  fontDict.put(newRef, fontIndirect)
+
+  return newRef
+}
 
 function replaceTextInStream(
   pageIndex: number,

@@ -105,6 +105,21 @@ export class MuPDFBridge {
   }
 
   /**
+   * Add new text at a position on a page.
+   */
+  async addText(
+    pageIndex: number,
+    x: number,
+    y: number,
+    text: string,
+    fontSize: number,
+    fontName: string,
+    color?: [number, number, number]
+  ): Promise<{ success: boolean; error?: string }> {
+    return this.send('addText', { pageIndex, x, y, text, fontSize, fontName, color })
+  }
+
+  /**
    * Debug: inspect font encodings on a page.
    */
   async debugFonts(pageIndex: number): Promise<any> {

@@ -7,6 +7,7 @@
     <div class="pdf-page-wrapper" :style="pageWrapperStyle">
       <canvas ref="canvasRef" class="pdf-canvas" />
       <TextBlockOverlay
+        ref="textBlockOverlayRef"
         :page-width="pageWidth"
         :page-height="pageHeight"
         :pdf-width="pdfPageWidth"
@@ -32,6 +33,7 @@ const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const canvasRef = ref<HTMLCanvasElement | null>(null)
+const textBlockOverlayRef = ref<InstanceType<typeof TextBlockOverlay> | null>(null)
 const pageWidth = ref(0)
 const pageHeight = ref(0)
 const pdfPageWidth = ref(612) // default letter size
@@ -83,6 +85,7 @@ async function onTextChanged() {
 
 watch(() => docStore.currentPage, render)
 watch(() => docStore.scale, render)
+watch(() => docStore.renderVersion, render)
 
 watch(() => docStore.loaded, async (loaded) => {
   if (loaded) {
@@ -94,6 +97,8 @@ watch(() => docStore.loaded, async (loaded) => {
 onMounted(() => {
   if (docStore.loaded) render()
 })
+
+defineExpose({ textBlockOverlayRef })
 </script>
 
 <style scoped>

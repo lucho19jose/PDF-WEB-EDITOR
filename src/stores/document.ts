@@ -9,6 +9,7 @@ export const useDocumentStore = defineStore('document', () => {
   const scale = ref(1.5)
   const isModified = ref(false)
   const pdfBytes = ref<Uint8Array | null>(null)
+  const renderVersion = ref(0)
 
   const fileSizeFormatted = computed(() => {
     if (!pdfBytes.value) return '0 KB'
@@ -29,6 +30,7 @@ export const useDocumentStore = defineStore('document', () => {
   function reloadBytes(bytes: Uint8Array, pages?: number) {
     pdfBytes.value = bytes
     if (pages !== undefined) totalPages.value = pages
+    renderVersion.value++
   }
 
   function setPage(page: number) {
@@ -59,7 +61,7 @@ export const useDocumentStore = defineStore('document', () => {
 
   return {
     loaded, fileName, totalPages, currentPage, scale,
-    isModified, pdfBytes, fileSizeFormatted,
+    isModified, pdfBytes, fileSizeFormatted, renderVersion,
     setDocument, reloadBytes, setPage, setScale, markModified, markSaved, reset
   }
 })

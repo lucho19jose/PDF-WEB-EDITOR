@@ -131,6 +131,32 @@ export function usePDFEngine() {
   }
 
   /**
+   * Add new text at a position on a page.
+   */
+  async function addText(
+    pageIndex: number,
+    x: number,
+    y: number,
+    text: string,
+    fontSize: number,
+    fontName: string,
+    color?: [number, number, number]
+  ): Promise<boolean> {
+    try {
+      const result = await bridge.addText(pageIndex, x, y, text, fontSize, fontName, color)
+      if (result.success) {
+        pageTextCache.delete(pageIndex)
+      } else {
+        error.value = result.error || 'Unknown error adding text'
+      }
+      return result.success
+    } catch (err: any) {
+      error.value = `Failed to add text: ${err.message}`
+      throw err
+    }
+  }
+
+  /**
    * Save the modified document and return the PDF bytes.
    */
   async function saveDocument(): Promise<ArrayBuffer> {
@@ -169,6 +195,7 @@ export function usePDFEngine() {
     getTextBlocks,
     readContentStream,
     replaceText,
+    addText,
     saveDocument,
     destroyEngine
   }

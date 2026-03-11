@@ -6,6 +6,16 @@
 
     <q-separator vertical inset class="q-mx-xs" />
 
+    <!-- Undo / Redo -->
+    <q-btn flat dense icon="undo" :disable="!historyStore.canUndo" @click="undo" size="sm">
+      <q-tooltip>Undo (Ctrl+Z)</q-tooltip>
+    </q-btn>
+    <q-btn flat dense icon="redo" :disable="!historyStore.canRedo" @click="redo" size="sm">
+      <q-tooltip>Redo (Ctrl+Shift+Z)</q-tooltip>
+    </q-btn>
+
+    <q-separator vertical inset class="q-mx-xs" />
+
     <!-- Edit Tools -->
     <q-btn-group flat>
       <q-btn
@@ -50,11 +60,15 @@
 import { computed, inject } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, type Tool } from '@/stores/editor'
+import { useHistoryStore } from '@/stores/history'
 
 const docStore = useDocumentStore()
 const editorStore = useEditorStore()
+const historyStore = useHistoryStore()
 
 const openFile = inject<() => void>('openFile', () => {})
+const undo = inject<() => void>('undo', () => {})
+const redo = inject<() => void>('redo', () => {})
 
 const tools: { name: Tool; label: string; icon: string; shortcut?: string }[] = [
   { name: 'select', label: 'Select', icon: 'arrow_selector_tool', shortcut: 'V' },
