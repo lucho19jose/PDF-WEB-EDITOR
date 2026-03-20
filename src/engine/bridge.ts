@@ -120,6 +120,25 @@ export class MuPDFBridge {
   }
 
   /**
+   * Transform a text block's position and/or scale.
+   * dx, dy: translation in PDF Tm coords (bottom-left origin)
+   * sx, sy: scale factors (1.0 = no change)
+   * anchorX, anchorY: anchor for scaling in PDF Tm coords
+   */
+  async transformTextBlock(
+    pageIndex: number,
+    blockId: string,
+    dx: number,
+    dy: number,
+    sx: number,
+    sy: number,
+    anchorX: number,
+    anchorY: number
+  ): Promise<{ success: boolean; error?: string }> {
+    return this.send('transformTextBlock', { pageIndex, blockId, dx, dy, sx, sy, anchorX, anchorY })
+  }
+
+  /**
    * Debug: inspect font encodings on a page.
    */
   async debugFonts(pageIndex: number): Promise<any> {

@@ -10,6 +10,7 @@ export type WorkerRequest =
   | { id: number; type: 'writeContentStream'; data: { pageIndex: number; streamBytes: ArrayBuffer } }
   | { id: number; type: 'replaceText'; data: { pageIndex: number; blockId: string; newText: string } }
   | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number] } }
+  | { id: number; type: 'transformTextBlock'; data: { pageIndex: number; blockId: string; dx: number; dy: number; sx: number; sy: number; anchorX: number; anchorY: number } }
   | { id: number; type: 'debugFonts'; data: { pageIndex: number } }
   | { id: number; type: 'saveDocument' }
   | { id: number; type: 'destroy' }

@@ -157,6 +157,33 @@ export function usePDFEngine() {
   }
 
   /**
+   * Transform a text block (move/resize) by modifying its Tm matrix.
+   */
+  async function transformTextBlock(
+    pageIndex: number,
+    blockId: string,
+    dx: number,
+    dy: number,
+    sx: number,
+    sy: number,
+    anchorX: number,
+    anchorY: number
+  ): Promise<boolean> {
+    try {
+      const result = await bridge.transformTextBlock(pageIndex, blockId, dx, dy, sx, sy, anchorX, anchorY)
+      if (result.success) {
+        pageTextCache.delete(pageIndex)
+      } else {
+        error.value = result.error || 'Unknown error transforming text block'
+      }
+      return result.success
+    } catch (err: any) {
+      error.value = `Failed to transform text block: ${err.message}`
+      throw err
+    }
+  }
+
+  /**
    * Save the modified document and return the PDF bytes.
    */
   async function saveDocument(): Promise<ArrayBuffer> {
@@ -196,6 +223,7 @@ export function usePDFEngine() {
     readContentStream,
     replaceText,
     addText,
+    transformTextBlock,
     saveDocument,
     destroyEngine
   }

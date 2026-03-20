@@ -93,6 +93,18 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      case 'transformTextBlock': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const transformResult = transformTextBlock(
+          req.data.pageIndex, req.data.blockId,
+          req.data.dx, req.data.dy,
+          req.data.sx, req.data.sy,
+          req.data.anchorX, req.data.anchorY
+        )
+        respond({ id: req.id, type: 'success', data: transformResult })
+        break
+      }
+
       case 'debugFonts': {
         if (!pdfDoc) throw new Error('No document loaded')
         const debugInfo = debugPageFonts(req.data.pageIndex)
@@ -228,7 +240,111 @@ function extractPageText(pageIndex: number): PageTextData {
   stext.destroy()
   page.destroy()
 
-  return { pageIndex, blocks, lines }
+  // Split blocks at significant horizontal gaps so each text segment
+  // becomes its own clickable/movable element (e.g., "Label:" and "Value"
+  // on the same line become separate blocks instead of one big block)
+  const splitBlocks = splitBlocksAtGaps(blocks, pageIndex)
+
+  return { pageIndex, blocks: splitBlocks, lines }
+}
+
+/**
+ * Split TextBlocks at large horizontal gaps between characters.
+ * MuPDF groups all text on the same line into one block, but for
+ * move/resize we need finer granularity (like Adobe Acrobat).
+ */
+function splitBlocksAtGaps(blocks: TextBlock[], pageIndex: number): TextBlock[] {
+  const result: TextBlock[] = []
+  let subIndex = 0
+
+  for (const block of blocks) {
+    if (block.chars.length < 2) {
+      block.id = `${pageIndex}:${subIndex++}`
+      result.push(block)
+      continue
+    }
+
+    // Compute average character width for this block
+    let totalWidth = 0
+    let widthCount = 0
+    for (const ch of block.chars) {
+      // quad: [ulx, uly, urx, ury, llx, lly, lrx, lry]
+      const charW = Math.abs(ch.quad[2] - ch.quad[0])
+      if (charW > 0) {
+        totalWidth += charW
+        widthCount++
+      }
+    }
+    const avgCharW = widthCount > 0 ? totalWidth / widthCount : block.fontSize * 0.6
+    // Gap threshold: if gap between chars > 3x average char width, split
+    const gapThreshold = Math.max(avgCharW * 3, block.fontSize * 1.5)
+
+    // Find split points
+    const splitPoints: number[] = [] // indices where a new segment starts
+    for (let i = 1; i < block.chars.length; i++) {
+      const prev = block.chars[i - 1]
+      const curr = block.chars[i]
+      // Gap = distance between end of previous char and start of current char
+      const prevEnd = Math.max(prev.quad[2], prev.quad[6]) // right edge (urx or lrx)
+      const currStart = Math.min(curr.quad[0], curr.quad[4]) // left edge (ulx or llx)
+      const gap = currStart - prevEnd
+
+      if (gap > gapThreshold) {
+        splitPoints.push(i)
+      }
+    }
+
+    if (splitPoints.length === 0) {
+      // No splits needed
+      block.id = `${pageIndex}:${subIndex++}`
+      result.push(block)
+      continue
+    }
+
+    // Split into segments
+    const segments: TextChar[][] = []
+    let start = 0
+    for (const sp of splitPoints) {
+      segments.push(block.chars.slice(start, sp))
+      start = sp
+    }
+    segments.push(block.chars.slice(start))
+
+    for (const segChars of segments) {
+      if (segChars.length === 0) continue
+
+      // Compute bbox from character quads
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+      for (const ch of segChars) {
+        minX = Math.min(minX, ch.quad[0], ch.quad[4])
+        minY = Math.min(minY, ch.quad[1], ch.quad[3])
+        maxX = Math.max(maxX, ch.quad[2], ch.quad[6])
+        maxY = Math.max(maxY, ch.quad[5], ch.quad[7])
+      }
+
+      const firstChar = segChars[0]
+      const text = segChars.map(c => c.c).join('')
+
+      result.push({
+        id: `${pageIndex}:${subIndex++}`,
+        pageIndex,
+        x: minX,
+        y: minY,
+        width: maxX - minX,
+        height: maxY - minY,
+        bbox: [minX, minY, maxX, maxY],
+        text,
+        fontName: firstChar.fontName,
+        fontSize: firstChar.size,
+        isBold: block.isBold,
+        isItalic: block.isItalic,
+        color: block.color,
+        chars: segChars
+      })
+    }
+  }
+
+  return result
 }
 
 // ==========================================
@@ -687,12 +803,342 @@ function replaceTextInStream(
   }
 }
 
+/**
+ * Transform a text block's position and/or scale by modifying the Tm matrix in the content stream.
+ * dx, dy: translation delta in PDF Tm coords (bottom-left origin)
+ * sx, sy: scale factors (1.0 = no change)
+ * anchorX, anchorY: anchor point in PDF Tm coords (used for scaling)
+ */
+function transformTextBlock(
+  pageIndex: number,
+  blockId: string,
+  dx: number,
+  dy: number,
+  sx: number,
+  sy: number,
+  anchorX: number,
+  anchorY: number
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+
+  try {
+    const pageData = extractPageText(pageIndex)
+    const targetBlock = pageData.blocks.find(b => b.id === blockId)
+    if (!targetBlock) {
+      return { success: false, error: `Block ${blockId} not found` }
+    }
+
+    const stream = readContentStream(pageIndex)
+
+    // Build font ref mappings (same as replaceTextInStream)
+    const fontRefs = [...new Set((stream.match(/\/(F\d+)/g) || []).map(s => s.slice(1)))]
+    const fontRefToBaseName = new Map<string, string>()
+    for (const fontRef of fontRefs) {
+      getFontEncoding(pageIndex, fontRef)
+      try {
+        const page2 = pdfDoc.loadPage(pageIndex)
+        const pObj = page2.getObject()
+        const fDict = pObj.get('Resources').get('Font').get(fontRef)
+        if (fDict) {
+          const baseFontStr = fDict.resolve().get('BaseFont')?.toString?.() || ''
+          fontRefToBaseName.set(fontRef, baseFontStr.replace(/^\//, ''))
+        }
+        page2.destroy()
+      } catch (_) {}
+    }
+
+    const targetFontRef = findMatchingFontRef(targetBlock.fontName, fontRefToBaseName)
+
+    // For transforms, use position-based matching to find only the specific
+    // BT block(s) that correspond to this text block — NOT the entire line.
+    const matchedBlocks = findBtBlocksByPosition(stream, pageIndex, targetBlock, targetFontRef)
+    if (!matchedBlocks || matchedBlocks.length === 0) {
+      return { success: false, error: 'Could not find matching text in content stream' }
+    }
+
+    // Apply transformation to each matched block's Tm matrix
+    let modifiedStream = stream
+    // Process from end to start to preserve string offsets
+    const sorted = [...matchedBlocks].sort((a, b) => b.start - a.start)
+
+    let anyModified = false
+    for (const block of sorted) {
+      const tmRegex = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/
+      const tmMatch = block.content.match(tmRegex)
+      if (!tmMatch) continue
+
+      const a = parseFloat(tmMatch[1])
+      const bVal = parseFloat(tmMatch[2])
+      const c = parseFloat(tmMatch[3])
+      const d = parseFloat(tmMatch[4])
+      const e = parseFloat(tmMatch[5])
+      const f = parseFloat(tmMatch[6])
+
+      // Apply transformation: scale around anchor then translate
+      const newA = a * sx
+      const newD = d * sy
+      const newE = anchorX + (e - anchorX) * sx + dx
+      const newF = anchorY + (f - anchorY) * sy + dy
+
+      const newTm = `${fmtNum(newA)} ${fmtNum(bVal)} ${fmtNum(c)} ${fmtNum(newD)} ${fmtNum(newE)} ${fmtNum(newF)} Tm`
+      const newContent = block.content.replace(tmRegex, newTm)
+
+      modifiedStream = modifiedStream.substring(0, block.start) +
+                       'BT' + newContent + 'ET' +
+                       modifiedStream.substring(block.end)
+      anyModified = true
+    }
+
+    if (!anyModified) {
+      return { success: false, error: 'No Tm matrix found in matched blocks' }
+    }
+
+    // Write modified stream back (Latin-1 for byte transparency)
+    const streamBytes = new Uint8Array(modifiedStream.length)
+    for (let i = 0; i < modifiedStream.length; i++) {
+      streamBytes[i] = modifiedStream.charCodeAt(i) & 0xFF
+    }
+
+    const page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+    const contents = pageObj.get('Contents')
+
+    if (contents.isArray()) {
+      const newStreamObj = pdfDoc.addStream(streamBytes, {})
+      pageObj.put('Contents', newStreamObj)
+    } else if (contents.isStream()) {
+      contents.writeStream(streamBytes)
+    }
+
+    page.destroy()
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+/** Format a number for PDF content stream (avoid excessive decimals) */
+function fmtNum(n: number): string {
+  if (Number.isInteger(n)) return String(n)
+  // Use enough precision for position/scale values
+  const s = n.toFixed(4)
+  // Strip trailing zeros
+  return s.replace(/\.?0+$/, '') || '0'
+}
+
+/**
+ * Find the BT/ET blocks in the content stream that match a given TextBlock.
+ * Reuses the same matching strategy as replaceTextInContentStreamFontAware.
+ */
+function findMatchingBtBlocks(
+  stream: string,
+  pageIndex: number,
+  targetBlock: TextBlock,
+  targetFontRef: string | null
+): BtInfo[] | null {
+  const btEtRegex = /BT\b([\s\S]*?)ET\b/g
+  let match: RegExpExecArray | null
+  const allBlocks: BtInfo[] = []
+
+  while ((match = btEtRegex.exec(stream)) !== null) {
+    const content = match[1]
+    const fontMatch = content.match(/\/(F\d+)\s+[\d.]+\s+Tf/)
+    if (!fontMatch) continue
+
+    const fontRef = fontMatch[1]
+    const tmMatch = content.match(/[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)\s+Tm/)
+    const yPos = tmMatch ? parseFloat(tmMatch[1]) : -1
+
+    const encoding = getFontEncoding(pageIndex, fontRef)
+    const mode = detectBlockEncoding(content)
+    const decodedText = decodeBtBlockText(content, encoding)
+
+    allBlocks.push({
+      content,
+      start: match.index,
+      end: match.index + match[0].length,
+      fontRef,
+      yPos,
+      decodedText,
+      mode,
+      encoding,
+      hasSubstantialText: decodedText.trim().length > 1
+    })
+  }
+
+  const normalizedTarget = targetBlock.text.replace(/\s+/g, ' ').trim()
+
+  // Try line-grouped matching first
+  const lineGroups = new Map<number, BtInfo[]>()
+  for (const block of allBlocks) {
+    if (block.yPos < 0) continue
+    const yKey = Math.round(block.yPos * 2) / 2
+    if (!lineGroups.has(yKey)) lineGroups.set(yKey, [])
+    lineGroups.get(yKey)!.push(block)
+  }
+
+  for (const [, lineBlocks] of lineGroups) {
+    if (lineBlocks.length < 2) continue
+    const lineText = lineBlocks.map(b => b.decodedText).join('')
+    const normalizedLine = lineText.replace(/\s+/g, ' ').trim()
+    if (!normalizedLine || normalizedLine.length < 2) continue
+
+    if (normalizedLine === normalizedTarget || fuzzyTextMatch(normalizedLine, normalizedTarget)) {
+      return lineBlocks
+    }
+  }
+
+  // Fallback: single-block matching
+  for (const block of allBlocks) {
+    if (targetFontRef && block.fontRef !== targetFontRef) continue
+    const normalizedDecoded = block.decodedText.replace(/\s+/g, ' ').trim()
+    if (!normalizedDecoded || normalizedDecoded.length < 2) continue
+
+    if (normalizedDecoded === normalizedTarget || fuzzyTextMatch(normalizedDecoded, normalizedTarget)) {
+      return [block]
+    }
+  }
+
+  return null
+}
+
+/**
+ * Position-based BT block matching for transforms.
+ * Uses the target TextBlock's Tm Y coordinate (from MuPDF bbox) to find
+ * only the specific BT block(s) at that position, NOT the entire line.
+ * Falls back to single-block text matching if position matching fails.
+ */
+function findBtBlocksByPosition(
+  stream: string,
+  pageIndex: number,
+  targetBlock: TextBlock,
+  targetFontRef: string | null
+): BtInfo[] | null {
+  const btEtRegex = /BT\b([\s\S]*?)ET\b/g
+  let match: RegExpExecArray | null
+  const allBlocks: BtInfo[] = []
+
+  while ((match = btEtRegex.exec(stream)) !== null) {
+    const content = match[1]
+    const fontMatch = content.match(/\/(F\d+)\s+[\d.]+\s+Tf/)
+    if (!fontMatch) continue
+
+    const fontRef = fontMatch[1]
+    // Extract full Tm: a b c d x y Tm
+    const tmMatch = content.match(
+      /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/
+    )
+    if (!tmMatch) continue
+    const xPos = parseFloat(tmMatch[5])
+    const yPos = parseFloat(tmMatch[6])
+
+    const encoding = getFontEncoding(pageIndex, fontRef)
+    const mode = detectBlockEncoding(content)
+    const decodedText = decodeBtBlockText(content, encoding)
+
+    allBlocks.push({
+      content,
+      start: match.index,
+      end: match.index + match[0].length,
+      fontRef,
+      yPos,
+      decodedText,
+      mode,
+      encoding,
+      hasSubstantialText: decodedText.trim().length > 1,
+      xPos
+    })
+  }
+
+  // Target block's position in Tm coords (bottom-left origin):
+  // bbox is top-left origin from MuPDF, so:
+  //   Tm Y ≈ pageHeight - bbox[3]  (bottom of text)
+  // But we don't have pageHeight here. Instead, use the Tm Y values
+  // from the content stream and match by proximity.
+
+  // Target bbox center in top-left coords
+  const targetCenterX = (targetBlock.bbox[0] + targetBlock.bbox[2]) / 2
+  // Target left edge
+  const targetLeftX = targetBlock.bbox[0]
+
+  // Strategy: find BT blocks whose Tm X position is close to the target block's X
+  // AND whose Tm Y position matches the target's Y line.
+  // First, group by Y and find the right Y line.
+  const normalizedTarget = targetBlock.text.replace(/\s+/g, ' ').trim()
+
+  // Step 1: Find BT blocks on the same Y line as the target
+  const lineGroups = new Map<number, (BtInfo & { xPos: number })[]>()
+  for (const block of allBlocks) {
+    const yKey = Math.round(block.yPos * 2) / 2
+    if (!lineGroups.has(yKey)) lineGroups.set(yKey, [])
+    lineGroups.get(yKey)!.push(block as BtInfo & { xPos: number })
+  }
+
+  // Step 2: For each line group, check if concatenated text contains the target
+  for (const [, lineBlocks] of lineGroups) {
+    const lineText = lineBlocks.map(b => b.decodedText).join('')
+    const normalizedLine = lineText.replace(/\s+/g, ' ').trim()
+
+    const isMatch = normalizedLine === normalizedTarget ||
+                    fuzzyTextMatch(normalizedLine, normalizedTarget) ||
+                    (normalizedLine.length > 5 && normalizedTarget.length > 5 &&
+                     (normalizedLine.includes(normalizedTarget) || normalizedTarget.includes(normalizedLine)))
+
+    if (!isMatch) continue
+
+    if (lineBlocks.length === 1) {
+      return lineBlocks
+    }
+
+    // Multiple blocks on this line — find only the ones that overlap
+    // with the target block's X range
+    const targetX0 = targetBlock.bbox[0]
+    const targetX1 = targetBlock.bbox[2]
+
+    const matching = lineBlocks.filter(b => {
+      // BT block's X position (from Tm) should be within the target's X range
+      // with some tolerance
+      const tolerance = targetBlock.width * 0.3
+      return b.xPos >= targetX0 - tolerance && b.xPos <= targetX1 + tolerance
+    })
+
+    if (matching.length > 0) return matching
+
+    // If position filtering returned nothing, try text-based single-block match
+    for (const block of lineBlocks) {
+      const nd = block.decodedText.replace(/\s+/g, ' ').trim()
+      if (nd === normalizedTarget) return [block]
+    }
+
+    // Last resort: return the block with the closest X position
+    const sorted = [...lineBlocks].sort((a, b) => {
+      const distA = Math.abs(a.xPos - targetCenterX)
+      const distB = Math.abs(b.xPos - targetCenterX)
+      return distA - distB
+    })
+    return [sorted[0]]
+  }
+
+  // Step 3: Fallback to single-block text matching (exact or fuzzy)
+  for (const block of allBlocks) {
+    if (targetFontRef && block.fontRef !== targetFontRef) continue
+    const nd = block.decodedText.replace(/\s+/g, ' ').trim()
+    if (!nd || nd.length < 2) continue
+    if (nd === normalizedTarget || fuzzyTextMatch(nd, normalizedTarget)) {
+      return [block]
+    }
+  }
+
+  return null
+}
+
 interface BtInfo {
   content: string
   start: number
   end: number
   fontRef: string
   yPos: number
+  xPos?: number
   decodedText: string
   mode: 'hex' | 'plain'
   encoding: ReturnType<typeof getFontEncoding>

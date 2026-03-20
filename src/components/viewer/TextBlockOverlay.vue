@@ -5,10 +5,36 @@
       v-for="block in scaledBlocks"
       :key="block.id"
       class="text-block"
-      :class="{ selected: selectedBlockId === block.id }"
+      :class="{
+        selected: selectedBlockId === block.id,
+        movable: selectedBlockId === block.id && ['select', 'edit'].includes(editorStore.currentTool)
+      }"
       :style="block.style"
-      @click.stop="selectBlock(block.id)"
+      @mousedown.stop="onBlockMouseDown($event, block.id)"
     />
+
+    <!-- Selection handles (select or edit mode, block selected, not editing inline) -->
+    <template v-if="selectedBlockId && ['select', 'edit'].includes(editorStore.currentTool) && !editingBlock">
+      <div
+        v-for="handle in selectionHandles"
+        :key="handle.pos"
+        class="selection-handle"
+        :style="handle.style"
+        @mousedown.stop.prevent="onHandleMouseDown($event, handle.pos)"
+      />
+    </template>
+
+    <!-- Delete hint when block selected (not editing inline) -->
+    <div
+      v-if="selectedBlockId && !editingBlock && !isAddingText && ['select', 'edit'].includes(editorStore.currentTool) && !dragState?.isDragging"
+      class="delete-hint"
+      :style="deleteHintStyle"
+      @mousedown.prevent
+    >
+      <q-btn dense flat size="xs" color="negative" icon="delete" @click.stop="deleteSelectedBlock">
+        <q-tooltip>Delete (Del)</q-tooltip>
+      </q-btn>
+    </div>
 
     <!-- Inline editor (edit mode only) -->
     <div
@@ -57,28 +83,31 @@
         <q-btn dense flat size="xs" color="negative" icon="close" @click.stop="cancelAddText" />
       </div>
     </div>
-
-    <!-- Delete hint when block selected in select mode -->
-    <div
-      v-if="selectedBlockId && !editingBlock && !isAddingText && editorStore.currentTool !== 'edit'"
-      class="delete-hint"
-      :style="deleteHintStyle"
-      @mousedown.prevent
-    >
-      <q-btn dense flat size="xs" color="negative" icon="delete" @click.stop="deleteSelectedBlock">
-        <q-tooltip>Delete (Del)</q-tooltip>
-      </q-btn>
-    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, inject } from 'vue'
+import { ref, computed, watch, nextTick, inject, onBeforeUnmount } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
 import type { TextBlock } from '@/engine/types'
+
+type HandlePosition = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+
+interface DragState {
+  mode: 'move' | 'resize'
+  blockId: string
+  handle?: HandlePosition
+  startMouseX: number
+  startMouseY: number
+  currentDeltaX: number
+  currentDeltaY: number
+  origScreenBbox: { left: number; top: number; width: number; height: number }
+  origPdfBbox: [number, number, number, number]
+  isDragging: boolean
+}
 
 const props = defineProps<{
   pageWidth: number
@@ -112,6 +141,9 @@ const addTextPdfX = ref(0)
 const addTextPdfY = ref(0)
 const addTextEditorRef = ref<HTMLTextAreaElement | null>(null)
 
+// Drag state for move/resize
+const dragState = ref<DragState | null>(null)
+
 // Show overlay for edit, select, and addText modes
 const showOverlay = computed(() =>
   ['edit', 'select', 'addText'].includes(editorStore.currentTool)
@@ -121,24 +153,92 @@ const showOverlay = computed(() =>
 const scaleX = computed(() => props.pageWidth / props.pdfWidth)
 const scaleY = computed(() => props.pageHeight / props.pdfHeight)
 
+/** Get screen bbox for a block, accounting for active drag */
+function getScreenBbox(block: TextBlock) {
+  const left = block.bbox[0] * scaleX.value
+  const top = block.bbox[1] * scaleY.value
+  const width = (block.bbox[2] - block.bbox[0]) * scaleX.value
+  const height = (block.bbox[3] - block.bbox[1]) * scaleY.value
+
+  if (dragState.value?.isDragging && dragState.value.blockId === block.id) {
+    const ds = dragState.value
+    if (ds.mode === 'move') {
+      return {
+        left: ds.origScreenBbox.left + ds.currentDeltaX,
+        top: ds.origScreenBbox.top + ds.currentDeltaY,
+        width: ds.origScreenBbox.width,
+        height: ds.origScreenBbox.height
+      }
+    } else if (ds.mode === 'resize' && ds.handle) {
+      return computeResizedBbox(ds.origScreenBbox, ds.handle, ds.currentDeltaX, ds.currentDeltaY)
+    }
+  }
+
+  return { left, top, width, height }
+}
+
 // Transform blocks from PDF coords to screen coords
 const scaledBlocks = computed(() => {
   return blocks.value.map(block => {
-    const x = block.bbox[0] * scaleX.value
-    const y = block.bbox[1] * scaleY.value
-    const w = (block.bbox[2] - block.bbox[0]) * scaleX.value
-    const h = (block.bbox[3] - block.bbox[1]) * scaleY.value
-
+    const bbox = getScreenBbox(block)
     return {
       id: block.id,
       style: {
-        left: `${x}px`,
-        top: `${y}px`,
-        width: `${w}px`,
-        height: `${h}px`
+        left: `${bbox.left}px`,
+        top: `${bbox.top}px`,
+        width: `${bbox.width}px`,
+        height: `${bbox.height}px`
       }
     }
   })
+})
+
+// Selection handles around the selected block
+const selectionHandles = computed(() => {
+  if (!selectedBlockId.value || !['select', 'edit'].includes(editorStore.currentTool)) return []
+
+  const block = blocks.value.find(b => b.id === selectedBlockId.value)
+  if (!block) return []
+
+  const { left, top, width, height } = getScreenBbox(block)
+  const hs = 8 // handle size
+  const ho = hs / 2
+
+  const handles: { pos: HandlePosition; cursor: string }[] = [
+    { pos: 'nw', cursor: 'nwse-resize' },
+    { pos: 'n', cursor: 'ns-resize' },
+    { pos: 'ne', cursor: 'nesw-resize' },
+    { pos: 'e', cursor: 'ew-resize' },
+    { pos: 'se', cursor: 'nwse-resize' },
+    { pos: 's', cursor: 'ns-resize' },
+    { pos: 'sw', cursor: 'nesw-resize' },
+    { pos: 'w', cursor: 'ew-resize' },
+  ]
+
+  const posMap: Record<HandlePosition, { x: number; y: number }> = {
+    nw: { x: left, y: top },
+    n: { x: left + width / 2, y: top },
+    ne: { x: left + width, y: top },
+    e: { x: left + width, y: top + height / 2 },
+    se: { x: left + width, y: top + height },
+    s: { x: left + width / 2, y: top + height },
+    sw: { x: left, y: top + height },
+    w: { x: left, y: top + height / 2 },
+  }
+
+  return handles.map(h => ({
+    pos: h.pos,
+    style: {
+      left: `${posMap[h.pos].x - ho}px`,
+      top: `${posMap[h.pos].y - ho}px`,
+      width: `${hs}px`,
+      height: `${hs}px`,
+      cursor: h.cursor,
+      position: 'absolute' as const,
+      pointerEvents: 'auto' as const,
+      zIndex: 20
+    }
+  }))
 })
 
 const editorStyle = computed(() => {
@@ -179,18 +279,18 @@ const deleteHintStyle = computed(() => {
   if (!selectedBlockId.value) return {}
   const block = blocks.value.find(b => b.id === selectedBlockId.value)
   if (!block) return {}
-  const x = block.bbox[2] * scaleX.value + 4
-  const y = block.bbox[1] * scaleY.value
+  const bbox = getScreenBbox(block)
   return {
-    left: `${x}px`,
-    top: `${y}px`,
-    position: 'absolute',
-    pointerEvents: 'auto',
+    left: `${bbox.left + bbox.width + 4}px`,
+    top: `${bbox.top}px`,
+    position: 'absolute' as const,
+    pointerEvents: 'auto' as const,
     zIndex: 10
   }
 })
 
-// Load text blocks when page changes or tool changes
+// ── Block loading ──
+
 async function loadBlocks() {
   if (!showOverlay.value || !pdfEngine.isReady.value) return
 
@@ -207,17 +307,17 @@ async function loadBlocks() {
   }
 }
 
+// ── Block selection & editing ──
+
 function selectBlock(id: string) {
   const block = blocks.value.find(b => b.id === id)
   if (!block) return
 
   selectedBlockId.value = id
 
-  // Only open inline editor in edit mode
   if (editorStore.currentTool === 'edit') {
     editingBlock.value = block
     editText.value = block.text
-
     nextTick(() => {
       editorRef.value?.focus()
       editorRef.value?.select()
@@ -233,7 +333,6 @@ function onBlur() {
   }, 150)
 }
 
-/** Push undo snapshot of current PDF bytes */
 function pushUndoSnapshot() {
   const currentBytes = docStore.pdfBytes
   if (currentBytes) {
@@ -253,9 +352,7 @@ async function commitEdit() {
   const blockId = editingBlock.value.id
   const newText = editText.value
 
-  // Snapshot for undo BEFORE mutation
   pushUndoSnapshot()
-
   editorStore.setStatus('Applying text change...')
 
   try {
@@ -280,7 +377,7 @@ async function commitEdit() {
 function cancelEdit() {
   isCommitting = false
   editingBlock.value = null
-  selectedBlockId.value = null
+  // Keep selectedBlockId so handles remain visible for move/resize
 }
 
 async function deleteSelectedBlock() {
@@ -288,9 +385,7 @@ async function deleteSelectedBlock() {
   const block = blocks.value.find(b => b.id === selectedBlockId.value)
   if (!block) return
 
-  // Snapshot for undo
   pushUndoSnapshot()
-
   const pageIndex = docStore.currentPage - 1
   editorStore.setStatus('Deleting text block...')
 
@@ -312,6 +407,171 @@ async function deleteSelectedBlock() {
   editingBlock.value = null
 }
 
+// ── Move / Resize drag ──
+
+function onBlockMouseDown(event: MouseEvent, blockId: string) {
+  // In select or edit mode, select and start potential drag for move
+  if (['select', 'edit'].includes(editorStore.currentTool)) {
+    selectedBlockId.value = blockId
+    startDrag(event, blockId, 'move')
+  }
+}
+
+function onHandleMouseDown(event: MouseEvent, handle: HandlePosition) {
+  if (!selectedBlockId.value) return
+  startDrag(event, selectedBlockId.value, 'resize', handle)
+}
+
+function startDrag(event: MouseEvent, blockId: string, mode: 'move' | 'resize', handle?: HandlePosition) {
+  const block = blocks.value.find(b => b.id === blockId)
+  if (!block) return
+
+  const left = block.bbox[0] * scaleX.value
+  const top = block.bbox[1] * scaleY.value
+  const width = (block.bbox[2] - block.bbox[0]) * scaleX.value
+  const height = (block.bbox[3] - block.bbox[1]) * scaleY.value
+
+  dragState.value = {
+    mode,
+    blockId,
+    handle,
+    startMouseX: event.clientX,
+    startMouseY: event.clientY,
+    currentDeltaX: 0,
+    currentDeltaY: 0,
+    origScreenBbox: { left, top, width, height },
+    origPdfBbox: [...block.bbox] as [number, number, number, number],
+    isDragging: false
+  }
+
+  document.addEventListener('mousemove', onDragMove)
+  document.addEventListener('mouseup', onDragEnd)
+}
+
+function onDragMove(event: MouseEvent) {
+  if (!dragState.value) return
+
+  const dx = event.clientX - dragState.value.startMouseX
+  const dy = event.clientY - dragState.value.startMouseY
+
+  dragState.value.currentDeltaX = dx
+  dragState.value.currentDeltaY = dy
+
+  if (!dragState.value.isDragging && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+    dragState.value.isDragging = true
+  }
+}
+
+async function onDragEnd() {
+  document.removeEventListener('mousemove', onDragMove)
+  document.removeEventListener('mouseup', onDragEnd)
+
+  if (!dragState.value || !dragState.value.isDragging) {
+    // No drag happened — it was a click
+    const blockId = dragState.value?.blockId
+    dragState.value = null
+    // In edit mode, a click (no drag) opens the inline editor
+    if (blockId && editorStore.currentTool === 'edit') {
+      selectBlock(blockId)
+    }
+    return
+  }
+
+  const ds = dragState.value
+  const pageIndex = docStore.currentPage - 1
+
+  pushUndoSnapshot()
+  editorStore.setStatus(ds.mode === 'move' ? 'Moving text block...' : 'Resizing text block...')
+
+  try {
+    let success = false
+
+    if (ds.mode === 'move') {
+      // Convert screen delta to PDF Tm coords (bottom-left origin, y up)
+      const dxTm = ds.currentDeltaX / scaleX.value
+      const dyTm = -ds.currentDeltaY / scaleY.value
+
+      success = await pdfEngine.transformTextBlock(
+        pageIndex, ds.blockId,
+        dxTm, dyTm, 1, 1, 0, 0
+      )
+    } else if (ds.mode === 'resize' && ds.handle) {
+      const newBbox = computeResizedBbox(ds.origScreenBbox, ds.handle, ds.currentDeltaX, ds.currentDeltaY)
+      const sx = newBbox.width / ds.origScreenBbox.width
+      const sy = newBbox.height / ds.origScreenBbox.height
+
+      // Compute anchor in PDF Tm coords (bottom-left origin)
+      const anchor = getAnchorPoint(ds.handle, ds.origPdfBbox)
+      const anchorTmX = anchor.x
+      const anchorTmY = props.pdfHeight - anchor.y
+
+      success = await pdfEngine.transformTextBlock(
+        pageIndex, ds.blockId,
+        0, 0, sx, sy, anchorTmX, anchorTmY
+      )
+    }
+
+    if (success) {
+      docStore.markModified()
+      editorStore.setStatus(ds.mode === 'move' ? 'Text block moved' : 'Text block resized')
+      emit('textChanged')
+      await loadBlocks()
+    } else {
+      editorStore.setStatus(`Transform failed: ${pdfEngine.error.value || 'unknown error'}`)
+    }
+  } catch (err: any) {
+    editorStore.setStatus(`Error: ${err.message}`)
+  }
+
+  dragState.value = null
+}
+
+function computeResizedBbox(
+  orig: { left: number; top: number; width: number; height: number },
+  handle: HandlePosition,
+  dx: number,
+  dy: number
+): { left: number; top: number; width: number; height: number } {
+  let { left, top, width, height } = orig
+
+  switch (handle) {
+    case 'nw': left += dx; top += dy; width -= dx; height -= dy; break
+    case 'n': top += dy; height -= dy; break
+    case 'ne': top += dy; width += dx; height -= dy; break
+    case 'e': width += dx; break
+    case 'se': width += dx; height += dy; break
+    case 's': height += dy; break
+    case 'sw': left += dx; width -= dx; height += dy; break
+    case 'w': left += dx; width -= dx; break
+  }
+
+  // Enforce minimum size
+  if (width < 20) { width = 20 }
+  if (height < 10) { height = 10 }
+
+  return { left, top, width, height }
+}
+
+function getAnchorPoint(handle: HandlePosition, pdfBbox: [number, number, number, number]): { x: number; y: number } {
+  const [x0, y0, x1, y1] = pdfBbox
+  const cx = (x0 + x1) / 2
+  const cy = (y0 + y1) / 2
+
+  // Returns the anchor in PDF top-left coords (the corner opposite to the handle)
+  switch (handle) {
+    case 'nw': return { x: x1, y: y1 }
+    case 'n': return { x: cx, y: y1 }
+    case 'ne': return { x: x0, y: y1 }
+    case 'e': return { x: x0, y: cy }
+    case 'se': return { x: x0, y: y0 }
+    case 's': return { x: cx, y: y0 }
+    case 'sw': return { x: x1, y: y0 }
+    case 'w': return { x: x1, y: cy }
+  }
+}
+
+// ── Add text ──
+
 function onAddTextClick(event: MouseEvent) {
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
   const screenX = event.clientX - rect.left
@@ -319,14 +579,11 @@ function onAddTextClick(event: MouseEvent) {
 
   addTextScreenX.value = screenX
   addTextScreenY.value = screenY
-
-  // Convert to PDF coordinates (content stream uses bottom-left origin)
   addTextPdfX.value = screenX / scaleX.value
   addTextPdfY.value = props.pdfHeight - (screenY / scaleY.value)
 
   isAddingText.value = true
   addTextValue.value = ''
-
   nextTick(() => addTextEditorRef.value?.focus())
 }
 
@@ -336,9 +593,7 @@ async function commitAddText() {
     return
   }
 
-  // Snapshot for undo
   pushUndoSnapshot()
-
   const pageIndex = docStore.currentPage - 1
   editorStore.setStatus('Adding text...')
 
@@ -373,6 +628,18 @@ function cancelAddText() {
   addTextValue.value = ''
 }
 
+// ── Cleanup ──
+
+function cleanupDrag() {
+  document.removeEventListener('mousemove', onDragMove)
+  document.removeEventListener('mouseup', onDragEnd)
+  dragState.value = null
+}
+
+onBeforeUnmount(cleanupDrag)
+
+// ── Watchers ──
+
 watch(() => editorStore.currentTool, (tool) => {
   if (['edit', 'select', 'addText'].includes(tool)) {
     loadBlocks()
@@ -380,19 +647,19 @@ watch(() => editorStore.currentTool, (tool) => {
     blocks.value = []
     cancelEdit()
   }
-  // Cancel any in-progress add-text when switching tools
   if (tool !== 'addText') {
     cancelAddText()
   }
-  // Deselect when switching tools
-  if (tool !== 'select') {
+  if (!['select', 'edit'].includes(tool)) {
     selectedBlockId.value = null
+    cleanupDrag()
   }
 })
 
 watch(() => docStore.currentPage, () => {
   cancelEdit()
   cancelAddText()
+  cleanupDrag()
   loadBlocks()
 })
 
@@ -425,6 +692,16 @@ defineExpose({ loadBlocks, deleteSelectedBlock })
 .text-block.selected {
   border-color: #2196f3;
   background-color: rgba(33, 150, 243, 0.15);
+}
+
+.text-block.movable {
+  cursor: move;
+}
+
+.selection-handle {
+  background: #2196f3;
+  border: 1px solid #1565c0;
+  box-sizing: border-box;
 }
 
 .inline-editor-wrapper {
