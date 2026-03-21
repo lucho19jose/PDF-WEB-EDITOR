@@ -36,26 +36,16 @@
       </q-btn>
     </div>
 
-    <!-- Inline editor (edit mode only) -->
+    <!-- In-place editor (contenteditable div exactly over the text block) -->
     <div
       v-if="editingBlock"
-      class="inline-editor-wrapper"
+      ref="editorRef"
+      class="inline-editor"
       :style="editorStyle"
-    >
-      <textarea
-        ref="editorRef"
-        v-model="editText"
-        class="inline-editor"
-        :style="editorTextStyle"
-        @keydown.enter.ctrl="commitEdit"
-        @keydown.escape="cancelEdit"
-        @blur="onBlur"
-      />
-      <div class="editor-actions" @mousedown.prevent>
-        <q-btn dense flat size="xs" color="positive" icon="check" @click.stop="commitEdit" />
-        <q-btn dense flat size="xs" color="negative" icon="close" @click.stop="cancelEdit" />
-      </div>
-    </div>
+      contenteditable="true"
+      @keydown.escape.prevent="cancelEdit"
+      @blur="onBlur"
+    />
 
     <!-- Add text click target (addText mode) -->
     <div
@@ -129,7 +119,7 @@ const blocks = ref<TextBlock[]>([])
 const selectedBlockId = ref<string | null>(null)
 const editingBlock = ref<TextBlock | null>(null)
 const editText = ref('')
-const editorRef = ref<HTMLTextAreaElement | null>(null)
+const editorRef = ref<HTMLDivElement | null>(null)
 let isCommitting = false
 
 // Add text state
@@ -246,25 +236,20 @@ const editorStyle = computed(() => {
   const block = editingBlock.value
   const x = block.bbox[0] * scaleX.value
   const y = block.bbox[1] * scaleY.value
-  const w = Math.max((block.bbox[2] - block.bbox[0]) * scaleX.value, 200)
-  const h = Math.max((block.bbox[3] - block.bbox[1]) * scaleY.value, 30)
+  const w = (block.bbox[2] - block.bbox[0]) * scaleX.value
+  const h = (block.bbox[3] - block.bbox[1]) * scaleY.value
+  const fs = block.fontSize * scaleY.value
 
   return {
-    left: `${x}px`,
-    top: `${y}px`,
-    width: `${w + 20}px`,
-    minHeight: `${h}px`
-  }
-})
-
-const editorTextStyle = computed(() => {
-  if (!editingBlock.value) return {}
-  const block = editingBlock.value
-  return {
-    fontSize: `${block.fontSize * scaleY.value}px`,
+    left: `${x - 1}px`,
+    top: `${y - 1}px`,
+    width: `${Math.max(w + 2, 60)}px`,
+    minHeight: `${Math.max(h + 2, fs + 4)}px`,
+    fontSize: `${fs}px`,
     fontWeight: block.isBold ? 'bold' : 'normal',
     fontStyle: block.isItalic ? 'italic' : 'normal',
-    color: `rgb(${Math.round(block.color[0] * 255)}, ${Math.round(block.color[1] * 255)}, ${Math.round(block.color[2] * 255)})`
+    color: `rgb(${Math.round(block.color[0] * 255)}, ${Math.round(block.color[1] * 255)}, ${Math.round(block.color[2] * 255)})`,
+    lineHeight: '1.15'
   }
 })
 
@@ -319,8 +304,16 @@ function selectBlock(id: string) {
     editingBlock.value = block
     editText.value = block.text
     nextTick(() => {
-      editorRef.value?.focus()
-      editorRef.value?.select()
+      if (editorRef.value) {
+        editorRef.value.textContent = block.text
+        editorRef.value.focus()
+        // Select all text
+        const range = document.createRange()
+        range.selectNodeContents(editorRef.value)
+        const sel = window.getSelection()
+        sel?.removeAllRanges()
+        sel?.addRange(range)
+      }
     })
   }
 }
@@ -342,7 +335,10 @@ function pushUndoSnapshot() {
 
 async function commitEdit() {
   if (isCommitting) return
-  if (!editingBlock.value || editText.value === editingBlock.value.text) {
+
+  // Read current text from contenteditable div
+  const currentText = editorRef.value?.textContent || ''
+  if (!editingBlock.value || currentText === editingBlock.value.text) {
     cancelEdit()
     return
   }
@@ -350,7 +346,7 @@ async function commitEdit() {
   isCommitting = true
   const pageIndex = docStore.currentPage - 1
   const blockId = editingBlock.value.id
-  const newText = editText.value
+  const newText = currentText
 
   pushUndoSnapshot()
   editorStore.setStatus('Applying text change...')
@@ -705,6 +701,27 @@ defineExpose({ loadBlocks, deleteSelectedBlock })
   box-shadow: 0 0 2px rgba(0, 0, 0, 0.3);
 }
 
+.inline-editor {
+  position: absolute;
+  pointer-events: auto;
+  z-index: 10;
+  border: 1.5px solid #4285f4;
+  background: rgba(255, 255, 255, 0.96);
+  padding: 1px 2px;
+  outline: none;
+  font-family: inherit;
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  word-break: break-word;
+  cursor: text;
+  overflow: visible;
+}
+
+.inline-editor:focus {
+  border-color: #1a73e8;
+  box-shadow: 0 1px 4px rgba(26, 115, 232, 0.25);
+}
+
 .inline-editor-wrapper {
   position: absolute;
   pointer-events: auto;
@@ -713,30 +730,18 @@ defineExpose({ loadBlocks, deleteSelectedBlock })
   flex-direction: column;
 }
 
-.inline-editor {
+.add-text-editor {
   width: 100%;
-  min-height: 100%;
-  border: 1.5px solid #4285f4;
+  min-height: 40px;
+  border: 1.5px solid #34a853;
   background: rgba(255, 255, 255, 0.97);
   padding: 3px 4px;
   resize: both;
   outline: none;
-  font-family: inherit;
-  line-height: 1.3;
-  box-sizing: border-box;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
-}
-
-.inline-editor:focus {
-  border-color: #1a73e8;
-  box-shadow: 0 2px 8px rgba(26, 115, 232, 0.2);
-}
-
-.add-text-editor {
-  border-color: #34a853;
   font-family: Helvetica, Arial, sans-serif;
   font-size: 12px;
-  min-height: 40px;
+  line-height: 1.3;
+  box-sizing: border-box;
 }
 
 .editor-actions {
