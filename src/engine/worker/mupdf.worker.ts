@@ -254,8 +254,35 @@ function extractPageText(pageIndex: number): PageTextData {
  * move/resize we need finer granularity (like Adobe Acrobat).
  */
 function splitBlocksAtGaps(blocks: TextBlock[], pageIndex: number): TextBlock[] {
-  const result: TextBlock[] = []
   let subIndex = 0
+
+  /** Create a TextBlock from a group of characters */
+  function makeBlock(chars: TextChar[], parentBlock: TextBlock): TextBlock {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    for (const ch of chars) {
+      minX = Math.min(minX, ch.quad[0], ch.quad[4])
+      minY = Math.min(minY, ch.quad[1], ch.quad[3])
+      maxX = Math.max(maxX, ch.quad[2], ch.quad[6])
+      maxY = Math.max(maxY, ch.quad[5], ch.quad[7])
+    }
+    const firstChar = chars[0]
+    return {
+      id: `${pageIndex}:${subIndex++}`,
+      pageIndex,
+      x: minX, y: minY,
+      width: maxX - minX, height: maxY - minY,
+      bbox: [minX, minY, maxX, maxY],
+      text: chars.map(c => c.c).join(''),
+      fontName: firstChar.fontName,
+      fontSize: firstChar.size,
+      isBold: parentBlock.isBold,
+      isItalic: parentBlock.isItalic,
+      color: parentBlock.color,
+      chars
+    }
+  }
+
+  const result: TextBlock[] = []
 
   for (const block of blocks) {
     if (block.chars.length < 2) {
@@ -264,83 +291,58 @@ function splitBlocksAtGaps(blocks: TextBlock[], pageIndex: number): TextBlock[] 
       continue
     }
 
-    // Compute average character width for this block
-    let totalWidth = 0
-    let widthCount = 0
+    // Step 1: Split into lines by Y position
+    // Group characters by baseline Y (chars on same line have similar Y)
+    const lineMap = new Map<number, TextChar[]>()
     for (const ch of block.chars) {
-      // quad: [ulx, uly, urx, ury, llx, lly, lrx, lry]
-      const charW = Math.abs(ch.quad[2] - ch.quad[0])
-      if (charW > 0) {
-        totalWidth += charW
-        widthCount++
+      // Use origin Y rounded to nearest 0.5 for grouping
+      const yKey = Math.round(ch.origin[1] * 2) / 2
+      if (!lineMap.has(yKey)) lineMap.set(yKey, [])
+      lineMap.get(yKey)!.push(ch)
+    }
+
+    // Sort lines by Y position (top to bottom in PDF coords)
+    const lineKeys = [...lineMap.keys()].sort((a, b) => a - b)
+    const lines: TextChar[][] = lineKeys.map(k => lineMap.get(k)!)
+
+    // Step 2: For each line, split at horizontal gaps
+    for (const lineChars of lines) {
+      if (lineChars.length === 0) continue
+
+      // Sort chars by X position (left to right)
+      lineChars.sort((a, b) => a.origin[0] - b.origin[0])
+
+      // Compute average char width for this line
+      let totalW = 0, wCount = 0
+      for (const ch of lineChars) {
+        const cw = Math.abs(ch.quad[2] - ch.quad[0])
+        if (cw > 0) { totalW += cw; wCount++ }
       }
-    }
-    const avgCharW = widthCount > 0 ? totalWidth / widthCount : block.fontSize * 0.6
-    // Gap threshold: if gap between chars > 3x average char width, split
-    const gapThreshold = Math.max(avgCharW * 3, block.fontSize * 1.5)
+      const avgCharW = wCount > 0 ? totalW / wCount : block.fontSize * 0.6
+      const gapThreshold = Math.max(avgCharW * 3, block.fontSize * 1.5)
 
-    // Find split points
-    const splitPoints: number[] = [] // indices where a new segment starts
-    for (let i = 1; i < block.chars.length; i++) {
-      const prev = block.chars[i - 1]
-      const curr = block.chars[i]
-      // Gap = distance between end of previous char and start of current char
-      const prevEnd = Math.max(prev.quad[2], prev.quad[6]) // right edge (urx or lrx)
-      const currStart = Math.min(curr.quad[0], curr.quad[4]) // left edge (ulx or llx)
-      const gap = currStart - prevEnd
+      // Find horizontal split points
+      const segments: TextChar[][] = []
+      let segStart = 0
+      for (let i = 1; i < lineChars.length; i++) {
+        const prev = lineChars[i - 1]
+        const curr = lineChars[i]
+        const prevEnd = Math.max(prev.quad[2], prev.quad[6])
+        const currStart = Math.min(curr.quad[0], curr.quad[4])
+        const gap = currStart - prevEnd
 
-      if (gap > gapThreshold) {
-        splitPoints.push(i)
+        if (gap > gapThreshold) {
+          segments.push(lineChars.slice(segStart, i))
+          segStart = i
+        }
       }
-    }
+      segments.push(lineChars.slice(segStart))
 
-    if (splitPoints.length === 0) {
-      // No splits needed
-      block.id = `${pageIndex}:${subIndex++}`
-      result.push(block)
-      continue
-    }
-
-    // Split into segments
-    const segments: TextChar[][] = []
-    let start = 0
-    for (const sp of splitPoints) {
-      segments.push(block.chars.slice(start, sp))
-      start = sp
-    }
-    segments.push(block.chars.slice(start))
-
-    for (const segChars of segments) {
-      if (segChars.length === 0) continue
-
-      // Compute bbox from character quads
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-      for (const ch of segChars) {
-        minX = Math.min(minX, ch.quad[0], ch.quad[4])
-        minY = Math.min(minY, ch.quad[1], ch.quad[3])
-        maxX = Math.max(maxX, ch.quad[2], ch.quad[6])
-        maxY = Math.max(maxY, ch.quad[5], ch.quad[7])
+      // Create a block for each segment
+      for (const seg of segments) {
+        if (seg.length === 0) continue
+        result.push(makeBlock(seg, block))
       }
-
-      const firstChar = segChars[0]
-      const text = segChars.map(c => c.c).join('')
-
-      result.push({
-        id: `${pageIndex}:${subIndex++}`,
-        pageIndex,
-        x: minX,
-        y: minY,
-        width: maxX - minX,
-        height: maxY - minY,
-        bbox: [minX, minY, maxX, maxY],
-        text,
-        fontName: firstChar.fontName,
-        fontSize: firstChar.size,
-        isBold: block.isBold,
-        isItalic: block.isItalic,
-        color: block.color,
-        chars: segChars
-      })
     }
   }
 
