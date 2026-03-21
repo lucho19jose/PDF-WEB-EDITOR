@@ -744,7 +744,7 @@ function replaceTextInStream(
     const stream = readContentStream(pageIndex)
 
     // Build font ref name → baseFont mapping and parse encodings
-    const fontRefs = [...new Set((stream.match(/\/(F\d+)/g) || []).map(s => s.slice(1)))]
+    const fontRefs = [...new Set((stream.match(/\/(F[\d.]+)/g) || []).map(s => s.slice(1)))]
     const fontRefToBaseName = new Map<string, string>()
     for (const fontRef of fontRefs) {
       getFontEncoding(pageIndex, fontRef)
@@ -839,7 +839,7 @@ function transformTextBlock(
     const stream = readContentStream(pageIndex)
 
     // Build font ref mappings (same as replaceTextInStream)
-    const fontRefs = [...new Set((stream.match(/\/(F\d+)/g) || []).map(s => s.slice(1)))]
+    const fontRefs = [...new Set((stream.match(/\/(F[\d.]+)/g) || []).map(s => s.slice(1)))]
     const fontRefToBaseName = new Map<string, string>()
     for (const fontRef of fontRefs) {
       getFontEncoding(pageIndex, fontRef)
@@ -950,11 +950,11 @@ function findMatchingBtBlocks(
 
   while ((match = btEtRegex.exec(stream)) !== null) {
     const content = match[1]
-    const fontMatch = content.match(/\/(F\d+)\s+[\d.]+\s+Tf/)
+    const fontMatch = content.match(/\/(F[\d.]+)\s+[\d.]+\s+Tf/)
     if (!fontMatch) continue
 
     const fontRef = fontMatch[1]
-    const tmMatch = content.match(/[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)\s+Tm/)
+    const tmMatch = content.match(/-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+(-?[\d.]+)\s+Tm/)
     const yPos = tmMatch ? parseFloat(tmMatch[1]) : -1
 
     const encoding = getFontEncoding(pageIndex, fontRef)
@@ -1028,7 +1028,7 @@ function findBtBlocksByPosition(
 
   while ((match = btEtRegex.exec(stream)) !== null) {
     const content = match[1]
-    const fontMatch = content.match(/\/(F\d+)\s+[\d.]+\s+Tf/)
+    const fontMatch = content.match(/\/(F[\d.]+)\s+[\d.]+\s+Tf/)
     if (!fontMatch) continue
 
     const fontRef = fontMatch[1]
@@ -1177,13 +1177,13 @@ function replaceTextInContentStreamFontAware(
 
   while ((match = btEtRegex.exec(stream)) !== null) {
     const content = match[1]
-    const fontMatch = content.match(/\/(F\d+)\s+[\d.]+\s+Tf/)
+    const fontMatch = content.match(/\/(F[\d.]+)\s+[\d.]+\s+Tf/)
     if (!fontMatch) continue
 
     const fontRef = fontMatch[1]
 
     // Extract Y position from Tm: "1 0 0 1 <x> <y> Tm"
-    const tmMatch = content.match(/[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)\s+Tm/)
+    const tmMatch = content.match(/-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+(-?[\d.]+)\s+Tm/)
     const yPos = tmMatch ? parseFloat(tmMatch[1]) : -1
 
     const encoding = getFontEncoding(pageIndex, fontRef)
@@ -1334,7 +1334,7 @@ function applyWrappedReplacement(
   if (lines.length <= 1) return null // No wrapping needed, fall through to standard
 
   // Parse font size from the BT block for line spacing
-  const tfMatch = block.content.match(/\/(F\d+)\s+([\d.]+)\s+Tf/)
+  const tfMatch = block.content.match(/\/(F[\d.]+)\s+([\d.]+)\s+Tf/)
   const fontSize = tfMatch ? parseFloat(tfMatch[2]) : 12
   const lineHeight = fontSize * 1.2
 
