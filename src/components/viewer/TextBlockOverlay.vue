@@ -678,20 +678,19 @@ defineExpose({ loadBlocks, deleteSelectedBlock })
 
 .text-block {
   position: absolute;
-  border: 1px solid transparent;
+  border: 1px dashed transparent;
   cursor: text;
   pointer-events: auto;
-  transition: border-color 0.15s, background-color 0.15s;
+  transition: border-color 0.15s;
 }
 
 .text-block:hover {
-  border-color: rgba(33, 150, 243, 0.6);
-  background-color: rgba(33, 150, 243, 0.08);
+  border-color: rgba(66, 133, 244, 0.5);
 }
 
 .text-block.selected {
-  border-color: #2196f3;
-  background-color: rgba(33, 150, 243, 0.15);
+  border: 1.5px dashed #4285f4;
+  background-color: rgba(66, 133, 244, 0.06);
 }
 
 .text-block.movable {
@@ -699,9 +698,11 @@ defineExpose({ loadBlocks, deleteSelectedBlock })
 }
 
 .selection-handle {
-  background: #2196f3;
-  border: 1px solid #1565c0;
+  background: #4285f4;
+  border: 1px solid #1a73e8;
+  border-radius: 1px;
   box-sizing: border-box;
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.3);
 }
 
 .inline-editor-wrapper {
@@ -715,18 +716,24 @@ defineExpose({ loadBlocks, deleteSelectedBlock })
 .inline-editor {
   width: 100%;
   min-height: 100%;
-  border: 2px solid #2196f3;
-  background: rgba(255, 255, 255, 0.95);
-  padding: 2px 4px;
+  border: 1.5px solid #4285f4;
+  background: rgba(255, 255, 255, 0.97);
+  padding: 3px 4px;
   resize: both;
   outline: none;
   font-family: inherit;
-  line-height: 1.2;
+  line-height: 1.3;
   box-sizing: border-box;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.inline-editor:focus {
+  border-color: #1a73e8;
+  box-shadow: 0 2px 8px rgba(26, 115, 232, 0.2);
 }
 
 .add-text-editor {
-  border-color: #4caf50;
+  border-color: #34a853;
   font-family: Helvetica, Arial, sans-serif;
   font-size: 12px;
   min-height: 40px;
@@ -736,8 +743,9 @@ defineExpose({ loadBlocks, deleteSelectedBlock })
   display: flex;
   justify-content: flex-end;
   gap: 2px;
-  background: #333;
+  background: rgba(50, 50, 50, 0.9);
   border-radius: 0 0 4px 4px;
+  padding: 1px;
 }
 
 .add-text-target {

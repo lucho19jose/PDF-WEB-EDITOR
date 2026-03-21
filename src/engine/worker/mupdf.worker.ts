@@ -1336,12 +1336,17 @@ function applyWrappedReplacement(
   const fontSize = tfMatch ? parseFloat(tfMatch[2]) : 12
   const lineHeight = fontSize * 1.2
 
-  // Build the wrapped BT content
-  // Keep everything from original content up to and including the first Tj,
-  // then replace with multi-line Tj + Td sequence
+  // Rebuild the ENTIRE BT block: keep only Tf and Tm, strip ALL old Tj/Td/TJ content,
+  // then append the new wrapped lines. This prevents duplication when re-editing.
+  const tfPart = tfMatch ? tfMatch[0] : ''
+  const tmMatch = block.content.match(/(-?[\d.]+\s+){5}-?[\d.]+\s+Tm/)
+  const tmPart = tmMatch ? tmMatch[0] : ''
+  // Also preserve any color operators (rg/RG/g/G/k/K)
+  const colorMatch = block.content.match(/[\d.]+(?:\s+[\d.]+){0,3}\s+(?:rg|RG|g|G|k|K)\b/)
+  const colorPart = colorMatch ? colorMatch[0] : ''
+
   if (block.mode === 'hex') {
     if (!block.encoding) return null
-    // Encode each line and build the content
     const tjParts: string[] = []
     for (let i = 0; i < lines.length; i++) {
       const encResult = encodeTextForFont(lines[i], block.encoding)
@@ -1352,18 +1357,12 @@ function applyWrappedReplacement(
         tjParts.push(`0 ${(-lineHeight).toFixed(1)} Td\n<${encResult.hex}> Tj`)
       }
     }
-    const newTjContent = tjParts.join('\n')
-    // Replace the first Tj (hex pattern) in the block content
-    const hexTjRegex = /<[0-9A-Fa-f]+>\s*Tj/
-    const newContent = block.content.replace(hexTjRegex, newTjContent)
-    if (newContent !== block.content) {
-      return {
-        stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
-                stream.substring(block.end)
-      }
+    const newContent = `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${tmPart}\n${tjParts.join('\n')}\n`
+    return {
+      stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
+              stream.substring(block.end)
     }
   } else {
-    // Plain mode
     const tjParts: string[] = []
     for (let i = 0; i < lines.length; i++) {
       const escaped = escapePdfString(lines[i])
@@ -1373,18 +1372,12 @@ function applyWrappedReplacement(
         tjParts.push(`0 ${(-lineHeight).toFixed(1)} Td\n(${escaped}) Tj`)
       }
     }
-    const newTjContent = tjParts.join('\n')
-    const plainTjRegex = /\([^)]*\)\s*Tj/
-    const newContent = block.content.replace(plainTjRegex, newTjContent)
-    if (newContent !== block.content) {
-      return {
-        stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
-                stream.substring(block.end)
-      }
+    const newContent = `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${tmPart}\n${tjParts.join('\n')}\n`
+    return {
+      stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
+              stream.substring(block.end)
     }
   }
-
-  return null
 }
 
 /**
@@ -1670,6 +1663,10 @@ function replaceTjInBlock(block: string, newText: string, mode: 'hex' | 'plain',
       }
     }
   }
+
+  // Strip leftover Td operators from previous line wrapping
+  // (remove "0 -X.X Td" lines that precede blanked Tj operators)
+  result = result.replace(/[\d.-]+\s+[\d.-]+\s+Td\s*\n?\s*(?:<>\s*Tj|\(\)\s*Tj)/g, '')
 
   return result
 }
