@@ -240,10 +240,13 @@ const editorStyle = computed(() => {
   const h = (block.bbox[3] - block.bbox[1]) * scaleY.value
   const fs = block.fontSize * scaleY.value
 
+  // Extend editor width to page right edge so text stays on one line
+  const availableW = props.pageWidth - x
   return {
     left: `${x - 1}px`,
     top: `${y - 1}px`,
-    width: `${Math.max(w + 2, 60)}px`,
+    minWidth: `${Math.max(w + 2, 60)}px`,
+    maxWidth: `${Math.max(availableW, w + 2)}px`,
     minHeight: `${Math.max(h + 2, fs + 4)}px`,
     fontSize: `${fs}px`,
     fontWeight: block.isBold ? 'bold' : 'normal',
@@ -705,21 +708,20 @@ defineExpose({ loadBlocks, deleteSelectedBlock })
   position: absolute;
   pointer-events: auto;
   z-index: 10;
-  border: 1.5px solid #4285f4;
-  background: rgba(255, 255, 255, 0.96);
-  padding: 1px 2px;
+  border: 1px solid #4285f4;
+  background: rgba(255, 255, 255, 0.97);
+  padding: 1px 1px;
   outline: none;
   font-family: inherit;
   box-sizing: border-box;
-  white-space: pre-wrap;
-  word-break: break-word;
+  white-space: nowrap;
   cursor: text;
   overflow: visible;
 }
 
 .inline-editor:focus {
   border-color: #1a73e8;
-  box-shadow: 0 1px 4px rgba(26, 115, 232, 0.25);
+  background: rgba(255, 255, 255, 1);
 }
 
 .inline-editor-wrapper {
