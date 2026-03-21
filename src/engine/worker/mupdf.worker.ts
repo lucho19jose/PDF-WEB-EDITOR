@@ -764,9 +764,15 @@ function replaceTextInStream(
     const targetFontRef = findMatchingFontRef(targetBlock.fontName, fontRefToBaseName)
     // Font matched
 
+    // Get page width for line wrapping
+    const pageBounds = pdfDoc.loadPage(pageIndex)
+    const boundsRect = pageBounds.getBounds()
+    const pageWidth = boundsRect[2] - boundsRect[0]
+    pageBounds.destroy()
+
     // Find and replace the text in the content stream
     const replaceResult = replaceTextInContentStreamFontAware(
-      stream, pageIndex, targetBlock, newText, targetFontRef
+      stream, pageIndex, targetBlock, newText, targetFontRef, pageWidth
     )
 
     if (!replaceResult) {
@@ -1159,7 +1165,8 @@ function replaceTextInContentStreamFontAware(
   pageIndex: number,
   targetBlock: TextBlock,
   newText: string,
-  targetFontRef: string | null
+  targetFontRef: string | null,
+  pageWidth?: number
 ): { stream: string } | { error: string } | null {
   // Step 1: Parse all BT blocks with position and text info
   const btEtRegex = /BT\b([\s\S]*?)ET\b/g
@@ -1232,7 +1239,7 @@ function replaceTextInContentStreamFontAware(
     if (!normalizedDecoded || normalizedDecoded.length < 2) continue
 
     if (normalizedDecoded === normalizedTarget || fuzzyTextMatch(normalizedDecoded, normalizedTarget)) {
-      const replaceResult = applyBlockReplacement(stream, [block], newText, pageIndex)
+      const replaceResult = applyBlockReplacement(stream, [block], newText, pageIndex, targetBlock, pageWidth)
       if (replaceResult) return replaceResult
     }
   }
@@ -1247,10 +1254,22 @@ function applyBlockReplacement(
   stream: string,
   blocks: BtInfo[],
   newText: string,
-  pageIndex: number
+  pageIndex: number,
+  targetBlock?: TextBlock,
+  pageWidth?: number
 ): { stream: string } | { error: string } | null {
   const block = blocks[0]
 
+  // Check if we need line wrapping
+  const needsWrap = targetBlock && pageWidth && newText.length > 0 &&
+    shouldWrapText(newText, targetBlock, pageWidth)
+
+  if (needsWrap && targetBlock && pageWidth) {
+    const wrappedResult = applyWrappedReplacement(stream, block, newText, targetBlock, pageWidth)
+    if (wrappedResult) return wrappedResult
+  }
+
+  // Standard single-line replacement
   if (block.mode === 'hex') {
     if (!block.encoding) return null
     const encodeResult = encodeTextForFont(newText, block.encoding)
@@ -1270,6 +1289,133 @@ function applyBlockReplacement(
     }
   }
   return null
+}
+
+/**
+ * Check if text needs wrapping based on estimated width.
+ */
+function shouldWrapText(newText: string, targetBlock: TextBlock, pageWidth: number): boolean {
+  const origText = targetBlock.text
+  const blockWidth = targetBlock.width
+  if (blockWidth <= 0 || origText.length === 0) return false
+
+  // Estimate average char width from the original block
+  const avgCharWidth = blockWidth / origText.length
+  const estimatedNewWidth = newText.length * avgCharWidth
+  // Available width: from block's left edge to right margin (with 20pt margin)
+  const availableWidth = pageWidth - targetBlock.x - 20
+
+  return estimatedNewWidth > availableWidth * 1.1 // 10% tolerance
+}
+
+/**
+ * Apply text replacement with automatic line wrapping.
+ * Generates multiple Tj + Td operators for multi-line text.
+ */
+function applyWrappedReplacement(
+  stream: string,
+  block: BtInfo,
+  newText: string,
+  targetBlock: TextBlock,
+  pageWidth: number
+): { stream: string } | { error: string } | null {
+  const origText = targetBlock.text
+  const blockWidth = targetBlock.width
+  const avgCharWidth = blockWidth / Math.max(origText.length, 1)
+  const availableWidth = pageWidth - targetBlock.x - 20
+
+  // Max chars per line
+  const maxCharsPerLine = Math.max(Math.floor(availableWidth / avgCharWidth), 10)
+
+  // Word-wrap the text
+  const lines = wordWrap(newText, maxCharsPerLine)
+  if (lines.length <= 1) return null // No wrapping needed, fall through to standard
+
+  // Parse font size from the BT block for line spacing
+  const tfMatch = block.content.match(/\/(F\d+)\s+([\d.]+)\s+Tf/)
+  const fontSize = tfMatch ? parseFloat(tfMatch[2]) : 12
+  const lineHeight = fontSize * 1.2
+
+  // Build the wrapped BT content
+  // Keep everything from original content up to and including the first Tj,
+  // then replace with multi-line Tj + Td sequence
+  if (block.mode === 'hex') {
+    if (!block.encoding) return null
+    // Encode each line and build the content
+    const tjParts: string[] = []
+    for (let i = 0; i < lines.length; i++) {
+      const encResult = encodeTextForFont(lines[i], block.encoding)
+      if ('error' in encResult) return { error: encResult.error }
+      if (i === 0) {
+        tjParts.push(`<${encResult.hex}> Tj`)
+      } else {
+        tjParts.push(`0 ${(-lineHeight).toFixed(1)} Td\n<${encResult.hex}> Tj`)
+      }
+    }
+    const newTjContent = tjParts.join('\n')
+    // Replace the first Tj (hex pattern) in the block content
+    const hexTjRegex = /<[0-9A-Fa-f]+>\s*Tj/
+    const newContent = block.content.replace(hexTjRegex, newTjContent)
+    if (newContent !== block.content) {
+      return {
+        stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
+                stream.substring(block.end)
+      }
+    }
+  } else {
+    // Plain mode
+    const tjParts: string[] = []
+    for (let i = 0; i < lines.length; i++) {
+      const escaped = escapePdfString(lines[i])
+      if (i === 0) {
+        tjParts.push(`(${escaped}) Tj`)
+      } else {
+        tjParts.push(`0 ${(-lineHeight).toFixed(1)} Td\n(${escaped}) Tj`)
+      }
+    }
+    const newTjContent = tjParts.join('\n')
+    const plainTjRegex = /\([^)]*\)\s*Tj/
+    const newContent = block.content.replace(plainTjRegex, newTjContent)
+    if (newContent !== block.content) {
+      return {
+        stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
+                stream.substring(block.end)
+      }
+    }
+  }
+
+  return null
+}
+
+/**
+ * Word-wrap text to fit within maxCharsPerLine.
+ */
+function wordWrap(text: string, maxCharsPerLine: number): string[] {
+  const words = text.split(/\s+/)
+  const lines: string[] = []
+  let currentLine = ''
+
+  for (const word of words) {
+    if (currentLine.length === 0) {
+      currentLine = word
+    } else if (currentLine.length + 1 + word.length <= maxCharsPerLine) {
+      currentLine += ' ' + word
+    } else {
+      lines.push(currentLine)
+      currentLine = word
+    }
+    // Handle very long words that exceed maxCharsPerLine
+    while (currentLine.length > maxCharsPerLine) {
+      lines.push(currentLine.substring(0, maxCharsPerLine))
+      currentLine = currentLine.substring(maxCharsPerLine)
+    }
+  }
+
+  if (currentLine.length > 0) {
+    lines.push(currentLine)
+  }
+
+  return lines
 }
 
 /**
