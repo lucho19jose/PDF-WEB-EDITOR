@@ -7,3 +7,7 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Test PDFs carrying real personal or business data (this repo is public).
+# public/sample.pdf is lorem ipsum and is tracked on purpose.
+public/test.pdf

@@ -67,6 +67,34 @@ App.vue
     └── StatusBar.vue (q-footer)
 ```
 
+### Concurrency invariant
+ALL document-level mutations (text edits, annotations, page ops, undo/redo,
+save) run through the global FIFO queue in `src/utils/opQueue.ts`
+(`enqueueOp`). An op landing between another op's `saveDocument` and
+`loadDocument` mutates a doc that is about to be replaced (silently lost), and
+undo snapshots read stale `docStore.pdfBytes`. Never call the engine's
+mutating APIs outside the queue.
+
+### Ghostscript / signed-PDF support (Intellisign etc.)
+- `readContentStream` must call `readStream()` on the INDIRECT array element,
+  never on the resolved object (MuPDF quirk) — resolving first makes every
+  chunk of a multi-stream page read as empty.
+- Symbolic embedded subsets with no `/Encoding` (Flags bit 3) use raw glyph
+  indices as byte codes; they decode/encode via the ToUnicode CMap
+  (`codeBytes` 1 or 2), and replacements are written as hex literals.
+- Ghostscript merges a whole table ROW into one TJ array with kern jumps
+  between cells: `replaceInsideTjArray` swaps only the target glyphs, appends
+  a width-compensating kern, and picks the occurrence nearest the clicked
+  position (`scanShowOps` tracks per-op x/y via Tm/Td/TL/T*).
+
+### Content-stream parsing invariant
+BT/ET block scanning uses `scanBtBlocks()`/`maskStreamLiterals()` — string
+literals, hex strings and name tokens are masked before operator scans, so
+text like "(BUDGET REPORT)" or "/GS_ET" can't truncate a block. Show-text ops
+are decoded/replaced via a sequential literal walk (`decodeBtBlockText`,
+`replaceTjInBlock`) covering Tj, TJ, ' and " with nested parens and `]`
+inside array strings. ToUnicode CMaps record `codeBytes` (1- or 2-byte codes).
+
 ### Key Patterns
 - `usePDFViewer` and `usePDFEngine` composables are `provide`d from `EditorPage` and `inject`ed in children
 - PDF.js worker: `new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url)`
@@ -74,11 +102,51 @@ App.vue
 - `shallowRef` used for PDF.js document proxy (prevents Vue deep proxying)
 - Font encoding cache avoids re-parsing ToUnicode CMaps on each edit
 
+### Font handling (Acrobat-style)
+Replacement text is encoded via `planTextEncoding()` in the worker:
+1. **Keep original font** when every character can be encoded: hex CID fonts via
+   reverse ToUnicode CMap; simple fonts via MacRoman/WinAnsi tables plus a
+   glyph-availability check (Widths of 0 inside FirstChar..LastChar = glyph
+   missing from the subset).
+2. **Substitute a standard base-14 font** (Helvetica/Times/Courier family picked
+   from the original's name + FontDescriptor flags, preserving bold/italic) when
+   the original subset lacks needed glyphs — like Acrobat's font fallback. The
+   UI reports "substituted <font>" in the status bar and `replaceText()` returns
+   `substitutedFont`.
+3. Error only when even WinAnsi can't represent the text (e.g. CJK).
+
+`getCtmAtOffset()` replays q/Q/cm operators so move/resize (`transformTextBlock`)
+converts page-space deltas through the inverse CTM — required for print-to-PDF
+files that wrap text in scaled/flipped matrices like `0.24 0 0 0.24 cm`.
+
+### Text positioning invariant (Tm is NOT guaranteed)
+A BT block's origin must be read with `getBlockOrigin()`, which replays
+Tm/Td/TD/TL/T*, never by grepping for `Tm`. Many generators (wkhtmltopdf,
+FPDF/TCPDF — e.g. the "ACTA DE ENTREGA" forms) emit `BT x y Td (text) Tj ET`
+with no Tm at all; reading only Tm reported "no position", which silently
+disabled line grouping and made move/resize fail with "Could not find matching
+text in content stream". `BtInfo.hasPos`/`hasTm` carry that state — filter on
+`hasPos`, not on `yPos >= 0` (a legitimate Td origin can be negative).
+
+`transformTextBlock` therefore has two paths: rewrite the existing Tm, or —
+when the block has none — inject `sx 0 0 sy e f Tm` right after `BT`. BT resets
+the line matrix to the identity, so every following Td/TD/T* is relative to the
+injected matrix and the whole block (all its lines) transforms with it.
+
+### Text-block selection is anchored, not id-based
+`TextBlock.id` is `page:extractionIndex` and is **not stable**: every edit runs
+a save→reload cycle that re-extracts the page, and moving a block changes its
+place in MuPDF's extraction order. `TextBlockOverlay` keeps a
+`selectionAnchor` (text + centre) and re-resolves `selectedBlockId` after each
+`loadBlocks()`. Never persist a raw block id across a reload — before this, the
+selection either vanished on every move (the `renderVersion` watcher cleared
+it) or, worse, stayed pointing at whatever paragraph inherited the index.
+
 ### Known Limitations
-- **Subsetted fonts**: Only characters already in the font subset can be used. Attempting to use missing characters shows a clear error ("Characters not in font subset: X, Y")
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
-- **Text position**: Replaced text uses the same position/size as original — no automatic reflow
+- **Text position**: Replaced text uses the same position/size as original — no automatic reflow; justified TJ kerning is not regenerated
+- **Substituted fonts are not embedded** (standard base-14, always available in viewers)
 
 ## Vite Config Notes
 - COEP/COOP headers needed for SharedArrayBuffer (WASM)
