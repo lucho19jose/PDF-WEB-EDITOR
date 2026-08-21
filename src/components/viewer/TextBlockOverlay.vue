@@ -81,6 +81,7 @@ import { ref, computed, watch, nextTick, inject, onBeforeUnmount } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
+import { enqueueOp } from '@/utils/opQueue'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
 import type { TextBlock } from '@/engine/types'
 
@@ -117,6 +118,14 @@ const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
 
 const blocks = ref<TextBlock[]>([])
 const selectedBlockId = ref<string | null>(null)
+/**
+ * Block ids are "page:extractionIndex" and are NOT stable: a save→reload cycle
+ * (every edit) re-extracts the page, and moving a block changes its position in
+ * MuPDF's extraction order. Remembering what was selected — its text and where
+ * it sits — lets the selection be re-resolved after each reload instead of
+ * being dropped (or, worse, left pointing at somebody else's paragraph).
+ */
+const selectionAnchor = ref<{ text: string; cx: number; cy: number } | null>(null)
 const editingBlock = ref<TextBlock | null>(null)
 const editText = ref('')
 const editorRef = ref<HTMLDivElement | null>(null)
@@ -279,20 +288,96 @@ const deleteHintStyle = computed(() => {
 
 // ── Block loading ──
 
+const pageRotated = ref(false)
+
 async function loadBlocks() {
-  if (!showOverlay.value || !pdfEngine.isReady.value) return
+  if (!showOverlay.value || !pdfEngine.isReady.value || !pdfEngine.docLoaded.value) return
 
   try {
     const pageIndex = docStore.currentPage - 1
+
+    // Rotated pages: MuPDF extraction splits rotated glyph runs into
+    // per-character blocks (thousands of useless hitboxes) and the Tm-space
+    // math in move/add-text assumes an unrotated page. Disable text editing
+    // there instead of corrupting the layout.
+    const size = await pdfEngine.getPageSize(pageIndex).catch(() => null)
+    pageRotated.value = !!size && size.rotation % 360 !== 0
+    if (pageRotated.value) {
+      blocks.value = []
+      clearSelection()
+      if (editorStore.currentTool === 'edit' || editorStore.currentTool === 'addText') {
+        editorStore.setStatus('Text editing is disabled on rotated pages — rotate back to 0° first')
+      }
+      return
+    }
+
     const data = await pdfEngine.getTextBlocks(pageIndex)
     blocks.value = data
+    resolveSelection()
     if (editorStore.currentTool === 'edit') {
       editorStore.setStatus(`Edit mode: ${data.length} text blocks found`)
     }
   } catch (err: any) {
     console.error('Failed to load text blocks:', err)
     blocks.value = []
+    clearSelection()
   }
+}
+
+/** Select a block (or nothing) and remember it for post-reload re-resolution. */
+function setSelection(block: TextBlock | null) {
+  selectedBlockId.value = block?.id ?? null
+  selectionAnchor.value = block
+    ? {
+        text: block.text,
+        cx: (block.bbox[0] + block.bbox[2]) / 2,
+        cy: (block.bbox[1] + block.bbox[3]) / 2
+      }
+    : null
+}
+
+function clearSelection() {
+  selectedBlockId.value = null
+  selectionAnchor.value = null
+}
+
+/** Re-point selectedBlockId at the anchored block in the freshly loaded set. */
+function resolveSelection() {
+  const anchor = selectionAnchor.value
+  if (!anchor) { selectedBlockId.value = null; return }
+
+  let candidates = blocks.value.filter(b => b.text === anchor.text)
+  if (candidates.length === 0) {
+    // Scaling text up can push its tail past the page edge, so re-extraction
+    // returns a clipped string — match on the surviving prefix instead.
+    const prefix = anchor.text.slice(0, 3)
+    candidates = prefix.length === 3
+      ? blocks.value.filter(b => b.text.startsWith(prefix) &&
+          (b.text.startsWith(anchor.text) || anchor.text.startsWith(b.text)))
+      : []
+  }
+  if (candidates.length === 0) { clearSelection(); return }
+
+  // Unambiguous text wins outright — a resize can move the centre a long way,
+  // so a distance cutoff would drop the selection on big drags.
+  if (candidates.length === 1) {
+    selectedBlockId.value = candidates[0].id
+    return
+  }
+
+  // Repeated text (table cells, signature lines): disambiguate by position,
+  // and rather lose the selection than adopt a twin on the far side of the
+  // page — that would move the wrong text on the next drag.
+  let best: { id: string; dist: number } | null = null
+  for (const b of candidates) {
+    const dist = Math.hypot(
+      (b.bbox[0] + b.bbox[2]) / 2 - anchor.cx,
+      (b.bbox[1] + b.bbox[3]) / 2 - anchor.cy
+    )
+    if (!best || dist < best.dist) best = { id: b.id, dist }
+  }
+  if (best && best.dist < 24) selectedBlockId.value = best.id
+  else clearSelection()
 }
 
 // ── Block selection & editing ──
@@ -301,7 +386,7 @@ function selectBlock(id: string) {
   const block = blocks.value.find(b => b.id === id)
   if (!block) return
 
-  selectedBlockId.value = id
+  setSelection(block)
 
   if (editorStore.currentTool === 'edit') {
     editingBlock.value = block
@@ -322,9 +407,15 @@ function selectBlock(id: string) {
 }
 
 function onBlur() {
+  // Capture WHICH block and WHAT text at blur time — reading live state when
+  // the timer fires can commit block A's text under block B's id (or silently
+  // drop the edit) if the user quick-clicks another block within 150 ms.
+  const block = editingBlock.value
+  const text = editorRef.value?.textContent ?? ''
+  if (!block) return
   setTimeout(() => {
-    if (editingBlock.value && !isCommitting) {
-      commitEdit()
+    if (!isCommitting) {
+      commitEdit(block, text)
     }
   }, 150)
 }
@@ -336,40 +427,41 @@ function pushUndoSnapshot() {
   }
 }
 
-async function commitEdit() {
+async function commitEdit(block: TextBlock, newText: string) {
   if (isCommitting) return
-
-  // Read current text from contenteditable div
-  const currentText = editorRef.value?.textContent || ''
-  if (!editingBlock.value || currentText === editingBlock.value.text) {
+  if (newText === block.text) {
     cancelEdit()
     return
   }
 
   isCommitting = true
   const pageIndex = docStore.currentPage - 1
-  const blockId = editingBlock.value.id
-  const newText = currentText
 
-  pushUndoSnapshot()
   editorStore.setStatus('Applying text change...')
 
   try {
-    const success = await pdfEngine.replaceText(pageIndex, blockId, newText)
-    if (success) {
-      docStore.markModified()
-      editorStore.setStatus('Text replaced successfully')
-      emit('textChanged')
-      await loadBlocks()
-    } else {
-      editorStore.setStatus(`Edit failed: ${pdfEngine.error.value || 'unknown error'}`)
-    }
+    // Serialized: guarantees the previous edit's save→reload finished, so
+    // pushUndoSnapshot reads the true pre-edit bytes.
+    await enqueueOp(async () => {
+      const result = await pdfEngine.replaceText(pageIndex, block.id, newText)
+      if (result.success) {
+        pushUndoSnapshot() // snapshot pre-edit bytes only on success (before re-render)
+        docStore.markModified()
+        emit('textChanged')
+        await loadBlocks()
+        editorStore.setStatus(result.substitutedFont
+          ? `Text replaced — original font lacks some characters, substituted ${result.substitutedFont}`
+          : 'Text replaced successfully')
+      } else {
+        editorStore.setStatus(`Edit failed: ${pdfEngine.error.value || 'unknown error'}`)
+      }
+    })
   } catch (err: any) {
     editorStore.setStatus(`Error: ${err.message}`)
   }
 
   editingBlock.value = null
-  selectedBlockId.value = null
+  clearSelection()
   isCommitting = false
 }
 
@@ -384,25 +476,27 @@ async function deleteSelectedBlock() {
   const block = blocks.value.find(b => b.id === selectedBlockId.value)
   if (!block) return
 
-  pushUndoSnapshot()
   const pageIndex = docStore.currentPage - 1
   editorStore.setStatus('Deleting text block...')
 
   try {
-    const success = await pdfEngine.replaceText(pageIndex, block.id, '')
-    if (success) {
-      docStore.markModified()
-      editorStore.setStatus('Text block deleted')
-      emit('textChanged')
-      await loadBlocks()
-    } else {
-      editorStore.setStatus(`Delete failed: ${pdfEngine.error.value || 'unknown error'}`)
-    }
+    await enqueueOp(async () => {
+      const result = await pdfEngine.replaceText(pageIndex, block.id, '')
+      if (result.success) {
+        pushUndoSnapshot() // snapshot pre-edit bytes only on success (before re-render)
+        docStore.markModified()
+        emit('textChanged')
+        await loadBlocks()
+        editorStore.setStatus('Text block deleted')
+      } else {
+        editorStore.setStatus(`Delete failed: ${pdfEngine.error.value || 'unknown error'}`)
+      }
+    })
   } catch (err: any) {
     editorStore.setStatus(`Error: ${err.message}`)
   }
 
-  selectedBlockId.value = null
+  clearSelection()
   editingBlock.value = null
 }
 
@@ -411,7 +505,7 @@ async function deleteSelectedBlock() {
 function onBlockMouseDown(event: MouseEvent, blockId: string) {
   // In select or edit mode, select and start potential drag for move
   if (['select', 'edit'].includes(editorStore.currentTool)) {
-    selectedBlockId.value = blockId
+    setSelection(blocks.value.find(b => b.id === blockId) ?? null)
     startDrag(event, blockId, 'move')
   }
 }
@@ -478,46 +572,77 @@ async function onDragEnd() {
 
   const ds = dragState.value
   const pageIndex = docStore.currentPage - 1
+  const dragged = blocks.value.find(b => b.id === ds.blockId) || null
 
-  pushUndoSnapshot()
   editorStore.setStatus(ds.mode === 'move' ? 'Moving text block...' : 'Resizing text block...')
 
   try {
-    let success = false
+    await enqueueOp(async () => {
+      let success = false
+      // Where the block should land, in PDF page coords (top-left origin) —
+      // used to re-find it afterwards.
+      let expectedBbox: [number, number, number, number] | null = null
 
-    if (ds.mode === 'move') {
-      // Convert screen delta to PDF Tm coords (bottom-left origin, y up)
-      const dxTm = ds.currentDeltaX / scaleX.value
-      const dyTm = -ds.currentDeltaY / scaleY.value
+      if (ds.mode === 'move') {
+        // Screen delta in PDF page units (top-left origin, y down)
+        const dxP = ds.currentDeltaX / scaleX.value
+        const dyP = ds.currentDeltaY / scaleY.value
 
-      success = await pdfEngine.transformTextBlock(
-        pageIndex, ds.blockId,
-        dxTm, dyTm, 1, 1, 0, 0
-      )
-    } else if (ds.mode === 'resize' && ds.handle) {
-      const newBbox = computeResizedBbox(ds.origScreenBbox, ds.handle, ds.currentDeltaX, ds.currentDeltaY)
-      const sx = newBbox.width / ds.origScreenBbox.width
-      const sy = newBbox.height / ds.origScreenBbox.height
+        if (dragged) {
+          expectedBbox = [
+            dragged.bbox[0] + dxP, dragged.bbox[1] + dyP,
+            dragged.bbox[2] + dxP, dragged.bbox[3] + dyP
+          ]
+        }
 
-      // Compute anchor in PDF Tm coords (bottom-left origin)
-      const anchor = getAnchorPoint(ds.handle, ds.origPdfBbox)
-      const anchorTmX = anchor.x
-      const anchorTmY = props.pdfHeight - anchor.y
+        // Tm coords are bottom-left origin, y up — flip dy
+        success = await pdfEngine.transformTextBlock(
+          pageIndex, ds.blockId,
+          dxP, -dyP, 1, 1, 0, 0
+        )
+      } else if (ds.mode === 'resize' && ds.handle) {
+        const newBbox = computeResizedBbox(ds.origScreenBbox, ds.handle, ds.currentDeltaX, ds.currentDeltaY)
+        // A zero-extent block would make the scale factor Infinity and corrupt
+        // the text matrix — leave it unscaled on that axis instead.
+        const sx = ds.origScreenBbox.width > 0.01 ? newBbox.width / ds.origScreenBbox.width : 1
+        const sy = ds.origScreenBbox.height > 0.01 ? newBbox.height / ds.origScreenBbox.height : 1
 
-      success = await pdfEngine.transformTextBlock(
-        pageIndex, ds.blockId,
-        0, 0, sx, sy, anchorTmX, anchorTmY
-      )
-    }
+        // Compute anchor in PDF Tm coords (bottom-left origin)
+        const anchor = getAnchorPoint(ds.handle, ds.origPdfBbox)
+        const anchorTmX = anchor.x
+        const anchorTmY = props.pdfHeight - anchor.y
 
-    if (success) {
-      docStore.markModified()
-      editorStore.setStatus(ds.mode === 'move' ? 'Text block moved' : 'Text block resized')
-      emit('textChanged')
-      await loadBlocks()
-    } else {
-      editorStore.setStatus(`Transform failed: ${pdfEngine.error.value || 'unknown error'}`)
-    }
+        expectedBbox = [
+          newBbox.left / scaleX.value, newBbox.top / scaleY.value,
+          (newBbox.left + newBbox.width) / scaleX.value,
+          (newBbox.top + newBbox.height) / scaleY.value
+        ]
+
+        success = await pdfEngine.transformTextBlock(
+          pageIndex, ds.blockId,
+          0, 0, sx, sy, anchorTmX, anchorTmY
+        )
+      }
+
+      if (success) {
+        pushUndoSnapshot() // snapshot pre-edit bytes only on success (before re-render)
+        docStore.markModified()
+        editorStore.setStatus(ds.mode === 'move' ? 'Text block moved' : 'Text block resized')
+        // Re-anchor to where the block lands so the selection survives this
+        // reload AND the save→reload that emit('textChanged') queues behind it.
+        if (dragged && expectedBbox) {
+          selectionAnchor.value = {
+            text: dragged.text,
+            cx: (expectedBbox[0] + expectedBbox[2]) / 2,
+            cy: (expectedBbox[1] + expectedBbox[3]) / 2
+          }
+        }
+        emit('textChanged')
+        await loadBlocks()
+      } else {
+        editorStore.setStatus(`Transform failed: ${pdfEngine.error.value || 'unknown error'}`)
+      }
+    })
   } catch (err: any) {
     editorStore.setStatus(`Error: ${err.message}`)
   }
@@ -572,6 +697,10 @@ function getAnchorPoint(handle: HandlePosition, pdfBbox: [number, number, number
 // ── Add text ──
 
 function onAddTextClick(event: MouseEvent) {
+  if (pageRotated.value) {
+    editorStore.setStatus('Text editing is disabled on rotated pages — rotate back to 0° first')
+    return
+  }
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
   const screenX = event.clientX - rect.left
   const screenY = event.clientY - rect.top
@@ -579,7 +708,10 @@ function onAddTextClick(event: MouseEvent) {
   addTextScreenX.value = screenX
   addTextScreenY.value = screenY
   addTextPdfX.value = screenX / scaleX.value
-  addTextPdfY.value = props.pdfHeight - (screenY / scaleY.value)
+  // Tm Y is the text BASELINE (bottom of the glyph box). The user clicks where they
+  // expect the TOP of the text, so drop the baseline by ~one ascent (0.8em) below
+  // the click point, matching the inline preview which grows downward.
+  addTextPdfY.value = props.pdfHeight - (screenY / scaleY.value) - editorStore.fontSize * 0.8
 
   isAddingText.value = true
   addTextValue.value = ''
@@ -592,28 +724,30 @@ async function commitAddText() {
     return
   }
 
-  pushUndoSnapshot()
   const pageIndex = docStore.currentPage - 1
   editorStore.setStatus('Adding text...')
 
   try {
-    const success = await pdfEngine.addText(
-      pageIndex,
-      addTextPdfX.value,
-      addTextPdfY.value,
-      addTextValue.value,
-      editorStore.fontSize,
-      'Helvetica'
-    )
+    await enqueueOp(async () => {
+      const success = await pdfEngine.addText(
+        pageIndex,
+        addTextPdfX.value,
+        addTextPdfY.value,
+        addTextValue.value,
+        editorStore.fontSize,
+        'Helvetica'
+      )
 
-    if (success) {
-      docStore.markModified()
-      editorStore.setStatus('Text added successfully')
-      emit('textChanged')
-      await loadBlocks()
-    } else {
-      editorStore.setStatus(`Add text failed: ${pdfEngine.error.value || 'unknown error'}`)
-    }
+      if (success) {
+        pushUndoSnapshot() // snapshot pre-edit bytes only on success (before re-render)
+        docStore.markModified()
+        editorStore.setStatus('Text added successfully')
+        emit('textChanged')
+        await loadBlocks()
+      } else {
+        editorStore.setStatus(`Add text failed: ${pdfEngine.error.value || 'unknown error'}`)
+      }
+    })
   } catch (err: any) {
     editorStore.setStatus(`Error: ${err.message}`)
   }
@@ -635,7 +769,23 @@ function cleanupDrag() {
   dragState.value = null
 }
 
-onBeforeUnmount(cleanupDrag)
+function onKeyDown(e: KeyboardEvent) {
+  if (e.defaultPrevented) return // another layer already handled this keypress
+  const tag = (e.target as HTMLElement)?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+  if ((e.key === 'Delete' || e.key === 'Backspace')
+      && selectedBlockId.value && !editingBlock.value
+      && ['select', 'edit'].includes(editorStore.currentTool)) {
+    e.preventDefault()
+    deleteSelectedBlock()
+  }
+}
+window.addEventListener('keydown', onKeyDown)
+
+onBeforeUnmount(() => {
+  cleanupDrag()
+  window.removeEventListener('keydown', onKeyDown)
+})
 
 // ── Watchers ──
 
@@ -650,7 +800,7 @@ watch(() => editorStore.currentTool, (tool) => {
     cancelAddText()
   }
   if (!['select', 'edit'].includes(tool)) {
-    selectedBlockId.value = null
+    clearSelection()
     cleanupDrag()
   }
 })
@@ -658,6 +808,17 @@ watch(() => editorStore.currentTool, (tool) => {
 watch(() => docStore.currentPage, () => {
   cancelEdit()
   cancelAddText()
+  cleanupDrag()
+  clearSelection() // the anchored block lives on the page we just left
+  loadBlocks()
+})
+
+// Document bytes changed outside this overlay (rotate, page ops, undo/redo) —
+// cached block geometry is stale, so reload it. The selection is NOT dropped
+// here: loadBlocks re-resolves it from selectionAnchor, so a moved block stays
+// selected through the save→reload cycle that every edit triggers.
+watch(() => docStore.renderVersion, () => {
+  cancelEdit()
   cleanupDrag()
   loadBlocks()
 })
