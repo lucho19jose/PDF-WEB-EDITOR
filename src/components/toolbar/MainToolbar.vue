@@ -1,59 +1,100 @@
 <template>
-  <q-toolbar class="bg-grey-9 q-px-sm" style="min-height: 42px">
-    <!-- File Operations -->
-    <q-btn flat dense icon="folder_open" label="Open" @click="openFile" size="sm" />
-    <q-btn flat dense icon="save" label="Save" :disable="!docStore.loaded" @click="saveFile" size="sm" />
+  <div>
+    <!-- Main tool row -->
+    <q-toolbar class="bg-grey-9 q-px-sm" style="min-height: 42px">
+      <!-- File -->
+      <q-btn flat dense icon="folder_open" @click="openFile" size="sm"><q-tooltip>Open (Ctrl+O)</q-tooltip></q-btn>
+      <q-btn flat dense icon="save" :disable="!docStore.loaded" @click="saveFile" size="sm"><q-tooltip>Save (Ctrl+S)</q-tooltip></q-btn>
 
-    <q-separator vertical inset class="q-mx-xs" />
+      <q-separator vertical inset class="q-mx-xs" />
 
-    <!-- Undo / Redo -->
-    <q-btn flat dense icon="undo" :disable="!historyStore.canUndo" @click="undo" size="sm">
-      <q-tooltip>Undo (Ctrl+Z)</q-tooltip>
-    </q-btn>
-    <q-btn flat dense icon="redo" :disable="!historyStore.canRedo" @click="redo" size="sm">
-      <q-tooltip>Redo (Ctrl+Shift+Z)</q-tooltip>
-    </q-btn>
+      <!-- Undo / Redo -->
+      <q-btn flat dense icon="undo" :disable="!historyStore.canUndo" @click="undo" size="sm"><q-tooltip>Undo (Ctrl+Z)</q-tooltip></q-btn>
+      <q-btn flat dense icon="redo" :disable="!historyStore.canRedo" @click="redo" size="sm"><q-tooltip>Redo (Ctrl+Shift+Z)</q-tooltip></q-btn>
 
-    <q-separator vertical inset class="q-mx-xs" />
+      <q-separator vertical inset class="q-mx-xs" />
 
-    <!-- Edit Tools -->
-    <q-btn-group flat>
-      <q-btn
-        v-for="tool in tools"
-        :key="tool.name"
-        flat dense
-        :icon="tool.icon"
-        :color="editorStore.currentTool === tool.name ? 'primary' : undefined"
-        :disable="!docStore.loaded"
-        @click="editorStore.setTool(tool.name)"
-        size="sm"
-      >
-        <q-tooltip>{{ tool.label }} {{ tool.shortcut ? `(${tool.shortcut})` : '' }}</q-tooltip>
-      </q-btn>
-    </q-btn-group>
+      <!-- Tools -->
+      <template v-for="group in toolGroups" :key="group.label">
+        <q-btn
+          v-for="tool in group.tools"
+          :key="tool.name"
+          flat dense
+          :icon="tool.icon"
+          :color="editorStore.currentTool === tool.name ? 'primary' : undefined"
+          :disable="!docStore.loaded"
+          @click="editorStore.setTool(tool.name)"
+          size="sm"
+        >
+          <q-tooltip>{{ tool.label }}{{ tool.shortcut ? ` (${tool.shortcut})` : '' }}</q-tooltip>
+        </q-btn>
+        <q-separator vertical inset class="q-mx-xs" />
+      </template>
 
-    <q-separator vertical inset class="q-mx-xs" />
+      <!-- Zoom -->
+      <q-btn flat dense icon="remove" @click="zoomOut" size="sm" :disable="!docStore.loaded" />
+      <span class="text-caption q-mx-xs" style="min-width: 40px; text-align: center">{{ zoomPercent }}%</span>
+      <q-btn flat dense icon="add" @click="zoomIn" size="sm" :disable="!docStore.loaded" />
+      <q-btn flat dense icon="fit_screen" @click="fitPage" size="sm" :disable="!docStore.loaded"><q-tooltip>Reset zoom</q-tooltip></q-btn>
 
-    <!-- Zoom -->
-    <q-btn flat dense icon="remove" @click="zoomOut" size="sm" />
-    <span class="text-caption q-mx-xs" style="min-width: 40px; text-align: center">
-      {{ zoomPercent }}%
-    </span>
-    <q-btn flat dense icon="add" @click="zoomIn" size="sm" />
-    <q-btn flat dense icon="fit_screen" @click="fitPage" size="sm">
-      <q-tooltip>Fit Page</q-tooltip>
-    </q-btn>
+      <q-separator vertical inset class="q-mx-xs" />
 
-    <q-separator vertical inset class="q-mx-xs" />
+      <!-- Page ops -->
+      <q-btn flat dense icon="rotate_left" :disable="!docStore.loaded" @click="rotatePage(-90)" size="sm"><q-tooltip>Rotate left</q-tooltip></q-btn>
+      <q-btn flat dense icon="rotate_right" :disable="!docStore.loaded" @click="rotatePage(90)" size="sm"><q-tooltip>Rotate right</q-tooltip></q-btn>
 
-    <!-- Page Operations -->
-    <q-btn flat dense icon="rotate_left" :disable="!docStore.loaded" @click="$emit('rotate-left')" size="sm">
-      <q-tooltip>Rotate Left</q-tooltip>
-    </q-btn>
-    <q-btn flat dense icon="rotate_right" :disable="!docStore.loaded" @click="$emit('rotate-right')" size="sm">
-      <q-tooltip>Rotate Right</q-tooltip>
-    </q-btn>
-  </q-toolbar>
+      <q-space />
+
+      <q-btn flat dense icon="search" :disable="!docStore.loaded" @click="openFind" size="sm"><q-tooltip>Find (Ctrl+F)</q-tooltip></q-btn>
+    </q-toolbar>
+
+    <!-- Context-sensitive properties row -->
+    <q-toolbar v-if="ctx !== 'none' && docStore.loaded" class="bg-grey-8 q-px-md" style="min-height: 36px">
+      <!-- Text -->
+      <template v-if="ctx === 'text'">
+        <q-select v-model="editorStore.fontFamily" :options="fonts" dense options-dense borderless
+                  class="font-select" style="min-width: 120px" />
+        <q-separator vertical inset class="q-mx-sm" />
+        <span class="text-caption q-mr-xs">Size</span>
+        <q-input v-model.number="editorStore.fontSize" type="number" dense borderless style="width: 56px" :min="4" :max="200" />
+        <q-separator vertical inset class="q-mx-sm" />
+        <ColorSwatch v-model="editorStore.textColor" label="Text" />
+      </template>
+
+      <!-- Markup -->
+      <template v-else-if="ctx === 'markup'">
+        <ColorSwatch v-model="editorStore.highlightColor" label="Color" />
+        <q-separator vertical inset class="q-mx-sm" />
+        <span class="text-caption q-mr-sm">Opacity</span>
+        <q-slider v-model="editorStore.opacity" :min="0.1" :max="1" :step="0.1" style="width: 100px" dense />
+      </template>
+
+      <!-- Shapes -->
+      <template v-else-if="ctx === 'shape'">
+        <ColorSwatch v-model="editorStore.strokeColor" label="Stroke" />
+        <q-separator vertical inset class="q-mx-sm" />
+        <span class="text-caption q-mr-xs">Width</span>
+        <q-input v-model.number="editorStore.strokeWidth" type="number" dense borderless style="width: 50px" :min="0.5" :max="20" :step="0.5" />
+        <q-separator vertical inset class="q-mx-sm" />
+        <q-toggle v-model="editorStore.fillEnabled" label="Fill" dense size="sm" />
+        <ColorSwatch v-if="editorStore.fillEnabled" v-model="editorStore.fillColor" label="" class="q-ml-sm" />
+        <q-separator vertical inset class="q-mx-sm" />
+        <span class="text-caption q-mr-sm">Opacity</span>
+        <q-slider v-model="editorStore.opacity" :min="0.1" :max="1" :step="0.1" style="width: 90px" dense />
+      </template>
+
+      <!-- Draw -->
+      <template v-else-if="ctx === 'draw'">
+        <ColorSwatch v-model="editorStore.strokeColor" label="Color" />
+        <q-separator vertical inset class="q-mx-sm" />
+        <span class="text-caption q-mr-xs">Width</span>
+        <q-input v-model.number="editorStore.strokeWidth" type="number" dense borderless style="width: 50px" :min="0.5" :max="20" :step="0.5" />
+        <q-separator vertical inset class="q-mx-sm" />
+        <span class="text-caption q-mr-sm">Opacity</span>
+        <q-slider v-model="editorStore.opacity" :min="0.1" :max="1" :step="0.1" style="width: 100px" dense />
+      </template>
+    </q-toolbar>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -61,38 +102,52 @@ import { computed, inject } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, type Tool } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
+import ColorSwatch from './ColorSwatch.vue'
 
 const docStore = useDocumentStore()
 const editorStore = useEditorStore()
 const historyStore = useHistoryStore()
 
 const openFile = inject<() => void>('openFile', () => {})
+const saveFile = inject<() => void>('saveFile', () => {})
 const undo = inject<() => void>('undo', () => {})
 const redo = inject<() => void>('redo', () => {})
+const rotatePage = inject<(d: number) => void>('rotatePage', () => {})
+const openFind = inject<() => void>('openFind', () => {})
 
-const tools: { name: Tool; label: string; icon: string; shortcut?: string }[] = [
-  { name: 'select', label: 'Select', icon: 'arrow_selector_tool', shortcut: 'V' },
-  { name: 'edit', label: 'Edit Text', icon: 'edit', shortcut: 'E' },
-  { name: 'addText', label: 'Add Text', icon: 'title', shortcut: 'T' },
-  { name: 'highlight', label: 'Highlight', icon: 'highlight', shortcut: 'H' },
-  { name: 'line', label: 'Line', icon: 'horizontal_rule', shortcut: 'L' },
-  { name: 'rectangle', label: 'Rectangle', icon: 'crop_square', shortcut: 'R' },
-  { name: 'circle', label: 'Circle', icon: 'circle', shortcut: 'O' },
+const ctx = computed(() => editorStore.propertyContext)
+const fonts = ['Helvetica', 'Times-Roman', 'Courier']
+
+const toolGroups: { label: string; tools: { name: Tool; label: string; icon: string; shortcut?: string }[] }[] = [
+  { label: 'select', tools: [
+    { name: 'select', label: 'Select', icon: 'arrow_selector_tool', shortcut: 'V' },
+    { name: 'edit', label: 'Edit Text', icon: 'edit', shortcut: 'E' },
+    { name: 'addText', label: 'Add Text', icon: 'text_fields', shortcut: 'T' },
+  ]},
+  { label: 'markup', tools: [
+    { name: 'highlight', label: 'Highlight', icon: 'border_color', shortcut: 'H' },
+    { name: 'underline', label: 'Underline', icon: 'format_underlined' },
+    { name: 'strikeout', label: 'Strikethrough', icon: 'format_strikethrough' },
+  ]},
+  { label: 'draw', tools: [
+    { name: 'draw', label: 'Draw (freehand)', icon: 'gesture', shortcut: 'D' },
+    { name: 'line', label: 'Line', icon: 'horizontal_rule' },
+    { name: 'rectangle', label: 'Rectangle', icon: 'crop_square', shortcut: 'R' },
+    { name: 'circle', label: 'Ellipse', icon: 'circle', shortcut: 'O' },
+  ]},
+  { label: 'insert', tools: [
+    { name: 'freetext', label: 'Text Box', icon: 'rtt' },
+    { name: 'note', label: 'Sticky Note', icon: 'sticky_note_2' },
+    { name: 'image', label: 'Insert Image', icon: 'image' },
+  ]},
 ]
 
 const zoomPercent = computed(() => Math.round(docStore.scale * 100))
-
-function zoomIn() {
-  docStore.setScale(docStore.scale + 0.25)
-}
-function zoomOut() {
-  docStore.setScale(docStore.scale - 0.25)
-}
-function fitPage() {
-  docStore.setScale(1.0)
-}
-
-const saveFile = inject<() => void>('saveFile', () => {})
-
-defineEmits(['rotate-left', 'rotate-right'])
+function zoomIn() { docStore.setScale(docStore.scale + 0.25) }
+function zoomOut() { docStore.setScale(docStore.scale - 0.25) }
+function fitPage() { docStore.setScale(1.5) }
 </script>
+
+<style scoped>
+.font-select :deep(.q-field__native) { font-size: 12px; }
+</style>
