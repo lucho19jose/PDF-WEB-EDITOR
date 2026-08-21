@@ -18,6 +18,14 @@ export const useHistoryStore = defineStore('history', () => {
     redoStack.value = [] // new edit invalidates redo
   }
 
+  /** Push an undo snapshot WITHOUT clearing redo — used by redo() itself. */
+  function pushUndoNoClear(bytes: Uint8Array) {
+    undoStack.value.push(bytes)
+    if (undoStack.value.length > maxSnapshots) {
+      undoStack.value.shift()
+    }
+  }
+
   /** Pop the most recent undo snapshot. */
   function popUndo(): Uint8Array | null {
     return undoStack.value.pop() ?? null
@@ -42,5 +50,5 @@ export const useHistoryStore = defineStore('history', () => {
     redoStack.value = []
   }
 
-  return { undoStack, redoStack, canUndo, canRedo, pushSnapshot, popUndo, pushRedo, popRedo, clear }
+  return { undoStack, redoStack, canUndo, canRedo, pushSnapshot, pushUndoNoClear, popUndo, pushRedo, popRedo, clear }
 })

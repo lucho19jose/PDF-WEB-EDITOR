@@ -1,24 +1,50 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 
-export type Tool = 'select' | 'edit' | 'addText' | 'highlight' | 'underline' | 'strikeout'
-  | 'line' | 'rectangle' | 'circle' | 'comment'
+export type Tool =
+  | 'select' | 'edit' | 'addText'
+  | 'highlight' | 'underline' | 'strikeout'
+  | 'draw' | 'line' | 'rectangle' | 'circle'
+  | 'freetext' | 'note' | 'image'
+
+/** Tools that create/select MuPDF annotations (handled by AnnotationLayer). */
+export const ANNOTATION_TOOLS: Tool[] = [
+  'highlight', 'underline', 'strikeout',
+  'draw', 'line', 'rectangle', 'circle',
+  'freetext', 'note', 'image'
+]
+
+/** Text-markup tools that operate by dragging over existing text. */
+export const MARKUP_TOOLS: Tool[] = ['highlight', 'underline', 'strikeout']
 
 export const useEditorStore = defineStore('editor', () => {
   const currentTool = ref<Tool>('select')
   const statusMessage = ref('Ready')
 
-  // Text editing state
+  // Text styling (for addText / edit)
   const fontFamily = ref('Helvetica')
-  const fontSize = ref(12)
+  const fontSize = ref(14)
   const textColor = ref('#000000')
-  const highlightColor = ref('#ffff00')
-  const strokeColor = ref('#ff0000')
+
+  // Annotation styling
+  const highlightColor = ref('#ffeb3b')
+  const strokeColor = ref('#e53935')
+  const fillColor = ref('#ffffff')
+  const fillEnabled = ref(false)
   const strokeWidth = ref(2)
   const opacity = ref(1)
 
-  const showEditToolbar = computed(() => {
-    return ['edit', 'addText', 'highlight', 'underline', 'strikeout'].includes(currentTool.value)
+  const isAnnotationTool = computed(() => ANNOTATION_TOOLS.includes(currentTool.value))
+  const isMarkupTool = computed(() => MARKUP_TOOLS.includes(currentTool.value))
+
+  /** Which property controls to show in the properties bar for the active tool. */
+  const propertyContext = computed<'text' | 'markup' | 'shape' | 'draw' | 'none'>(() => {
+    const t = currentTool.value
+    if (t === 'addText' || t === 'edit' || t === 'freetext') return 'text'
+    if (MARKUP_TOOLS.includes(t)) return 'markup'
+    if (t === 'rectangle' || t === 'circle' || t === 'line') return 'shape'
+    if (t === 'draw') return 'draw'
+    return 'none'
   })
 
   function setTool(tool: Tool) {
@@ -31,9 +57,9 @@ export const useEditorStore = defineStore('editor', () => {
   }
 
   return {
-    currentTool, statusMessage, fontFamily, fontSize,
-    textColor, highlightColor, strokeColor, strokeWidth, opacity,
-    showEditToolbar,
+    currentTool, statusMessage, fontFamily, fontSize, textColor,
+    highlightColor, strokeColor, fillColor, fillEnabled, strokeWidth, opacity,
+    isAnnotationTool, isMarkupTool, propertyContext,
     setTool, setStatus
   }
 })

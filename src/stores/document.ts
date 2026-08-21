@@ -24,12 +24,20 @@ export const useDocumentStore = defineStore('document', () => {
     pdfBytes.value = bytes
     currentPage.value = 1
     isModified.value = false
+    // A new document invalidates every overlay's cached geometry even when
+    // currentPage/tool don't change (e.g. opening a 2nd PDF while on page 1)
+    renderVersion.value++
   }
 
   /** Reload bytes without resetting page/state — used after in-place editing */
   function reloadBytes(bytes: Uint8Array, pages?: number) {
     pdfBytes.value = bytes
-    if (pages !== undefined) totalPages.value = pages
+    if (pages !== undefined) {
+      totalPages.value = pages
+      // Clamp BEFORE bumping renderVersion so the re-render never requests an
+      // out-of-range page (e.g. after deleting the last page).
+      if (currentPage.value > pages) currentPage.value = Math.max(1, pages)
+    }
     renderVersion.value++
   }
 
