@@ -1,13 +1,12 @@
 import { ref, shallowRef } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
+// Vite-bundled module worker — avoids the "Setting up fake worker" fallback
+// (main-thread parsing) that workerSrc URL strings trigger under Vite dev
+import PdfJsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 
-// Configure PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url
-).toString()
+pdfjsLib.GlobalWorkerOptions.workerPort = new PdfJsWorker()
 
 export function usePDFViewer() {
   const docStore = useDocumentStore()
@@ -58,22 +57,44 @@ export function usePDFViewer() {
     docStore.reloadBytes(bytes, doc.numPages)
   }
 
+  let renderToken = 0
+  let currentRenderTask: any = null
+
   async function renderPage(canvas: HTMLCanvasElement, pageNum: number) {
     if (!pdfDoc.value) return
 
+    // Supersede any in-flight render so stale pages can't paint over the latest.
+    if (currentRenderTask) { try { currentRenderTask.cancel() } catch (_) {} currentRenderTask = null }
+    const myToken = ++renderToken
+
     try {
       const page = await pdfDoc.value.getPage(pageNum)
+      if (myToken !== renderToken) return // superseded during getPage
       const viewport = page.getViewport({ scale: docStore.scale })
 
-      canvas.width = viewport.width
-      canvas.height = viewport.height
+      // Render at devicePixelRatio so HiDPI displays get sharp text; the
+      // canvas is styled at CSS-pixel size so all overlay math is unchanged.
+      const dpr = window.devicePixelRatio || 1
+      canvas.width = Math.floor(viewport.width * dpr)
+      canvas.height = Math.floor(viewport.height * dpr)
+      canvas.style.width = `${viewport.width}px`
+      canvas.style.height = `${viewport.height}px`
 
       const ctx = canvas.getContext('2d')!
-      await page.render({ canvasContext: ctx, viewport, canvas } as any).promise
+      const task = page.render({
+        canvasContext: ctx,
+        viewport,
+        canvas,
+        transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined
+      } as any)
+      currentRenderTask = task
+      await task.promise
+      if (myToken === renderToken) currentRenderTask = null
+      if (myToken !== renderToken) return // superseded during render
 
-      docStore.setPage(pageNum)
       return { viewport, width: viewport.width, height: viewport.height }
     } catch (err: any) {
+      if (err?.name === 'RenderingCancelledException') return
       console.error('Error rendering page:', err)
       error.value = err.message
     }

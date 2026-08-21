@@ -1,6 +1,6 @@
 import { ref, readonly } from 'vue'
 import { getMuPDFBridge } from '@/engine/bridge'
-import type { PageTextData, TextBlock } from '@/engine/types'
+import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit } from '@/engine/types'
 
 /**
  * Composable for interacting with the MuPDF editing engine.
@@ -11,6 +11,7 @@ export function usePDFEngine() {
   const bridge = getMuPDFBridge()
   const isReady = ref(false)
   const isLoading = ref(false)
+  const docLoaded = ref(false)
   const error = ref<string | null>(null)
   const pageTextCache = new Map<number, PageTextData>()
 
@@ -55,6 +56,7 @@ export function usePDFEngine() {
       // Pass a copy since the original may be transferred
       const copy = bytes.slice(0)
       const result = await bridge.loadDocument(copy)
+      docLoaded.value = true
       console.log(`[PDFEngine] Document loaded: ${result.pageCount} pages`)
       return result.pageCount
     } catch (err: any) {
@@ -112,7 +114,7 @@ export function usePDFEngine() {
     pageIndex: number,
     blockId: string,
     newText: string
-  ): Promise<boolean> {
+  ): Promise<{ success: boolean; substitutedFont?: string }> {
     try {
       const result = await bridge.replaceText(pageIndex, blockId, newText)
       if (result.success) {
@@ -123,7 +125,7 @@ export function usePDFEngine() {
         error.value = result.error || 'Unknown error replacing text'
         console.warn('[PDFEngine]', error.value)
       }
-      return result.success
+      return { success: result.success, substitutedFont: result.substitutedFont }
     } catch (err: any) {
       error.value = `Failed to replace text: ${err.message}`
       throw err
@@ -183,6 +185,94 @@ export function usePDFEngine() {
     }
   }
 
+  // ===== ANNOTATIONS =====
+
+  async function getPageSize(pageIndex: number) {
+    return bridge.getPageSize(pageIndex)
+  }
+
+  async function getAnnotations(pageIndex: number): Promise<AnnotationInfo[]> {
+    try {
+      const res = await bridge.getAnnotations(pageIndex)
+      return res.annotations
+    } catch (err: any) {
+      error.value = `Failed to get annotations: ${err.message}`
+      return []
+    }
+  }
+
+  function wrap(result: { success: boolean; error?: string }, ctx: string, pageIndex?: number): boolean {
+    if (result.success) {
+      if (pageIndex !== undefined) pageTextCache.delete(pageIndex)
+    } else {
+      error.value = result.error || `Unknown error: ${ctx}`
+      console.warn('[PDFEngine]', ctx, error.value)
+    }
+    return result.success
+  }
+
+  async function addTextMarkup(pageIndex: number, markupType: MarkupType, quads: Quad[], color: [number, number, number], opacity?: number): Promise<boolean> {
+    return wrap(await bridge.addTextMarkup(pageIndex, markupType, quads, color, opacity), 'addTextMarkup', pageIndex)
+  }
+  async function addShape(pageIndex: number, shapeType: ShapeType, opts: { rect?: RectT; points?: [Pt, Pt]; color: [number, number, number]; interiorColor?: [number, number, number] | null; width: number; opacity?: number }): Promise<boolean> {
+    return wrap(await bridge.addShape(pageIndex, shapeType, opts), 'addShape', pageIndex)
+  }
+  async function addInk(pageIndex: number, strokes: Pt[][], color: [number, number, number], width: number, opacity?: number): Promise<boolean> {
+    return wrap(await bridge.addInk(pageIndex, strokes, color, width, opacity), 'addInk', pageIndex)
+  }
+  async function addFreeText(pageIndex: number, rect: RectT, text: string, fontSize: number, color: [number, number, number], fontName?: string): Promise<boolean> {
+    return wrap(await bridge.addFreeText(pageIndex, rect, text, fontSize, color, fontName), 'addFreeText', pageIndex)
+  }
+  async function addStickyNote(pageIndex: number, x: number, y: number, text: string, color: [number, number, number]): Promise<boolean> {
+    return wrap(await bridge.addStickyNote(pageIndex, x, y, text, color), 'addStickyNote', pageIndex)
+  }
+  async function addImageStamp(pageIndex: number, rect: RectT, imageBytes: ArrayBuffer): Promise<boolean> {
+    return wrap(await bridge.addImageStamp(pageIndex, rect, imageBytes), 'addImageStamp', pageIndex)
+  }
+  async function deleteAnnotation(pageIndex: number, annotIndex: number): Promise<boolean> {
+    return wrap(await bridge.deleteAnnotation(pageIndex, annotIndex), 'deleteAnnotation', pageIndex)
+  }
+  async function updateAnnotation(pageIndex: number, annotIndex: number, changes: { rect?: RectT; color?: [number, number, number]; interiorColor?: [number, number, number] | null; opacity?: number; width?: number; contents?: string }): Promise<boolean> {
+    return wrap(await bridge.updateAnnotation(pageIndex, annotIndex, changes), 'updateAnnotation', pageIndex)
+  }
+
+  // ===== PAGE MANAGEMENT =====
+
+  async function rotatePage(pageIndex: number, degrees: number): Promise<boolean> {
+    return wrap(await bridge.rotatePage(pageIndex, degrees), 'rotatePage', pageIndex)
+  }
+  async function insertBlankPage(atIndex: number, width: number, height: number): Promise<number | false> {
+    const r = await bridge.insertBlankPage(atIndex, width, height)
+    pageTextCache.clear()
+    return r.success ? (r.pageCount ?? 0) : (error.value = r.error || 'insert failed', false)
+  }
+  async function deletePage(pageIndex: number): Promise<number | false> {
+    const r = await bridge.deletePageOp(pageIndex)
+    pageTextCache.clear()
+    return r.success ? (r.pageCount ?? 0) : (error.value = r.error || 'delete failed', false)
+  }
+  async function duplicatePage(pageIndex: number): Promise<number | false> {
+    const r = await bridge.duplicatePage(pageIndex)
+    pageTextCache.clear()
+    return r.success ? (r.pageCount ?? 0) : (error.value = r.error || 'duplicate failed', false)
+  }
+  async function movePage(from: number, to: number): Promise<number | false> {
+    const r = await bridge.movePage(from, to)
+    pageTextCache.clear()
+    return r.success ? (r.pageCount ?? 0) : (error.value = r.error || 'move failed', false)
+  }
+
+  // ===== SEARCH =====
+
+  async function searchPage(pageIndex: number, needle: string, maxHits?: number): Promise<SearchHit[]> {
+    const r = await bridge.searchPage(pageIndex, needle, maxHits)
+    return r.hits
+  }
+  async function searchDocument(needle: string, maxHitsPerPage?: number): Promise<SearchHit[]> {
+    const r = await bridge.searchDocument(needle, maxHitsPerPage)
+    return r.hits
+  }
+
   /**
    * Save the modified document and return the PDF bytes.
    */
@@ -207,12 +297,15 @@ export function usePDFEngine() {
     pageTextCache.clear()
     await bridge.destroy()
     isReady.value = false
+    docLoaded.value = false
+    error.value = null
   }
 
   return {
     // State
     isReady: readonly(isReady),
     isLoading: readonly(isLoading),
+    docLoaded: readonly(docLoaded),
     error: readonly(error),
 
     // Methods
@@ -225,6 +318,27 @@ export function usePDFEngine() {
     addText,
     transformTextBlock,
     saveDocument,
-    destroyEngine
+    destroyEngine,
+    // geometry
+    getPageSize,
+    // annotations
+    getAnnotations,
+    addTextMarkup,
+    addShape,
+    addInk,
+    addFreeText,
+    addStickyNote,
+    addImageStamp,
+    deleteAnnotation,
+    updateAnnotation,
+    // page management
+    rotatePage,
+    insertBlankPage,
+    deletePage,
+    duplicatePage,
+    movePage,
+    // search
+    searchPage,
+    searchDocument
   }
 }

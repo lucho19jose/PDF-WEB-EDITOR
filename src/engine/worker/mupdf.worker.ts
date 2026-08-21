@@ -7,11 +7,12 @@ import type { TextBlock, TextChar, TextLine, PageTextData } from '../types'
 let mupdf: typeof import('mupdf') | null = null
 let pdfDoc: any = null // mupdf.PDFDocument
 
-// Font encoding cache: fontName → { unicodeToGlyph, glyphToUnicode }
+// Font encoding cache: fontName → { unicodeToGlyph, glyphToUnicode, codeBytes } (null = no ToUnicode CMap)
 const fontEncodingCache = new Map<string, {
   unicodeToGlyph: Map<number, number>
   glyphToUnicode: Map<number, number>
-}>()
+  codeBytes?: number
+} | null>()
 
 function respond(msg: WorkerResponse) {
   self.postMessage(msg)
@@ -42,6 +43,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
           pdfDoc = null
         }
         fontEncodingCache.clear()
+        simpleFontInfoCache.clear()
         const bytes = new Uint8Array(req.data.bytes)
         pdfDoc = new mupdf.PDFDocument(bytes)
         const pageCount = pdfDoc.countPages()
@@ -112,16 +114,116 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      case 'getPageSize': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: getPageSize(req.data.pageIndex) })
+        break
+      }
+
+      // ===== ANNOTATIONS =====
+      case 'getAnnotations': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: { annotations: listAnnotations(req.data.pageIndex) } })
+        break
+      }
+      case 'addTextMarkup': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const d = req.data
+        respond({ id: req.id, type: 'success', data: addTextMarkup(d.pageIndex, d.markupType, d.quads, d.color, d.opacity) })
+        break
+      }
+      case 'addShape': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const d = req.data
+        respond({ id: req.id, type: 'success', data: addShape(d.pageIndex, d.shapeType, d.rect, d.points, d.color, d.interiorColor, d.width, d.opacity) })
+        break
+      }
+      case 'addInk': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const d = req.data
+        respond({ id: req.id, type: 'success', data: addInk(d.pageIndex, d.strokes, d.color, d.width, d.opacity) })
+        break
+      }
+      case 'addFreeText': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const d = req.data
+        respond({ id: req.id, type: 'success', data: addFreeText(d.pageIndex, d.rect, d.text, d.fontSize, d.color, d.fontName) })
+        break
+      }
+      case 'addStickyNote': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const d = req.data
+        respond({ id: req.id, type: 'success', data: addStickyNote(d.pageIndex, d.x, d.y, d.text, d.color) })
+        break
+      }
+      case 'addImageStamp': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const d = req.data
+        respond({ id: req.id, type: 'success', data: addImageStamp(d.pageIndex, d.rect, new Uint8Array(d.imageBytes)) })
+        break
+      }
+      case 'deleteAnnotation': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: deleteAnnotationAt(req.data.pageIndex, req.data.annotIndex) })
+        break
+      }
+      case 'updateAnnotation': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: updateAnnotationAt(req.data) })
+        break
+      }
+
+      // ===== PAGE MANAGEMENT =====
+      case 'rotatePage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: rotatePage(req.data.pageIndex, req.data.degrees) })
+        break
+      }
+      case 'insertBlankPage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: insertBlankPage(req.data.atIndex, req.data.width, req.data.height) })
+        break
+      }
+      case 'deletePageOp': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: deletePageOp(req.data.pageIndex) })
+        break
+      }
+      case 'duplicatePage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: duplicatePage(req.data.pageIndex) })
+        break
+      }
+      case 'movePage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: movePage(req.data.from, req.data.to) })
+        break
+      }
+
+      // ===== SEARCH =====
+      case 'searchPage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: { hits: searchPage(req.data.pageIndex, req.data.needle, req.data.maxHits) } })
+        break
+      }
+      case 'searchDocument': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: { hits: searchDocument(req.data.needle, req.data.maxHitsPerPage) } })
+        break
+      }
+
       case 'saveDocument': {
         if (!pdfDoc) throw new Error('No document loaded')
-        const buf = pdfDoc.saveToBuffer('compress')
+        // garbage=compact removes orphaned objects (e.g. content streams replaced
+        // wholesale during edits) so the output doesn't bloat across edit cycles.
+        const buf = pdfDoc.saveToBuffer('compress,garbage=compact')
         const savedBytes = buf.asUint8Array().slice()
         buf.destroy()
-        respond({
-          id: req.id,
-          type: 'success',
-          data: { bytes: savedBytes.buffer }
-        })
+        // Transfer instead of structured-cloning the whole document
+        self.postMessage(
+          { id: req.id, type: 'success', data: { bytes: savedBytes.buffer } },
+          [savedBytes.buffer] as any
+        )
         break
       }
 
@@ -131,6 +233,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
           pdfDoc = null
         }
         fontEncodingCache.clear()
+        simpleFontInfoCache.clear()
         respond({ id: req.id, type: 'success', data: null })
         break
       }
@@ -162,6 +265,7 @@ function extractPageText(pageIndex: number): PageTextData {
   let currentLine: TextLine | null = null
   let blockIndex = 0
 
+  try {
   stext.walk({
     beginTextBlock(bbox: number[]) {
       currentBlock = {
@@ -236,9 +340,10 @@ function extractPageText(pageIndex: number): PageTextData {
       currentBlock = null
     }
   })
-
-  stext.destroy()
-  page.destroy()
+  } finally {
+    stext.destroy()
+    page.destroy()
+  }
 
   // Split blocks at significant horizontal gaps so each text segment
   // becomes its own clickable/movable element (e.g., "Label:" and "Value"
@@ -363,31 +468,49 @@ function readContentStream(pageIndex: number): string {
   // Read as raw bytes to preserve non-UTF-8 characters (e.g., WinAnsi ñ = 0xF1)
   const chunks: Uint8Array[] = []
 
+  // MuPDF quirk: readStream()/isStream() work on the INDIRECT reference but
+  // not on the resolved object — resolving first made every array chunk read
+  // as "not a stream", so multi-stream pages (Ghostscript output) appeared
+  // EMPTY and nothing on them could be edited.
+  function readChunk(obj: any): Uint8Array | null {
+    for (const target of [obj, obj?.resolve?.()]) {
+      if (!target) continue
+      try {
+        const buf = target.readStream()
+        const bytes = buf.asUint8Array().slice()
+        buf.destroy()
+        return bytes
+      } catch (_) { /* try next */ }
+    }
+    return null
+  }
+
   if (contents.isArray()) {
     for (let i = 0; i < contents.length; i++) {
-      const streamObj = contents.get(i).resolve()
-      if (streamObj.isStream()) {
-        const buf = streamObj.readStream()
-        chunks.push(buf.asUint8Array().slice())
-        buf.destroy()
-      }
+      const bytes = readChunk(contents.get(i))
+      if (bytes) chunks.push(bytes)
     }
-  } else if (contents.isStream()) {
-    const buf = contents.readStream()
-    chunks.push(buf.asUint8Array().slice())
-    buf.destroy()
+  } else {
+    const bytes = readChunk(contents)
+    if (bytes) chunks.push(bytes)
   }
 
   page.destroy()
 
   // Convert bytes to string using Latin-1 (byte-transparent: each byte maps 1:1 to a char)
   // This preserves raw bytes like 0xF1 (ñ) as char code 241
-  const totalLen = chunks.reduce((sum, c) => sum + c.length, 0)
+  // Join chunks with a newline separator between them. The PDF spec allows a
+  // producer to split content streams at any token boundary; concatenating raw
+  // bytes without whitespace can merge adjacent tokens (e.g. "Tj"+"ET" or two
+  // numbers) and corrupt re-parsing.
+  const sep = chunks.length > 1 ? chunks.length - 1 : 0
+  const totalLen = chunks.reduce((sum, c) => sum + c.length, 0) + sep
   const allBytes = new Uint8Array(totalLen)
   let offset = 0
-  for (const chunk of chunks) {
-    allBytes.set(chunk, offset)
-    offset += chunk.length
+  for (let i = 0; i < chunks.length; i++) {
+    allBytes.set(chunks[i], offset)
+    offset += chunks[i].length
+    if (i < chunks.length - 1) { allBytes[offset] = 0x0A; offset += 1 }
   }
 
   // Latin-1 decode: each byte becomes its corresponding code point
@@ -408,8 +531,11 @@ function writeContentStream(pageIndex: number, bytes: Uint8Array): void {
   const contents = pageObj.get('Contents')
 
   if (contents.isArray()) {
-    const firstStream = contents.get(0).resolve()
-    firstStream.writeStream(bytes)
+    // readContentStream merged ALL array members — writing the merged bytes
+    // into just the first element would draw members 1..n twice. Replace the
+    // whole array with a single stream.
+    const newStream = pdfDoc.addStream(bytes, {})
+    pageObj.put('Contents', newStream)
   } else if (contents.isStream()) {
     contents.writeStream(bytes)
   } else {
@@ -434,9 +560,13 @@ function writeContentStream(pageIndex: number, bytes: Uint8Array): void {
 function parseToUnicodeCMap(cmapText: string): {
   unicodeToGlyph: Map<number, number>
   glyphToUnicode: Map<number, number>
+  codeBytes: number
 } {
   const unicodeToGlyph = new Map<number, number>()
   const glyphToUnicode = new Map<number, number>()
+  // Track the code width: fonts with 1-byte codes write <41> keys; decoding
+  // them with a fixed 2-byte stride turns "Hello" into CJK garbage.
+  let maxKeyHexLen = 0
 
   // Parse bfchar entries: <glyphHex> <unicodeHex>
   const bfcharRegex = /beginbfchar\s([\s\S]*?)endbfchar/g
@@ -448,6 +578,7 @@ function parseToUnicodeCMap(cmapText: string): {
     while ((pair = pairRegex.exec(entries)) !== null) {
       const glyphId = parseInt(pair[1], 16)
       const unicode = parseInt(pair[2], 16)
+      maxKeyHexLen = Math.max(maxKeyHexLen, pair[1].length)
       glyphToUnicode.set(glyphId, unicode)
       unicodeToGlyph.set(unicode, glyphId)
     }
@@ -463,6 +594,7 @@ function parseToUnicodeCMap(cmapText: string): {
       const startGlyph = parseInt(range[1], 16)
       const endGlyph = parseInt(range[2], 16)
       const startUnicode = parseInt(range[3], 16)
+      maxKeyHexLen = Math.max(maxKeyHexLen, range[1].length)
 
       for (let g = startGlyph; g <= endGlyph; g++) {
         const u = startUnicode + (g - startGlyph)
@@ -472,7 +604,7 @@ function parseToUnicodeCMap(cmapText: string): {
     }
   }
 
-  return { unicodeToGlyph, glyphToUnicode }
+  return { unicodeToGlyph, glyphToUnicode, codeBytes: maxKeyHexLen > 0 && maxKeyHexLen <= 2 ? 1 : 2 }
 }
 
 /**
@@ -482,6 +614,7 @@ function parseToUnicodeCMap(cmapText: string): {
 function getFontEncoding(pageIndex: number, fontRefName: string): {
   unicodeToGlyph: Map<number, number>
   glyphToUnicode: Map<number, number>
+  codeBytes?: number
 } | null {
   const cacheKey = `${pageIndex}:${fontRefName}`
   if (fontEncodingCache.has(cacheKey)) {
@@ -490,20 +623,20 @@ function getFontEncoding(pageIndex: number, fontRefName: string): {
 
   if (!pdfDoc) return null
 
+  let page: any = null
   try {
-    const page = pdfDoc.loadPage(pageIndex)
+    page = pdfDoc.loadPage(pageIndex)
     const pageObj = page.getObject()
     const resources = pageObj.get('Resources')
-    if (!resources) { page.destroy(); return null }
+    if (!resources) return null
 
     const fontDict = resources.get('Font')
-    if (!fontDict) { page.destroy(); return null }
+    if (!fontDict) return null
 
     // Access font by name directly (fontDict.length doesn't work reliably)
     const fontObj = fontDict.get(fontRefName)
     if (!fontObj) {
       console.warn(`[MuPDF Worker] Font ${fontRefName} not found in Resources`)
-      page.destroy()
       return null
     }
 
@@ -513,8 +646,6 @@ function getFontEncoding(pageIndex: number, fontRefName: string): {
     const encoding = tryReadToUnicode(resolved)
     if (encoding) {
       fontEncodingCache.set(cacheKey, encoding)
-      // Font encoding parsed
-      page.destroy()
       return encoding
     }
 
@@ -526,19 +657,19 @@ function getFontEncoding(pageIndex: number, fontRefName: string): {
         const descEncoding = tryReadToUnicode(desc)
         if (descEncoding) {
           fontEncodingCache.set(cacheKey, descEncoding)
-          // Descendant font encoding parsed
-          page.destroy()
           return descEncoding
         }
       }
     }
 
-    console.warn(`[MuPDF Worker] No ToUnicode CMap found for font ${fontRefName}`)
-    page.destroy()
+    console.warn(`[MuPDF Worker] No ToUnicode CMap for font ${fontRefName} — will use simple-encoding path`)
+    fontEncodingCache.set(cacheKey, null)
     return null
   } catch (err) {
     console.error(`[MuPDF Worker] Error reading font encoding for ${fontRefName}:`, err)
     return null
+  } finally {
+    try { page?.destroy() } catch (_) { /* already destroyed */ }
   }
 }
 
@@ -548,6 +679,7 @@ function getFontEncoding(pageIndex: number, fontRefName: string): {
 function tryReadToUnicode(fontObj: any): {
   unicodeToGlyph: Map<number, number>
   glyphToUnicode: Map<number, number>
+  codeBytes?: number
 } | null {
   try {
     const toUnicode = fontObj.get('ToUnicode')
@@ -585,17 +717,18 @@ function tryReadToUnicode(fontObj: any): {
  */
 function encodeTextForFont(
   text: string,
-  encoding: { unicodeToGlyph: Map<number, number> }
+  encoding: { unicodeToGlyph: Map<number, number>; codeBytes?: number }
 ): { hex: string } | { error: string; missingChars: string[] } {
   let hex = ''
   const missingChars: string[] = []
+  const pad = (encoding.codeBytes === 1 ? 1 : 2) * 2
   for (let i = 0; i < text.length; i++) {
     const codePoint = text.codePointAt(i)!
     const glyphId = encoding.unicodeToGlyph.get(codePoint)
     if (glyphId === undefined) {
-      missingChars.push(text[i])
+      missingChars.push(String.fromCodePoint(codePoint))
     } else {
-      hex += glyphId.toString(16).padStart(4, '0').toUpperCase()
+      hex += glyphId.toString(16).padStart(pad, '0').toUpperCase()
     }
     // Handle surrogate pairs
     if (codePoint > 0xFFFF) i++
@@ -605,6 +738,387 @@ function encodeTextForFont(
     return { error: `Characters not in font subset: ${unique.join(', ')}`, missingChars: unique }
   }
   return { hex }
+}
+
+// ==========================================
+// SIMPLE FONT ENCODING (MacRoman / WinAnsi) + FONT SUBSTITUTION
+// ==========================================
+
+// MacRomanEncoding 0x80–0xFF → Unicode (0x00–0x7F is ASCII)
+const MACROMAN_HIGH = [
+  0x00C4, 0x00C5, 0x00C7, 0x00C9, 0x00D1, 0x00D6, 0x00DC, 0x00E1,
+  0x00E0, 0x00E2, 0x00E4, 0x00E3, 0x00E5, 0x00E7, 0x00E9, 0x00E8,
+  0x00EA, 0x00EB, 0x00ED, 0x00EC, 0x00EE, 0x00EF, 0x00F1, 0x00F3,
+  0x00F2, 0x00F4, 0x00F6, 0x00F5, 0x00FA, 0x00F9, 0x00FB, 0x00FC,
+  0x2020, 0x00B0, 0x00A2, 0x00A3, 0x00A7, 0x2022, 0x00B6, 0x00DF,
+  0x00AE, 0x00A9, 0x2122, 0x00B4, 0x00A8, 0x2260, 0x00C6, 0x00D8,
+  0x221E, 0x00B1, 0x2264, 0x2265, 0x00A5, 0x00B5, 0x2202, 0x2211,
+  0x220F, 0x03C0, 0x222B, 0x00AA, 0x00BA, 0x03A9, 0x00E6, 0x00F8,
+  0x00BF, 0x00A1, 0x00AC, 0x221A, 0x0192, 0x2248, 0x2206, 0x00AB,
+  0x00BB, 0x2026, 0x00A0, 0x00C0, 0x00C3, 0x00D5, 0x0152, 0x0153,
+  0x2013, 0x2014, 0x201C, 0x201D, 0x2018, 0x2019, 0x00F7, 0x25CA,
+  0x00FF, 0x0178, 0x2044, 0x20AC, 0x2039, 0x203A, 0xFB01, 0xFB02,
+  0x2021, 0x00B7, 0x201A, 0x201E, 0x2030, 0x00C2, 0x00CA, 0x00C1,
+  0x00CB, 0x00C8, 0x00CD, 0x00CE, 0x00CF, 0x00CC, 0x00D3, 0x00D4,
+  0xF8FF, 0x00D2, 0x00DA, 0x00DB, 0x00D9, 0x0131, 0x02C6, 0x02DC,
+  0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7
+]
+
+// WinAnsiEncoding (CP1252) 0x80–0x9F → Unicode (rest of high range is Latin-1)
+const WINANSI_HIGH: Record<number, number> = {
+  0x80: 0x20AC, 0x82: 0x201A, 0x83: 0x0192, 0x84: 0x201E, 0x85: 0x2026,
+  0x86: 0x2020, 0x87: 0x2021, 0x88: 0x02C6, 0x89: 0x2030, 0x8A: 0x0160,
+  0x8B: 0x2039, 0x8C: 0x0152, 0x8E: 0x017D, 0x91: 0x2018, 0x92: 0x2019,
+  0x93: 0x201C, 0x94: 0x201D, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014,
+  0x98: 0x02DC, 0x99: 0x2122, 0x9A: 0x0161, 0x9B: 0x203A, 0x9C: 0x0153,
+  0x9E: 0x017E, 0x9F: 0x0178
+}
+
+let _unicodeToMacRoman: Map<number, number> | null = null
+function unicodeToMacRoman(): Map<number, number> {
+  if (!_unicodeToMacRoman) {
+    _unicodeToMacRoman = new Map()
+    for (let b = 0x20; b < 0x80; b++) _unicodeToMacRoman.set(b, b)
+    for (let i = 0; i < 128; i++) _unicodeToMacRoman.set(MACROMAN_HIGH[i], 0x80 + i)
+  }
+  return _unicodeToMacRoman
+}
+
+let _unicodeToWinAnsi: Map<number, number> | null = null
+function unicodeToWinAnsi(): Map<number, number> {
+  if (!_unicodeToWinAnsi) {
+    _unicodeToWinAnsi = new Map()
+    for (let b = 0x20; b < 0x80; b++) _unicodeToWinAnsi.set(b, b)
+    for (let b = 0xA0; b <= 0xFF; b++) _unicodeToWinAnsi.set(b, b)
+    for (const [byte, uni] of Object.entries(WINANSI_HIGH)) _unicodeToWinAnsi.set(uni, Number(byte))
+  }
+  return _unicodeToWinAnsi
+}
+
+function byteToUnicode(byte: number, encodingName: string): number {
+  if (byte < 0x80) return byte
+  if (encodingName === 'MacRoman') return MACROMAN_HIGH[byte - 0x80]
+  if (byte >= 0x80 && byte <= 0x9F && WINANSI_HIGH[byte] !== undefined) return WINANSI_HIGH[byte]
+  return byte // Latin-1 / WinAnsi high range
+}
+
+interface SimpleFontInfo {
+  encodingName: 'MacRoman' | 'WinAnsi' | 'Standard' | 'Unknown'
+  firstChar: number
+  lastChar: number
+  widths: number[] | null
+  baseFont: string
+  flags: number
+  isEmbedded: boolean
+  isSubset: boolean
+  isType0: boolean
+}
+
+const simpleFontInfoCache = new Map<string, SimpleFontInfo | null>()
+
+/**
+ * Read encoding + glyph availability info for a simple (non-CID) font.
+ * Widths of 0 inside [FirstChar..LastChar] indicate glyphs missing from a subset.
+ */
+function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontInfo | null {
+  const cacheKey = `${pageIndex}:${fontRefName}`
+  if (simpleFontInfoCache.has(cacheKey)) return simpleFontInfoCache.get(cacheKey)!
+  if (!pdfDoc) return null
+
+  let info: SimpleFontInfo | null = null
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+    const fontObj = pageObj.get('Resources')?.get('Font')?.get(fontRefName)
+    if (fontObj && String(fontObj) !== 'null') {
+      const r = fontObj.resolve()
+      const subtype = String(r.get('Subtype') || '')
+      const baseFont = String(r.get('BaseFont') || '').replace(/^\//, '')
+
+      let encodingName: SimpleFontInfo['encodingName'] = 'Unknown'
+      const encObj = r.get('Encoding')
+      const encStr = String(encObj || 'null')
+      if (encStr.includes('MacRoman')) encodingName = 'MacRoman'
+      else if (encStr.includes('WinAnsi')) encodingName = 'WinAnsi'
+      else if (encStr.includes('Standard')) encodingName = 'Standard'
+      else if (encObj && encStr !== 'null') {
+        // Encoding dictionary — use BaseEncoding if present
+        try {
+          const baseEnc = String(encObj.resolve().get('BaseEncoding') || '')
+          if (baseEnc.includes('MacRoman')) encodingName = 'MacRoman'
+          else if (baseEnc.includes('WinAnsi')) encodingName = 'WinAnsi'
+        } catch (_) { /* keep Unknown */ }
+      } else if (encStr === 'null' && subtype !== '/Type0') {
+        // No /Encoding: only NON-symbolic fonts default to StandardEncoding.
+        // Symbolic embedded subsets (Ghostscript output: byte codes are raw
+        // glyph indices 1..N) must NOT be treated as ASCII — flagged below
+        // once Flags is read.
+        encodingName = 'Standard'
+      }
+
+      const firstChar = parseInt(String(r.get('FirstChar') || '0')) || 0
+      const lastChar = parseInt(String(r.get('LastChar') || '255')) || 255
+      let widths: number[] | null = null
+      try {
+        const wObj = r.get('Widths')
+        if (wObj && String(wObj) !== 'null') {
+          const wr = wObj.resolve ? wObj.resolve() : wObj
+          widths = []
+          for (let i = 0; i < wr.length; i++) widths.push(Number(String(wr.get(i))) || 0)
+        }
+      } catch (_) { widths = null }
+
+      let flags = 0
+      let isEmbedded = false
+      try {
+        const fd = r.get('FontDescriptor')
+        if (fd && String(fd) !== 'null') {
+          const fdr = fd.resolve()
+          flags = parseInt(String(fdr.get('Flags') || '0')) || 0
+          isEmbedded = ['FontFile', 'FontFile2', 'FontFile3']
+            .some(k => String(fdr.get(k) || 'null') !== 'null')
+        }
+      } catch (_) { /* ignore */ }
+
+      // Symbolic font (Flags bit 3) with no explicit /Encoding → the byte
+      // codes are font-internal glyph indices, not any standard encoding
+      if (encodingName === 'Standard' && (flags & 4) !== 0) {
+        encodingName = 'Unknown'
+      }
+
+      info = {
+        encodingName,
+        firstChar,
+        lastChar,
+        widths,
+        baseFont,
+        flags,
+        isEmbedded,
+        isSubset: /^[A-Z]{6}\+/.test(baseFont),
+        isType0: subtype === '/Type0'
+      }
+    }
+    page.destroy()
+  } catch (err) {
+    console.warn(`[MuPDF Worker] getSimpleFontInfo failed for ${fontRefName}:`, err)
+  }
+
+  simpleFontInfoCache.set(cacheKey, info)
+  return info
+}
+
+/**
+ * Encode Unicode text into this simple font's byte encoding, verifying each
+ * glyph actually exists in the (possibly subsetted) font.
+ * Returns a Latin-1 byte string (charCode === byte value) or the missing chars.
+ */
+function encodeForSimpleFont(
+  text: string,
+  info: SimpleFontInfo
+): { bytes: string } | { missing: string[] } {
+  const table = info.encodingName === 'MacRoman' ? unicodeToMacRoman() : unicodeToWinAnsi()
+  let bytes = ''
+  const missing: string[] = []
+
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!
+    const byte = table.get(cp)
+    if (byte === undefined) { missing.push(ch); continue }
+
+    // For embedded subset fonts, verify the glyph survived subsetting
+    if (info.isEmbedded && info.isSubset && info.widths) {
+      if (byte < info.firstChar || byte > info.lastChar || (info.widths[byte - info.firstChar] || 0) === 0) {
+        missing.push(ch)
+        continue
+      }
+    }
+    bytes += String.fromCharCode(byte)
+  }
+
+  if (missing.length > 0) return { missing: [...new Set(missing)] }
+  return { bytes }
+}
+
+/** Encode text as WinAnsi bytes for a standard base-14 font. */
+function encodeWinAnsiText(text: string): { bytes: string } | { missing: string[] } {
+  const table = unicodeToWinAnsi()
+  let bytes = ''
+  const missing: string[] = []
+  for (const ch of text) {
+    const byte = table.get(ch.codePointAt(0)!)
+    if (byte === undefined) missing.push(ch)
+    else bytes += String.fromCharCode(byte)
+  }
+  if (missing.length > 0) return { missing: [...new Set(missing)] }
+  return { bytes }
+}
+
+/**
+ * Pick the best-matching standard base-14 font for a font we can't re-encode
+ * (what Acrobat does when the original font isn't fully embedded/usable).
+ */
+function pickSubstituteFont(info: SimpleFontInfo | null, targetBlock?: TextBlock): string {
+  const name = (info?.baseFont || targetBlock?.fontName || '').replace(/^[A-Z]{6}\+/, '').toLowerCase()
+  const flags = info?.flags || 0
+
+  const fixedPitch = (flags & 1) !== 0 || /courier|mono/.test(name)
+  const serif = (flags & 2) !== 0 || /times|georgia|garamond|book|palatino|serif|roman/.test(name)
+  const bold = targetBlock?.isBold || /bold|black|heavy/.test(name) || ((flags & 0x40000) !== 0)
+  const italic = targetBlock?.isItalic || /italic|oblique/.test(name) || ((flags & 0x40) !== 0)
+
+  if (fixedPitch) {
+    if (bold && italic) return 'Courier-BoldOblique'
+    if (bold) return 'Courier-Bold'
+    if (italic) return 'Courier-Oblique'
+    return 'Courier'
+  }
+  if (serif) {
+    if (bold && italic) return 'Times-BoldItalic'
+    if (bold) return 'Times-Bold'
+    if (italic) return 'Times-Italic'
+    return 'Times-Roman'
+  }
+  if (bold && italic) return 'Helvetica-BoldOblique'
+  if (bold) return 'Helvetica-Bold'
+  if (italic) return 'Helvetica-Oblique'
+  return 'Helvetica'
+}
+
+/**
+ * Rebuild a BT block's inner content to draw the given pre-encoded lines,
+ * optionally switching to a different font resource. Preserves the original
+ * text matrix, color operators and Tf size.
+ */
+function rebuildBtContent(
+  content: string,
+  encodedLines: string[],
+  newFontRef: string | null,
+  hex = false
+): string {
+  const tfMatch = content.match(/\/([A-Za-z0-9_.+-]+)\s+([\d.]+)\s+Tf/)
+  const tfSize = tfMatch ? tfMatch[2] : '12'
+  const tfPart = newFontRef ? `/${newFontRef} ${tfSize} Tf` : (tfMatch ? tfMatch[0] : '')
+
+  const tmMatch = content.match(/(-?[\d.]+\s+){5}-?[\d.]+\s+Tm/)
+  const tmPart = tmMatch ? tmMatch[0] : ''
+
+  // Preserve Td offsets that precede the first show-text op — some generators
+  // position every line via "Tm 0 -N Td"; dropping them would move the text
+  // back to the Tm origin.
+  const preShow = content.split(/[(<[]/)[0]
+  const tdMatches = preShow.match(/-?[\d.]+\s+-?[\d.]+\s+Td/g)
+  const tdPart = tdMatches ? tdMatches.join('\n') : ''
+
+  const colorMatch = content.match(/[\d.]+(?:\s+[\d.]+){0,3}\s+(?:rg|g|k|sc|scn)\b/)
+  const colorPart = colorMatch ? colorMatch[0] : ''
+
+  // Td moves in text space (before Tm scaling), so the per-line step is the
+  // raw Tf size — the Tm matrix applies any page-space scaling on top of it.
+  const tdStep = (parseFloat(tfSize) || 12) * 1.2
+
+  const tjParts: string[] = []
+  for (let i = 0; i < encodedLines.length; i++) {
+    const op = hex ? `<${encodedLines[i]}> Tj` : `(${escapePdfString(encodedLines[i])}) Tj`
+    if (i === 0) tjParts.push(op)
+    else tjParts.push(`0 ${(-tdStep).toFixed(2)} Td\n${op}`)
+  }
+
+  return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${tmPart}\n${tdPart ? tdPart + '\n' : ''}${tjParts.join('\n')}\n`
+}
+
+type EncodingPlan =
+  | { kind: 'keep-hex'; hexLines: string[] }
+  | { kind: 'keep-plain'; byteLines: string[] }
+  | { kind: 'subst'; fontRef: string; fontName: string; byteLines: string[] }
+  | { kind: 'error'; error: string }
+
+/**
+ * Decide how to encode replacement text for a BT block:
+ * 1. Re-encode with the original font when every character is available.
+ * 2. Otherwise substitute a matching standard font (Acrobat-style fallback).
+ */
+function planTextEncoding(
+  pageIndex: number,
+  block: { mode: 'hex' | 'plain'; fontRef: string; encoding: ReturnType<typeof getFontEncoding> },
+  lines: string[],
+  targetBlock?: TextBlock
+): EncodingPlan {
+  // Empty replacement (deletion) never needs substitution
+  const isEmpty = lines.every(l => l.length === 0)
+
+  if (block.mode === 'hex' && block.encoding) {
+    const hexLines: string[] = []
+    let ok = true
+    for (const line of lines) {
+      const res = encodeTextForFont(line, block.encoding)
+      if ('error' in res) { ok = false; break }
+      hexLines.push(res.hex)
+    }
+    if (ok) return { kind: 'keep-hex', hexLines }
+  } else if (block.mode === 'plain') {
+    if (isEmpty) return { kind: 'keep-plain', byteLines: lines.map(() => '') }
+    const info = getSimpleFontInfo(pageIndex, block.fontRef)
+
+    // Glyph-coded font drawing plain strings (bytes = CMap codes): re-encode
+    // through the reverse CMap and emit HEX literals — a hex string is a
+    // valid replacement for a plain one and avoids writing raw control bytes.
+    if (block.encoding && (!info || info.encodingName === 'Unknown')) {
+      const hexLines: string[] = []
+      let ok = true
+      for (const line of lines) {
+        const res = encodeTextForFont(line, block.encoding)
+        if ('error' in res) { ok = false; break }
+        hexLines.push(res.hex)
+      }
+      if (ok) return { kind: 'keep-hex', hexLines }
+    }
+
+    if (info && !info.isType0 && info.encodingName !== 'Unknown') {
+      const byteLines: string[] = []
+      let ok = true
+      for (const line of lines) {
+        const res = encodeForSimpleFont(line, info)
+        if ('missing' in res) { ok = false; break }
+        byteLines.push(res.bytes)
+      }
+      if (ok) return { kind: 'keep-plain', byteLines }
+    } else if (info === null) {
+      // Font resource unreadable — trust plain ASCII only
+      if (lines.every(l => /^[\x20-\x7E]*$/.test(l))) {
+        return { kind: 'keep-plain', byteLines: [...lines] }
+      }
+    }
+  }
+
+  if (isEmpty) {
+    return block.mode === 'hex'
+      ? { kind: 'keep-hex', hexLines: lines.map(() => '') }
+      : { kind: 'keep-plain', byteLines: lines.map(() => '') }
+  }
+
+  // ── Substitution fallback ──
+  const byteLines: string[] = []
+  for (const line of lines) {
+    const res = encodeWinAnsiText(line)
+    if ('missing' in res) {
+      return { kind: 'error', error: `Cannot encode characters: ${res.missing.join(', ')} (not supported by fallback font)` }
+    }
+    byteLines.push(res.bytes)
+  }
+
+  const info = getSimpleFontInfo(pageIndex, block.fontRef)
+  const fontName = pickSubstituteFont(info, targetBlock)
+
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+    const fontRef = ensureStandardFont(pageObj, fontName)
+    page.destroy()
+    console.log(`[MuPDF Worker] Substituting font ${info?.baseFont || block.fontRef} → ${fontName} (/${fontRef})`)
+    return { kind: 'subst', fontRef, fontName, byteLines }
+  } catch (err: any) {
+    return { kind: 'error', error: `Font substitution failed: ${err.message || err}` }
+  }
 }
 
 // ==========================================
@@ -636,11 +1150,17 @@ function addTextToPage(
     // 2. Read existing content stream
     const existingStream = readContentStream(pageIndex)
 
-    // 3. Build new BT block
+    // 3. Build new BT block. Encode to WinAnsi bytes first — serializing raw
+    // Unicode with "& 0xFF" would silently mangle €, smart quotes, dashes…
+    const winAnsi = encodeWinAnsiText(text)
+    if ('missing' in winAnsi) {
+      page.destroy()
+      return { success: false, error: `Characters not supported by ${fontName}: ${winAnsi.missing.join(', ')}` }
+    }
     const r = color?.[0] ?? 0
     const g = color?.[1] ?? 0
     const b = color?.[2] ?? 0
-    const escaped = escapePdfString(text)
+    const escaped = escapePdfString(winAnsi.bytes)
 
     const newBlock = `\nBT\n${r} ${g} ${b} rg\n/${fontRefName} ${fontSize} Tf\n1 0 0 1 ${x.toFixed(2)} ${y.toFixed(2)} Tm\n(${escaped}) Tj\nET\n`
 
@@ -689,7 +1209,11 @@ function ensureStandardFont(pageObj: any, fontName: string): string {
   }
   fontDict = fontDict.resolve()
 
-  // Check existing font references for our target font
+  // Check existing font references for our target font. Require an EXACT
+  // BaseFont + Type1 + non-embedded match: a substring test would reuse
+  // "Helvetica-Bold" for "Helvetica" (silently bolding new text) or an
+  // embedded subset "ABCDEF+Helvetica" whose custom encoding garbles
+  // WinAnsi bytes.
   const existingRefs = new Set<string>()
   for (let i = 1; i <= 99; i++) {
     const ref = `F${i}`
@@ -700,8 +1224,9 @@ function ensureStandardFont(pageObj: any, fontName: string): string {
         const resolved = val.resolve()
         const baseFont = resolved.get('BaseFont')
         if (baseFont) {
-          const baseFontStr = baseFont.asName?.() || baseFont.toString() || ''
-          if (baseFontStr.includes(fontName)) {
+          const baseFontStr = String(baseFont.asName?.() || baseFont.toString() || '').replace(/^\//, '')
+          const subtype = String(resolved.get('Subtype') || '')
+          if (baseFontStr === fontName && subtype === '/Type1') {
             return ref // Already registered
           }
         }
@@ -731,7 +1256,7 @@ function replaceTextInStream(
   pageIndex: number,
   blockId: string,
   newText: string
-): { success: boolean; error?: string } {
+): { success: boolean; error?: string; substitutedFont?: string } {
   if (!pdfDoc) return { success: false, error: 'No document' }
 
   try {
@@ -744,13 +1269,14 @@ function replaceTextInStream(
     const stream = readContentStream(pageIndex)
 
     // Build font ref name → baseFont mapping and parse encodings
-    const fontRefs = [...new Set((stream.match(/\/(F[\d.]+)/g) || []).map(s => s.slice(1)))]
+    const fontRefs = [...new Set([...stream.matchAll(/\/([A-Za-z0-9_.+-]+)\s+[\d.]+\s+Tf/g)].map(m => m[1]))]
     const fontRefToBaseName = new Map<string, string>()
     for (const fontRef of fontRefs) {
       getFontEncoding(pageIndex, fontRef)
       // Get the BaseFont name for matching with MuPDF's font name
+      let page2: any = null
       try {
-        const page2 = pdfDoc.loadPage(pageIndex)
+        page2 = pdfDoc.loadPage(pageIndex)
         const pObj = page2.getObject()
         const fDict = pObj.get('Resources').get('Font').get(fontRef)
         if (fDict) {
@@ -758,23 +1284,26 @@ function replaceTextInStream(
           // e.g., "/CAAAAA+Calibri" → "CAAAAA+Calibri"
           fontRefToBaseName.set(fontRef, baseFontStr.replace(/^\//, ''))
         }
-        page2.destroy()
-      } catch (_) {}
+      } catch (_) {
+      } finally {
+        try { page2?.destroy() } catch (_) { /* already destroyed */ }
+      }
     }
 
     // Find which font ref matches the target block's font
     const targetFontRef = findMatchingFontRef(targetBlock.fontName, fontRefToBaseName)
     // Font matched
 
-    // Get page width for line wrapping
+    // Get page size for line wrapping + position-aware matching
     const pageBounds = pdfDoc.loadPage(pageIndex)
     const boundsRect = pageBounds.getBounds()
     const pageWidth = boundsRect[2] - boundsRect[0]
+    const pageHeight = boundsRect[3] - boundsRect[1]
     pageBounds.destroy()
 
     // Find and replace the text in the content stream
     const replaceResult = replaceTextInContentStreamFontAware(
-      stream, pageIndex, targetBlock, newText, targetFontRef, pageWidth
+      stream, pageIndex, targetBlock, newText, targetFontRef, pageWidth, pageHeight
     )
 
     if (!replaceResult) {
@@ -802,10 +1331,15 @@ function replaceTextInStream(
       pageObj.put('Contents', newStreamObj)
     } else if (contents.isStream()) {
       contents.writeStream(streamBytes)
+    } else {
+      // No Contents at all — without this branch the edit is silently dropped
+      // while still being reported as success
+      const newStreamObj = pdfDoc.addStream(streamBytes, {})
+      pageObj.put('Contents', newStreamObj)
     }
 
     page.destroy()
-    return { success: true }
+    return { success: true, substitutedFont: replaceResult.substitutedFont }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
   }
@@ -839,20 +1373,23 @@ function transformTextBlock(
     const stream = readContentStream(pageIndex)
 
     // Build font ref mappings (same as replaceTextInStream)
-    const fontRefs = [...new Set((stream.match(/\/(F[\d.]+)/g) || []).map(s => s.slice(1)))]
+    const fontRefs = [...new Set([...stream.matchAll(/\/([A-Za-z0-9_.+-]+)\s+[\d.]+\s+Tf/g)].map(m => m[1]))]
     const fontRefToBaseName = new Map<string, string>()
     for (const fontRef of fontRefs) {
       getFontEncoding(pageIndex, fontRef)
+      let page2: any = null
       try {
-        const page2 = pdfDoc.loadPage(pageIndex)
+        page2 = pdfDoc.loadPage(pageIndex)
         const pObj = page2.getObject()
         const fDict = pObj.get('Resources').get('Font').get(fontRef)
         if (fDict) {
           const baseFontStr = fDict.resolve().get('BaseFont')?.toString?.() || ''
           fontRefToBaseName.set(fontRef, baseFontStr.replace(/^\//, ''))
         }
-        page2.destroy()
-      } catch (_) {}
+      } catch (_) {
+      } finally {
+        try { page2?.destroy() } catch (_) { /* already destroyed */ }
+      }
     }
 
     const targetFontRef = findMatchingFontRef(targetBlock.fontName, fontRefToBaseName)
@@ -871,25 +1408,57 @@ function transformTextBlock(
 
     let anyModified = false
     for (const block of sorted) {
+      // dx/dy/anchor arrive in PAGE space, but the text matrix lives inside the
+      // enclosing CTM (print-to-PDF files wrap text in scaled/flipped cm like
+      // "0.24 0 0 0.24 cm"). Convert through the inverse CTM so a 100pt page
+      // drag moves the block exactly 100pt on screen.
+      let dxL = dx, dyL = dy, anchorXL = anchorX, anchorYL = anchorY
+      const ctm = getCtmAtOffset(stream, block.start)
+      const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
+      if (Math.abs(det) > 1e-9) {
+        const ia = ctm[3] / det, ib = -ctm[1] / det
+        const ic = -ctm[2] / det, id = ctm[0] / det
+        dxL = dx * ia + dy * ic
+        dyL = dx * ib + dy * id
+        const ax = anchorX - ctm[4], ay = anchorY - ctm[5]
+        anchorXL = ax * ia + ay * ic
+        anchorYL = ax * ib + ay * id
+      }
+
+      // Literals are masked before locating the Tm so digits inside a string
+      // like "(1 0 0 1 5 5 Tm)" can't be mistaken for the operator.
       const tmRegex = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/
-      const tmMatch = block.content.match(tmRegex)
-      if (!tmMatch) continue
+      const tmMatch = maskStreamLiterals(block.content).match(tmRegex)
 
-      const a = parseFloat(tmMatch[1])
-      const bVal = parseFloat(tmMatch[2])
-      const c = parseFloat(tmMatch[3])
-      const d = parseFloat(tmMatch[4])
-      const e = parseFloat(tmMatch[5])
-      const f = parseFloat(tmMatch[6])
+      let newContent: string
+      if (tmMatch) {
+        const a = parseFloat(tmMatch[1])
+        const bVal = parseFloat(tmMatch[2])
+        const c = parseFloat(tmMatch[3])
+        const d = parseFloat(tmMatch[4])
+        const e = parseFloat(tmMatch[5])
+        const f = parseFloat(tmMatch[6])
 
-      // Apply transformation: scale around anchor then translate
-      const newA = a * sx
-      const newD = d * sy
-      const newE = anchorX + (e - anchorX) * sx + dx
-      const newF = anchorY + (f - anchorY) * sy + dy
+        // Apply transformation: scale around anchor then translate
+        const newA = a * sx
+        const newD = d * sy
+        const newE = anchorXL + (e - anchorXL) * sx + dxL
+        const newF = anchorYL + (f - anchorYL) * sy + dyL
 
-      const newTm = `${fmtNum(newA)} ${fmtNum(bVal)} ${fmtNum(c)} ${fmtNum(newD)} ${fmtNum(newE)} ${fmtNum(newF)} Tm`
-      const newContent = block.content.replace(tmRegex, newTm)
+        const newTm = `${fmtNum(newA)} ${fmtNum(bVal)} ${fmtNum(c)} ${fmtNum(newD)} ${fmtNum(newE)} ${fmtNum(newF)} Tm`
+        const at = tmMatch.index!
+        newContent = block.content.slice(0, at) + newTm + block.content.slice(at + tmMatch[0].length)
+      } else {
+        // No Tm — the block positions itself with Td/TD/T* (wkhtmltopdf, FPDF,
+        // TCPDF…). BT resets the line matrix to the identity, so every one of
+        // those operators is relative to it: injecting the transform AS that
+        // identity moves/scales the whole block, subsequent lines included.
+        //   p' = anchor + (p - anchor)·s + d
+        const mE = anchorXL * (1 - sx) + dxL
+        const mF = anchorYL * (1 - sy) + dyL
+        const injected = `${fmtNum(sx)} 0 0 ${fmtNum(sy)} ${fmtNum(mE)} ${fmtNum(mF)} Tm`
+        newContent = ` ${injected}${block.content}`
+      }
 
       modifiedStream = modifiedStream.substring(0, block.start) +
                        'BT' + newContent + 'ET' +
@@ -898,7 +1467,7 @@ function transformTextBlock(
     }
 
     if (!anyModified) {
-      return { success: false, error: 'No Tm matrix found in matched blocks' }
+      return { success: false, error: 'No matched blocks to transform' }
     }
 
     // Write modified stream back (Latin-1 for byte transparency)
@@ -916,6 +1485,11 @@ function transformTextBlock(
       pageObj.put('Contents', newStreamObj)
     } else if (contents.isStream()) {
       contents.writeStream(streamBytes)
+    } else {
+      // No Contents at all — without this branch the edit is silently dropped
+      // while still being reported as success
+      const newStreamObj = pdfDoc.addStream(streamBytes, {})
+      pageObj.put('Contents', newStreamObj)
     }
 
     page.destroy()
@@ -923,6 +1497,44 @@ function transformTextBlock(
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
   }
+}
+
+// ── CTM tracking (q/Q/cm) so Tm edits can convert page-space deltas to local space ──
+
+type Mat6 = [number, number, number, number, number, number]
+
+/** Row-vector affine concat: apply A then B (PDF cm pre-concatenation: CTM' = Mcm × CTM). */
+function matConcat(A: Mat6, B: Mat6): Mat6 {
+  return [
+    A[0] * B[0] + A[1] * B[2],
+    A[0] * B[1] + A[1] * B[3],
+    A[2] * B[0] + A[3] * B[2],
+    A[2] * B[1] + A[3] * B[3],
+    A[4] * B[0] + A[5] * B[2] + B[4],
+    A[4] * B[1] + A[5] * B[3] + B[5]
+  ]
+}
+
+/**
+ * Compute the effective CTM at a given stream offset by replaying q/Q/cm
+ * operators. String literals are masked first so 'q' bytes inside text
+ * can't corrupt the graphics-state stack.
+ */
+function getCtmAtOffset(stream: string, offset: number): Mat6 {
+  let masked = stream.slice(0, offset)
+  masked = masked.replace(/\((?:\\.|[^()\\])*\)/g, m => ' '.repeat(m.length))
+  masked = masked.replace(/<[0-9A-Fa-f\s]*>/g, m => ' '.repeat(m.length))
+
+  const stack: Mat6[] = []
+  let ctm: Mat6 = [1, 0, 0, 1, 0, 0]
+  const re = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+cm\b|(?:^|[\s\]>])([qQ])(?=[\s(<\[/%]|$)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m[7] === 'q') stack.push([...ctm] as Mat6)
+    else if (m[7] === 'Q') ctm = stack.pop() || [1, 0, 0, 1, 0, 0]
+    else ctm = matConcat([+m[1], +m[2], +m[3], +m[4], +m[5], +m[6]], ctm)
+  }
+  return ctm
 }
 
 /** Format a number for PDF content stream (avoid excessive decimals) */
@@ -935,6 +1547,107 @@ function fmtNum(n: number): string {
 }
 
 /**
+ * Mask string literals (with one nesting level), hex strings and name tokens
+ * with spaces of identical length, so operator scans (BT/ET, q/Q, Tm…) can
+ * never match text INSIDE a literal like "(BUDGET REPORT)" or "/GS_ET".
+ * Offsets in the masked string map 1:1 to the original.
+ */
+function maskStreamLiterals(stream: string): string {
+  return stream
+    .replace(/\((?:\\.|[^()\\]|\((?:\\.|[^()\\])*\))*\)/g, m => '(' + ' '.repeat(m.length - 2) + ')')
+    .replace(/<[0-9A-Fa-f\s]*>/g, m => '<' + ' '.repeat(Math.max(m.length - 2, 0)) + '>')
+    .replace(/\/[^\s<>[\]()/%]+/g, m => '/' + ' '.repeat(m.length - 1))
+}
+
+/**
+ * Text-space position where a BT block starts drawing.
+ *
+ * BT resets the text/line matrix to the identity, so replaying the
+ * positioning operators (Tm, Td, TD, TL, T* and the implicit T* of the
+ * quote operators) up to the FIRST show-text op yields the block's origin.
+ * Reading only `Tm` — as this used to — reports "no position" for the very
+ * common `BT x y Td (text) Tj ET` shape emitted by wkhtmltopdf/FPDF/TCPDF,
+ * which silently disabled line grouping and move/resize for those files.
+ *
+ * `masked` must be the literal-masked content (see maskStreamLiterals) so
+ * digits inside a string like "(1 0 0 1 5 5 Tm)" can't be read as operators.
+ */
+function getBlockOrigin(masked: string): { x: number; y: number; hasPos: boolean; hasTm: boolean } {
+  const re = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm\b|(-?[\d.]+)\s+(-?[\d.]+)\s+(Td|TD)\b|(-?[\d.]+)\s+TL\b|T\*|\)\s*(?:Tj|TJ|'|")|>\s*(?:Tj|TJ|'|")|\]\s*TJ/g
+  let x = 0, y = 0, leading = 0
+  let hasPos = false, hasTm = false
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m[1] !== undefined) {            // Tm — absolute line matrix
+      x = parseFloat(m[5]); y = parseFloat(m[6])
+      hasPos = true; hasTm = true
+      continue
+    }
+    if (m[7] !== undefined) {            // Td / TD — relative to the line matrix
+      x += parseFloat(m[7]); y += parseFloat(m[8])
+      if (m[9] === 'TD') leading = -parseFloat(m[8])
+      hasPos = true
+      continue
+    }
+    if (m[10] !== undefined) { leading = parseFloat(m[10]); continue } // TL
+    if (m[0] === 'T*') { y -= leading; hasPos = true; continue }
+    // First show-text op — the pen is where the block starts drawing.
+    // ' and " carry an implicit T*, but the block still starts on this line.
+    break
+  }
+  return { x, y, hasPos, hasTm }
+}
+
+/**
+ * Scan a content stream for BT...ET blocks, immune to "BT"/"ET" byte
+ * sequences inside string literals or name tokens. Content is sliced from the
+ * ORIGINAL stream so downstream regexes see the real bytes.
+ */
+function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
+  const masked = maskStreamLiterals(stream)
+  const re = /(?<![A-Za-z0-9])BT(?![A-Za-z0-9])([\s\S]*?)(?<![A-Za-z0-9])ET(?![A-Za-z0-9])/g
+  const out: BtInfo[] = []
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    const start = m.index
+    const end = m.index + m[0].length
+    const content = stream.slice(start + 2, end - 2)
+    const maskedContent = masked.slice(start + 2, end - 2)
+
+    const fontMatch = maskedContent.match(/\/[ ]*\s+[\d.]+\s+Tf/)
+    // Read the actual font name from the original at the same offset
+    let fontRef: string | null = null
+    if (fontMatch) {
+      const nameMatch = content.slice(fontMatch.index).match(/^\/([^\s<>[\]()/%]+)/)
+      fontRef = nameMatch ? nameMatch[1] : null
+    }
+    if (!fontRef) continue
+
+    const origin = getBlockOrigin(maskedContent)
+
+    const encoding = getFontEncoding(pageIndex, fontRef)
+    const mode = detectBlockEncoding(content)
+    const decodedText = decodeBtBlockText(content, encoding, getSimpleFontInfo(pageIndex, fontRef))
+
+    out.push({
+      content,
+      start,
+      end,
+      fontRef,
+      yPos: origin.y,
+      xPos: origin.x,
+      hasPos: origin.hasPos,
+      hasTm: origin.hasTm,
+      decodedText,
+      mode,
+      encoding,
+      hasSubstantialText: decodedText.trim().length > 1
+    })
+  }
+  return out
+}
+
+/**
  * Find the BT/ET blocks in the content stream that match a given TextBlock.
  * Reuses the same matching strategy as replaceTextInContentStreamFontAware.
  */
@@ -944,42 +1657,14 @@ function findMatchingBtBlocks(
   targetBlock: TextBlock,
   targetFontRef: string | null
 ): BtInfo[] | null {
-  const btEtRegex = /BT\b([\s\S]*?)ET\b/g
-  let match: RegExpExecArray | null
-  const allBlocks: BtInfo[] = []
-
-  while ((match = btEtRegex.exec(stream)) !== null) {
-    const content = match[1]
-    const fontMatch = content.match(/\/(F[\d.]+)\s+[\d.]+\s+Tf/)
-    if (!fontMatch) continue
-
-    const fontRef = fontMatch[1]
-    const tmMatch = content.match(/-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+(-?[\d.]+)\s+Tm/)
-    const yPos = tmMatch ? parseFloat(tmMatch[1]) : -1
-
-    const encoding = getFontEncoding(pageIndex, fontRef)
-    const mode = detectBlockEncoding(content)
-    const decodedText = decodeBtBlockText(content, encoding)
-
-    allBlocks.push({
-      content,
-      start: match.index,
-      end: match.index + match[0].length,
-      fontRef,
-      yPos,
-      decodedText,
-      mode,
-      encoding,
-      hasSubstantialText: decodedText.trim().length > 1
-    })
-  }
+  const allBlocks = scanBtBlocks(stream, pageIndex)
 
   const normalizedTarget = targetBlock.text.replace(/\s+/g, ' ').trim()
 
   // Try line-grouped matching first
   const lineGroups = new Map<number, BtInfo[]>()
   for (const block of allBlocks) {
-    if (block.yPos < 0) continue
+    if (!block.hasPos) continue
     const yKey = Math.round(block.yPos * 2) / 2
     if (!lineGroups.has(yKey)) lineGroups.set(yKey, [])
     lineGroups.get(yKey)!.push(block)
@@ -1022,41 +1707,9 @@ function findBtBlocksByPosition(
   targetBlock: TextBlock,
   targetFontRef: string | null
 ): BtInfo[] | null {
-  const btEtRegex = /BT\b([\s\S]*?)ET\b/g
-  let match: RegExpExecArray | null
-  const allBlocks: BtInfo[] = []
-
-  while ((match = btEtRegex.exec(stream)) !== null) {
-    const content = match[1]
-    const fontMatch = content.match(/\/(F[\d.]+)\s+[\d.]+\s+Tf/)
-    if (!fontMatch) continue
-
-    const fontRef = fontMatch[1]
-    // Extract full Tm: a b c d x y Tm
-    const tmMatch = content.match(
-      /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/
-    )
-    if (!tmMatch) continue
-    const xPos = parseFloat(tmMatch[5])
-    const yPos = parseFloat(tmMatch[6])
-
-    const encoding = getFontEncoding(pageIndex, fontRef)
-    const mode = detectBlockEncoding(content)
-    const decodedText = decodeBtBlockText(content, encoding)
-
-    allBlocks.push({
-      content,
-      start: match.index,
-      end: match.index + match[0].length,
-      fontRef,
-      yPos,
-      decodedText,
-      mode,
-      encoding,
-      hasSubstantialText: decodedText.trim().length > 1,
-      xPos
-    })
-  }
+  // Position matching needs a text-space origin; skip blocks without any
+  // positioning operator at all (they draw at the identity origin).
+  const allBlocks = scanBtBlocks(stream, pageIndex).filter(b => b.hasPos)
 
   // Target block's position in Tm coords (bottom-left origin):
   // bbox is top-left origin from MuPDF, so:
@@ -1146,7 +1799,11 @@ interface BtInfo {
   end: number
   fontRef: string
   yPos: number
-  xPos?: number
+  xPos: number
+  /** The block carries at least one text-positioning operator (Tm/Td/TD/T*). */
+  hasPos: boolean
+  /** The block positions its first show-op with Tm (vs. only Td/TD/T*). */
+  hasTm: boolean
   decodedText: string
   mode: 'hex' | 'plain'
   encoding: ReturnType<typeof getFontEncoding>
@@ -1168,40 +1825,11 @@ function replaceTextInContentStreamFontAware(
   targetBlock: TextBlock,
   newText: string,
   targetFontRef: string | null,
-  pageWidth?: number
-): { stream: string } | { error: string } | null {
+  pageWidth?: number,
+  pageHeight?: number
+): { stream: string; substitutedFont?: string } | { error: string } | null {
   // Step 1: Parse all BT blocks with position and text info
-  const btEtRegex = /BT\b([\s\S]*?)ET\b/g
-  let match: RegExpExecArray | null
-  const allBlocks: BtInfo[] = []
-
-  while ((match = btEtRegex.exec(stream)) !== null) {
-    const content = match[1]
-    const fontMatch = content.match(/\/(F[\d.]+)\s+[\d.]+\s+Tf/)
-    if (!fontMatch) continue
-
-    const fontRef = fontMatch[1]
-
-    // Extract Y position from Tm: "1 0 0 1 <x> <y> Tm"
-    const tmMatch = content.match(/-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+-?[\d.]+\s+(-?[\d.]+)\s+Tm/)
-    const yPos = tmMatch ? parseFloat(tmMatch[1]) : -1
-
-    const encoding = getFontEncoding(pageIndex, fontRef)
-    const mode = detectBlockEncoding(content)
-    const decodedText = decodeBtBlockText(content, encoding)
-
-    allBlocks.push({
-      content,
-      start: match.index,
-      end: match.index + match[0].length,
-      fontRef,
-      yPos,
-      decodedText,
-      mode,
-      encoding,
-      hasSubstantialText: decodedText.trim().length > 1
-    })
-  }
+  const allBlocks = scanBtBlocks(stream, pageIndex)
 
   // Step 2: Group blocks by Y position and try line-grouped matching FIRST
   // (MuPDF often groups multiple BT blocks into one TextBlock)
@@ -1209,7 +1837,7 @@ function replaceTextInContentStreamFontAware(
 
   const lineGroups = new Map<number, BtInfo[]>()
   for (const block of allBlocks) {
-    if (block.yPos < 0) continue
+    if (!block.hasPos) continue
     // Round Y to nearest 0.5 to group same-line blocks
     const yKey = Math.round(block.yPos * 2) / 2
     if (!lineGroups.has(yKey)) lineGroups.set(yKey, [])
@@ -1219,17 +1847,33 @@ function replaceTextInContentStreamFontAware(
   for (const [, lineBlocks] of lineGroups) {
     if (lineBlocks.length < 2) continue
 
-    // Concatenate all text on this line
-    const lineText = lineBlocks.map(b => b.decodedText).join('')
-    const normalizedLine = lineText.replace(/\s+/g, ' ').trim()
-    if (!normalizedLine || normalizedLine.length < 2) continue
+    // Find the best CONTIGUOUS run of blocks whose concatenated text matches
+    // the target — never treat the whole group as the match. Some generators
+    // give EVERY block on a page the same Tm y and position lines via Td;
+    // whole-group matching then blanks the entire page on a single edit.
+    const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
+    let best: { blocks: BtInfo[]; score: number } | null = null
+    for (let i = 0; i < sorted.length; i++) {
+      let acc = ''
+      for (let j = i; j < sorted.length; j++) {
+        acc += sorted[j].decodedText
+        const norm = acc.replace(/\s+/g, ' ').trim()
+        if (norm.length > normalizedTarget.length * 1.5 + 8) break // overshot the target
+        if (!norm) continue
+        const ratio = Math.min(norm.length, normalizedTarget.length) /
+                      Math.max(norm.length, normalizedTarget.length)
+        if (ratio < 0.7) continue
+        let score = 0
+        if (norm === normalizedTarget) score = 2
+        else if (fuzzyTextMatch(norm, normalizedTarget)) score = ratio
+        if (score > 0 && (!best || score > best.score)) {
+          best = { blocks: sorted.slice(i, j + 1), score }
+        }
+      }
+    }
 
-    if (normalizedLine === normalizedTarget || fuzzyTextMatch(normalizedLine, normalizedTarget)) {
-      // Use all line blocks for replacement (handles blanking sibling blocks)
-      const targetBlocks = lineBlocks
-      if (targetBlocks.length === 0) continue
-
-      const replaceResult = applyLineReplacement(stream, targetBlocks, newText, pageIndex)
+    if (best) {
+      const replaceResult = applyLineReplacement(stream, best.blocks, newText, pageIndex, targetBlock, pageWidth)
       if (replaceResult) return replaceResult
     }
   }
@@ -1241,8 +1885,28 @@ function replaceTextInContentStreamFontAware(
     if (!normalizedDecoded || normalizedDecoded.length < 2) continue
 
     if (normalizedDecoded === normalizedTarget || fuzzyTextMatch(normalizedDecoded, normalizedTarget)) {
-      const replaceResult = applyBlockReplacement(stream, [block], newText, pageIndex, targetBlock, pageWidth)
+      const replaceResult = applyBlockReplacement(stream, [block], newText, pageIndex, targetBlock, pageWidth, pageHeight)
       if (replaceResult) return replaceResult
+    }
+  }
+
+  // Step 4: Target CONTAINED inside a larger BT block (Ghostscript draws a
+  // whole table column as one BT with each cell its own show-op — a short
+  // cell like "16:00" never fuzzy-matches the whole block). Replace just the
+  // matching show-ops, picking the occurrence nearest the clicked position.
+  const targetCompact = normalizedTarget.replace(/\s+/g, '')
+  if (targetCompact.length >= 2) {
+    for (const fontFiltered of [true, false]) {
+      for (const block of allBlocks) {
+        if (fontFiltered && targetFontRef && block.fontRef !== targetFontRef) continue
+        if (!fontFiltered && targetFontRef && block.fontRef === targetFontRef) continue
+        const decodedCompact = block.decodedText.replace(/\s+/g, '')
+        if (decodedCompact.length <= targetCompact.length) continue
+        if (!decodedCompact.includes(targetCompact)) continue
+        const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
+        if (partial) return partial
+      }
+      if (!targetFontRef) break // second pass is identical when no font filter exists
     }
   }
 
@@ -1258,37 +1922,51 @@ function applyBlockReplacement(
   newText: string,
   pageIndex: number,
   targetBlock?: TextBlock,
-  pageWidth?: number
-): { stream: string } | { error: string } | null {
+  pageWidth?: number,
+  pageHeight?: number
+): { stream: string; substitutedFont?: string } | { error: string } | null {
   const block = blocks[0]
+
+  // If this BT block holds much MORE text than the target (one BT drawing
+  // several lines via Td/'), replacing the whole block would wipe the other
+  // lines — replace only the show-ops that correspond to the target.
+  if (targetBlock) {
+    const blockNorm = block.decodedText.replace(/\s+/g, ' ').trim()
+    const targetNorm = targetBlock.text.replace(/\s+/g, ' ').trim()
+    if (targetNorm && blockNorm.length > targetNorm.length * 1.4) {
+      const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
+      if (partial) return partial
+    }
+  }
 
   // Check if we need line wrapping
   const needsWrap = targetBlock && pageWidth && newText.length > 0 &&
     shouldWrapText(newText, targetBlock, pageWidth)
 
   if (needsWrap && targetBlock && pageWidth) {
-    const wrappedResult = applyWrappedReplacement(stream, block, newText, targetBlock, pageWidth)
+    const wrappedResult = applyWrappedReplacement(stream, block, newText, targetBlock, pageWidth, pageIndex)
     if (wrappedResult) return wrappedResult
   }
 
   // Standard single-line replacement
-  if (block.mode === 'hex') {
-    if (!block.encoding) return null
-    const encodeResult = encodeTextForFont(newText, block.encoding)
-    if ('error' in encodeResult) return { error: encodeResult.error }
-    const newContent = replaceTjInBlock(block.content, newText, 'hex', encodeResult.hex)
-    if (newContent !== block.content) {
-      const result = stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
-                     stream.substring(block.end)
-      return { stream: result }
-    }
+  const plan = planTextEncoding(pageIndex, block, [newText], targetBlock)
+  if (plan.kind === 'error') return { error: plan.error }
+
+  let newContent: string
+  let substitutedFont: string | undefined
+  if (plan.kind === 'keep-hex') {
+    newContent = replaceTjInBlock(block.content, newText, 'hex', plan.hexLines[0])
+  } else if (plan.kind === 'keep-plain') {
+    newContent = replaceTjInBlock(block.content, plan.byteLines[0], 'plain')
   } else {
-    const newContent = replaceTjInBlock(block.content, newText, 'plain')
-    if (newContent !== block.content) {
-      const result = stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
-                     stream.substring(block.end)
-      return { stream: result }
-    }
+    newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef)
+    substitutedFont = plan.fontName
+  }
+
+  if (newContent !== block.content) {
+    const result = stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
+                   stream.substring(block.end)
+    return { stream: result, substitutedFont }
   }
   return null
 }
@@ -1319,8 +1997,9 @@ function applyWrappedReplacement(
   block: BtInfo,
   newText: string,
   targetBlock: TextBlock,
-  pageWidth: number
-): { stream: string } | { error: string } | null {
+  pageWidth: number,
+  pageIndex: number
+): { stream: string; substitutedFont?: string } | { error: string } | null {
   const origText = targetBlock.text
   const blockWidth = targetBlock.width
   const avgCharWidth = blockWidth / Math.max(origText.length, 1)
@@ -1333,52 +2012,26 @@ function applyWrappedReplacement(
   const lines = wordWrap(newText, maxCharsPerLine)
   if (lines.length <= 1) return null // No wrapping needed, fall through to standard
 
-  // Parse font size from the BT block for line spacing
-  const tfMatch = block.content.match(/\/(F[\d.]+)\s+([\d.]+)\s+Tf/)
-  const fontSize = tfMatch ? parseFloat(tfMatch[2]) : 12
-  const lineHeight = fontSize * 1.2
+  const plan = planTextEncoding(pageIndex, block, lines, targetBlock)
+  if (plan.kind === 'error') return { error: plan.error }
 
-  // Rebuild the ENTIRE BT block: keep only Tf and Tm, strip ALL old Tj/Td/TJ content,
-  // then append the new wrapped lines. This prevents duplication when re-editing.
-  const tfPart = tfMatch ? tfMatch[0] : ''
-  const tmMatch = block.content.match(/(-?[\d.]+\s+){5}-?[\d.]+\s+Tm/)
-  const tmPart = tmMatch ? tmMatch[0] : ''
-  // Also preserve any color operators (rg/RG/g/G/k/K)
-  const colorMatch = block.content.match(/[\d.]+(?:\s+[\d.]+){0,3}\s+(?:rg|RG|g|G|k|K)\b/)
-  const colorPart = colorMatch ? colorMatch[0] : ''
-
-  if (block.mode === 'hex') {
-    if (!block.encoding) return null
-    const tjParts: string[] = []
-    for (let i = 0; i < lines.length; i++) {
-      const encResult = encodeTextForFont(lines[i], block.encoding)
-      if ('error' in encResult) return { error: encResult.error }
-      if (i === 0) {
-        tjParts.push(`<${encResult.hex}> Tj`)
-      } else {
-        tjParts.push(`0 ${(-lineHeight).toFixed(1)} Td\n<${encResult.hex}> Tj`)
-      }
-    }
-    const newContent = `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${tmPart}\n${tjParts.join('\n')}\n`
-    return {
-      stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
-              stream.substring(block.end)
-    }
+  // Rebuild the ENTIRE BT block: keep only color/Tf/Tm, strip ALL old Tj/Td/TJ
+  // content, then append the new wrapped lines (prevents duplication on re-edit).
+  let newContent: string
+  let substitutedFont: string | undefined
+  if (plan.kind === 'keep-hex') {
+    newContent = rebuildBtContent(block.content, plan.hexLines, null, true)
+  } else if (plan.kind === 'keep-plain') {
+    newContent = rebuildBtContent(block.content, plan.byteLines, null)
   } else {
-    const tjParts: string[] = []
-    for (let i = 0; i < lines.length; i++) {
-      const escaped = escapePdfString(lines[i])
-      if (i === 0) {
-        tjParts.push(`(${escaped}) Tj`)
-      } else {
-        tjParts.push(`0 ${(-lineHeight).toFixed(1)} Td\n(${escaped}) Tj`)
-      }
-    }
-    const newContent = `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${tmPart}\n${tjParts.join('\n')}\n`
-    return {
-      stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
-              stream.substring(block.end)
-    }
+    newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef)
+    substitutedFont = plan.fontName
+  }
+
+  return {
+    stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
+            stream.substring(block.end),
+    substitutedFont
   }
 }
 
@@ -1421,8 +2074,10 @@ function applyLineReplacement(
   stream: string,
   lineBlocks: BtInfo[],
   newText: string,
-  pageIndex: number
-): { stream: string } | { error: string } | null {
+  pageIndex: number,
+  targetBlock?: TextBlock,
+  pageWidth?: number
+): { stream: string; substitutedFont?: string } | { error: string } | null {
   // Sort by position in stream (ascending)
   const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
 
@@ -1433,20 +2088,35 @@ function applyLineReplacement(
 
   // Build replacements (process from end to start to preserve offsets)
   const replacements: { start: number; end: number; newContent: string }[] = []
+  let substitutedFont: string | undefined
 
   for (let i = sorted.length - 1; i >= 0; i--) {
     const block = sorted[i]
     let newContent: string
 
     if (i === primaryIdx) {
-      // Primary block: insert the new text
-      if (block.mode === 'hex') {
-        if (!block.encoding) return null
-        const encodeResult = encodeTextForFont(newText, block.encoding)
-        if ('error' in encodeResult) return { error: encodeResult.error }
-        newContent = replaceTjInBlock(block.content, newText, 'hex', encodeResult.hex)
+      // Primary block: insert the new text, word-wrapped if it won't fit the line
+      let lines = [newText]
+      if (targetBlock && pageWidth && newText.length > 0 && shouldWrapText(newText, targetBlock, pageWidth)) {
+        const avgCharWidth = targetBlock.width / Math.max(targetBlock.text.length, 1)
+        const availableWidth = pageWidth - targetBlock.x - 20
+        const maxCharsPerLine = Math.max(Math.floor(availableWidth / avgCharWidth), 10)
+        lines = wordWrap(newText, maxCharsPerLine)
+      }
+
+      const plan = planTextEncoding(pageIndex, block, lines, targetBlock)
+      if (plan.kind === 'error') return { error: plan.error }
+      if (plan.kind === 'subst') {
+        newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef)
+        substitutedFont = plan.fontName
+      } else if (lines.length > 1) {
+        newContent = plan.kind === 'keep-hex'
+          ? rebuildBtContent(block.content, plan.hexLines, null, true)
+          : rebuildBtContent(block.content, plan.byteLines, null)
+      } else if (plan.kind === 'keep-hex') {
+        newContent = replaceTjInBlock(block.content, newText, 'hex', plan.hexLines[0])
       } else {
-        newContent = replaceTjInBlock(block.content, newText, 'plain')
+        newContent = replaceTjInBlock(block.content, plan.byteLines[0], 'plain')
       }
     } else if (block.hasSubstantialText) {
       // Other blocks with text: blank them
@@ -1464,7 +2134,7 @@ function applyLineReplacement(
     result = result.substring(0, rep.start) + 'BT' + rep.newContent + 'ET' + result.substring(rep.end)
   }
 
-  return result !== stream ? { stream: result } : null
+  return result !== stream ? { stream: result, substitutedFont } : null
 }
 
 /**
@@ -1532,21 +2202,40 @@ function findMatchingFontRef(
  * Detect whether a BT block uses hex encoding (<hex> Tj) or plain text ((text) Tj / TJ arrays).
  */
 function detectBlockEncoding(block: string): 'hex' | 'plain' {
-  if (/<[0-9A-Fa-f]+>\s*Tj/i.test(block)) return 'hex'
-  // TJ arrays with hex inside
-  if (/\[[^\]]*<[0-9A-Fa-f]+>[^\]]*\]\s*TJ/i.test(block)) return 'hex'
+  if (/<[0-9A-Fa-f\s]*[0-9A-Fa-f][0-9A-Fa-f\s]*>\s*(Tj|')/i.test(block)) return 'hex'
+  // TJ arrays containing hex strings
+  if (/<[0-9A-Fa-f\s]*[0-9A-Fa-f][0-9A-Fa-f\s]*>/.test(block) && /\]\s*TJ/.test(block)) return 'hex'
   return 'plain'
 }
 
+// String literal with one nesting level (PDF allows balanced unescaped parens)
+const STR_LIT_SRC = String.raw`\((?:\\.|[^()\\]|\((?:\\.|[^()\\])*\))*\)`
+// Hex string; the spec allows interior whitespace
+const HEX_LIT_SRC = String.raw`<[0-9A-Fa-f\s]*>`
+
 /**
- * Decode all text from a BT block, handling both hex-encoded CID fonts
- * and plain text (WinAnsi/standard encoding).
+ * Decode all text from a BT block IN STREAM ORDER, handling hex-encoded CID
+ * fonts, plain WinAnsi/MacRoman strings, nested parens, hex whitespace, and
+ * every show operator (Tj, ', ", TJ arrays) uniformly by walking the string
+ * and hex literals sequentially.
  */
 function decodeBtBlockText(
   block: string,
-  encoding: { glyphToUnicode: Map<number, number> } | null
+  encoding: { glyphToUnicode: Map<number, number>; codeBytes?: number } | null,
+  simpleInfo?: SimpleFontInfo | null
 ): string {
   let text = ''
+  const stride = (encoding?.codeBytes === 1 ? 1 : 2) * 2
+
+  // Map raw plain-string bytes through the font's simple encoding (MacRoman/WinAnsi)
+  function mapPlainBytes(s: string): string {
+    if (!simpleInfo || simpleInfo.encodingName === 'Unknown') return s
+    let out = ''
+    for (let i = 0; i < s.length; i++) {
+      out += String.fromCodePoint(byteToUnicode(s.charCodeAt(i), simpleInfo.encodingName))
+    }
+    return out
+  }
 
   function decodeGlyph(glyphId: number): string {
     if (encoding) {
@@ -1562,45 +2251,422 @@ function decodeBtBlockText(
     return '?'
   }
 
-  function decodeHexString(hex: string) {
-    for (let i = 0; i + 3 < hex.length; i += 4) {
-      text += decodeGlyph(parseInt(hex.substring(i, i + 4), 16))
-    }
-  }
+  // Glyph-coded fonts (symbolic subsets with a ToUnicode CMap but no simple
+  // encoding — Ghostscript output) draw PLAIN strings whose bytes are CMap
+  // codes, not ASCII: route those through the CMap too.
+  const glyphCodedPlain = !!encoding && (!simpleInfo || simpleInfo.encodingName === 'Unknown')
+  const plainCodeBytes = encoding?.codeBytes === 2 ? 2 : 1
 
+  const litRe = new RegExp(`(${STR_LIT_SRC})|(${HEX_LIT_SRC})`, 'g')
   let m: RegExpExecArray | null
-
-  // Match hex string Tj: <hexdata> Tj
-  const hexTjRegex = /<([0-9A-Fa-f]+)>\s*Tj/g
-  while ((m = hexTjRegex.exec(block)) !== null) {
-    decodeHexString(m[1])
-  }
-
-  // Plain text Tj: (string) Tj
-  const plainTjRegex = /\(([^)]*)\)\s*Tj/g
-  while ((m = plainTjRegex.exec(block)) !== null) {
-    text += unescapePdfString(m[1])
-  }
-
-  // TJ arrays: [<hex> num (text) num ...] TJ
-  const tjArrayRegex = /\[([^\]]*)\]\s*TJ/g
-  while ((m = tjArrayRegex.exec(block)) !== null) {
-    const inner = m[1]
-    // Extract hex strings
-    const hexInArray = /<([0-9A-Fa-f]+)>/g
-    let hm: RegExpExecArray | null
-    while ((hm = hexInArray.exec(inner)) !== null) {
-      decodeHexString(hm[1])
-    }
-    // Extract parenthesized strings
-    const plainInArray = /\(([^)]*)\)/g
-    let pm: RegExpExecArray | null
-    while ((pm = plainInArray.exec(inner)) !== null) {
-      text += unescapePdfString(pm[1])
+  while ((m = litRe.exec(block)) !== null) {
+    if (m[1] !== undefined) {
+      const raw = unescapePdfString(m[1].slice(1, -1))
+      if (glyphCodedPlain) {
+        for (let i = 0; i + plainCodeBytes - 1 < raw.length; i += plainCodeBytes) {
+          let code = 0
+          for (let k = 0; k < plainCodeBytes; k++) code = (code << 8) | raw.charCodeAt(i + k)
+          text += decodeGlyph(code)
+        }
+      } else {
+        text += mapPlainBytes(raw)
+      }
+    } else {
+      const hex = m[2].slice(1, -1).replace(/\s+/g, '')
+      for (let i = 0; i + stride - 1 < hex.length; i += stride) {
+        text += decodeGlyph(parseInt(hex.substring(i, i + stride), 16))
+      }
     }
   }
 
   return text
+}
+
+interface ShowOpInfo {
+  start: number
+  end: number
+  raw: string
+  decoded: string
+  kind: 'Tj' | 'quote' | 'dquote' | 'TJ'
+  isHex: boolean
+  /** Text-space position where this op draws (tracked via Tm/Td/TD/T*) */
+  x: number
+  y: number
+}
+
+/**
+ * Scan every show-text operation (Tj, ', ", TJ) in a BT block's content, in
+ * order, tracking the text-space position of each op so callers can pick the
+ * RIGHT occurrence when identical strings repeat (e.g. "16:00" in 8 table rows).
+ */
+function scanShowOps(
+  content: string,
+  encoding: ReturnType<typeof getFontEncoding>,
+  simpleInfo?: SimpleFontInfo | null
+): ShowOpInfo[] {
+  const re = new RegExp(
+    // positioning operators (tracked, not collected)
+    `(-?[\\d.]+)\\s+(-?[\\d.]+)\\s+(-?[\\d.]+)\\s+(-?[\\d.]+)\\s+(-?[\\d.]+)\\s+(-?[\\d.]+)\\s+Tm` + '|' +
+    `(-?[\\d.]+)\\s+(-?[\\d.]+)\\s+(Td|TD)` + '|' +
+    `(-?[\\d.]+)\\s+TL` + '|' +
+    `T\\*` + '|' +
+    // show-text operators (collected)
+    `(\\[(?:${STR_LIT_SRC}|${HEX_LIT_SRC}|[^\\]])*\\]\\s*TJ)` + '|' +
+    `((?:-?[\\d.]+\\s+-?[\\d.]+\\s+)?(?:${STR_LIT_SRC}|${HEX_LIT_SRC})\\s*")` + '|' +
+    `((?:${STR_LIT_SRC}|${HEX_LIT_SRC})\\s*(?:Tj|'))`,
+    'g'
+  )
+
+  const ops: ShowOpInfo[] = []
+  let x = 0, y = 0, leading = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(content)) !== null) {
+    if (m[1] !== undefined) { // Tm — take translation part
+      x = parseFloat(m[5]); y = parseFloat(m[6])
+      continue
+    }
+    if (m[7] !== undefined) { // Td / TD
+      x += parseFloat(m[7]); y += parseFloat(m[8])
+      if (m[9] === 'TD') leading = -parseFloat(m[8])
+      continue
+    }
+    if (m[10] !== undefined) { leading = parseFloat(m[10]); continue } // TL
+    if (m[0] === 'T*') { y -= leading; continue }
+
+    const raw = m[0]
+    const kind: ShowOpInfo['kind'] =
+      m[11] !== undefined ? 'TJ'
+      : m[12] !== undefined ? 'dquote'
+      : raw.trimEnd().endsWith("'") ? 'quote' : 'Tj'
+    if (kind === 'quote' || kind === 'dquote') { y -= leading } // implicit T*
+    ops.push({
+      start: m.index,
+      end: m.index + raw.length,
+      raw,
+      decoded: decodeBtBlockText(raw, encoding, simpleInfo),
+      kind,
+      isHex: /<[0-9A-Fa-f\s]*[0-9A-Fa-f]/.test(raw),
+      x, y
+    })
+  }
+  return ops
+}
+
+/** Split a hex string into CMap codes. */
+function hexToCodes(hex: string, codeBytes: number): number[] {
+  const stride = codeBytes * 2
+  const codes: number[] = []
+  for (let i = 0; i + stride - 1 < hex.length; i += stride) {
+    codes.push(parseInt(hex.substring(i, i + stride), 16))
+  }
+  return codes
+}
+
+interface TjItem {
+  start: number  // offset within op.raw
+  end: number
+  isLiteral: boolean
+  decoded: string       // literals only
+  codes: number[]       // literals only — CMap/byte codes
+  value?: number        // numbers only — kern value
+}
+
+/** Parse a TJ array op's items (literals + kern numbers) with offsets into op.raw. */
+function parseTjItems(
+  raw: string,
+  encoding: ReturnType<typeof getFontEncoding>,
+  simpleInfo?: SimpleFontInfo | null
+): TjItem[] {
+  const open = raw.indexOf('[')
+  const close = raw.lastIndexOf(']')
+  if (open < 0 || close < 0) return []
+  const items: TjItem[] = []
+  const re = new RegExp(`(${STR_LIT_SRC})|(${HEX_LIT_SRC})|(-?[\\d.]+)`, 'g')
+  const inner = raw.slice(open + 1, close)
+  let m: RegExpExecArray | null
+  const codeBytes = encoding?.codeBytes === 1 ? 1 : (encoding ? 2 : 1)
+  const glyphCodedPlain = !!encoding && (!simpleInfo || simpleInfo.encodingName === 'Unknown')
+  while ((m = re.exec(inner)) !== null) {
+    const start = open + 1 + m.index
+    const end = start + m[0].length
+    if (m[3] !== undefined) {
+      items.push({ start, end, isLiteral: false, decoded: '', codes: [], value: parseFloat(m[3]) })
+      continue
+    }
+    // literal → decode + extract codes
+    const codes: number[] = []
+    if (m[2] !== undefined) {
+      const hex = m[2].slice(1, -1).replace(/\s+/g, '')
+      const stride = (encoding?.codeBytes === 1 ? 1 : 2) * 2
+      for (let i = 0; i + stride - 1 < hex.length; i += stride) codes.push(parseInt(hex.substring(i, i + stride), 16))
+    } else {
+      const rawBytes = unescapePdfString(m[1].slice(1, -1))
+      if (glyphCodedPlain && codeBytes === 2) {
+        for (let i = 0; i + 1 < rawBytes.length; i += 2) codes.push((rawBytes.charCodeAt(i) << 8) | rawBytes.charCodeAt(i + 1))
+      } else {
+        for (let i = 0; i < rawBytes.length; i++) codes.push(rawBytes.charCodeAt(i))
+      }
+    }
+    items.push({
+      start, end, isLiteral: true,
+      decoded: decodeBtBlockText(raw.slice(start, end) + ' Tj', encoding, simpleInfo),
+      codes
+    })
+  }
+  return items
+}
+
+/**
+ * Replace target text INSIDE a single TJ array (Ghostscript merges a whole
+ * table row into one array, jumping between cells with kern numbers). Keeps
+ * every other item verbatim and appends a compensating kern so the following
+ * cells don't shift when the new text is wider/narrower.
+ */
+function replaceInsideTjArray(
+  op: ShowOpInfo,
+  targetText: string,
+  newLiteral: { literal: string; codes: number[] },
+  encoding: ReturnType<typeof getFontEncoding>,
+  simpleInfo: SimpleFontInfo | null,
+  targetLocalX: number | null,
+  tfSize: number
+): string | null {
+  if (op.kind !== 'TJ') return null
+  const items = parseTjItems(op.raw, encoding, simpleInfo)
+  if (!items.length) return null
+
+  // char-position map over concatenated literal text
+  const charItem: { item: number; charInItem: number }[] = []
+  let full = ''
+  items.forEach((it, idx) => {
+    for (let c = 0; c < it.decoded.length; c++) charItem.push({ item: idx, charInItem: c })
+    full += it.decoded
+  })
+
+  const target = targetText.trim()
+  if (!target) return null
+  // all occurrences
+  const occ: number[] = []
+  let p = full.indexOf(target)
+  while (p !== -1) { occ.push(p); p = full.indexOf(target, p + 1) }
+  if (!occ.length) return null
+
+  // Pick the occurrence nearest the clicked x when we can estimate positions
+  // (identical values repeat across table columns)
+  let chosen = occ[0]
+  if (occ.length > 1 && targetLocalX !== null && simpleInfo?.widths && tfSize > 0) {
+    const w = simpleInfo.widths
+    const fc = simpleInfo.firstChar
+    const xAt: number[] = []  // x offset of each char, in 1000-unit width space
+    let acc = 0
+    let ci = 0
+    for (const it of items) {
+      if (it.isLiteral) {
+        for (const code of it.codes) {
+          xAt[ci++] = acc
+          acc += (w[code - fc] || 500)
+        }
+      } else {
+        acc -= (it.value || 0)
+      }
+    }
+    const clickedRel = (targetLocalX - op.x) * 1000 / tfSize
+    let bestD = Infinity
+    for (const o of occ) {
+      const d = Math.abs(clickedRel - (xAt[o] ?? 0))
+      if (d < bestD) { bestD = d; chosen = o }
+    }
+  }
+
+  const startC = chosen
+  const endC = chosen + target.length
+  const first = charItem[startC]
+  const last = charItem[endC - 1]
+  if (!first || !last) return null
+
+  // Require boundary alignment: the range must start at a literal's first
+  // char and end at a literal's last char (true for Ghostscript's per-glyph
+  // literals; bail otherwise rather than corrupt)
+  if (first.charInItem !== 0) return null
+  if (last.charInItem !== items[last.item].decoded.length - 1) return null
+
+  // width compensation
+  let comp = ''
+  if (simpleInfo?.widths) {
+    const w = simpleInfo.widths
+    const fc = simpleInfo.firstChar
+    let oldW = 0, newW = 0, known = true
+    for (let k = first.item; k <= last.item; k++) {
+      const it = items[k]
+      if (it.isLiteral) for (const code of it.codes) {
+        const cw = w[code - fc]
+        if (cw === undefined) { known = false } else oldW += cw
+      } else {
+        oldW -= (it.value || 0) // keep kerns' displacement accounted
+      }
+    }
+    for (const code of newLiteral.codes) {
+      const cw = w[code - fc]
+      if (cw === undefined) { known = false } else newW += cw
+    }
+    if (known) comp = ` ${fmtNum(newW - oldW)} `
+  }
+
+  const spliceStart = items[first.item].start
+  const spliceEnd = items[last.item].end
+  return op.raw.slice(0, spliceStart) + newLiteral.literal + comp + ' ' + op.raw.slice(spliceEnd)
+}
+
+/** Rebuild a show op with a new literal, PRESERVING its operator (so the
+ *  line advances of ' and " and the structure of TJ stay intact). */
+function buildShowOp(kind: ShowOpInfo['kind'], literal: string, rawOld: string): string {
+  switch (kind) {
+    case 'Tj': return `${literal} Tj`
+    case 'quote': return `${literal} '`
+    case 'dquote': {
+      const nums = rawOld.match(/^(-?[\d.]+\s+-?[\d.]+\s+)/)
+      return `${nums ? nums[1] : '0 0 '}${literal} "`
+    }
+    case 'TJ': return `[${literal}] TJ`
+  }
+}
+
+/**
+ * Replace only the show-ops matching the target text INSIDE a BT block that
+ * contains more text than the target (a single BT holding several Td/'-
+ * positioned lines — e.g. a 4-line header box). Whole-block replacement in
+ * that situation would wipe the sibling lines.
+ */
+function applyPartialBlockReplacement(
+  stream: string,
+  block: BtInfo,
+  newText: string,
+  pageIndex: number,
+  targetBlock: TextBlock,
+  pageHeight?: number
+): { stream: string; substitutedFont?: string } | { error: string } | null {
+  const simpleInfo = getSimpleFontInfo(pageIndex, block.fontRef)
+  const ops = scanShowOps(block.content, block.encoding, simpleInfo)
+  if (ops.length < 1) return null
+
+  const targetNorm = targetBlock.text.replace(/\s+/g, ' ').trim()
+  if (!targetNorm) return null
+
+  // Map the clicked block's page position into this BT block's local text
+  // space so repeated identical strings ("16:00" in every table row) resolve
+  // to the occurrence the user actually clicked.
+  let targetLocal: { x: number; y: number } | null = null
+  if (pageHeight !== undefined) {
+    const ctm = getCtmAtOffset(stream, block.start)
+    const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
+    if (Math.abs(det) > 1e-9) {
+      const pageX = targetBlock.bbox[0]
+      const pageY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2 // bottom-up
+      const ax = pageX - ctm[4], ay = pageY - ctm[5]
+      targetLocal = {
+        x: (ax * ctm[3] - ay * ctm[2]) / det,
+        y: (ay * ctm[0] - ax * ctm[1]) / det
+      }
+    }
+  }
+
+  // Best contiguous run of ops whose concatenated text matches the target;
+  // ties broken by distance to the clicked position
+  let best: { i: number; j: number; score: number; dist: number } | null = null
+  for (let i = 0; i < ops.length; i++) {
+    let acc = ''
+    for (let j = i; j < ops.length; j++) {
+      acc += ops[j].decoded
+      const norm = acc.replace(/\s+/g, ' ').trim()
+      if (norm.length > targetNorm.length * 1.5 + 8) break
+      if (!norm) continue
+      const ratio = Math.min(norm.length, targetNorm.length) / Math.max(norm.length, targetNorm.length)
+      if (ratio < 0.7) continue
+      let score = 0
+      if (norm === targetNorm) score = 2
+      else if (fuzzyTextMatch(norm, targetNorm)) score = ratio
+      if (score <= 0) continue
+      const dist = targetLocal
+        ? Math.abs(ops[i].x - targetLocal.x) + Math.abs(ops[i].y - targetLocal.y) * 4
+        : 0
+      if (!best || score > best.score + 0.05 ||
+          (Math.abs(score - best.score) <= 0.05 && dist < best.dist)) {
+        best = { i, j, score, dist }
+      }
+    }
+  }
+
+  // No op-level window matched — the target may live INSIDE a single TJ
+  // array (Ghostscript merges a whole table row into one array, jumping
+  // between cells with kern numbers). Replace just those glyphs.
+  if (!best) {
+    const plan = planTextEncoding(pageIndex, block, [newText], targetBlock)
+    if (plan.kind === 'error') return { error: plan.error }
+    if (plan.kind === 'subst') return null // can't switch fonts inside an array
+
+    const newLit = plan.kind === 'keep-hex'
+      ? { literal: `<${plan.hexLines[0]}>`, codes: hexToCodes(plan.hexLines[0], block.encoding?.codeBytes === 1 ? 1 : 2) }
+      : { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [...plan.byteLines[0]].map(c => c.charCodeAt(0)) }
+
+    const tfMatch = block.content.match(/\/(?:[^\s<>[\]()/%]+)\s+([\d.]+)\s+Tf/)
+    const tfSize = tfMatch ? parseFloat(tfMatch[1]) : 12
+
+    // Candidate arrays containing the target, nearest clicked position first
+    const candidates = ops
+      .filter(o => o.kind === 'TJ' && o.decoded.includes(targetNorm))
+      .sort((a, b) => {
+        if (!targetLocal) return 0
+        const da = Math.abs(a.x - targetLocal.x) + Math.abs(a.y - targetLocal.y) * 4
+        const db = Math.abs(b.x - targetLocal.x) + Math.abs(b.y - targetLocal.y) * 4
+        return da - db
+      })
+
+    for (const op of candidates) {
+      const newRaw = replaceInsideTjArray(op, targetNorm, newLit, block.encoding, simpleInfo, targetLocal?.x ?? null, tfSize)
+      if (newRaw) {
+        const content = block.content.slice(0, op.start) + newRaw + block.content.slice(op.end)
+        return {
+          stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end)
+        }
+      }
+    }
+    return null
+  }
+
+  const plan = planTextEncoding(pageIndex, block, [newText], targetBlock)
+  if (plan.kind === 'error') return { error: plan.error }
+
+  let content = block.content
+  let substitutedFont: string | undefined
+  for (let k = best.j; k >= best.i; k--) {
+    const op = ops[k]
+    let repl: string
+    if (k === best.i) {
+      if (plan.kind === 'keep-hex') {
+        repl = buildShowOp(op.kind, `<${plan.hexLines[0]}>`, op.raw)
+      } else if (plan.kind === 'keep-plain') {
+        repl = buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw)
+      } else {
+        // Substituted font applies to THIS op only — restore the block's
+        // original font afterwards so the untouched lines keep theirs.
+        const tfMatch = block.content.match(/\/([^\s<>[\]()/%]+)\s+([\d.]+)\s+Tf/)
+        const size = tfMatch ? tfMatch[2] : '12'
+        const restore = tfMatch ? ` /${tfMatch[1]} ${size} Tf` : ''
+        repl = `/${plan.fontRef} ${size} Tf ${buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw)}${restore}`
+        substitutedFont = plan.fontName
+      }
+    } else {
+      // Blank the other ops in the range, keeping their operators so
+      // subsequent line advances stay correct
+      repl = buildShowOp(op.kind, op.isHex ? '<>' : '()', op.raw)
+    }
+    content = content.slice(0, op.start) + repl + content.slice(op.end)
+  }
+
+  return {
+    stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end),
+    substitutedFont
+  }
 }
 
 /**
@@ -1609,62 +2675,32 @@ function decodeBtBlockText(
  * For plain text fonts: replaces with escaped PDF strings.
  */
 function replaceTjInBlock(block: string, newText: string, mode: 'hex' | 'plain', newHex?: string): string {
-  let result = block
-  let m: RegExpExecArray | null
+  // Single sequential pass over ALL show-text operations (Tj, ', ", TJ) in
+  // stream order: the new text goes into the FIRST one, every other one is
+  // blanked — regardless of literal type. This handles nested parens, ']'
+  // inside array strings, hex whitespace, and the quote operators that the
+  // previous per-operator regexes missed (leaving old text on the page).
+  const showRe = new RegExp(
+    // [ ...strings/hex/numbers... ] TJ
+    String.raw`\[(?:${STR_LIT_SRC}|${HEX_LIT_SRC}|[^\]])*\]\s*TJ` + '|' +
+    // aw ac (string) "  — strip the two numeric operands too
+    String.raw`(?:-?[\d.]+\s+-?[\d.]+\s+)?(?:${STR_LIT_SRC}|${HEX_LIT_SRC})\s*"` + '|' +
+    // (string) Tj   (string) '
+    String.raw`(?:${STR_LIT_SRC}|${HEX_LIT_SRC})\s*(?:Tj|')`,
+    'g'
+  )
 
-  if (mode === 'hex' && newHex) {
-    // Replace hex Tj operands
-    const hexTjRegex = /<([0-9A-Fa-f]+)>\s*Tj/g
-    const matches: string[] = []
-    while ((m = hexTjRegex.exec(block)) !== null) {
-      matches.push(m[0])
-    }
-    if (matches.length > 0) {
-      result = result.replace(matches[0], `<${newHex}> Tj`)
-      for (let i = 1; i < matches.length; i++) {
-        result = result.replace(matches[i], '<> Tj')
-      }
-    }
-    // Replace hex in TJ arrays
-    const tjArrayRegex = /\[([^\]]*<[0-9A-Fa-f]+>[^\]]*)\]\s*TJ/g
-    while ((m = tjArrayRegex.exec(block)) !== null) {
-      result = result.replace(m[0], `<${newHex}> Tj`)
-    }
-  } else {
-    // Plain text mode: replace all TJ arrays and Tj operands with a single plain Tj
-    const escaped = escapePdfString(newText)
+  let first = true
+  const firstOp = mode === 'hex' && newHex !== undefined
+    ? `<${newHex}> Tj`
+    : `(${escapePdfString(newText)}) Tj`
+  const blankOp = mode === 'hex' ? '<> Tj' : '() Tj'
 
-    // Replace TJ arrays first (they contain the main text)
-    const tjArrayRegex = /\[([^\]]*)\]\s*TJ/g
-    let first = true
-    const tjArrayMatches: string[] = []
-    while ((m = tjArrayRegex.exec(block)) !== null) {
-      tjArrayMatches.push(m[0])
-    }
-    for (const match of tjArrayMatches) {
-      if (first) {
-        result = result.replace(match, `(${escaped}) Tj`)
-        first = false
-      } else {
-        result = result.replace(match, `() Tj`)
-      }
-    }
-
-    // Replace plain Tj operands
-    const plainTjRegex = /\(([^)]*)\)\s*Tj/g
-    const plainMatches: string[] = []
-    while ((m = plainTjRegex.exec(block)) !== null) {
-      plainMatches.push(m[0])
-    }
-    for (const match of plainMatches) {
-      if (first) {
-        result = result.replace(match, `(${escaped}) Tj`)
-        first = false
-      } else {
-        result = result.replace(match, `() Tj`)
-      }
-    }
-  }
+  let result = block.replace(showRe, () => {
+    const r = first ? firstOp : blankOp
+    first = false
+    return r
+  })
 
   // Strip leftover Td operators from previous line wrapping
   // (remove "0 -X.X Td" lines that precede blanked Tj operators)
@@ -1678,14 +2714,21 @@ function replaceTjInBlock(block: string, newText: string, mode: 'hex' | 'plain',
 // ==========================================
 
 function unescapePdfString(s: string): string {
-  return s
-    .replace(/\\n/g, '\n')
-    .replace(/\\r/g, '\r')
-    .replace(/\\t/g, '\t')
-    .replace(/\\\\/g, '\\')
-    .replace(/\\\(/g, '(')
-    .replace(/\\\)/g, ')')
-    .replace(/\\(\d{1,3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
+  // Single pass — sequential .replace() calls mis-decode sequences like
+  // "\\n" (escaped backslash + n, e.g. a Windows path), turning them into
+  // backslash + linefeed and corrupting block matching.
+  return s.replace(/\\(\d{1,3}|\r\n|[\s\S])/g, (_, esc: string) => {
+    if (/^\d/.test(esc)) return String.fromCharCode(parseInt(esc, 8) & 0xFF)
+    switch (esc) {
+      case 'n': return '\n'
+      case 'r': return '\r'
+      case 't': return '\t'
+      case 'b': return '\b'
+      case 'f': return '\f'
+      case '\r\n': case '\r': case '\n': return '' // line continuation
+      default: return esc // \\ \( \) and any other escaped char → literal
+    }
+  })
 }
 
 function escapePdfString(s: string): string {
@@ -1797,4 +2840,357 @@ function debugPageFonts(pageIndex: number): any {
 
   page.destroy()
   return { pageIndex, fontCount: len, fonts, debug: debugInfo }
+}
+
+// ==========================================
+// PAGE GEOMETRY
+// ==========================================
+
+function getPageSize(pageIndex: number): { width: number; height: number; rotation: number } {
+  const page = pdfDoc.loadPage(pageIndex)
+  try {
+    const b = page.getBounds()
+    let rotation = 0
+    try {
+      const r = page.getObject().get('Rotate')
+      if (r && r.toString() !== 'null') rotation = ((r.asNumber?.() ?? parseInt(r.toString(), 10)) % 360 + 360) % 360
+    } catch (_) {}
+    return { width: b[2] - b[0], height: b[3] - b[1], rotation }
+  } finally {
+    page.destroy()
+  }
+}
+
+// ==========================================
+// ANNOTATIONS (MuPDF native PDFAnnotation API)
+// ==========================================
+
+/** Coerce an AnnotColor (possibly empty) into a plain number[] (0-1). */
+function colorArr(c: any): number[] {
+  if (!c || !Array.isArray(c)) return []
+  return c.map((n: any) => Number(n))
+}
+
+function safe<T>(fn: () => T, fallback: T): T {
+  try { return fn() } catch { return fallback }
+}
+
+function listAnnotations(pageIndex: number): any[] {
+  const page = pdfDoc.loadPage(pageIndex)
+  const annots = page.getAnnotations()
+  const out: any[] = []
+  annots.forEach((annot: any, index: number) => {
+    const type = safe(() => annot.getType(), 'Unknown')
+    // Some annotation types (Ink, Line) may throw on getRect — fall back to getBounds.
+    let rect = safe<number[] | null>(() => annot.getRect(), null)
+    if (!rect) rect = safe<number[] | null>(() => annot.getBounds(), null)
+    if (!rect) rect = [0, 0, 0, 0]
+    out.push({
+      index,
+      type,
+      rect: [rect[0], rect[1], rect[2], rect[3]],
+      color: colorArr(safe(() => annot.getColor(), [])),
+      interiorColor: colorArr(safe(() => annot.getInteriorColor(), [])),
+      opacity: safe(() => annot.getOpacity(), 1),
+      borderWidth: safe(() => annot.getBorderWidth(), 1),
+      contents: safe(() => annot.getContents(), ''),
+      author: safe(() => annot.getAuthor(), ''),
+      hasQuadPoints: safe(() => annot.hasQuadPoints(), false)
+    })
+  })
+  page.destroy()
+  return out
+}
+
+function addTextMarkup(
+  pageIndex: number,
+  markupType: string,
+  quads: number[][],
+  color: [number, number, number],
+  opacity = 1
+): { success: boolean; index?: number; error?: string } {
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const annot = page.createAnnotation(markupType as any)
+    annot.setQuadPoints(quads as any)
+    annot.setColor(color as any)
+    try { annot.setOpacity(opacity) } catch (_) {}
+    annot.update()
+    const index = page.getAnnotations().length - 1
+    page.destroy()
+    return { success: true, index }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function addShape(
+  pageIndex: number,
+  shapeType: string,
+  rect: number[] | undefined,
+  points: number[][] | undefined,
+  color: [number, number, number],
+  interiorColor: [number, number, number] | null | undefined,
+  width: number,
+  opacity = 1
+): { success: boolean; index?: number; error?: string } {
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const annot = page.createAnnotation(shapeType as any)
+
+    if (shapeType === 'Line' && points && points.length === 2) {
+      // Line annotations derive their Rect from the endpoints — calling setRect throws.
+      annot.setLine(points[0] as any, points[1] as any)
+    } else if (rect) {
+      annot.setRect(rect as any)
+    }
+
+    annot.setColor(color as any)
+    if (interiorColor && (shapeType === 'Square' || shapeType === 'Circle')) {
+      try { annot.setInteriorColor(interiorColor as any) } catch (_) {}
+    }
+    try { annot.setBorderWidth(width) } catch (_) {}
+    try { annot.setOpacity(opacity) } catch (_) {}
+    annot.update()
+    const index = page.getAnnotations().length - 1
+    page.destroy()
+    return { success: true, index }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function addInk(
+  pageIndex: number,
+  strokes: number[][][],
+  color: [number, number, number],
+  width: number,
+  opacity = 1
+): { success: boolean; index?: number; error?: string } {
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const annot = page.createAnnotation('Ink')
+    annot.setInkList(strokes as any)
+    annot.setColor(color as any)
+    try { annot.setBorderWidth(width) } catch (_) {}
+    try { annot.setOpacity(opacity) } catch (_) {}
+    annot.update()
+    const index = page.getAnnotations().length - 1
+    page.destroy()
+    return { success: true, index }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function addFreeText(
+  pageIndex: number,
+  rect: number[],
+  text: string,
+  fontSize: number,
+  color: [number, number, number],
+  fontName = 'Helv'
+): { success: boolean; index?: number; error?: string } {
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const annot = page.createAnnotation('FreeText')
+    annot.setRect(rect as any)
+    annot.setContents(text)
+    try { annot.setDefaultAppearance(fontName, fontSize, color as any) } catch (_) {}
+    annot.update()
+    const index = page.getAnnotations().length - 1
+    page.destroy()
+    return { success: true, index }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function addStickyNote(
+  pageIndex: number,
+  x: number,
+  y: number,
+  text: string,
+  color: [number, number, number]
+): { success: boolean; index?: number; error?: string } {
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const annot = page.createAnnotation('Text')
+    annot.setRect([x, y, x + 20, y + 20] as any)
+    annot.setContents(text)
+    try { annot.setColor(color as any) } catch (_) {}
+    try { annot.setIcon('Note') } catch (_) {}
+    annot.update()
+    const index = page.getAnnotations().length - 1
+    page.destroy()
+    return { success: true, index }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function addImageStamp(
+  pageIndex: number,
+  rect: number[],
+  imageBytes: Uint8Array
+): { success: boolean; index?: number; error?: string } {
+  if (!mupdf) return { success: false, error: 'No engine' }
+  let page: any = null
+  let image: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    image = new mupdf.Image(imageBytes)
+    const annot = page.createAnnotation('Stamp')
+    annot.setRect(rect as any)
+    annot.setStampImage(image)
+    annot.update()
+    const index = page.getAnnotations().length - 1
+    return { success: true, index }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  } finally {
+    // mupdf.Image and PDFPage are WASM-heap objects; free deterministically.
+    try { image?.destroy() } catch (_) {}
+    try { page?.destroy() } catch (_) {}
+  }
+}
+
+function deleteAnnotationAt(pageIndex: number, annotIndex: number): { success: boolean; error?: string } {
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const annots = page.getAnnotations()
+    if (annotIndex < 0 || annotIndex >= annots.length) {
+      page.destroy()
+      return { success: false, error: `Annotation ${annotIndex} not found` }
+    }
+    page.deleteAnnotation(annots[annotIndex])
+    page.destroy()
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function updateAnnotationAt(d: {
+  pageIndex: number; annotIndex: number
+  rect?: number[]; color?: [number, number, number]; interiorColor?: [number, number, number] | null
+  opacity?: number; width?: number; contents?: string
+}): { success: boolean; error?: string } {
+  try {
+    const page = pdfDoc.loadPage(d.pageIndex)
+    const annots = page.getAnnotations()
+    const annot = annots[d.annotIndex]
+    if (!annot) { page.destroy(); return { success: false, error: 'Annotation not found' } }
+    if (d.rect) { try { annot.setRect(d.rect as any) } catch (_) {} }
+    if (d.color) { try { annot.setColor(d.color as any) } catch (_) {} }
+    if (d.interiorColor !== undefined) { try { annot.setInteriorColor((d.interiorColor || []) as any) } catch (_) {} }
+    if (d.opacity !== undefined) { try { annot.setOpacity(d.opacity) } catch (_) {} }
+    if (d.width !== undefined) { try { annot.setBorderWidth(d.width) } catch (_) {} }
+    if (d.contents !== undefined) { try { annot.setContents(d.contents) } catch (_) {} }
+    annot.update()
+    page.destroy()
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+// ==========================================
+// PAGE MANAGEMENT
+// ==========================================
+
+function rotatePage(pageIndex: number, degrees: number): { success: boolean; rotation?: number; error?: string } {
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+    let cur = 0
+    const r = pageObj.get('Rotate')
+    if (r && r.toString() !== 'null') cur = (r.asNumber?.() ?? parseInt(r.toString(), 10)) || 0
+    const next = ((cur + degrees) % 360 + 360) % 360
+    pageObj.put('Rotate', pdfDoc.newInteger(next))
+    page.destroy()
+    return { success: true, rotation: next }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function insertBlankPage(atIndex: number, width: number, height: number): { success: boolean; pageCount?: number; error?: string } {
+  try {
+    const mediabox: [number, number, number, number] = [0, 0, width, height]
+    const resources = pdfDoc.newDictionary()
+    const contents = new Uint8Array(0)
+    const pageObj = pdfDoc.addPage(mediabox, 0, resources, contents)
+    const at = Math.max(0, Math.min(atIndex, pdfDoc.countPages()))
+    pdfDoc.insertPage(at, pageObj)
+    return { success: true, pageCount: pdfDoc.countPages() }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function deletePageOp(pageIndex: number): { success: boolean; pageCount?: number; error?: string } {
+  try {
+    if (pdfDoc.countPages() <= 1) return { success: false, error: 'Cannot delete the last page' }
+    pdfDoc.deletePage(pageIndex)
+    return { success: true, pageCount: pdfDoc.countPages() }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function duplicatePage(pageIndex: number): { success: boolean; pageCount?: number; error?: string } {
+  try {
+    // graftPage(to, srcDoc, srcPage): copy srcPage and insert it at position `to`
+    pdfDoc.graftPage(pageIndex + 1, pdfDoc, pageIndex)
+    return { success: true, pageCount: pdfDoc.countPages() }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+function movePage(from: number, to: number): { success: boolean; pageCount?: number; error?: string } {
+  try {
+    const n = pdfDoc.countPages()
+    if (from < 0 || from >= n || to < 0 || to >= n) return { success: false, error: 'Index out of range' }
+    const order: number[] = []
+    for (let i = 0; i < n; i++) order.push(i)
+    const [moved] = order.splice(from, 1)
+    order.splice(to, 0, moved)
+    pdfDoc.rearrangePages(order)
+    return { success: true, pageCount: pdfDoc.countPages() }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+// ==========================================
+// SEARCH
+// ==========================================
+
+function searchPage(pageIndex: number, needle: string, maxHits = 100): any[] {
+  if (!needle) return []
+  const page = pdfDoc.loadPage(pageIndex)
+  const results = page.search(needle, maxHits) as number[][][] // Quad[][]
+  page.destroy()
+  return results.map((quads) => {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+    for (const q of quads) {
+      for (let i = 0; i < q.length; i += 2) {
+        x0 = Math.min(x0, q[i]); x1 = Math.max(x1, q[i])
+        y0 = Math.min(y0, q[i + 1]); y1 = Math.max(y1, q[i + 1])
+      }
+    }
+    return { pageIndex, quads, rect: [x0, y0, x1, y1] }
+  })
+}
+
+function searchDocument(needle: string, maxHitsPerPage = 100): any[] {
+  if (!needle) return []
+  const all: any[] = []
+  const n = pdfDoc.countPages()
+  for (let i = 0; i < n; i++) {
+    all.push(...searchPage(i, needle, maxHitsPerPage))
+  }
+  return all
 }

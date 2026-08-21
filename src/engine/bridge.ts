@@ -1,4 +1,4 @@
-import type { PageTextData } from './types'
+import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit } from './types'
 import type { WorkerResponse } from './worker/worker-protocol'
 
 /**
@@ -15,13 +15,27 @@ export class MuPDFBridge {
     reject: (err: Error) => void
   }>()
   private _ready = false
+  private initPromise: Promise<void> | null = null
 
   get ready() { return this._ready }
 
   /**
    * Initialize the worker and load the WASM module.
+   * Memoized: concurrent callers all await the SAME init round-trip — the old
+   * `if (this.worker) return` returned immediately for caller #2 while WASM
+   * was still compiling, letting loadDocument hit an uninitialized worker.
    */
-  async init(): Promise<void> {
+  init(): Promise<void> {
+    if (!this.initPromise) {
+      this.initPromise = this.doInit().catch(err => {
+        this.initPromise = null // allow retry after failure
+        throw err
+      })
+    }
+    return this.initPromise
+  }
+
+  private async doInit(): Promise<void> {
     if (this.worker) return
 
     this.worker = new Worker(
@@ -47,10 +61,16 @@ export class MuPDFBridge {
     this.worker.onerror = (err) => {
       console.error('[MuPDF Bridge] Worker error:', err)
       // Reject all pending promises
-      for (const [id, p] of this.pending) {
+      for (const [, p] of this.pending) {
         p.reject(new Error(`Worker error: ${err.message}`))
       }
       this.pending.clear()
+      // Tear down so future sends fail fast (reject) instead of hanging forever
+      // against a dead worker, and so init() can recreate it.
+      try { this.worker?.terminate() } catch (_) {}
+      this.worker = null
+      this._ready = false
+      this.initPromise = null
     }
 
     // Send init message and wait for WASM to load
@@ -100,7 +120,7 @@ export class MuPDFBridge {
     pageIndex: number,
     blockId: string,
     newText: string
-  ): Promise<{ success: boolean; error?: string }> {
+  ): Promise<{ success: boolean; error?: string; substitutedFont?: string }> {
     return this.send('replaceText', { pageIndex, blockId, newText })
   }
 
@@ -145,6 +165,76 @@ export class MuPDFBridge {
     return this.send('debugFonts', { pageIndex })
   }
 
+  /** Page size + rotation in PDF points (top-left origin). */
+  async getPageSize(pageIndex: number): Promise<{ width: number; height: number; rotation: number }> {
+    return this.send('getPageSize', { pageIndex })
+  }
+
+  // ===== ANNOTATIONS =====
+
+  async getAnnotations(pageIndex: number): Promise<{ annotations: AnnotationInfo[] }> {
+    return this.send('getAnnotations', { pageIndex })
+  }
+
+  async addTextMarkup(pageIndex: number, markupType: MarkupType, quads: Quad[], color: [number, number, number], opacity?: number): Promise<{ success: boolean; index?: number; error?: string }> {
+    return this.send('addTextMarkup', { pageIndex, markupType, quads, color, opacity })
+  }
+
+  async addShape(pageIndex: number, shapeType: ShapeType, opts: { rect?: RectT; points?: [Pt, Pt]; color: [number, number, number]; interiorColor?: [number, number, number] | null; width: number; opacity?: number }): Promise<{ success: boolean; index?: number; error?: string }> {
+    return this.send('addShape', { pageIndex, shapeType, ...opts })
+  }
+
+  async addInk(pageIndex: number, strokes: Pt[][], color: [number, number, number], width: number, opacity?: number): Promise<{ success: boolean; index?: number; error?: string }> {
+    return this.send('addInk', { pageIndex, strokes, color, width, opacity })
+  }
+
+  async addFreeText(pageIndex: number, rect: RectT, text: string, fontSize: number, color: [number, number, number], fontName?: string): Promise<{ success: boolean; index?: number; error?: string }> {
+    return this.send('addFreeText', { pageIndex, rect, text, fontSize, color, fontName })
+  }
+
+  async addStickyNote(pageIndex: number, x: number, y: number, text: string, color: [number, number, number]): Promise<{ success: boolean; index?: number; error?: string }> {
+    return this.send('addStickyNote', { pageIndex, x, y, text, color })
+  }
+
+  async addImageStamp(pageIndex: number, rect: RectT, imageBytes: ArrayBuffer): Promise<{ success: boolean; index?: number; error?: string }> {
+    return this.send('addImageStamp', { pageIndex, rect, imageBytes }, [imageBytes])
+  }
+
+  async deleteAnnotation(pageIndex: number, annotIndex: number): Promise<{ success: boolean; error?: string }> {
+    return this.send('deleteAnnotation', { pageIndex, annotIndex })
+  }
+
+  async updateAnnotation(pageIndex: number, annotIndex: number, changes: { rect?: RectT; color?: [number, number, number]; interiorColor?: [number, number, number] | null; opacity?: number; width?: number; contents?: string }): Promise<{ success: boolean; error?: string }> {
+    return this.send('updateAnnotation', { pageIndex, annotIndex, ...changes })
+  }
+
+  // ===== PAGE MANAGEMENT =====
+
+  async rotatePage(pageIndex: number, degrees: number): Promise<{ success: boolean; rotation?: number; error?: string }> {
+    return this.send('rotatePage', { pageIndex, degrees })
+  }
+  async insertBlankPage(atIndex: number, width: number, height: number): Promise<{ success: boolean; pageCount?: number; error?: string }> {
+    return this.send('insertBlankPage', { atIndex, width, height })
+  }
+  async deletePageOp(pageIndex: number): Promise<{ success: boolean; pageCount?: number; error?: string }> {
+    return this.send('deletePageOp', { pageIndex })
+  }
+  async duplicatePage(pageIndex: number): Promise<{ success: boolean; pageCount?: number; error?: string }> {
+    return this.send('duplicatePage', { pageIndex })
+  }
+  async movePage(from: number, to: number): Promise<{ success: boolean; pageCount?: number; error?: string }> {
+    return this.send('movePage', { from, to })
+  }
+
+  // ===== SEARCH =====
+
+  async searchPage(pageIndex: number, needle: string, maxHits?: number): Promise<{ hits: SearchHit[] }> {
+    return this.send('searchPage', { pageIndex, needle, maxHits })
+  }
+  async searchDocument(needle: string, maxHitsPerPage?: number): Promise<{ hits: SearchHit[] }> {
+    return this.send('searchDocument', { needle, maxHitsPerPage })
+  }
+
   /**
    * Save the current document state to a new PDF buffer.
    */
@@ -158,10 +248,17 @@ export class MuPDFBridge {
    */
   async destroy(): Promise<void> {
     if (!this.worker) return
-    await this.send('destroy')
+    try { await this.send('destroy') } catch (_) { /* worker may already be dead */ }
     this.worker.terminate()
     this.worker = null
     this._ready = false
+    this.initPromise = null
+    // Reject anything still in flight — otherwise those callers hang forever
+    // (stuck isLoading/searching flags after unmount).
+    for (const [, p] of this.pending) {
+      p.reject(new Error('Bridge destroyed'))
+    }
+    this.pending.clear()
   }
 
   /**

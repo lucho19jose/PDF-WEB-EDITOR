@@ -56,3 +56,36 @@ export interface PageTextData {
   blocks: TextBlock[]
   lines: TextLine[]
 }
+
+/** Quad: [ulx, uly, urx, ury, llx, lly, lrx, lry] — matches MuPDF Quad & TextChar.quad */
+export type Quad = [number, number, number, number, number, number, number, number]
+/** Point [x, y] in page space (top-left origin, y-down) */
+export type Pt = [number, number]
+/** Rect [x0, y0, x1, y1] in page space (top-left origin, y-down) */
+export type RectT = [number, number, number, number]
+
+export type MarkupType = 'Highlight' | 'Underline' | 'StrikeOut' | 'Squiggly'
+export type ShapeType = 'Square' | 'Circle' | 'Line'
+
+/** Summary of an existing annotation on a page (index is positional within the page). */
+export interface AnnotationInfo {
+  index: number
+  type: string
+  /** Bounds in page space (top-left origin, y-down) */
+  rect: RectT
+  color: number[]
+  interiorColor: number[]
+  opacity: number
+  borderWidth: number
+  contents: string
+  author: string
+  hasQuadPoints: boolean
+}
+
+/** A text search hit: one match made of one or more quads (multi-line). */
+export interface SearchHit {
+  pageIndex: number
+  quads: Quad[]
+  /** Bounding rect of all quads in page space */
+  rect: RectT
+}
