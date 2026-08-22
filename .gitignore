@@ -11,3 +11,19 @@ Thumbs.db
 # Test PDFs carrying real personal or business data (this repo is public).
 # public/sample.pdf is lorem ipsum and is tracked on purpose.
 public/test.pdf
+
+# PDF sweep corpus and its output. The staged PDFs are the user's real
+# documents and the reports quote their text and file names, so only the
+# harness scripts are tracked — never the data.
+public/_sweep/*.pdf
+public/_sweep/manifest.json
+tools/pdf-sweep/manifest.json
+tools/pdf-sweep/survey.json
+tools/pdf-sweep/survey.err
+tools/pdf-sweep/features.json
+tools/pdf-sweep/results.json
+tools/pdf-sweep/reports/
+tools/pdf-sweep/dataset.jsonl
+tools/pdf-sweep/partial.json
+tools/pdf-sweep/tmp.txt
+tools/pdf-sweep/aggregate.json

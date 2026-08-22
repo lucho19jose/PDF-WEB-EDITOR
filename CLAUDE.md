@@ -149,6 +149,36 @@ when the block has none — inject `sx 0 0 sy e f Tm` right after `BT`. BT reset
 the line matrix to the identity, so every following Td/TD/T* is relative to the
 injected matrix and the whole block (all its lines) transforms with it.
 
+### Text is not only in the page's content stream
+`getContentSources()` returns the page stream AND every Form XObject the page
+invokes, walked recursively (TCPDF's page invokes `/TPL0`, whose stream invokes
+a *different* `/TPL0` — the text is two levels down). Each source carries the
+`/Resources` its fonts resolve against, set through `withSource()`; `/F1` inside
+an XObject is a different font from `/F1` on the page, and the font caches are
+keyed by source for that reason. Whole generators (TCPDF, Canva) were entirely
+uneditable before this: MuPDF extracts their text, so the UI showed blocks the
+editor could never find.
+
+Sources are cached per page and invalidated on load, on any content-stream
+write, and on page reordering. Without the cache a Visio page with 230 `Do`
+operations re-read every XObject on every keystroke-level operation and the
+editor hung for minutes. The number of XObject sources is capped
+(`MAX_XOBJECT_SOURCES`) and the cap is logged rather than silently applied.
+
+### A glyph is unusable when its advance is zero
+`encodeForSimpleFont` decides substitution from the **Widths array**, never from
+the BaseFont name or the embedding flag. Word subsets fonts without the
+`ABCDEF+` prefix, and even a NON-embedded font takes its advances from the PDF's
+own Widths — so a zero width stacks every such glyph on one spot whatever face
+the viewer substitutes. Reading it any other way silently turned "SWEEPMARK"
+into "SWEPMARK".
+
+### ToUnicode bfrange has two destination forms
+`<lo> <hi> <dst>` (incremental) and `<lo> <hi> [<d1> <d2> …]` (explicit list).
+A regex that only knows the first does not merely miss the second — it
+re-matches triples of entries INSIDE the array and invents mappings, which is
+why Qt output decoded as `????????` and could not be edited at all.
+
 ### Matching invariant: text alone never identifies a block
 The same string appears more than once on a page all the time — an email
 subject repeated in the quoted original, a running header, a value in several
@@ -163,6 +193,21 @@ Never compare raw Tm values against a bbox: print-to-PDF files wrap text in
 matrices like `0.675 0 0 -0.675 28.5 813.42 cm`, so the two live in different
 spaces. Distances are bucketed (8pt) before the score tiebreak so the
 comparator stays a valid total order.
+
+### Moving one line out of a many-line block
+Adobe and TeX draw a whole page from one BT whose lines hang off a single
+shared Tm; nudging that Tm slides all of them (dragging one label moved 34
+blocks). When the block holds materially more text than the target and the move
+is a pure translation, `transformTextBlock` brackets just the target's show-op
+run with a `Td` and its inverse — the line matrix is restored immediately after,
+so every later line lands exactly where it did.
+
+Two constraints: the run must START a line (a Td inserted mid-line resets the
+pen to the line start and scrambles the rest of it), and the operands must be
+expressed in **Tm space**, not CTM space — Td is multiplied by the text matrix,
+so feeding it the CTM-space delta overshot by 5.9x on a page whose Tm scales by
+0.17. **Known limitation:** a mid-line target inside a shared-Tm block still
+falls back to moving the whole block.
 
 ### One BT block can hold several independently positioned lines
 SUNAT/JasperReports emit `BT Tm (line 1) Tj Tm (line 2) Tj ... ET`. Moving such

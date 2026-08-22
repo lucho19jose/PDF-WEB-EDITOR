@@ -13,6 +13,8 @@ export function usePDFEngine() {
   const isLoading = ref(false)
   const docLoaded = ref(false)
   const error = ref<string | null>(null)
+  /** Internal path taken by the last transformTextBlock — read by the sweep harness. */
+  const lastTransform = ref<{ strategy?: string; clipAdjusted?: boolean }>({})
   const pageTextCache = new Map<number, PageTextData>()
 
   /**
@@ -114,7 +116,7 @@ export function usePDFEngine() {
     pageIndex: number,
     blockId: string,
     newText: string
-  ): Promise<{ success: boolean; substitutedFont?: string }> {
+  ): Promise<{ success: boolean; substitutedFont?: string; strategy?: string }> {
     try {
       const result = await bridge.replaceText(pageIndex, blockId, newText)
       if (result.success) {
@@ -125,7 +127,7 @@ export function usePDFEngine() {
         error.value = result.error || 'Unknown error replacing text'
         console.warn('[PDFEngine]', error.value)
       }
-      return { success: result.success, substitutedFont: result.substitutedFont }
+      return { success: result.success, substitutedFont: result.substitutedFont, strategy: result.strategy }
     } catch (err: any) {
       error.value = `Failed to replace text: ${err.message}`
       throw err
@@ -173,6 +175,8 @@ export function usePDFEngine() {
   ): Promise<boolean> {
     try {
       const result = await bridge.transformTextBlock(pageIndex, blockId, dx, dy, sx, sy, anchorX, anchorY)
+      // Which internal path handled it — read by the sweep harness, not the UI.
+      lastTransform.value = { strategy: result.strategy, clipAdjusted: result.clipAdjusted }
       if (result.success) {
         pageTextCache.delete(pageIndex)
       } else {
@@ -317,6 +321,7 @@ export function usePDFEngine() {
     replaceText,
     addText,
     transformTextBlock,
+    lastTransform,
     saveDocument,
     destroyEngine,
     // geometry

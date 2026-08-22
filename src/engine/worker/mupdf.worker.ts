@@ -44,6 +44,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         }
         fontEncodingCache.clear()
         simpleFontInfoCache.clear()
+        invalidateContentSources()
         const bytes = new Uint8Array(req.data.bytes)
         pdfDoc = new mupdf.PDFDocument(bytes)
         const pageCount = pdfDoc.countPages()
@@ -523,8 +524,149 @@ function readContentStream(pageIndex: number): string {
   return streamText
 }
 
+/**
+ * Every content stream that can draw text on a page: the page's own, plus each
+ * Form XObject it invokes with `Do`.
+ *
+ * Without this, whole generators are uneditable. TCPDF puts an entire page
+ * inside one `/TPL0 Do` and leaves the page stream holding nothing but
+ * `BT /F1 12 Tf ET`; Canva spreads text across thirty XObjects. MuPDF's text
+ * extraction walks into them, so the UI shows blocks the editor could never
+ * find — every edit failed with "Could not find matching text in content
+ * stream".
+ *
+ * Nesting is followed to a small depth because it is load-bearing, not exotic:
+ * TCPDF's page invokes /TPL0, and THAT form's stream invokes another /TPL0 from
+ * its own resources — the real text is two levels down. Each level carries the
+ * resource dict its own fonts resolve against, and a visited set guards against
+ * a form that (directly or otherwise) invokes itself.
+ */
+interface ContentSource {
+  key: string
+  stream: string
+  /** Resource dict fonts in this stream resolve against. */
+  resources: any
+  write(bytes: Uint8Array): void
+}
+
+const MAX_XOBJECT_DEPTH = 4
+/**
+ * Ceiling on how many Form XObjects one page contributes.
+ *
+ * A Visio page invokes 230 of them. Reading and scanning every one on every
+ * edit turned a 200ms operation into minutes — the editor simply hung. Sources
+ * are ordered page-first and the search stops at the first match, so the cap
+ * only bites when the text genuinely is not there; when it does, it is logged
+ * rather than silently narrowing the search.
+ */
+const MAX_XOBJECT_SOURCES = 64
+
+/** Content sources are re-read only when the document changes underneath us. */
+let contentSourceCache = new Map<number, ContentSource[]>()
+function invalidateContentSources(pageIndex?: number) {
+  if (pageIndex === undefined) contentSourceCache = new Map()
+  else contentSourceCache.delete(pageIndex)
+}
+
+function getContentSources(pageIndex: number): ContentSource[] {
+  if (!pdfDoc) return []
+  const cached = contentSourceCache.get(pageIndex)
+  if (cached) return cached
+  const sources: ContentSource[] = []
+
+  const pageStream = readContentStream(pageIndex)
+  sources.push({
+    key: 'page',
+    stream: pageStream,
+    resources: null, // null => the page's own Resources
+    write: (bytes) => writeContentStream(pageIndex, bytes)
+  })
+
+  let page: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    const pageRes = page.getObject().get('Resources')
+    const seen = new Set<string>()
+
+    const walk = (stream: string, resources: any, path: string, depth: number) => {
+      if (depth > MAX_XOBJECT_DEPTH) return
+      const xobjects = resources?.get?.('XObject')
+      if (!xobjects || String(xobjects) === 'null') return
+
+      // Only the forms this stream actually invokes.
+      const invoked = [...new Set(
+        [...stream.matchAll(/\/([A-Za-z0-9_.+-]+)\s+Do(?![A-Za-z0-9])/g)].map(m => m[1])
+      )]
+
+      for (const name of invoked) {
+        let ref: any
+        try { ref = xobjects.get(name) } catch { continue }
+        if (!ref || String(ref) === 'null') continue
+
+        // Identity is the indirect reference, not the name: TCPDF nests a
+        // /TPL0 inside /TPL0 (a different object), so name-based dedup would
+        // stop at the wrapper and never reach the text. This still breaks a
+        // genuine cycle.
+        const id = String(ref)
+        if (seen.has(id)) continue
+        seen.add(id)
+
+        let resolved: any
+        try { resolved = ref.resolve() } catch { continue }
+        if (String(resolved.get('Subtype') || '') !== '/Form') continue // images hold no text
+
+        let text = ''
+        try {
+          const buf = ref.readStream()
+          const bytes = buf.asUint8Array()
+          for (let i = 0; i < bytes.length; i += 4096) {
+            text += String.fromCharCode(...bytes.subarray(i, Math.min(i + 4096, bytes.length)))
+          }
+          buf.destroy()
+        } catch { continue }
+
+        // A Form XObject may omit /Resources and inherit from its parent.
+        const ownRes = resolved.get('Resources')
+        const childRes = (ownRes && String(ownRes) !== 'null') ? ownRes : resources
+
+        if (sources.length > MAX_XOBJECT_SOURCES) return
+
+        const key = path + '/' + name
+        if (/(?<![A-Za-z0-9])BT(?![A-Za-z0-9])/.test(text)) {
+          const target = ref
+          sources.push({
+            key: 'xobj:' + key,
+            stream: text,
+            resources: childRes ?? pageRes,
+            write: (bytes) => { target.writeStream(bytes) }
+          })
+        }
+        walk(text, childRes ?? pageRes, key, depth + 1)
+      }
+    }
+
+    walk(pageStream, pageRes, '', 1)
+  } catch (_) { /* fall back to the page stream alone */ }
+  finally { try { page?.destroy() } catch (_) { /* already gone */ } }
+
+  if (sources.length > MAX_XOBJECT_SOURCES + 1) {
+    console.warn(`[MuPDF Worker] page ${pageIndex} has ${sources.length - 1} text-bearing ` +
+      `Form XObjects; searching the first ${MAX_XOBJECT_SOURCES}`)
+    sources.length = MAX_XOBJECT_SOURCES + 1
+  }
+  contentSourceCache.set(pageIndex, sources)
+  return sources
+}
+
+/** Run `fn` with font lookups scoped to a content source. */
+function withSource<T>(src: ContentSource, fn: () => T): T {
+  activeResources = src.resources ? { key: src.key, dict: src.resources } : null
+  try { return fn() } finally { activeResources = null }
+}
+
 function writeContentStream(pageIndex: number, bytes: Uint8Array): void {
   if (!pdfDoc) throw new Error('No document')
+  invalidateContentSources(pageIndex)
 
   const page = pdfDoc.loadPage(pageIndex)
   const pageObj = page.getObject()
@@ -584,22 +726,64 @@ function parseToUnicodeCMap(cmapText: string): {
     }
   }
 
-  // Parse bfrange entries: <startGlyph> <endGlyph> <startUnicode>
+  // Parse bfrange entries. The spec allows TWO destination forms and a naive
+  // `<lo> <hi> <dst>` regex mishandles both halves of the problem: it skips the
+  // array form entirely AND then re-matches triples of entries INSIDE the
+  // array, inventing mappings that decode every glyph as '?' or worse. Qt's
+  // output is entirely array-form, so its pages could not be edited at all.
+  //
+  //   <0001> <0003> <0041>                    incremental: 1→A, 2→B, 3→C
+  //   <0001> <0003> [<0052> <0065> <0070>]    explicit list, one dst per code
   const bfrangeRegex = /beginbfrange\s([\s\S]*?)endbfrange/g
   while ((m = bfrangeRegex.exec(cmapText)) !== null) {
     const entries = m[1]
-    const rangeRegex = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g
-    let range: RegExpExecArray | null
-    while ((range = rangeRegex.exec(entries)) !== null) {
-      const startGlyph = parseInt(range[1], 16)
-      const endGlyph = parseInt(range[2], 16)
-      const startUnicode = parseInt(range[3], 16)
-      maxKeyHexLen = Math.max(maxKeyHexLen, range[1].length)
+    // `<hex>` or a bracketed list, in order.
+    const tokenRegex = /<([0-9A-Fa-f\s]+)>|(\[)|(\])/g
+    const pending: string[] = []
+    let inArray = false
+    let arrayDst: string[] = []
+    let lo: string | null = null, hi: string | null = null
+    let tok: RegExpExecArray | null
 
-      for (let g = startGlyph; g <= endGlyph; g++) {
-        const u = startUnicode + (g - startGlyph)
+    const firstCodePoint = (hex: string) => parseInt(hex.replace(/\s+/g, '').slice(0, 4) || '0', 16)
+    const applyIncremental = (loHex: string, hiHex: string, dstHex: string) => {
+      const start = parseInt(loHex, 16), end = parseInt(hiHex, 16)
+      const base = firstCodePoint(dstHex)
+      maxKeyHexLen = Math.max(maxKeyHexLen, loHex.length)
+      // A corrupt range can span the whole 16-bit space; cap the work.
+      for (let g = start; g <= end && g - start < 65536; g++) {
+        const u = base + (g - start)
         glyphToUnicode.set(g, u)
-        unicodeToGlyph.set(u, g)
+        if (!unicodeToGlyph.has(u)) unicodeToGlyph.set(u, g)
+      }
+    }
+    const applyArray = (loHex: string, dst: string[]) => {
+      const start = parseInt(loHex, 16)
+      maxKeyHexLen = Math.max(maxKeyHexLen, loHex.length)
+      dst.forEach((d, i) => {
+        const u = firstCodePoint(d)
+        glyphToUnicode.set(start + i, u)
+        if (!unicodeToGlyph.has(u)) unicodeToGlyph.set(u, start + i)
+      })
+    }
+
+    while ((tok = tokenRegex.exec(entries)) !== null) {
+      if (tok[2]) { inArray = true; arrayDst = []; continue }
+      if (tok[3]) {
+        inArray = false
+        if (lo !== null) applyArray(lo, arrayDst)
+        lo = hi = null
+        pending.length = 0
+        continue
+      }
+      const hex = tok[1].replace(/\s+/g, '')
+      if (inArray) { arrayDst.push(hex); continue }
+      pending.push(hex)
+      if (pending.length === 2) { lo = pending[0]; hi = pending[1] }
+      if (pending.length === 3) {
+        applyIncremental(pending[0], pending[1], pending[2])
+        lo = hi = null
+        pending.length = 0
       }
     }
   }
@@ -611,12 +795,34 @@ function parseToUnicodeCMap(cmapText: string): {
  * Get font encoding for a font name (e.g., "F48") from the page's Resources.
  * Reads the ToUnicode CMap and caches the result.
  */
+/**
+ * Resource dictionary that font lookups should resolve against.
+ *
+ * Text is not always drawn by the page's own content stream: TCPDF wraps a
+ * whole page in a single `/TPL0 Do`, and Canva emits dozens of Form XObjects.
+ * Those carry their OWN /Resources, so while editing inside one, /F1 means a
+ * different font than /F1 on the page. Set for the duration of one operation
+ * (the worker handles one message at a time, so there is no interleaving) and
+ * always cleared in a finally block.
+ */
+let activeResources: { key: string; dict: any } | null = null
+
+/** Resources for the source currently being edited. */
+function resolveResources(pageObj: any): any {
+  return activeResources ? activeResources.dict : pageObj.get('Resources')
+}
+
+/** Cache-key prefix so page fonts and XObject fonts never collide. */
+function sourceKey(): string {
+  return activeResources ? activeResources.key : 'page'
+}
+
 function getFontEncoding(pageIndex: number, fontRefName: string): {
   unicodeToGlyph: Map<number, number>
   glyphToUnicode: Map<number, number>
   codeBytes?: number
 } | null {
-  const cacheKey = `${pageIndex}:${fontRefName}`
+  const cacheKey = `${pageIndex}:${sourceKey()}:${fontRefName}`
   if (fontEncodingCache.has(cacheKey)) {
     return fontEncodingCache.get(cacheKey)!
   }
@@ -627,7 +833,7 @@ function getFontEncoding(pageIndex: number, fontRefName: string): {
   try {
     page = pdfDoc.loadPage(pageIndex)
     const pageObj = page.getObject()
-    const resources = pageObj.get('Resources')
+    const resources = resolveResources(pageObj)
     if (!resources) return null
 
     const fontDict = resources.get('Font')
@@ -811,6 +1017,8 @@ interface SimpleFontInfo {
   flags: number
   isEmbedded: boolean
   isSubset: boolean
+  /** /MissingWidth from the FontDescriptor (PDF default 0). */
+  missingWidth: number
   isType0: boolean
 }
 
@@ -821,7 +1029,7 @@ const simpleFontInfoCache = new Map<string, SimpleFontInfo | null>()
  * Widths of 0 inside [FirstChar..LastChar] indicate glyphs missing from a subset.
  */
 function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontInfo | null {
-  const cacheKey = `${pageIndex}:${fontRefName}`
+  const cacheKey = `${pageIndex}:${sourceKey()}:${fontRefName}`
   if (simpleFontInfoCache.has(cacheKey)) return simpleFontInfoCache.get(cacheKey)!
   if (!pdfDoc) return null
 
@@ -829,7 +1037,7 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
   try {
     const page = pdfDoc.loadPage(pageIndex)
     const pageObj = page.getObject()
-    const fontObj = pageObj.get('Resources')?.get('Font')?.get(fontRefName)
+    const fontObj = resolveResources(pageObj)?.get('Font')?.get(fontRefName)
     if (fontObj && String(fontObj) !== 'null') {
       const r = fontObj.resolve()
       const subtype = String(r.get('Subtype') || '')
@@ -870,6 +1078,7 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
 
       let flags = 0
       let isEmbedded = false
+      let missingWidth = 0
       try {
         const fd = r.get('FontDescriptor')
         if (fd && String(fd) !== 'null') {
@@ -877,6 +1086,7 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
           flags = parseInt(String(fdr.get('Flags') || '0')) || 0
           isEmbedded = ['FontFile', 'FontFile2', 'FontFile3']
             .some(k => String(fdr.get(k) || 'null') !== 'null')
+          missingWidth = Number(String(fdr.get('MissingWidth') || '0')) || 0
         }
       } catch (_) { /* ignore */ }
 
@@ -895,6 +1105,7 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
         flags,
         isEmbedded,
         isSubset: /^[A-Z]{6}\+/.test(baseFont),
+        missingWidth,
         isType0: subtype === '/Type0'
       }
     }
@@ -925,9 +1136,24 @@ function encodeForSimpleFont(
     const byte = table.get(cp)
     if (byte === undefined) { missing.push(ch); continue }
 
-    // For embedded subset fonts, verify the glyph survived subsetting
-    if (info.isEmbedded && info.isSubset && info.widths) {
-      if (byte < info.firstChar || byte > info.lastChar || (info.widths[byte - info.firstChar] || 0) === 0) {
+    // A character is only usable if the font gives it a non-zero ADVANCE.
+    //
+    // Two traps here, both hit by real Word output:
+    //  - the BaseFont name is not evidence of subsetting. Word subsets without
+    //    the "ABCDEF+" prefix, so gating this on `isSubset` skipped the check
+    //    for one of the commonest producers there is.
+    //  - embedding is not the deciding factor either. Even for a NON-embedded
+    //    font the viewer takes advances from this Widths array, so a width of 0
+    //    stacks every such glyph on one spot no matter which face substitutes
+    //    for it. That is how "SWEEPMARK" came back out as "SWEPMARK": the
+    //    doubled zero-width E landed twice in the same place.
+    //
+    // Widths absent entirely (the standard 14) means the viewer supplies its
+    // own metrics, and the check is skipped.
+    if (info.widths && info.widths.length > 0) {
+      const inRange = byte >= info.firstChar && byte <= info.lastChar
+      const width = inRange ? (info.widths[byte - info.firstChar] || 0) : info.missingWidth
+      if (width === 0) {
         missing.push(ch)
         continue
       }
@@ -1256,7 +1482,7 @@ function replaceTextInStream(
   pageIndex: number,
   blockId: string,
   newText: string
-): { success: boolean; error?: string; substitutedFont?: string } {
+): { success: boolean; error?: string; substitutedFont?: string; strategy?: string } {
   if (!pdfDoc) return { success: false, error: 'No document' }
 
   try {
@@ -1266,34 +1492,6 @@ function replaceTextInStream(
       return { success: false, error: `Block ${blockId} not found` }
     }
 
-    const stream = readContentStream(pageIndex)
-
-    // Build font ref name → baseFont mapping and parse encodings
-    const fontRefs = [...new Set([...stream.matchAll(/\/([A-Za-z0-9_.+-]+)\s+[\d.]+\s+Tf/g)].map(m => m[1]))]
-    const fontRefToBaseName = new Map<string, string>()
-    for (const fontRef of fontRefs) {
-      getFontEncoding(pageIndex, fontRef)
-      // Get the BaseFont name for matching with MuPDF's font name
-      let page2: any = null
-      try {
-        page2 = pdfDoc.loadPage(pageIndex)
-        const pObj = page2.getObject()
-        const fDict = pObj.get('Resources').get('Font').get(fontRef)
-        if (fDict) {
-          const baseFontStr = fDict.resolve().get('BaseFont')?.toString?.() || ''
-          // e.g., "/CAAAAA+Calibri" → "CAAAAA+Calibri"
-          fontRefToBaseName.set(fontRef, baseFontStr.replace(/^\//, ''))
-        }
-      } catch (_) {
-      } finally {
-        try { page2?.destroy() } catch (_) { /* already destroyed */ }
-      }
-    }
-
-    // Find which font ref matches the target block's font
-    const targetFontRef = findMatchingFontRef(targetBlock.fontName, fontRefToBaseName)
-    // Font matched
-
     // Get page size for line wrapping + position-aware matching
     const pageBounds = pdfDoc.loadPage(pageIndex)
     const boundsRect = pageBounds.getBounds()
@@ -1301,45 +1499,61 @@ function replaceTextInStream(
     const pageHeight = boundsRect[3] - boundsRect[1]
     pageBounds.destroy()
 
-    // Find and replace the text in the content stream
-    const replaceResult = replaceTextInContentStreamFontAware(
-      stream, pageIndex, targetBlock, newText, targetFontRef, pageWidth, pageHeight
-    )
+    // The text may live in the page stream OR in a Form XObject it invokes.
+    // Try each in turn, with font lookups scoped to that source's resources.
+    let lastError: string | null = null
+    const searched: string[] = []
+    for (const src of getContentSources(pageIndex)) {
+      searched.push(src.key)
+      const outcome = withSource(src, () => {
+        const stream = src.stream
+        const fontRefs = [...new Set([...stream.matchAll(/\/([A-Za-z0-9_.+-]+)\s+[\d.]+\s+Tf/g)].map(m => m[1]))]
+        const fontRefToBaseName = new Map<string, string>()
+        for (const fontRef of fontRefs) {
+          getFontEncoding(pageIndex, fontRef)
+          let page2: any = null
+          try {
+            page2 = pdfDoc!.loadPage(pageIndex)
+            const fDict = resolveResources(page2.getObject())?.get('Font')?.get(fontRef)
+            if (fDict) {
+              const baseFontStr = fDict.resolve().get('BaseFont')?.toString?.() || ''
+              fontRefToBaseName.set(fontRef, baseFontStr.replace(/^\//, ''))
+            }
+          } catch (_) {
+          } finally {
+            try { page2?.destroy() } catch (_) { /* already destroyed */ }
+          }
+        }
+        const targetFontRef = findMatchingFontRef(targetBlock.fontName, fontRefToBaseName)
+        return replaceTextInContentStreamFontAware(
+          stream, pageIndex, targetBlock, newText, targetFontRef, pageWidth, pageHeight
+        )
+      })
 
-    if (!replaceResult) {
-      return { success: false, error: 'Could not find matching text in content stream' }
+      if (!outcome) continue
+      if ('error' in outcome) { lastError = outcome.error; continue }
+
+      // Latin-1 write-back (byte-transparent) preserves raw bytes like 0xF1.
+      const streamStr = outcome.stream
+      const streamBytes = new Uint8Array(streamStr.length)
+      for (let i = 0; i < streamStr.length; i++) {
+        streamBytes[i] = streamStr.charCodeAt(i) & 0xFF
+      }
+      src.write(streamBytes)
+      invalidateContentSources(pageIndex)
+      return {
+        success: true,
+        substitutedFont: outcome.substitutedFont,
+        strategy: (src.key === 'page' ? '' : 'xobject:') + (outcome.strategy ?? '')
+      }
     }
-    if ('error' in replaceResult) {
-      return { success: false, error: replaceResult.error }
+
+    return {
+      success: false,
+      error: lastError ||
+        `Could not find matching text in content stream ` +
+        `[searched: ${searched.join(', ') || 'none'}] (${lastMatchDiagnostic || 'no diagnostic'})`
     }
-
-    // Write modified stream back — use Latin-1 encoding (byte-transparent)
-    // to preserve raw bytes like 0xF1 (ñ in WinAnsi)
-    const streamStr = replaceResult.stream
-    const streamBytes = new Uint8Array(streamStr.length)
-    for (let i = 0; i < streamStr.length; i++) {
-      streamBytes[i] = streamStr.charCodeAt(i) & 0xFF
-    }
-
-    const page = pdfDoc.loadPage(pageIndex)
-    const pageObj = page.getObject()
-    const contents = pageObj.get('Contents')
-
-    if (contents.isArray()) {
-      // Replace with single merged stream
-      const newStreamObj = pdfDoc.addStream(streamBytes, {})
-      pageObj.put('Contents', newStreamObj)
-    } else if (contents.isStream()) {
-      contents.writeStream(streamBytes)
-    } else {
-      // No Contents at all — without this branch the edit is silently dropped
-      // while still being reported as success
-      const newStreamObj = pdfDoc.addStream(streamBytes, {})
-      pageObj.put('Contents', newStreamObj)
-    }
-
-    page.destroy()
-    return { success: true, substitutedFont: replaceResult.substitutedFont }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
   }
@@ -1360,7 +1574,7 @@ function transformTextBlock(
   sy: number,
   anchorX: number,
   anchorY: number
-): { success: boolean; error?: string } {
+): { success: boolean; error?: string; strategy?: string; clipAdjusted?: boolean } {
   if (!pdfDoc) return { success: false, error: 'No document' }
 
   try {
@@ -1370,18 +1584,37 @@ function transformTextBlock(
       return { success: false, error: `Block ${blockId} not found` }
     }
 
-    const stream = readContentStream(pageIndex)
+    // Text may live in the page stream or in a Form XObject it invokes.
+    for (const src of getContentSources(pageIndex)) {
+      const done = withSource(src, () => transformInSource(
+        src, pageIndex, targetBlock, dx, dy, sx, sy, anchorX, anchorY))
+      if (done) return done
+    }
+    return { success: false, error: 'Could not find matching text in content stream' }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
 
-    // Build font ref mappings (same as replaceTextInStream)
+/** Transform work for ONE content stream. Returns null when it holds no match. */
+function transformInSource(
+  src: ContentSource,
+  pageIndex: number,
+  targetBlock: TextBlock,
+  dx: number, dy: number, sx: number, sy: number,
+  anchorX: number, anchorY: number
+): { success: boolean; error?: string; strategy?: string; clipAdjusted?: boolean } | null {
+  try {
+    const stream = src.stream
+
     const fontRefs = [...new Set([...stream.matchAll(/\/([A-Za-z0-9_.+-]+)\s+[\d.]+\s+Tf/g)].map(m => m[1]))]
     const fontRefToBaseName = new Map<string, string>()
     for (const fontRef of fontRefs) {
       getFontEncoding(pageIndex, fontRef)
       let page2: any = null
       try {
-        page2 = pdfDoc.loadPage(pageIndex)
-        const pObj = page2.getObject()
-        const fDict = pObj.get('Resources').get('Font').get(fontRef)
+        page2 = pdfDoc!.loadPage(pageIndex)
+        const fDict = resolveResources(page2.getObject())?.get('Font')?.get(fontRef)
         if (fDict) {
           const baseFontStr = fDict.resolve().get('BaseFont')?.toString?.() || ''
           fontRefToBaseName.set(fontRef, baseFontStr.replace(/^\//, ''))
@@ -1398,9 +1631,7 @@ function transformTextBlock(
     // BT block(s) that correspond to this text block — NOT the entire line.
     const pageHeight = getPageSize(pageIndex).height
     const matchedBlocks = findBtBlocksByPosition(stream, pageIndex, targetBlock, targetFontRef, pageHeight)
-    if (!matchedBlocks || matchedBlocks.length === 0) {
-      return { success: false, error: 'Could not find matching text in content stream' }
-    }
+    if (!matchedBlocks || matchedBlocks.length === 0) return null
 
     // Every rewrite is collected as a splice and applied from the end of the
     // stream backwards, so earlier offsets stay valid. Clip rewrites sit BEFORE
@@ -1412,6 +1643,8 @@ function transformTextBlock(
     const sorted = [...matchedBlocks].sort((a, b) => b.start - a.start)
 
     let anyModified = false
+    let usedStrategy: string | undefined
+    let clipAdjusted = false
     for (const block of sorted) {
       // dx/dy/anchor arrive in PAGE space, but the text matrix lives inside the
       // enclosing CTM (print-to-PDF files wrap text in scaled/flipped cm like
@@ -1442,8 +1675,43 @@ function transformTextBlock(
         : (fallback ? { index: fallback.index!, text: fallback[0] } : null)
       const tmMatch = tmSource ? tmSource.text.match(tmRegex) : null
 
+      // When the block draws MORE than the target, the Tm is shared with other
+      // lines and moving it drags them along. Shift just this run instead, by
+      // bracketing it with a Td and its inverse: the line matrix is restored
+      // immediately afterwards, so every later line lands exactly where it did.
+      // Only for pure translation — scaling one run inside a shared matrix
+      // would need the glyph advances rebuilt.
+      const blockLen = matchLength(block.decodedText)
+      const targetLen = matchLength(targetBlock.text)
+      const holdsMoreThanTarget = blockLen > targetLen * 1.4 + 4
+      const pureTranslate = sx === 1 && sy === 1
+      const run = (holdsMoreThanTarget && pureTranslate)
+        ? findTargetRun(block, targetBlock.text, pageIndex)
+        : null
+
       let newContent: string
-      if (tmMatch && tmSource) {
+      if (run && run.startsLine) {
+        // Td operands are multiplied by the TEXT matrix, so the delta has to be
+        // expressed in Tm space — feeding it the CTM-space value moved this
+        // block 5.9x too far on a page whose Tm scales by 0.17.
+        let tdx = dxL, tdy = dyL
+        if (tmMatch) {
+          const a = parseFloat(tmMatch[1]), b2 = parseFloat(tmMatch[2])
+          const c2 = parseFloat(tmMatch[3]), d2 = parseFloat(tmMatch[4])
+          const det = a * d2 - b2 * c2
+          if (Math.abs(det) > 1e-9) {
+            tdx = (dxL * d2 - dyL * c2) / det
+            tdy = (dyL * a - dxL * b2) / det
+          }
+        }
+        newContent =
+          block.content.slice(0, run.start) +
+          `${fmtNum(tdx)} ${fmtNum(tdy)} Td ` +
+          block.content.slice(run.start, run.end) +
+          ` ${fmtNum(-tdx)} ${fmtNum(-tdy)} Td` +
+          block.content.slice(run.end)
+        usedStrategy ??= 'td_bracket_run'
+      } else if (tmMatch && tmSource) {
         const a = parseFloat(tmMatch[1])
         const bVal = parseFloat(tmMatch[2])
         const c = parseFloat(tmMatch[3])
@@ -1460,6 +1728,7 @@ function transformTextBlock(
         const newTm = `${fmtNum(newA)} ${fmtNum(bVal)} ${fmtNum(c)} ${fmtNum(newD)} ${fmtNum(newE)} ${fmtNum(newF)} Tm`
         const at = tmSource.index
         newContent = block.content.slice(0, at) + newTm + block.content.slice(at + tmSource.text.length)
+        usedStrategy ??= governing ? 'tm_rewrite_governing' : 'tm_rewrite_first'
       } else {
         // No Tm — the block positions itself with Td/TD/T* (wkhtmltopdf, FPDF,
         // TCPDF…). BT resets the line matrix to the identity, so every one of
@@ -1470,6 +1739,7 @@ function transformTextBlock(
         const mF = anchorYL * (1 - sy) + dyL
         const injected = `${fmtNum(sx)} 0 0 ${fmtNum(sy)} ${fmtNum(mE)} ${fmtNum(mF)} Tm`
         newContent = ` ${injected}${block.content}`
+        usedStrategy ??= 'tm_injected'
       }
 
       splices.push({ start: block.start, end: block.end, text: 'BT' + newContent + 'ET' })
@@ -1482,13 +1752,14 @@ function transformTextBlock(
       if (clip && !clipsDone.has(clip.index)) {
         clipsDone.add(clip.index)
         const newRect = expandClipForTransform(stream, clip, dx, dy, sx, sy, anchorX, anchorY)
-        if (newRect) splices.push({ start: clip.index, end: clip.index + clip.length, text: newRect })
+        if (newRect) {
+          splices.push({ start: clip.index, end: clip.index + clip.length, text: newRect })
+          clipAdjusted = true
+        }
       }
     }
 
-    if (!anyModified) {
-      return { success: false, error: 'No matched blocks to transform' }
-    }
+    if (!anyModified) return null
 
     let modifiedStream = stream
     for (const sp of splices.sort((a, b) => b.start - a.start)) {
@@ -1501,24 +1772,13 @@ function transformTextBlock(
       streamBytes[i] = modifiedStream.charCodeAt(i) & 0xFF
     }
 
-    const page = pdfDoc.loadPage(pageIndex)
-    const pageObj = page.getObject()
-    const contents = pageObj.get('Contents')
-
-    if (contents.isArray()) {
-      const newStreamObj = pdfDoc.addStream(streamBytes, {})
-      pageObj.put('Contents', newStreamObj)
-    } else if (contents.isStream()) {
-      contents.writeStream(streamBytes)
-    } else {
-      // No Contents at all — without this branch the edit is silently dropped
-      // while still being reported as success
-      const newStreamObj = pdfDoc.addStream(streamBytes, {})
-      pageObj.put('Contents', newStreamObj)
+    src.write(streamBytes)
+    invalidateContentSources(pageIndex)
+    return {
+      success: true,
+      strategy: (src.key === 'page' ? '' : 'xobject:') + (usedStrategy ?? ''),
+      clipAdjusted
     }
-
-    page.destroy()
-    return { success: true }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
   }
@@ -1560,6 +1820,54 @@ function getCtmAtOffset(stream: string, offset: number): Mat6 {
     else ctm = matConcat([+m[1], +m[2], +m[3], +m[4], +m[5], +m[6]], ctm)
   }
   return ctm
+}
+
+/**
+ * Byte range of the show-op run that draws the target text, and whether that
+ * run begins a line (i.e. a positioning operator precedes it with no show op
+ * in between).
+ *
+ * Needed to move ONE line out of a block that draws many. Adobe and TeX emit a
+ * single BT whose lines are all positioned by Td/T* off one shared Tm; nudging
+ * that Tm slides every line at once — dragging one label moved 34 blocks.
+ */
+function findTargetRun(
+  block: BtInfo,
+  targetText: string,
+  pageIndex: number
+): { start: number; end: number; startsLine: boolean } | null {
+  const targetNorm = targetText.replace(/\s+/g, ' ').trim()
+  if (!targetNorm) return null
+  const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef))
+  if (ops.length === 0) return null
+
+  let best: { i: number; j: number; score: number } | null = null
+  for (let i = 0; i < ops.length; i++) {
+    let acc = ''
+    for (let j = i; j < ops.length; j++) {
+      acc += ops[j].decoded
+      const norm = acc.replace(/\s+/g, ' ').trim()
+      if (norm.length > targetNorm.length * 1.5 + 8) break
+      if (!norm) continue
+      const ratio = matchRatio(norm, targetNorm)
+      if (ratio < 0.7) continue
+      let score = 0
+      if (norm === targetNorm) score = 2
+      else if (fuzzyTextMatch(norm, targetNorm)) score = ratio
+      if (score > 0 && (!best || score > best.score)) best = { i, j, score }
+    }
+  }
+  if (!best) return null
+
+  // A line-leading run has a positioning operator, and no other show op,
+  // immediately before it. Inserting a Td in front of a MID-line run would
+  // reset the pen to the line start and scramble the rest of that line.
+  const runStart = ops[best.i].start
+  const prevShowEnd = best.i > 0 ? ops[best.i - 1].end : 0
+  const between = maskStreamLiterals(block.content.slice(prevShowEnd, runStart))
+  const startsLine = best.i === 0 || /(?:Td|TD|Tm|T\*)/.test(between)
+
+  return { start: runStart, end: ops[best.j].end, startsLine }
 }
 
 /**
@@ -2004,6 +2312,9 @@ interface BtInfo {
  * 3. Concatenate decoded text per line, match against target
  * 4. On match: put new text in the first substantial block, blank the rest
  */
+/** Why the last match attempt failed — read by callers to build a useful error. */
+let lastMatchDiagnostic = ''
+
 function replaceTextInContentStreamFontAware(
   stream: string,
   pageIndex: number,
@@ -2012,7 +2323,7 @@ function replaceTextInContentStreamFontAware(
   targetFontRef: string | null,
   pageWidth?: number,
   pageHeight?: number
-): { stream: string; substitutedFont?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
   // Step 1: Parse all BT blocks with position and text info
   const allBlocks = scanBtBlocks(stream, pageIndex)
 
@@ -2114,7 +2425,10 @@ function replaceTextInContentStreamFontAware(
     const result = c.line
       ? applyLineReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth)
       : applyBlockReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth, pageHeight)
-    if (result) return result
+    if (result) {
+      if (!('error' in result)) result.strategy = c.line ? 'line_group' : 'single_block'
+      return result
+    }
   }
 
   // Step 4: Target CONTAINED inside a larger BT block (Ghostscript draws a
@@ -2135,7 +2449,10 @@ function replaceTextInContentStreamFontAware(
       containing.sort((a, b) => distOf(a) - distOf(b))
       for (const block of containing) {
         const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
-        if (partial) return partial
+        if (partial) {
+          if (!('error' in partial)) partial.strategy = 'partial_block'
+          return partial
+        }
       }
       if (!targetFontRef) break // second pass is identical when no font filter exists
     }
@@ -2143,8 +2460,15 @@ function replaceTextInContentStreamFontAware(
 
   // Nothing matched. Report what was actually on the page so the next
   // unsupported generator can be classified without re-instrumenting the worker.
-  console.warn('[MuPDF Worker] no BT match for', JSON.stringify(normalizedTarget.slice(0, 60)),
-    `— ${allBlocks.length} blocks, ${lineGroups.size} lines, font ${targetFontRef ?? 'any'}`)
+  // Record WHY nothing matched. Surfacing the decoder's own view is what turns
+  // "Could not find matching text" from a dead end into a diagnosis: mojibake
+  // here means a font-encoding problem, sensible text means a matcher problem.
+  lastMatchDiagnostic =
+    `${allBlocks.length} blocks, ${lineGroups.size} lines, font ${targetFontRef ?? 'any'}; saw ` +
+    allBlocks.slice(0, 3).map(b =>
+      `[${b.fontRef}@${b.hasPos ? `${Math.round(b.xPos)},${Math.round(b.yPos)}` : 'nopos'}]` +
+      JSON.stringify(b.decodedText.slice(0, 28))
+    ).join(' ')
   return null
 }
 
@@ -2159,7 +2483,7 @@ function applyBlockReplacement(
   targetBlock?: TextBlock,
   pageWidth?: number,
   pageHeight?: number
-): { stream: string; substitutedFont?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
   const block = blocks[0]
 
   // If this BT block holds much MORE text than the target (one BT drawing
@@ -2237,7 +2561,7 @@ function applyWrappedReplacement(
   targetBlock: TextBlock,
   pageWidth: number,
   pageIndex: number
-): { stream: string; substitutedFont?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
   const origText = targetBlock.text
   const blockWidth = targetBlock.width
   const avgCharWidth = blockWidth / Math.max(origText.length, 1)
@@ -2315,7 +2639,7 @@ function applyLineReplacement(
   pageIndex: number,
   targetBlock?: TextBlock,
   pageWidth?: number
-): { stream: string; substitutedFont?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
   // Sort by position in stream (ascending)
   const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
 
@@ -2854,7 +3178,7 @@ function applyPartialBlockReplacement(
   pageIndex: number,
   targetBlock: TextBlock,
   pageHeight?: number
-): { stream: string; substitutedFont?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
   const simpleInfo = getSimpleFontInfo(pageIndex, block.fontRef)
   const ops = scanShowOps(block.content, block.encoding, simpleInfo)
   if (ops.length < 1) return null
@@ -3409,7 +3733,9 @@ function updateAnnotationAt(d: {
 // PAGE MANAGEMENT
 // ==========================================
 
-function rotatePage(pageIndex: number, degrees: number): { success: boolean; rotation?: number; error?: string } {
+function rotatePage(pageIndex: number, degrees: number): {
+  success: boolean; rotation?: number; error?: string } {
+  invalidateContentSources() // page indices shift
   try {
     const page = pdfDoc.loadPage(pageIndex)
     const pageObj = page.getObject()
@@ -3425,7 +3751,9 @@ function rotatePage(pageIndex: number, degrees: number): { success: boolean; rot
   }
 }
 
-function insertBlankPage(atIndex: number, width: number, height: number): { success: boolean; pageCount?: number; error?: string } {
+function insertBlankPage(atIndex: number, width: number, height: number): {
+  success: boolean; pageCount?: number; error?: string } {
+  invalidateContentSources() // page indices shift
   try {
     const mediabox: [number, number, number, number] = [0, 0, width, height]
     const resources = pdfDoc.newDictionary()
@@ -3439,7 +3767,9 @@ function insertBlankPage(atIndex: number, width: number, height: number): { succ
   }
 }
 
-function deletePageOp(pageIndex: number): { success: boolean; pageCount?: number; error?: string } {
+function deletePageOp(pageIndex: number): {
+  success: boolean; pageCount?: number; error?: string } {
+  invalidateContentSources() // page indices shift
   try {
     if (pdfDoc.countPages() <= 1) return { success: false, error: 'Cannot delete the last page' }
     pdfDoc.deletePage(pageIndex)
@@ -3449,7 +3779,9 @@ function deletePageOp(pageIndex: number): { success: boolean; pageCount?: number
   }
 }
 
-function duplicatePage(pageIndex: number): { success: boolean; pageCount?: number; error?: string } {
+function duplicatePage(pageIndex: number): {
+  success: boolean; pageCount?: number; error?: string } {
+  invalidateContentSources() // page indices shift
   try {
     // graftPage(to, srcDoc, srcPage): copy srcPage and insert it at position `to`
     pdfDoc.graftPage(pageIndex + 1, pdfDoc, pageIndex)
@@ -3459,7 +3791,9 @@ function duplicatePage(pageIndex: number): { success: boolean; pageCount?: numbe
   }
 }
 
-function movePage(from: number, to: number): { success: boolean; pageCount?: number; error?: string } {
+function movePage(from: number, to: number): {
+  success: boolean; pageCount?: number; error?: string } {
+  invalidateContentSources() // page indices shift
   try {
     const n = pdfDoc.countPages()
     if (from < 0 || from >= n || to < 0 || to >= n) return { success: false, error: 'Index out of range' }

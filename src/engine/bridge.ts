@@ -120,7 +120,7 @@ export class MuPDFBridge {
     pageIndex: number,
     blockId: string,
     newText: string
-  ): Promise<{ success: boolean; error?: string; substitutedFont?: string }> {
+  ): Promise<{ success: boolean; error?: string; substitutedFont?: string; strategy?: string }> {
     return this.send('replaceText', { pageIndex, blockId, newText })
   }
 
@@ -154,7 +154,7 @@ export class MuPDFBridge {
     sy: number,
     anchorX: number,
     anchorY: number
-  ): Promise<{ success: boolean; error?: string }> {
+  ): Promise<{ success: boolean; error?: string; strategy?: string; clipAdjusted?: boolean }> {
     return this.send('transformTextBlock', { pageIndex, blockId, dx, dy, sx, sy, anchorX, anchorY })
   }
 
