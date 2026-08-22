@@ -1402,9 +1402,13 @@ function transformTextBlock(
       return { success: false, error: 'Could not find matching text in content stream' }
     }
 
-    // Apply transformation to each matched block's Tm matrix
-    let modifiedStream = stream
-    // Process from end to start to preserve string offsets
+    // Every rewrite is collected as a splice and applied from the end of the
+    // stream backwards, so earlier offsets stay valid. Clip rewrites sit BEFORE
+    // their block, so a single pass over blocks cannot do it in place.
+    interface Splice { start: number; end: number; text: string }
+    const splices: Splice[] = []
+    const clipsDone = new Set<number>()
+
     const sorted = [...matchedBlocks].sort((a, b) => b.start - a.start)
 
     let anyModified = false
@@ -1468,14 +1472,27 @@ function transformTextBlock(
         newContent = ` ${injected}${block.content}`
       }
 
-      modifiedStream = modifiedStream.substring(0, block.start) +
-                       'BT' + newContent + 'ET' +
-                       modifiedStream.substring(block.end)
+      splices.push({ start: block.start, end: block.end, text: 'BT' + newContent + 'ET' })
       anyModified = true
+
+      // Carry the clip window along. Without this, text drawn inside a tight
+      // `re W* n` band (browser page headers/footers) simply disappears as soon
+      // as the drag exceeds a few points.
+      const clip = getActiveClipAtOffset(stream, block.start)
+      if (clip && !clipsDone.has(clip.index)) {
+        clipsDone.add(clip.index)
+        const newRect = expandClipForTransform(stream, clip, dx, dy, sx, sy, anchorX, anchorY)
+        if (newRect) splices.push({ start: clip.index, end: clip.index + clip.length, text: newRect })
+      }
     }
 
     if (!anyModified) {
       return { success: false, error: 'No matched blocks to transform' }
+    }
+
+    let modifiedStream = stream
+    for (const sp of splices.sort((a, b) => b.start - a.start)) {
+      modifiedStream = modifiedStream.slice(0, sp.start) + sp.text + modifiedStream.slice(sp.end)
     }
 
     // Write modified stream back (Latin-1 for byte transparency)
@@ -1629,6 +1646,85 @@ function btBlockDistanceToTarget(
   const nx = Math.min(Math.max(x, Math.min(x0, x1)), Math.max(x0, x1))
   const ny = Math.min(Math.max(y, Math.min(y0, y1)), Math.max(y0, y1))
   return Math.hypot(x - nx, y - ny)
+}
+
+/**
+ * The innermost rectangular clip still in force at a stream offset.
+ *
+ * Browser print-to-PDF wraps each header/footer run in its own
+ * `q <x y w h> re W* n  q <scale> cm  BT … ET  Q Q`, and the band is barely
+ * taller than the line itself. Moving the text without moving that window
+ * pushes it outside and it vanishes from both the render and MuPDF's
+ * extraction — the text is still in the file, just clipped away.
+ *
+ * Only the simple `x y w h re W[*] n` form is recognised; anything more
+ * complex returns null and the caller leaves the clip alone.
+ */
+function getActiveClipAtOffset(
+  stream: string,
+  offset: number
+): { index: number; length: number; rect: [number, number, number, number] } | null {
+  type Clip = { index: number; length: number; rect: [number, number, number, number] } | null
+  const masked = maskStreamLiterals(stream.slice(0, offset))
+  const stack: Clip[] = []
+  let current: Clip = null
+
+  const re = /((-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re)\s+W\*?\s+n\b|(?:^|[\s\]>])([qQ])(?=[\s(<\[/%]|$)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m[6] === 'q') { stack.push(current); continue }
+    if (m[6] === 'Q') { current = stack.length > 0 ? stack.pop()! : null; continue }
+    // A new clip intersects whatever was active; the innermost one is what bounds the text.
+    current = { index: m.index, length: m[1].length, rect: [+m[2], +m[3], +m[4], +m[5]] }
+  }
+  return current
+}
+
+/**
+ * Rewritten `x y w h re` covering both the original clip window and its
+ * transformed self, or null when nothing needs to change.
+ *
+ * The union — rather than a plain translation — is deliberate: it can only ever
+ * reveal more of the group it bounds, never hide something that was visible.
+ * Hiding content is the failure being fixed here, so that is the safe direction
+ * to err in.
+ */
+function expandClipForTransform(
+  stream: string,
+  clip: { index: number; length: number; rect: [number, number, number, number] },
+  dx: number, dy: number, sx: number, sy: number,
+  anchorX: number, anchorY: number
+): string | null {
+  // The rect lives in the CTM at the `re` operator, which is NOT the one the
+  // text sits in (the text has an extra `cm` inside the clip's q).
+  const ctm = getCtmAtOffset(stream, clip.index)
+  const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
+  if (Math.abs(det) < 1e-9) return null
+
+  const ia = ctm[3] / det, ib = -ctm[1] / det
+  const ic = -ctm[2] / det, id = ctm[0] / det
+  const dxL = dx * ia + dy * ic
+  const dyL = dx * ib + dy * id
+  const ax = anchorX - ctm[4], ay = anchorY - ctm[5]
+  const anchorXL = ax * ia + ay * ic
+  const anchorYL = ax * ib + ay * id
+
+  const [rx, ry, rw, rh] = clip.rect
+  const x0 = Math.min(rx, rx + rw), x1 = Math.max(rx, rx + rw)
+  const y0 = Math.min(ry, ry + rh), y1 = Math.max(ry, ry + rh)
+  const tX = (v: number) => anchorXL + (v - anchorXL) * sx + dxL
+  const tY = (v: number) => anchorYL + (v - anchorYL) * sy + dyL
+
+  const nx0 = Math.min(x0, x1, tX(x0), tX(x1))
+  const nx1 = Math.max(x0, x1, tX(x0), tX(x1))
+  const ny0 = Math.min(y0, y1, tY(y0), tY(y1))
+  const ny1 = Math.max(y0, y1, tY(y0), tY(y1))
+
+  const unchanged = Math.abs(nx0 - x0) < 0.01 && Math.abs(nx1 - x1) < 0.01 &&
+                    Math.abs(ny0 - y0) < 0.01 && Math.abs(ny1 - y1) < 0.01
+  if (unchanged) return null
+
+  return `${fmtNum(nx0)} ${fmtNum(ny0)} ${fmtNum(nx1 - nx0)} ${fmtNum(ny1 - ny0)} re`
 }
 
 /** Format a number for PDF content stream (avoid excessive decimals) */

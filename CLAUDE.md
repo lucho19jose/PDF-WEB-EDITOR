@@ -155,6 +155,21 @@ locates the show-op run matching the target and walks back to the last Tm
 before it. A plain `content.match(/… Tm/)` grabs the first one and drags the
 wrong line (moving "GUÍA DE REMISIÓN ELECTRÓNICA" moved "RUC N°…" instead).
 
+### Moving text must move its clip window
+Browser print-to-PDF wraps each page header/footer in its own
+`q <x y w h> re W* n  q <scale> cm  BT … ET  Q Q`, and the band is barely
+taller than the line. `transformTextBlock` therefore looks up the innermost
+active clip (`getActiveClipAtOffset`) and grows it to the union of its old and
+transformed self (`expandClipForTransform`). Without that, dragging such a line
+more than ~3pt pushes it outside the band and it disappears from the render AND
+from MuPDF's extraction — the text is still in the file, just clipped away,
+which reads as "the block vanished".
+
+The union is used rather than a plain translation because it can only reveal
+more of the clipped group, never hide something that was visible — hiding is
+the failure being fixed. Rewrites are collected as splices and applied
+back-to-front, since a clip sits at a LOWER offset than the block it bounds.
+
 ### Text-block selection is anchored, not id-based
 `TextBlock.id` is `page:extractionIndex` and is **not stable**: every edit runs
 a save→reload cycle that re-extracts the page, and moving a block changes its
