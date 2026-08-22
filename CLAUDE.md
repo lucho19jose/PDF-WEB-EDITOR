@@ -67,6 +67,22 @@ App.vue
     └── StatusBar.vue (q-footer)
 ```
 
+### Saving is a download, and downloads have three preconditions
+`saveFile` → `offerDownload` in `EditorLayout.vue`. All three of these failed
+silently while the status bar still said "PDF saved successfully":
+- the anchor must be IN the document before `click()` (Firefox ignores a
+  detached one);
+- the object URL must outlive the click — `URL.revokeObjectURL` on the next
+  line cancels the transfer, worst on the multi-megabyte files this app makes;
+- a programmatic download needs **transient user activation**, which expires
+  ~5s after the click that granted it. `saveDocument()` can outlast that when
+  the op queue is still finishing an edit's save→reload on a large document,
+  and the browser then drops the download without firing any event.
+
+When `navigator.userActivation.isActive` is false at download time, prompt for
+a fresh click instead of reporting a success that never happened. Never mark
+the document saved on a path where the bytes did not actually leave.
+
 ### Concurrency invariant
 ALL document-level mutations (text edits, annotations, page ops, undo/redo,
 save) run through the global FIFO queue in `src/utils/opQueue.ts`

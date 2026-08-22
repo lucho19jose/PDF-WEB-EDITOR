@@ -36,6 +36,7 @@
 
 <script setup lang="ts">
 import { ref, provide, watch, onMounted, onUnmounted } from 'vue'
+import { useQuasar } from 'quasar'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
@@ -48,6 +49,7 @@ import PageThumbnails from '@/components/sidebar/PageThumbnails.vue'
 import StatusBar from '@/components/common/StatusBar.vue'
 import FindBar from '@/components/toolbar/FindBar.vue'
 
+const $q = useQuasar()
 const docStore = useDocumentStore()
 const editorStore = useEditorStore()
 const historyStore = useHistoryStore()
@@ -123,18 +125,91 @@ async function saveFile() {
   editorStore.setStatus('Saving PDF...')
   try {
     const bytes = await enqueueOp(() => pdfEngine.saveDocument())
+    if (!bytes || bytes.byteLength === 0) {
+      editorStore.setStatus('Save failed: the engine produced an empty document')
+      return
+    }
     const blob = new Blob([bytes], { type: 'application/pdf' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = (docStore.fileName || 'document.pdf').replace(/ \*$/, '')
-    a.click()
-    URL.revokeObjectURL(url)
-    docStore.markSaved()
-    editorStore.setStatus('PDF saved successfully')
+    const name = (docStore.fileName || 'document.pdf').replace(/ \*$/, '')
+    offerDownload(blob, name)
   } catch (err: any) {
     editorStore.setStatus(`Save error: ${err.message}`)
   }
+}
+
+/** Click a temporary anchor to start a download. */
+function triggerDownload(url: string, fileName: string) {
+  const a = document.createElement('a')
+  a.href = url
+  a.download = fileName
+  a.rel = 'noopener'
+  a.style.display = 'none'
+  // Firefox ignores a click on an anchor that is not in the document.
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+
+/**
+ * Hand the saved bytes to the browser.
+ *
+ * Three things have to be right here, and all three used to fail silently
+ * while the status bar still reported "PDF saved successfully":
+ *
+ * 1. The anchor must be attached to the document before it is clicked.
+ * 2. The object URL has to outlive the click — revoking it on the next line
+ *    cancels the transfer, which bites hardest on the multi-megabyte files
+ *    this editor produces.
+ * 3. A programmatic download needs TRANSIENT USER ACTIVATION, and that expires
+ *    about five seconds after the click that granted it. Saving can outlast
+ *    that (the op queue may still be finishing an edit's save->reload on a
+ *    large document), and the browser then drops the download without firing
+ *    any event. When the activation is gone, ask for a fresh click instead of
+ *    claiming a success that never happened.
+ */
+function offerDownload(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob)
+  // Keep the URL alive well past the click, then release it.
+  const scheduleRevoke = () => setTimeout(() => URL.revokeObjectURL(url), 60_000)
+
+  const activation = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation
+  if (activation && !activation.isActive) {
+    editorStore.setStatus('PDF ready — confirm the download')
+    $q.notify({
+      message: `"${fileName}" is ready.`,
+      caption: 'Saving took long enough that the browser needs a fresh click to start the download.',
+      color: 'primary',
+      icon: 'save',
+      timeout: 0,
+      multiLine: true,
+      actions: [
+        {
+          label: 'Download',
+          color: 'white',
+          handler: () => {
+            triggerDownload(url, fileName)
+            scheduleRevoke()
+            docStore.markSaved()
+            editorStore.setStatus('PDF saved successfully')
+          }
+        },
+        {
+          label: 'Cancel',
+          color: 'white',
+          handler: () => {
+            URL.revokeObjectURL(url)
+            editorStore.setStatus('Save cancelled — the document is still open and unsaved')
+          }
+        }
+      ]
+    })
+    return
+  }
+
+  triggerDownload(url, fileName)
+  scheduleRevoke()
+  docStore.markSaved()
+  editorStore.setStatus('PDF saved successfully')
 }
 
 // ===== shared re-render after a document-level edit =====
