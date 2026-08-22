@@ -133,6 +133,28 @@ when the block has none — inject `sx 0 0 sy e f Tm` right after `BT`. BT reset
 the line matrix to the identity, so every following Td/TD/T* is relative to the
 injected matrix and the whole block (all its lines) transforms with it.
 
+### Matching invariant: text alone never identifies a block
+The same string appears more than once on a page all the time — an email
+subject repeated in the quoted original, a running header, a value in several
+table rows. Both matchers (`replaceTextInContentStreamFontAware` and
+`findBtBlocksByPosition`) therefore COLLECT every textual match, score each by
+`btBlockDistanceToTarget()` — the block's Tm origin pushed through the
+enclosing CTM and flipped into MuPDF's top-left page coords — and apply the
+nearest one. Returning the first textual match silently rewrote a different
+paragraph while the clicked one looked uneditable.
+
+Never compare raw Tm values against a bbox: print-to-PDF files wrap text in
+matrices like `0.675 0 0 -0.675 28.5 813.42 cm`, so the two live in different
+spaces. Distances are bucketed (8pt) before the score tiebreak so the
+comparator stays a valid total order.
+
+### One BT block can hold several independently positioned lines
+SUNAT/JasperReports emit `BT Tm (line 1) Tj Tm (line 2) Tj ... ET`. Moving such
+a block must rewrite the Tm that GOVERNS the clicked text — `findGoverningTm()`
+locates the show-op run matching the target and walks back to the last Tm
+before it. A plain `content.match(/… Tm/)` grabs the first one and drags the
+wrong line (moving "GUÍA DE REMISIÓN ELECTRÓNICA" moved "RUC N°…" instead).
+
 ### Text-block selection is anchored, not id-based
 `TextBlock.id` is `page:extractionIndex` and is **not stable**: every edit runs
 a save→reload cycle that re-extracts the page, and moving a block changes its

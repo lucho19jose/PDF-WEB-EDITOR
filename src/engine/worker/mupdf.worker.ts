@@ -1396,7 +1396,8 @@ function transformTextBlock(
 
     // For transforms, use position-based matching to find only the specific
     // BT block(s) that correspond to this text block — NOT the entire line.
-    const matchedBlocks = findBtBlocksByPosition(stream, pageIndex, targetBlock, targetFontRef)
+    const pageHeight = getPageSize(pageIndex).height
+    const matchedBlocks = findBtBlocksByPosition(stream, pageIndex, targetBlock, targetFontRef, pageHeight)
     if (!matchedBlocks || matchedBlocks.length === 0) {
       return { success: false, error: 'Could not find matching text in content stream' }
     }
@@ -1426,12 +1427,19 @@ function transformTextBlock(
       }
 
       // Literals are masked before locating the Tm so digits inside a string
-      // like "(1 0 0 1 5 5 Tm)" can't be mistaken for the operator.
+      // like "(1 0 0 1 5 5 Tm)" can't be mistaken for the operator. Prefer the
+      // Tm that actually governs the clicked text: a BT block can hold several
+      // lines, each with its own Tm.
       const tmRegex = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/
-      const tmMatch = maskStreamLiterals(block.content).match(tmRegex)
+      const governing = findGoverningTm(block, targetBlock.text, pageIndex)
+      const fallback = maskStreamLiterals(block.content).match(tmRegex)
+      const tmSource = governing
+        ? { index: governing.index, text: governing.text }
+        : (fallback ? { index: fallback.index!, text: fallback[0] } : null)
+      const tmMatch = tmSource ? tmSource.text.match(tmRegex) : null
 
       let newContent: string
-      if (tmMatch) {
+      if (tmMatch && tmSource) {
         const a = parseFloat(tmMatch[1])
         const bVal = parseFloat(tmMatch[2])
         const c = parseFloat(tmMatch[3])
@@ -1446,8 +1454,8 @@ function transformTextBlock(
         const newF = anchorYL + (f - anchorYL) * sy + dyL
 
         const newTm = `${fmtNum(newA)} ${fmtNum(bVal)} ${fmtNum(c)} ${fmtNum(newD)} ${fmtNum(newE)} ${fmtNum(newF)} Tm`
-        const at = tmMatch.index!
-        newContent = block.content.slice(0, at) + newTm + block.content.slice(at + tmMatch[0].length)
+        const at = tmSource.index
+        newContent = block.content.slice(0, at) + newTm + block.content.slice(at + tmSource.text.length)
       } else {
         // No Tm — the block positions itself with Td/TD/T* (wkhtmltopdf, FPDF,
         // TCPDF…). BT resets the line matrix to the identity, so every one of
@@ -1535,6 +1543,92 @@ function getCtmAtOffset(stream: string, offset: number): Mat6 {
     else ctm = matConcat([+m[1], +m[2], +m[3], +m[4], +m[5], +m[6]], ctm)
   }
   return ctm
+}
+
+/**
+ * The Tm operator that governs the clicked text inside a BT block.
+ *
+ * One BT can hold several independent lines, each with its own Tm — SUNAT and
+ * JasperReports emit "Tm (line 1) Tj Tm (line 2) Tj ..." as a single block.
+ * Rewriting the FIRST Tm, as a plain regex does, then drags a different line
+ * than the one the user grabbed.
+ *
+ * Returns null when the text cannot be located or nothing positions it
+ * absolutely, leaving the caller to fall back to whole-block handling.
+ */
+function findGoverningTm(
+  block: BtInfo,
+  targetText: string,
+  pageIndex: number
+): { index: number; text: string } | null {
+  const targetNorm = targetText.replace(/\s+/g, ' ').trim()
+  if (!targetNorm) return null
+
+  const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef))
+  if (ops.length === 0) return null
+
+  // Best contiguous run of show-ops whose text matches the target
+  let runStart = -1
+  let bestScore = 0
+  for (let i = 0; i < ops.length; i++) {
+    let acc = ''
+    for (let j = i; j < ops.length; j++) {
+      acc += ops[j].decoded
+      const norm = acc.replace(/\s+/g, ' ').trim()
+      if (norm.length > targetNorm.length * 1.5 + 8) break
+      if (!norm) continue
+      const ratio = Math.min(norm.length, targetNorm.length) / Math.max(norm.length, targetNorm.length)
+      if (ratio < 0.7) continue
+      let score = 0
+      if (norm === targetNorm) score = 2
+      else if (fuzzyTextMatch(norm, targetNorm)) score = ratio
+      if (score > bestScore) { bestScore = score; runStart = ops[i].start }
+    }
+  }
+  if (runStart < 0) return null
+
+  // The governing Tm is the last one before that run starts
+  const masked = maskStreamLiterals(block.content)
+  const re = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/g
+  let found: { index: number; text: string } | null = null
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m.index > runStart) break
+    found = { index: m.index, text: m[0] }
+  }
+  return found
+}
+
+/**
+ * How far a BT block sits from the text block the user clicked, in page points.
+ *
+ * The block's Tm origin is pushed through the enclosing CTM and flipped into
+ * MuPDF's top-left page coords — print-to-PDF files wrap text in matrices like
+ * "0.675 0 0 -0.675 28.5 813.42 cm", so raw Tm values are not comparable with a
+ * bbox. Distance is measured to the NEAREST point of the target bbox, so a
+ * multi-line block whose BT starts on its first line still scores 0.
+ *
+ * Returns Infinity when the position cannot be established, which sorts the
+ * candidate last without discarding it.
+ */
+function btBlockDistanceToTarget(
+  stream: string,
+  block: BtInfo,
+  targetBlock: TextBlock,
+  pageHeight?: number
+): number {
+  if (pageHeight === undefined || !block.hasPos) return Infinity
+
+  const ctm = getCtmAtOffset(stream, block.start)
+  const ux = block.xPos * ctm[0] + block.yPos * ctm[2] + ctm[4]
+  const uy = block.xPos * ctm[1] + block.yPos * ctm[3] + ctm[5]
+  const x = ux
+  const y = pageHeight - uy
+
+  const [x0, y0, x1, y1] = targetBlock.bbox
+  const nx = Math.min(Math.max(x, Math.min(x0, x1)), Math.max(x0, x1))
+  const ny = Math.min(Math.max(y, Math.min(y0, y1)), Math.max(y0, y1))
+  return Math.hypot(x - nx, y - ny)
 }
 
 /** Format a number for PDF content stream (avoid excessive decimals) */
@@ -1697,100 +1791,93 @@ function findMatchingBtBlocks(
 
 /**
  * Position-based BT block matching for transforms.
- * Uses the target TextBlock's Tm Y coordinate (from MuPDF bbox) to find
- * only the specific BT block(s) at that position, NOT the entire line.
- * Falls back to single-block text matching if position matching fails.
+ *
+ * Text alone cannot identify a block: the same string often appears several
+ * times on a page. Every textual match is therefore ranked by how far it sits
+ * from the block the user clicked (in page points, via the enclosing CTM), and
+ * the nearest one wins. Comparing raw Tm values against a page-space bbox — as
+ * this used to — is wrong for any file that scales or flips text with a `cm`.
  */
 function findBtBlocksByPosition(
   stream: string,
   pageIndex: number,
   targetBlock: TextBlock,
-  targetFontRef: string | null
+  targetFontRef: string | null,
+  pageHeight?: number
 ): BtInfo[] | null {
   // Position matching needs a text-space origin; skip blocks without any
   // positioning operator at all (they draw at the identity origin).
   const allBlocks = scanBtBlocks(stream, pageIndex).filter(b => b.hasPos)
-
-  // Target block's position in Tm coords (bottom-left origin):
-  // bbox is top-left origin from MuPDF, so:
-  //   Tm Y ≈ pageHeight - bbox[3]  (bottom of text)
-  // But we don't have pageHeight here. Instead, use the Tm Y values
-  // from the content stream and match by proximity.
-
-  // Target bbox center in top-left coords
-  const targetCenterX = (targetBlock.bbox[0] + targetBlock.bbox[2]) / 2
-  // Target left edge
-  const targetLeftX = targetBlock.bbox[0]
-
-  // Strategy: find BT blocks whose Tm X position is close to the target block's X
-  // AND whose Tm Y position matches the target's Y line.
-  // First, group by Y and find the right Y line.
   const normalizedTarget = targetBlock.text.replace(/\s+/g, ' ').trim()
 
-  // Step 1: Find BT blocks on the same Y line as the target
-  const lineGroups = new Map<number, (BtInfo & { xPos: number })[]>()
+  const distCache = new Map<number, number>()
+  const distOf = (b: BtInfo) => {
+    let d = distCache.get(b.start)
+    if (d === undefined) {
+      d = btBlockDistanceToTarget(stream, b, targetBlock, pageHeight)
+      distCache.set(b.start, d)
+    }
+    return d
+  }
+  // A block counts as "on" the clicked text when its origin lands within about
+  // one line height of the bbox — enough for baseline/descender slack, tight
+  // enough to exclude a neighbour sharing the same line.
+  const onTarget = Math.max(6, targetBlock.height || 0)
+
+  interface Candidate { blocks: BtInfo[]; score: number; dist: number; order: number }
+  const candidates: Candidate[] = []
+
+  // Line groups — MuPDF often merges several BT blocks into one TextBlock
+  const lineGroups = new Map<number, BtInfo[]>()
   for (const block of allBlocks) {
     const yKey = Math.round(block.yPos * 2) / 2
     if (!lineGroups.has(yKey)) lineGroups.set(yKey, [])
-    lineGroups.get(yKey)!.push(block as BtInfo & { xPos: number })
+    lineGroups.get(yKey)!.push(block)
   }
 
-  // Step 2: For each line group, check if concatenated text contains the target
   for (const [, lineBlocks] of lineGroups) {
-    const lineText = lineBlocks.map(b => b.decodedText).join('')
-    const normalizedLine = lineText.replace(/\s+/g, ' ').trim()
-
-    const isMatch = normalizedLine === normalizedTarget ||
+    const normalizedLine = lineBlocks.map(b => b.decodedText).join('').replace(/\s+/g, ' ').trim()
+    const exact = normalizedLine === normalizedTarget
+    const isMatch = exact ||
                     fuzzyTextMatch(normalizedLine, normalizedTarget) ||
                     (normalizedLine.length > 5 && normalizedTarget.length > 5 &&
                      (normalizedLine.includes(normalizedTarget) || normalizedTarget.includes(normalizedLine)))
-
     if (!isMatch) continue
 
-    if (lineBlocks.length === 1) {
-      return lineBlocks
-    }
-
-    // Multiple blocks on this line — find only the ones that overlap
-    // with the target block's X range
-    const targetX0 = targetBlock.bbox[0]
-    const targetX1 = targetBlock.bbox[2]
-
-    const matching = lineBlocks.filter(b => {
-      // BT block's X position (from Tm) should be within the target's X range
-      // with some tolerance
-      const tolerance = targetBlock.width * 0.3
-      return b.xPos >= targetX0 - tolerance && b.xPos <= targetX1 + tolerance
+    // Keep only the blocks sitting on the clicked text. A line group can hold
+    // unrelated runs (a label and its value); transforming the whole group
+    // would drag the label along.
+    const near = lineBlocks.filter(b => distOf(b) <= onTarget)
+    const picked = near.length > 0 ? near : lineBlocks
+    candidates.push({
+      blocks: picked,
+      score: exact ? 2 : 1,
+      dist: Math.min(...picked.map(distOf)),
+      order: candidates.length
     })
-
-    if (matching.length > 0) return matching
-
-    // If position filtering returned nothing, try text-based single-block match
-    for (const block of lineBlocks) {
-      const nd = block.decodedText.replace(/\s+/g, ' ').trim()
-      if (nd === normalizedTarget) return [block]
-    }
-
-    // Last resort: return the block with the closest X position
-    const sorted = [...lineBlocks].sort((a, b) => {
-      const distA = Math.abs(a.xPos - targetCenterX)
-      const distB = Math.abs(b.xPos - targetCenterX)
-      return distA - distB
-    })
-    return [sorted[0]]
   }
 
-  // Step 3: Fallback to single-block text matching (exact or fuzzy)
+  // Single blocks
   for (const block of allBlocks) {
     if (targetFontRef && block.fontRef !== targetFontRef) continue
     const nd = block.decodedText.replace(/\s+/g, ' ').trim()
     if (!nd || nd.length < 2) continue
-    if (nd === normalizedTarget || fuzzyTextMatch(nd, normalizedTarget)) {
-      return [block]
+    const exact = nd === normalizedTarget
+    if (exact || fuzzyTextMatch(nd, normalizedTarget)) {
+      candidates.push({ blocks: [block], score: exact ? 2 : 1, dist: distOf(block), order: candidates.length })
     }
   }
 
-  return null
+  if (candidates.length === 0) return null
+
+  const bucket = (d: number) => Number.isFinite(d) ? Math.round(d / 8) : Number.MAX_SAFE_INTEGER
+  candidates.sort((a, b) =>
+    bucket(a.dist) - bucket(b.dist) ||
+    b.score - a.score ||
+    b.blocks.length - a.blocks.length || // prefer the fuller line match on a tie
+    a.order - b.order
+  )
+  return candidates[0].blocks
 }
 
 interface BtInfo {
@@ -1831,10 +1918,29 @@ function replaceTextInContentStreamFontAware(
   // Step 1: Parse all BT blocks with position and text info
   const allBlocks = scanBtBlocks(stream, pageIndex)
 
-  // Step 2: Group blocks by Y position and try line-grouped matching FIRST
-  // (MuPDF often groups multiple BT blocks into one TextBlock)
   const normalizedTarget = targetBlock.text.replace(/\s+/g, ' ').trim()
 
+  // The same string routinely appears more than once on a page: an email
+  // subject repeated in the quoted original, a running header, a value in
+  // several table rows. Text alone cannot tell those apart, so EVERY candidate
+  // is collected with its distance to the block the user actually clicked and
+  // the nearest one is applied. Returning the first textual match instead used
+  // to silently rewrite a different paragraph while the clicked one appeared
+  // not to be editable at all.
+  interface Candidate { blocks: BtInfo[]; score: number; dist: number; line: boolean; order: number }
+  const candidates: Candidate[] = []
+  const distCache = new Map<number, number>()
+  const distOf = (b: BtInfo) => {
+    let d = distCache.get(b.start)
+    if (d === undefined) {
+      d = btBlockDistanceToTarget(stream, b, targetBlock, pageHeight)
+      distCache.set(b.start, d)
+    }
+    return d
+  }
+
+  // Step 2: Group blocks by Y position and try line-grouped matching FIRST
+  // (MuPDF often groups multiple BT blocks into one TextBlock)
   const lineGroups = new Map<number, BtInfo[]>()
   for (const block of allBlocks) {
     if (!block.hasPos) continue
@@ -1873,21 +1979,45 @@ function replaceTextInContentStreamFontAware(
     }
 
     if (best) {
-      const replaceResult = applyLineReplacement(stream, best.blocks, newText, pageIndex, targetBlock, pageWidth)
-      if (replaceResult) return replaceResult
+      candidates.push({
+        blocks: best.blocks, score: best.score,
+        dist: distOf(best.blocks[0]), line: true, order: candidates.length
+      })
     }
   }
 
-  // Step 3: Fallback — try single-block matching (for PDFs where each text block is one BT)
+  // Step 3: single-block matching (for PDFs where each text block is one BT)
   for (const block of allBlocks) {
     if (targetFontRef && block.fontRef !== targetFontRef) continue
     const normalizedDecoded = block.decodedText.replace(/\s+/g, ' ').trim()
     if (!normalizedDecoded || normalizedDecoded.length < 2) continue
 
-    if (normalizedDecoded === normalizedTarget || fuzzyTextMatch(normalizedDecoded, normalizedTarget)) {
-      const replaceResult = applyBlockReplacement(stream, [block], newText, pageIndex, targetBlock, pageWidth, pageHeight)
-      if (replaceResult) return replaceResult
+    const exact = normalizedDecoded === normalizedTarget
+    if (exact || fuzzyTextMatch(normalizedDecoded, normalizedTarget)) {
+      candidates.push({
+        blocks: [block], score: exact ? 2 : 1,
+        dist: distOf(block), line: false, order: candidates.length
+      })
     }
+  }
+
+  // Nearest wins. Distances are bucketed so that sub-bucket jitter (a baseline
+  // sitting a couple of points off the bbox) does not outrank a better textual
+  // match, and so the comparator stays a valid total order. Candidates with no
+  // usable position keep their discovery order at the end.
+  const bucket = (d: number) => Number.isFinite(d) ? Math.round(d / 8) : Number.MAX_SAFE_INTEGER
+  candidates.sort((a, b) =>
+    bucket(a.dist) - bucket(b.dist) ||
+    b.score - a.score ||
+    (b.line ? 1 : 0) - (a.line ? 1 : 0) ||
+    a.order - b.order
+  )
+
+  for (const c of candidates) {
+    const result = c.line
+      ? applyLineReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth)
+      : applyBlockReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth, pageHeight)
+    if (result) return result
   }
 
   // Step 4: Target CONTAINED inside a larger BT block (Ghostscript draws a
@@ -1897,12 +2027,16 @@ function replaceTextInContentStreamFontAware(
   const targetCompact = normalizedTarget.replace(/\s+/g, '')
   if (targetCompact.length >= 2) {
     for (const fontFiltered of [true, false]) {
-      for (const block of allBlocks) {
-        if (fontFiltered && targetFontRef && block.fontRef !== targetFontRef) continue
-        if (!fontFiltered && targetFontRef && block.fontRef === targetFontRef) continue
+      const containing = allBlocks.filter(block => {
+        if (fontFiltered && targetFontRef && block.fontRef !== targetFontRef) return false
+        if (!fontFiltered && targetFontRef && block.fontRef === targetFontRef) return false
         const decodedCompact = block.decodedText.replace(/\s+/g, '')
-        if (decodedCompact.length <= targetCompact.length) continue
-        if (!decodedCompact.includes(targetCompact)) continue
+        return decodedCompact.length > targetCompact.length && decodedCompact.includes(targetCompact)
+      })
+      // Same reasoning as above: a repeated string must resolve to the copy the
+      // user clicked, not to whichever block comes first in the stream.
+      containing.sort((a, b) => distOf(a) - distOf(b))
+      for (const block of containing) {
         const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
         if (partial) return partial
       }
