@@ -194,6 +194,28 @@ the group being bounded, so erring high is free.
 PARENT's clip rectangle. Widening the whole invocation chain is not implemented,
 so deeply nested text (Canva) can still lose its last character or two.
 
+### Size guards must count glyphs, not decoded characters
+Rewriting a block that holds far more than the target destroys the rest of it —
+Ghostscript draws a whole table column as one BT, and one edit wiped 29 other
+blocks. Both `applyBlockReplacement` and `applyLineReplacement` refuse in that
+case rather than fall through to a whole-block rewrite: losing the edit is
+recoverable, silently deleting the column is not.
+
+The size must come from `estimateGlyphCount()`, which counts show-op literals in
+the STREAM. Measuring decoded text instead makes the guard blind exactly where
+it is needed most: when a font's ToUnicode is incomplete the decoded text is
+empty or `????` while the block still holds an entire table row.
+
+Font state also survives ET, so `rebuildBtContent` restores the original `Tf`
+after a substitution — otherwise every later block that inherited that font gets
+silently re-fonted.
+
+**Known unfixed:** on a Corel datasheet (`/Corel_OTF … DP` marked content, CID
+font with a 29-entry ToUnicode), replacing `3/4''` still rewrites a whole row —
+702 characters across 36 blocks. The block is matched as a line group and the
+guards above do not catch it; the changed region begins mid-block at a `TD`, so
+the run selection is what is wrong, not the size test.
+
 ### Matching invariant: text alone never identifies a block
 The same string appears more than once on a page all the time — an email
 subject repeated in the quoted original, a running header, a value in several

@@ -1252,7 +1252,13 @@ function rebuildBtContent(
     else tjParts.push(`0 ${(-tdStep).toFixed(2)} Td\n${op}`)
   }
 
-  return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${tmPart}\n${tdPart ? tdPart + '\n' : ''}${tjParts.join('\n')}\n`
+  // Font state survives ET. Swapping this block's Tf for a substituted face
+  // therefore re-fonts every LATER block that relied on inheriting it — one
+  // edit on a Corel datasheet silently changed 702 characters across 36 blocks
+  // that were never touched. Put the original font back on the way out.
+  const restoreTf = (newFontRef && tfMatch) ? `\n${tfMatch[0]}` : ''
+
+  return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${tmPart}\n${tdPart ? tdPart + '\n' : ''}${tjParts.join('\n')}${restoreTf}\n`
 }
 
 type EncodingPlan =
@@ -2210,6 +2216,32 @@ function getBlockOrigin(masked: string): { x: number; y: number; hasPos: boolean
  */
 function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
   const masked = maskStreamLiterals(stream)
+
+  // Font state persists across BT/ET — it is a property of the graphics state,
+  // not of the text object. Corel sets Tf BEFORE the BT and leaves the block
+  // itself fontless: requiring a Tf inside dropped 71 of that page's 95 blocks
+  // outright, so most of the page could not be edited at all.
+  const tfBefore: { at: number; name: string }[] = []
+  const tfRe = /\/([^\s<>[\]()/%]+)\s+[\d.-]+\s+Tf/g
+  {
+    let t: RegExpExecArray | null
+    const maskedTf = /\/[ ]*\s+[\d.-]+\s+Tf/g
+    while ((t = maskedTf.exec(masked)) !== null) {
+      const nameMatch = stream.slice(t.index).match(/^\/([^\s<>[\]()/%]+)/)
+      if (nameMatch) tfBefore.push({ at: t.index, name: nameMatch[1] })
+    }
+  }
+  void tfRe
+  /** Font in force at a stream offset. */
+  const fontAt = (offset: number): string | null => {
+    let found: string | null = null
+    for (const t of tfBefore) {
+      if (t.at > offset) break
+      found = t.name
+    }
+    return found
+  }
+
   const re = /(?<![A-Za-z0-9])BT(?![A-Za-z0-9])([\s\S]*?)(?<![A-Za-z0-9])ET(?![A-Za-z0-9])/g
   const out: BtInfo[] = []
   let m: RegExpExecArray | null
@@ -2219,20 +2251,27 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
     const content = stream.slice(start + 2, end - 2)
     const maskedContent = masked.slice(start + 2, end - 2)
 
-    const fontMatch = maskedContent.match(/\/[ ]*\s+[\d.]+\s+Tf/)
-    // Read the actual font name from the original at the same offset
+    const fontMatch = maskedContent.match(/\/[ ]*\s+[\d.-]+\s+Tf/)
     let fontRef: string | null = null
     if (fontMatch) {
       const nameMatch = content.slice(fontMatch.index).match(/^\/([^\s<>[\]()/%]+)/)
       fontRef = nameMatch ? nameMatch[1] : null
     }
+    // No Tf inside: inherit whatever was in force when the block opened.
+    if (!fontRef) fontRef = fontAt(start)
     if (!fontRef) continue
 
     const origin = getBlockOrigin(maskedContent)
 
     const encoding = getFontEncoding(pageIndex, fontRef)
     const mode = detectBlockEncoding(content)
-    const decodedText = decodeBtBlockText(content, encoding, getSimpleFontInfo(pageIndex, fontRef))
+    const decodedText = decodeBtBlockText(
+      content, encoding, getSimpleFontInfo(pageIndex, fontRef),
+      (name) => ({
+        encoding: getFontEncoding(pageIndex, name),
+        simpleInfo: getSimpleFontInfo(pageIndex, name)
+      })
+    )
 
     out.push({
       content,
@@ -2586,6 +2625,23 @@ function replaceTextInContentStreamFontAware(
 }
 
 /**
+ * Rough glyph count for a BT block, straight from the show-op literals.
+ *
+ * Deliberately independent of decoding: the size guards must work even when a
+ * font's ToUnicode is missing and the decoded text is empty or all '?'.
+ */
+function estimateGlyphCount(content: string): number {
+  let n = 0
+  const re = new RegExp(`(${STR_LIT_SRC})|(${HEX_LIT_SRC})`, 'g')
+  let m: RegExpExecArray | null
+  while ((m = re.exec(content)) !== null) {
+    if (m[1] !== undefined) n += Math.max(m[1].length - 2, 0)
+    else n += Math.floor(Math.max(m[2].replace(/\s+/g, '').length - 2, 0) / 2)
+  }
+  return n
+}
+
+/**
  * Apply replacement to a single matched BT block.
  */
 function applyBlockReplacement(
@@ -2603,11 +2659,19 @@ function applyBlockReplacement(
   // several lines via Td/'), replacing the whole block would wipe the other
   // lines — replace only the show-ops that correspond to the target.
   if (targetBlock) {
-    const blockNorm = block.decodedText.replace(/\s+/g, ' ').trim()
     const targetNorm = targetBlock.text.replace(/\s+/g, ' ').trim()
-    if (targetNorm && blockNorm.length > targetNorm.length * 1.4) {
+    // Glyph count from the stream, not decoded length: when a font's ToUnicode
+    // is incomplete the decoded text is empty or '????' while the block still
+    // holds an entire table row, and a decoded-length test waves it through.
+    const blockGlyphs = estimateGlyphCount(block.content)
+    if (targetNorm && blockGlyphs > targetNorm.length * 1.4) {
       const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
       if (partial) return partial
+      // Falling through would rewrite the WHOLE block, and this block holds far
+      // more than the target: Ghostscript draws an entire table column as one
+      // BT, so one edit destroyed 29 other blocks. Refusing the edit is bad;
+      // silently deleting the rest of the column is far worse.
+      return null
     }
   }
 
@@ -2766,6 +2830,21 @@ function applyLineReplacement(
   const primaryIdx = sorted.findIndex(contributes)
   if (primaryIdx === -1) return null
   const primary = sorted[primaryIdx]
+
+  // Every block here except the primary gets blanked, so refuse when the run
+  // carries far more text than the target: a bad line-group match on a Corel
+  // datasheet wiped 702 characters across 36 blocks. Losing the edit is
+  // recoverable; losing the page is not.
+  if (targetBlock) {
+    // Counted from the STREAM, not from decoded text. When a font's ToUnicode
+    // is incomplete our decoder returns '' or '????' for glyphs that are
+    // perfectly real on the page, so a decoded-length guard measured a 702
+    // character run as empty and let it through. Glyph counts do not depend on
+    // being able to read the text.
+    const runGlyphs = sorted.reduce((n, b) => n + estimateGlyphCount(b.content), 0)
+    const targetLen = targetBlock.text.replace(/\s+/g, ' ').trim().length
+    if (targetLen > 0 && runGlyphs > targetLen * 2.5 + 16) return null
+  }
 
   // Build replacements (process from end to start to preserve offsets)
   const replacements: { start: number; end: number; newContent: string }[] = []
@@ -2969,10 +3048,16 @@ const HEX_LIT_SRC = String.raw`<[0-9A-Fa-f\s]*>`
 function decodeBtBlockText(
   block: string,
   encoding: { glyphToUnicode: Map<number, number>; codeBytes?: number } | null,
-  simpleInfo?: SimpleFontInfo | null
+  simpleInfo?: SimpleFontInfo | null,
+  /**
+   * Resolves a font name mid-block. One BT can switch fonts several times —
+   * WeasyPrint emits three Tf per block — and decoding the whole thing with the
+   * first font's CMap turns every run in the other fonts into '?'.
+   */
+  resolveFont?: (name: string) => { encoding: ReturnType<typeof getFontEncoding>; simpleInfo: SimpleFontInfo | null }
 ): string {
   let text = ''
-  const stride = (encoding?.codeBytes === 1 ? 1 : 2) * 2
+  let stride = (encoding?.codeBytes === 1 ? 1 : 2) * 2
 
   // Map raw plain-string bytes through the font's simple encoding (MacRoman/WinAnsi)
   function mapPlainBytes(s: string): string {
@@ -3001,12 +3086,26 @@ function decodeBtBlockText(
   // Glyph-coded fonts (symbolic subsets with a ToUnicode CMap but no simple
   // encoding — Ghostscript output) draw PLAIN strings whose bytes are CMap
   // codes, not ASCII: route those through the CMap too.
-  const glyphCodedPlain = !!encoding && (!simpleInfo || simpleInfo.encodingName === 'Unknown')
-  const plainCodeBytes = encoding?.codeBytes === 2 ? 2 : 1
+  let glyphCodedPlain = !!encoding && (!simpleInfo || simpleInfo.encodingName === 'Unknown')
+  let plainCodeBytes = encoding?.codeBytes === 2 ? 2 : 1
 
-  const litRe = new RegExp(`(${STR_LIT_SRC})|(${HEX_LIT_SRC})`, 'g')
+  // Walk literals AND Tf operators in order, so a font switch inside the block
+  // takes effect for the runs that follow it.
+  const litRe = new RegExp(
+    `(${STR_LIT_SRC})|(${HEX_LIT_SRC})|\/([^\s<>\[\]()/%]+)\s+[\d.-]+\s+Tf`, 'g')
   let m: RegExpExecArray | null
   while ((m = litRe.exec(block)) !== null) {
+    if (m[3] !== undefined) {
+      if (resolveFont) {
+        const next = resolveFont(m[3])
+        encoding = next.encoding
+        simpleInfo = next.simpleInfo
+        stride = (encoding?.codeBytes === 1 ? 1 : 2) * 2
+        glyphCodedPlain = !!encoding && (!simpleInfo || simpleInfo.encodingName === 'Unknown')
+        plainCodeBytes = encoding?.codeBytes === 2 ? 2 : 1
+      }
+      continue
+    }
     if (m[1] !== undefined) {
       const raw = unescapePdfString(m[1].slice(1, -1))
       if (glyphCodedPlain) {
