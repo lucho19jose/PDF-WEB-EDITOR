@@ -1594,7 +1594,7 @@ function findGoverningTm(
       const norm = acc.replace(/\s+/g, ' ').trim()
       if (norm.length > targetNorm.length * 1.5 + 8) break
       if (!norm) continue
-      const ratio = Math.min(norm.length, targetNorm.length) / Math.max(norm.length, targetNorm.length)
+      const ratio = matchRatio(norm, targetNorm)
       if (ratio < 0.7) continue
       let score = 0
       if (norm === targetNorm) score = 2
@@ -1934,10 +1934,12 @@ function findBtBlocksByPosition(
   for (const [, lineBlocks] of lineGroups) {
     const normalizedLine = lineBlocks.map(b => b.decodedText).join('').replace(/\s+/g, ' ').trim()
     const exact = normalizedLine === normalizedTarget
+    const foldedLine = foldForMatch(normalizedLine)
+    const foldedTarget = foldForMatch(normalizedTarget)
     const isMatch = exact ||
                     fuzzyTextMatch(normalizedLine, normalizedTarget) ||
-                    (normalizedLine.length > 5 && normalizedTarget.length > 5 &&
-                     (normalizedLine.includes(normalizedTarget) || normalizedTarget.includes(normalizedLine)))
+                    (foldedLine.length > 5 && foldedTarget.length > 5 &&
+                     (foldedLine.includes(foldedTarget) || foldedTarget.includes(foldedLine)))
     if (!isMatch) continue
 
     // Keep only the blocks sitting on the clicked text. A line group can hold
@@ -2062,8 +2064,7 @@ function replaceTextInContentStreamFontAware(
         const norm = acc.replace(/\s+/g, ' ').trim()
         if (norm.length > normalizedTarget.length * 1.5 + 8) break // overshot the target
         if (!norm) continue
-        const ratio = Math.min(norm.length, normalizedTarget.length) /
-                      Math.max(norm.length, normalizedTarget.length)
+        const ratio = matchRatio(norm, normalizedTarget)
         if (ratio < 0.7) continue
         let score = 0
         if (norm === normalizedTarget) score = 2
@@ -2120,13 +2121,13 @@ function replaceTextInContentStreamFontAware(
   // whole table column as one BT with each cell its own show-op — a short
   // cell like "16:00" never fuzzy-matches the whole block). Replace just the
   // matching show-ops, picking the occurrence nearest the clicked position.
-  const targetCompact = normalizedTarget.replace(/\s+/g, '')
+  const targetCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '')
   if (targetCompact.length >= 2) {
     for (const fontFiltered of [true, false]) {
       const containing = allBlocks.filter(block => {
         if (fontFiltered && targetFontRef && block.fontRef !== targetFontRef) return false
         if (!fontFiltered && targetFontRef && block.fontRef === targetFontRef) return false
-        const decodedCompact = block.decodedText.replace(/\s+/g, '')
+        const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '')
         return decodedCompact.length > targetCompact.length && decodedCompact.includes(targetCompact)
       })
       // Same reasoning as above: a repeated string must resolve to the copy the
@@ -2140,6 +2141,10 @@ function replaceTextInContentStreamFontAware(
     }
   }
 
+  // Nothing matched. Report what was actually on the page so the next
+  // unsupported generator can be classified without re-instrumenting the worker.
+  console.warn('[MuPDF Worker] no BT match for', JSON.stringify(normalizedTarget.slice(0, 60)),
+    `— ${allBlocks.length} blocks, ${lineGroups.size} lines, font ${targetFontRef ?? 'any'}`)
   return null
 }
 
@@ -2194,6 +2199,9 @@ function applyBlockReplacement(
   }
 
   if (newContent !== block.content) {
+    // The whole block was rewritten, so any /ActualText describing the old
+    // glyphs is now a lie that extraction would report instead of the new text.
+    newContent = stripActualText(newContent)
     const result = stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
                    stream.substring(block.end)
     return { stream: result, substitutedFont }
@@ -2311,8 +2319,14 @@ function applyLineReplacement(
   // Sort by position in stream (ascending)
   const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
 
-  // Find the first block with substantial text to put replacement in
-  const primaryIdx = sorted.findIndex(b => b.hasSubstantialText)
+  // Any block carrying a visible glyph counts, NOT just those with >1 character.
+  // Small-caps exports put a single letter in each BT block ("L", ".", ","), and
+  // treating those as noise left them undeleted next to the replacement — the
+  // line came out as "LZZZ." instead of "ZZZ".
+  const contributes = (b: BtInfo) => b.decodedText.trim().length > 0
+
+  // Find the first block with visible text to put the replacement in
+  const primaryIdx = sorted.findIndex(contributes)
   if (primaryIdx === -1) return null
   const primary = sorted[primaryIdx]
 
@@ -2348,12 +2362,16 @@ function applyLineReplacement(
       } else {
         newContent = replaceTjInBlock(block.content, plan.byteLines[0], 'plain')
       }
-    } else if (block.hasSubstantialText) {
+    } else if (contributes(block)) {
       // Other blocks with text: blank them
       newContent = replaceTjInBlock(block.content, '', block.mode, block.mode === 'hex' ? '' : undefined)
     } else {
-      continue // Skip space-only blocks
+      continue // Skip whitespace-only blocks — nothing visible to erase
     }
+
+    // The glyphs these spans described are gone; leaving the overrides behind
+    // makes extraction report the old text over the new.
+    newContent = stripActualText(newContent)
 
     replacements.push({ start: block.start, end: block.end, newContent })
   }
@@ -2371,28 +2389,90 @@ function applyLineReplacement(
  * Fuzzy text match that accounts for '?' placeholders in decoded text
  * (from missing CMap entries). Also handles substring matching.
  */
+/**
+ * Comparison form for matching text decoded from the content stream against the
+ * text MuPDF extracted.
+ *
+ * Case is folded because SMALL-CAPS fonts store every letter as a capital glyph
+ * and only vary the Tf size — LibreOffice exports "El Principito" as
+ * `20 Tf <E> 14 Tf <L> …`, so the raw stream decodes to "EL PRINCIPITO" while
+ * MuPDF, honouring the `/Span <</ActualText (l)>>` marked content, reports
+ * "El Principito". Comparing case-sensitively made every such block
+ * uneditable.
+ *
+ * Discrimination lost to folding is recovered by the position ranking in the
+ * callers: a case-only difference no longer blocks a match, but the nearest
+ * candidate to the click still wins.
+ */
+function foldForMatch(s: string): string {
+  return s.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+/**
+ * Length used to score a candidate run against the target.
+ *
+ * '?' placeholders (glyphs absent from the ToUnicode CMap) are dropped first.
+ * Scoring on raw length rewarded a run for shedding its FIRST letter whenever
+ * the full run carried an unmapped glyph: "ANTOINE DE SAINT-EXUP??ÉRY" scored
+ * worse than "NTOINE DE SAINT-EXUP??ÉRY" against "Antoine de Saint-Exupéry",
+ * so the leading "A" was left behind un-replaced.
+ */
+function matchLength(s: string): number {
+  return foldForMatch(s).replace(/\?/g, '').length
+}
+
+/**
+ * Drop `/ActualText` overrides from marked-content property dictionaries.
+ *
+ * LibreOffice small-caps exports wrap every single glyph in
+ * `/Span <</ActualText (d) >> BDC … EMC`, and that string — not the glyph — is
+ * what text extraction reports. Once the glyphs underneath are replaced the
+ * override still claims the ORIGINAL letters, so the page renders the new text
+ * while every extractor (this engine included, which then cannot find the block
+ * again) keeps reading the old one. The dictionary itself is left in place so
+ * any /MCID inside it still resolves against the structure tree.
+ */
+function stripActualText(content: string): string {
+  return content.replace(
+    /\/ActualText\s*(?:\((?:\\.|[^()\\])*\)|<[0-9A-Fa-f\s]*>)/g,
+    ''
+  )
+}
+
+/** Size-similarity of a candidate run to the target, ignoring case and '?'. */
+function matchRatio(candidate: string, target: string): number {
+  const a = matchLength(candidate)
+  const b = matchLength(target)
+  if (a === 0 || b === 0) return 0
+  return Math.min(a, b) / Math.max(a, b)
+}
+
 function fuzzyTextMatch(decoded: string, target: string): boolean {
   // Exact match
   if (decoded === target) return true
 
+  const d = foldForMatch(decoded)
+  const t = foldForMatch(target)
+  if (d && d === t) return true
+
   // Strip '?' from decoded and compare known characters
-  const knownChars = decoded.replace(/\?/g, '')
+  const knownChars = d.replace(/\?/g, '')
   if (knownChars.length < 3) return false
 
   // Check if decoded is a substantial substring of target (or vice versa)
   // This handles cases where MuPDF groups multiple BT blocks into one text block
-  if (target.includes(decoded) && decoded.length > 5) return true
-  if (decoded.includes(target) && target.length > 5) return true
+  if (t.includes(d) && d.length > 5) return true
+  if (d.includes(t) && t.length > 5) return true
 
   // Check if target length is similar (within 40% tolerance)
-  const lenRatio = Math.min(decoded.length, target.length) / Math.max(decoded.length, target.length)
+  const lenRatio = Math.min(d.length, t.length) / Math.max(d.length, t.length)
   if (lenRatio < 0.6) return false
 
   // Check if known (non-?) characters appear in order in the target
   let targetIdx = 0
   let matchCount = 0
-  for (let i = 0; i < knownChars.length && targetIdx < target.length; i++) {
-    const found = target.indexOf(knownChars[i], targetIdx)
+  for (let i = 0; i < knownChars.length && targetIdx < t.length; i++) {
+    const found = t.indexOf(knownChars[i], targetIdx)
     if (found !== -1 && found - targetIdx <= 3) {
       matchCount++
       targetIdx = found + 1
@@ -2810,7 +2890,7 @@ function applyPartialBlockReplacement(
       const norm = acc.replace(/\s+/g, ' ').trim()
       if (norm.length > targetNorm.length * 1.5 + 8) break
       if (!norm) continue
-      const ratio = Math.min(norm.length, targetNorm.length) / Math.max(norm.length, targetNorm.length)
+      const ratio = matchRatio(norm, targetNorm)
       if (ratio < 0.7) continue
       let score = 0
       if (norm === targetNorm) score = 2

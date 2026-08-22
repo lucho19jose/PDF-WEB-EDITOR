@@ -155,6 +155,33 @@ locates the show-op run matching the target and walks back to the last Tm
 before it. A plain `content.match(/… Tm/)` grabs the first one and drags the
 wrong line (moving "GUÍA DE REMISIÓN ELECTRÓNICA" moved "RUC N°…" instead).
 
+### Small caps: fold case, and never trust /ActualText after an edit
+LibreOffice small-caps exports (Elejandría ebooks) draw every letter as a
+CAPITAL glyph and fake lowercase with a smaller `Tf` — one visual line becomes
+~24 BT blocks alternating 20pt/14pt, each letter wrapped in
+`/Span <</ActualText (l)>> BDC … EMC`. Three consequences, all of which made
+such pages completely uneditable:
+
+1. The stream decodes to `EL PRINCIPITO` while MuPDF, honouring ActualText,
+   reports `El Principito`. All text comparison therefore goes through
+   `foldForMatch()` (case-folded, whitespace-collapsed). The discrimination
+   this costs is bought back by the position ranking above.
+2. Run scoring uses `matchRatio()`, which measures length AFTER folding and
+   dropping `?` placeholders. Scoring on raw length rewarded a run for shedding
+   its first letter whenever the full run contained an unmapped glyph, leaving
+   a stray "A" in front of the replacement.
+3. `applyLineReplacement` counts any block with a visible glyph, NOT just
+   `hasSubstantialText` (>1 char). One-character blocks are the norm here, and
+   skipping them left "L", "." and "," stranded beside the new text.
+
+After rewriting glyphs, `stripActualText()` must run on the block: the override
+describes the OLD letters, so extraction (including this engine's own next
+`getTextBlocks`) reports them instead of what was actually drawn.
+
+**Known limitation:** when a font is substituted, MuPDF's re-extraction can
+report spurious spaces inside the new run ("Texto  editado corr ect amente").
+The render and the saved PDF are correct; only the block list is affected.
+
 ### Moving text must move its clip window
 Browser print-to-PDF wraps each page header/footer in its own
 `q <x y w h> re W* n  q <scale> cm  BT … ET  Q Q`, and the band is barely
