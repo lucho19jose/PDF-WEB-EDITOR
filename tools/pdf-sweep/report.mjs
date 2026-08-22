@@ -46,7 +46,10 @@ for (const f of features) {
     success: e.success,
     landed_exactly: e.landed_exactly ?? null,
     vanished: e.vanished ?? null,
-    collateral_blocks: e.collateral_blocks,
+    // 0 = nothing but the target's own characters changed anywhere on the page
+    char_delta: e.char_delta ?? null,
+    // blocks whose text or position moved; ~1 is correct, many means over-reach
+    blocks_touched: e.blocks_touched ?? null,
     block_count_delta: e.block_count_delta,
     substituted_font: e.substituted_font ?? null,
     clip_adjusted: e.clip_adjusted ?? null,
@@ -153,7 +156,8 @@ for (const f of features) {
       substituted_font: e.substituted_font,
       reported_success: e.reported_success,
       success: e.success,
-      collateral_blocks: e.collateral_blocks,
+      char_delta: e.char_delta,
+      blocks_touched: e.blocks_touched,
       block_count_delta: e.block_count_delta,
       visual_similarity: e.visual_similarity,
       geometry_error: e.geometry_error,

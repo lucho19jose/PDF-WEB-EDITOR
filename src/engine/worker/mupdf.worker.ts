@@ -547,6 +547,8 @@ interface ContentSource {
   /** Resource dict fonts in this stream resolve against. */
   resources: any
   write(bytes: Uint8Array): void
+  /** The Form XObject dict, when this source is one — its /BBox bounds the text. */
+  formDict?: any
 }
 
 const MAX_XOBJECT_DEPTH = 4
@@ -638,7 +640,8 @@ function getContentSources(pageIndex: number): ContentSource[] {
             key: 'xobj:' + key,
             stream: text,
             resources: childRes ?? pageRes,
-            write: (bytes) => { target.writeStream(bytes) }
+            write: (bytes) => { target.writeStream(bytes) },
+            formDict: resolved
           })
         }
         walk(text, childRes ?? pageRes, key, depth + 1)
@@ -1533,8 +1536,47 @@ function replaceTextInStream(
       if (!outcome) continue
       if ('error' in outcome) { lastError = outcome.error; continue }
 
-      // Latin-1 write-back (byte-transparent) preserves raw bytes like 0xF1.
-      const streamStr = outcome.stream
+      // Longer text needs a wider window, or the tail is clipped away and lost.
+      // The clip sits at a LOWER offset than the block it bounds, and the
+      // replacement only rewrote bytes at/after that block, so the offset found
+      // in the original stream is still valid in the rewritten one.
+      let streamStr = outcome.stream
+      if (outcome.anchorOffset !== undefined && newText.length > 0) {
+        const oldLen = Math.max(targetBlock.text.trim().length, 1)
+        const avgCharWidth = targetBlock.width / oldLen
+        // Deliberately generous. The average is taken over the ORIGINAL glyphs,
+        // and a substituted base-14 face is usually wider — sizing the window to
+        // the old average left "SWEEPMARK2" clipped to "SWEEP M". Over-widening
+        // only reveals more of the group the clip bounds, which is the text run
+        // itself, so erring high is free.
+        const needed = avgCharWidth * newText.length * 1.6 + 8
+        // Every clip in force, highest offset first so each splice leaves the
+        // earlier offsets valid.
+        const clips = getActiveClipsAtOffset(src.stream, outcome.anchorOffset)
+          .filter(c => c.index < outcome.anchorOffset!)
+          .sort((a, b) => b.index - a.index)
+        for (const clip of clips) {
+          const widened = widenClipForText(src.stream, clip, targetBlock, needed, pageHeight)
+          if (widened) {
+            streamStr = streamStr.slice(0, clip.index) + widened +
+                        streamStr.slice(clip.index + clip.length)
+          }
+        }
+
+        // A Form XObject is clipped to its own /BBox even without a `re W n`.
+        // Canva nests its text two forms deep in a box sized to the original
+        // string, so a wider replacement was cut off there instead —
+        // "Plataforma" came back as "SWEEPMA".
+        //
+        // The BBox lives in the form's coordinate space, and the chain that maps
+        // that to the page is not tracked here, so the box is grown by the same
+        // RATIO the text grew by. Widening a form's BBox can only reveal more of
+        // that form's own content, so a generous, capped factor is safe.
+        if (src.formDict && needed > targetBlock.width) {
+          widenFormBBox(src.formDict, Math.min(needed / Math.max(targetBlock.width, 1), 3))
+        }
+      }
+
       const streamBytes = new Uint8Array(streamStr.length)
       for (let i = 0; i < streamStr.length; i++) {
         streamBytes[i] = streamStr.charCodeAt(i) & 0xFF
@@ -1544,7 +1586,7 @@ function replaceTextInStream(
       return {
         success: true,
         substitutedFont: outcome.substitutedFont,
-        strategy: (src.key === 'page' ? '' : 'xobject:') + (outcome.strategy ?? '')
+        strategy: (src.key === 'page' ? '' : src.key + ':') + (outcome.strategy ?? '')
       }
     }
 
@@ -1748,8 +1790,8 @@ function transformInSource(
       // Carry the clip window along. Without this, text drawn inside a tight
       // `re W* n` band (browser page headers/footers) simply disappears as soon
       // as the drag exceeds a few points.
-      const clip = getActiveClipAtOffset(stream, block.start)
-      if (clip && !clipsDone.has(clip.index)) {
+      for (const clip of getActiveClipsAtOffset(stream, block.start)) {
+        if (clipsDone.has(clip.index)) continue
         clipsDone.add(clip.index)
         const newRect = expandClipForTransform(stream, clip, dx, dy, sx, sy, anchorX, anchorY)
         if (newRect) {
@@ -1776,7 +1818,7 @@ function transformInSource(
     invalidateContentSources(pageIndex)
     return {
       success: true,
-      strategy: (src.key === 'page' ? '' : 'xobject:') + (usedStrategy ?? ''),
+      strategy: (src.key === 'page' ? '' : src.key + ':') + (usedStrategy ?? ''),
       clipAdjusted
     }
   } catch (err: any) {
@@ -1968,24 +2010,89 @@ function btBlockDistanceToTarget(
  * Only the simple `x y w h re W[*] n` form is recognised; anything more
  * complex returns null and the caller leaves the clip alone.
  */
-function getActiveClipAtOffset(
+function getActiveClipsAtOffset(
   stream: string,
   offset: number
-): { index: number; length: number; rect: [number, number, number, number] } | null {
-  type Clip = { index: number; length: number; rect: [number, number, number, number] } | null
+): { index: number; length: number; rect: [number, number, number, number] }[] {
+  type Clip = { index: number; length: number; rect: [number, number, number, number] }
   const masked = maskStreamLiterals(stream.slice(0, offset))
-  const stack: Clip[] = []
-  let current: Clip = null
+  // Depth marks, not array copies: a Q only ever pops clips added since the
+  // matching q, so truncating to the saved length restores the state in O(1).
+  // Copying the array per q was O(n^2) and crawled on streams with hundreds of
+  // graphics-state saves.
+  const depths: number[] = []
+  const current: Clip[] = []
 
   const re = /((-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re)\s+W\*?\s+n\b|(?:^|[\s\]>])([qQ])(?=[\s(<\[/%]|$)/g
   let m: RegExpExecArray | null
   while ((m = re.exec(masked)) !== null) {
-    if (m[6] === 'q') { stack.push(current); continue }
-    if (m[6] === 'Q') { current = stack.length > 0 ? stack.pop()! : null; continue }
-    // A new clip intersects whatever was active; the innermost one is what bounds the text.
-    current = { index: m.index, length: m[1].length, rect: [+m[2], +m[3], +m[4], +m[5]] }
+    if (m[6] === 'q') { depths.push(current.length); continue }
+    if (m[6] === 'Q') { current.length = depths.length > 0 ? depths.pop()! : 0; continue }
+    // Clips INTERSECT, they do not replace one another. Word nests the SAME
+    // rectangle twice around a table cell, so widening only the innermost left
+    // the outer one still cutting the text off.
+    current.push({ index: m.index, length: m[1].length, rect: [+m[2], +m[3], +m[4], +m[5]] })
   }
   return current
+}
+
+/** Grow a Form XObject's /BBox to the right by `ratio`, so wider text still shows. */
+function widenFormBBox(formDict: any, ratio: number): void {
+  if (!pdfDoc || !(ratio > 1)) return
+  try {
+    const bbox = formDict.get('BBox')
+    if (!bbox || String(bbox) === 'null') return
+    const arr = bbox.resolve ? bbox.resolve() : bbox
+    if (arr.length !== 4) return
+    const v = [0, 1, 2, 3].map(i => Number(String(arr.get(i))))
+    if (v.some(n => !Number.isFinite(n))) return
+    const x0 = Math.min(v[0], v[2]), x1 = Math.max(v[0], v[2])
+    const grown = x0 + (x1 - x0) * ratio
+    if (!(grown > x1)) return
+    const out = pdfDoc.newArray()
+    out.push(pdfDoc.newReal(x0))
+    out.push(pdfDoc.newReal(Math.min(v[1], v[3])))
+    out.push(pdfDoc.newReal(grown))
+    out.push(pdfDoc.newReal(Math.max(v[1], v[3])))
+    formDict.put('BBox', out)
+  } catch (_) { /* leave the box alone rather than corrupt it */ }
+}
+
+/**
+ * Widened `x y w h re` when replacement text will not fit the clip it is drawn
+ * inside, or null when it already fits.
+ *
+ * Word table cells and Canva text boxes bound each run with a clip barely wider
+ * than the original string. Longer replacement text is then cut off mid-word —
+ * "Plataforma" edited to "SWEEPMARK0" came back as "SWEEPMA" — which is silent
+ * data loss, since the characters are in the file but can never be seen or
+ * found again.
+ */
+function widenClipForText(
+  stream: string,
+  clip: { index: number; length: number; rect: [number, number, number, number] },
+  targetBlock: TextBlock,
+  newWidthPage: number,
+  pageHeight: number
+): string | null {
+  const ctm = getCtmAtOffset(stream, clip.index)
+  const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
+  if (Math.abs(det) < 1e-9) return null
+  const ia = ctm[3] / det, ib = -ctm[1] / det
+  const ic = -ctm[2] / det, id = ctm[0] / det
+
+  // Required right edge, page space (top-left) -> user space -> clip space.
+  const ux = targetBlock.bbox[0] + newWidthPage
+  const uy = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2
+  const ax = ux - ctm[4], ay = uy - ctm[5]
+  const lx = ax * ia + ay * ic
+  const ly = ax * ib + ay * id
+  void ly
+
+  const [rx, ry, rw, rh] = clip.rect
+  const x0 = Math.min(rx, rx + rw), x1 = Math.max(rx, rx + rw)
+  if (!Number.isFinite(lx) || lx <= x1 + 0.5) return null
+  return `${fmtNum(x0)} ${fmtNum(ry)} ${fmtNum(lx - x0)} ${fmtNum(rh)} re`
 }
 
 /**
@@ -2323,7 +2430,7 @@ function replaceTextInContentStreamFontAware(
   targetFontRef: string | null,
   pageWidth?: number,
   pageHeight?: number
-): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
   // Step 1: Parse all BT blocks with position and text info
   const allBlocks = scanBtBlocks(stream, pageIndex)
 
@@ -2426,7 +2533,10 @@ function replaceTextInContentStreamFontAware(
       ? applyLineReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth)
       : applyBlockReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth, pageHeight)
     if (result) {
-      if (!('error' in result)) result.strategy = c.line ? 'line_group' : 'single_block'
+      if (!('error' in result)) {
+        result.strategy = c.line ? 'line_group' : 'single_block'
+        result.anchorOffset = c.blocks[0].start
+      }
       return result
     }
   }
@@ -2450,7 +2560,10 @@ function replaceTextInContentStreamFontAware(
       for (const block of containing) {
         const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
         if (partial) {
-          if (!('error' in partial)) partial.strategy = 'partial_block'
+          if (!('error' in partial)) {
+            partial.strategy = 'partial_block'
+            partial.anchorOffset = block.start
+          }
           return partial
         }
       }
@@ -2483,7 +2596,7 @@ function applyBlockReplacement(
   targetBlock?: TextBlock,
   pageWidth?: number,
   pageHeight?: number
-): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
   const block = blocks[0]
 
   // If this BT block holds much MORE text than the target (one BT drawing
@@ -2561,7 +2674,7 @@ function applyWrappedReplacement(
   targetBlock: TextBlock,
   pageWidth: number,
   pageIndex: number
-): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
   const origText = targetBlock.text
   const blockWidth = targetBlock.width
   const avgCharWidth = blockWidth / Math.max(origText.length, 1)
@@ -2639,7 +2752,7 @@ function applyLineReplacement(
   pageIndex: number,
   targetBlock?: TextBlock,
   pageWidth?: number
-): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
   // Sort by position in stream (ascending)
   const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
 
@@ -3178,7 +3291,7 @@ function applyPartialBlockReplacement(
   pageIndex: number,
   targetBlock: TextBlock,
   pageHeight?: number
-): { stream: string; substitutedFont?: string; strategy?: string } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
   const simpleInfo = getSimpleFontInfo(pageIndex, block.fontRef)
   const ops = scanShowOps(block.content, block.encoding, simpleInfo)
   if (ops.length < 1) return null

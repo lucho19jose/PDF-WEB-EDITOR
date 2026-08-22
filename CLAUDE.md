@@ -179,6 +179,21 @@ A regex that only knows the first does not merely miss the second — it
 re-matches triples of entries INSIDE the array and invents mappings, which is
 why Qt output decoded as `????????` and could not be edited at all.
 
+### Replacement text has to be given room
+Longer text is silently truncated by whatever bounds it, and the characters are
+then in the file but invisible and unfindable. `replaceTextInStream` widens two
+things: every clip rectangle in force at the match (clips INTERSECT — Word
+nests the same rect twice around a table cell, so widening only the innermost
+achieves nothing) and, for a Form XObject source, the form's own `/BBox`.
+
+Both are sized generously: the width estimate averages the ORIGINAL glyphs and
+a substituted base-14 face is usually wider. Over-widening only reveals more of
+the group being bounded, so erring high is free.
+
+**Known limitation:** a form invoked by another form is also clipped by the
+PARENT's clip rectangle. Widening the whole invocation chain is not implemented,
+so deeply nested text (Canva) can still lose its last character or two.
+
 ### Matching invariant: text alone never identifies a block
 The same string appears more than once on a page all the time — an email
 subject repeated in the quoted original, a running header, a value in several

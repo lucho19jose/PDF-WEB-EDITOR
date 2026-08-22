@@ -67,10 +67,25 @@ function nearest(blocks, bbox) {
   return bestD < 40 ? best : null
 }
 
-async function loadStaged(staged, timeoutMs = 45000) {
+/**
+ * Load a PDF for experiments.
+ *
+ * `engineOnly` skips the viewer entirely. Going through the app's drop handler
+ * also renders the page canvas and a thumbnail per page, which for a 173-page
+ * book or a Visio diagram costs minutes and has nothing to do with the
+ * content-stream behaviour under test. The visual-similarity check needs the
+ * viewer, so it is only available when engineOnly is off.
+ */
+async function loadStaged(staged, { engineOnly = false } = {}, timeoutMs = 45000) {
   const doc = store('document')
   const res = await fetch('/_sweep/' + staged)
   const buf = await res.arrayBuffer()
+
+  if (engineOnly) {
+    const pages = await window.__pdfEngine.loadDocument(buf.slice(0))
+    return { pages }
+  }
+
   const dt = new DataTransfer()
   dt.items.add(new File([buf], staged, { type: 'application/pdf' }))
   const before = doc.pdfBytes
@@ -94,10 +109,22 @@ function candidates(blocks, max) {
   return out
 }
 
+const RENDER_TIMEOUT_MS = 20000
+
+/**
+ * Rasterise a page, giving up after RENDER_TIMEOUT_MS.
+ *
+ * PDF.js needs over a minute on a Visio page built from 230 Form XObjects and
+ * 464 q/Q pairs. That is a rendering-layer cost, not a content-stream one, but
+ * without a bound it stalls the whole sweep on a single document.
+ */
 async function renderToImageData(pageNo) {
   const canvas = document.createElement('canvas')
-  const r = await window.__pdfViewer.renderPage(canvas, pageNo)
-  if (!r) return null
+  const r = await Promise.race([
+    window.__pdfViewer.renderPage(canvas, pageNo).catch(() => null),
+    new Promise(res => setTimeout(() => res('timeout'), RENDER_TIMEOUT_MS))
+  ])
+  if (!r || r === 'timeout') return r === 'timeout' ? 'timeout' : null
   const ctx = canvas.getContext('2d', { willReadFrequently: true })
   return { data: ctx.getImageData(0, 0, canvas.width, canvas.height), w: canvas.width, h: canvas.height }
 }
@@ -119,13 +146,14 @@ function similarityOutside(a, b, box) {
   return total ? Math.round((same / total) * 10000) / 10000 : null
 }
 
-export async function runPdf(entry) {
+export async function runPdf(entry, opts = {}) {
+  const engineOnly = !!opts.engineOnly
   const rec = { pdf_id: entry.pdf_id, staged: entry.staged, file: entry.file,
                 experiments: [], notes: [], error: null }
   const engine = window.__pdfEngine
 
   try {
-    const info = await loadStaged(entry.staged)
+    const info = await loadStaged(entry.staged, { engineOnly })
     rec.pages = info.pages
     if (!info.pages) { rec.error = 'document did not load'; return rec }
 
@@ -144,9 +172,12 @@ export async function runPdf(entry) {
       const target = before[i]
       if (!target) continue
       const marker = 'SWEEPMARK' + i
-      const wantVisual = !visualDone && rec.pages <= 40
+      const wantVisual = !engineOnly && !visualDone && rec.pages <= 40
       let baseImg = null
-      if (wantVisual) { try { baseImg = await renderToImageData(1) } catch { baseImg = null } }
+      if (wantVisual) {
+        try { baseImg = await renderToImageData(1) } catch { baseImg = null }
+        if (baseImg === 'timeout') { baseImg = null; rec.notes.push('render too slow for visual check') }
+      }
 
       let r = null, err = null
       try { r = await engine.replaceText(0, target.id, marker) } catch (e) { err = String(e.message || e) }
@@ -182,6 +213,7 @@ export async function runPdf(entry) {
           const saved = await engine.saveDocument()
           await window.__pdfViewer.reloadDocument(new Uint8Array(saved))
           const afterImg = await renderToImageData(1)
+          if (afterImg === 'timeout') throw new Error('render timeout')
           const scale = baseImg.w / (size?.width || 1)
           exp.visual_similarity = similarityOutside(baseImg, afterImg, {
             x0: Math.floor(target.bbox[0] * scale) - 4, x1: Math.ceil(target.bbox[2] * scale) + 4,
@@ -195,7 +227,7 @@ export async function runPdf(entry) {
     }
 
     // ---------- transform_move ----------
-    await loadStaged(entry.staged)
+    await loadStaged(entry.staged, { engineOnly })
     blocks0 = await engine.getTextBlocks(0)
     const DX = 20, DY = -20 // 20pt right, 20pt down in page coords
     for (const { i } of candidates(blocks0, 3)) {
