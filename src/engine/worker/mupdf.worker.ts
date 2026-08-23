@@ -204,6 +204,19 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         respond({ id: req.id, type: 'success', data: rotatePage(req.data.pageIndex, req.data.degrees) })
         break
       }
+      case 'drawImageInContent': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({
+          id: req.id,
+          type: 'success',
+          data: drawImageInContent(
+            req.data.pageIndex, req.data.rect,
+            new Uint8Array(req.data.bytes), req.data.behind
+          )
+        })
+        break
+      }
+
       case 'fillRect': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({ id: req.id, type: 'success', data: fillRect(req.data.pageIndex, req.data.rect, req.data.color) })
@@ -4539,6 +4552,95 @@ function addStickyNote(
     return { success: true, index }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Draw an image into the page's CONTENT STREAM rather than as an annotation.
+ *
+ * An annotation is always painted above every bit of page content, whatever
+ * order things were created in — the same rule that made the OCR patch cover
+ * its own replacement text. So a picture added as a Stamp can only ever sit in
+ * FRONT of the text, which is why "behind the text" was not available at all.
+ *
+ * Content is painted in the order it appears, so where the operators go decides
+ * what covers what: prepended, the image is behind everything on the page;
+ * appended, it is over everything.
+ *
+ * The cost of being content rather than an annotation is that it is part of the
+ * page afterwards — there is no annotation left to select, drag or resize. The
+ * caller says so rather than leaving the user hunting for handles.
+ */
+function drawImageInContent(
+  pageIndex: number,
+  rect: number[],
+  imageBytes: Uint8Array,
+  behind: boolean
+): { success: boolean; name?: string; error?: string } {
+  if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
+  let page: any = null
+  let image: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+    const bounds = page.getBounds()
+    const pageHeight = bounds[3] - bounds[1]
+
+    image = new mupdf.Image(imageBytes)
+    const imgRef = pdfDoc.addImage(image)
+
+    let resources = pageObj.get('Resources')
+    if (!resources || String(resources) === 'null') {
+      resources = pdfDoc.newDictionary()
+      pageObj.put('Resources', resources)
+    }
+    resources = resources.resolve()
+    let xobjects = resources.get('XObject')
+    if (!xobjects || String(xobjects) === 'null') {
+      xobjects = pdfDoc.newDictionary()
+      resources.put('XObject', xobjects)
+    }
+    xobjects = xobjects.resolve()
+
+    // A name nothing else on the page is using. Reusing one would silently
+    // replace whatever it pointed at — a logo, a scan, the whole background.
+    let name = ''
+    for (let i = 0; i < 500; i++) {
+      const candidate = `ImEd${i}`
+      const existing = xobjects.get(candidate)
+      if (!existing || String(existing) === 'null') { name = candidate; break }
+    }
+    if (!name) { page.destroy(); return { success: false, error: 'No free image slot on this page' } }
+    xobjects.put(name, imgRef)
+
+    const x = Math.min(rect[0], rect[2])
+    const w = Math.abs(rect[2] - rect[0])
+    const top = Math.min(rect[1], rect[3])
+    const h = Math.abs(rect[3] - rect[1])
+    // The UI works top-left down; PDF user space is bottom-left up.
+    const y = pageHeight - top - h
+    const op = `\nq ${fmtNum(w)} 0 0 ${fmtNum(h)} ${fmtNum(x)} ${fmtNum(y)} cm /${name} Do Q\n`
+
+    const existing = readContentStream(pageIndex)
+    // Prepended, everything already on the page paints over it; appended, it
+    // paints over everything.
+    const combined = behind ? op + existing : existing + op
+    const bytes = new Uint8Array(combined.length)
+    for (let i = 0; i < combined.length; i++) bytes[i] = combined.charCodeAt(i) & 0xFF
+
+    const contents = pageObj.get('Contents')
+    const isStream = !!contents && String(contents) !== 'null' &&
+      typeof contents.isStream === 'function' && contents.isStream()
+    if (isStream) contents.writeStream(bytes)
+    else pageObj.put('Contents', pdfDoc.addStream(bytes, {}))
+
+    invalidateContentSources(pageIndex)
+    return { success: true, name }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  } finally {
+    try { image?.destroy() } catch (_) {}
+    try { page?.destroy() } catch (_) {}
   }
 }
 

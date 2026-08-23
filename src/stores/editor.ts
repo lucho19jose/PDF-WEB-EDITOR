@@ -43,6 +43,21 @@ export const useEditorStore = defineStore('editor', () => {
   const reflowOnEdit = ref(false)
 
   const imagePlacement = ref<'above' | 'below'>('below')
+  /**
+   * How an inserted image sits with the text around it.
+   *
+   * `inline` puts it in the flow — the text is pushed aside to make room, as
+   * Word's "top and bottom" does. `front` lays it over the text and `behind`
+   * under it, neither moving anything.
+   *
+   * Word's "square" and "tight" — text flowing around the SIDES of a picture —
+   * are deliberately absent. A content stream has no flow: every line is drawn
+   * at an absolute position, so wrapping text around a shape means re-breaking
+   * and re-justifying every affected paragraph, which cannot be done to a table
+   * or a form without destroying it. Offering it and doing it badly would be
+   * worse than not offering it.
+   */
+  const imageWrap = ref<'inline' | 'front' | 'behind'>('inline')
   const imageWidthPct = ref(60)
 
   // Annotation styling
@@ -87,7 +102,7 @@ export const useEditorStore = defineStore('editor', () => {
 
   return {
     currentTool, statusMessage, fontFamily, fontSize, textColor,
-    imagePlacement, imageWidthPct, reflowOnEdit, ocrMode,
+    imagePlacement, imageWrap, imageWidthPct, reflowOnEdit, ocrMode,
     highlightColor, strokeColor, fillColor, fillEnabled, strokeWidth, opacity,
     isAnnotationTool, isMarkupTool, propertyContext,
     setTool, setStatus

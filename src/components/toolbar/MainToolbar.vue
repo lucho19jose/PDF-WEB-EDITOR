@@ -147,14 +147,37 @@
         <q-toggle v-model="ocrStore.layerVisible" label="Show boxes" dense size="sm" color="primary" />
       </template>
 
-      <!-- Image: how it sits in the text -->
+      <!-- Image: how it sits with the text around it -->
       <template v-else-if="ctx === 'image'">
-        <span class="text-caption q-mr-sm">Place</span>
+        <span class="text-caption q-mr-sm">Wrap</span>
         <q-btn-toggle
-          v-model="editorStore.imagePlacement"
-          :options="[{ label: 'Above the line', value: 'above' }, { label: 'Below the line', value: 'below' }]"
+          v-model="editorStore.imageWrap"
+          :options="[
+            { label: 'In the text', value: 'inline', slot: 'inline' },
+            { label: 'In front', value: 'front', slot: 'front' },
+            { label: 'Behind', value: 'behind', slot: 'behind' }
+          ]"
           dense unelevated no-caps size="sm" toggle-color="primary" color="grey-9" text-color="grey-4"
-        />
+        >
+          <template #inline>
+            <q-tooltip>The text moves aside to make room, above or below the line you click</q-tooltip>
+          </template>
+          <template #front>
+            <q-tooltip>Laid over the text. Selectable afterwards — drag its handles to move or resize it</q-tooltip>
+          </template>
+          <template #behind>
+            <q-tooltip>Under the text, like a watermark. It becomes part of the page, so use Ctrl+Z to change it</q-tooltip>
+          </template>
+        </q-btn-toggle>
+        <template v-if="editorStore.imageWrap === 'inline'">
+          <q-separator vertical inset class="q-mx-sm" />
+          <span class="text-caption q-mr-sm">Place</span>
+          <q-btn-toggle
+            v-model="editorStore.imagePlacement"
+            :options="[{ label: 'Above the line', value: 'above' }, { label: 'Below the line', value: 'below' }]"
+            dense unelevated no-caps size="sm" toggle-color="primary" color="grey-9" text-color="grey-4"
+          />
+        </template>
         <q-separator vertical inset class="q-mx-sm" />
         <span class="text-caption q-mr-sm">Width</span>
         <q-slider v-model="editorStore.imageWidthPct" :min="10" :max="100" :step="5" style="width: 110px" dense />

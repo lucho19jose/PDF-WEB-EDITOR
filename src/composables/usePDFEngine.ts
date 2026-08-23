@@ -301,6 +301,11 @@ export function usePDFEngine() {
   /**
    * Splice another PDF's pages in. Returns the new page count, or false.
    */
+  /** Draw an image into the page content — behind everything, or over everything. */
+  async function drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<boolean> {
+    return wrap(await bridge.drawImageInContent(pageIndex, rect, bytes, behind), 'drawImageInContent', pageIndex)
+  }
+
   /** Paint a filled rectangle into the page content stream (behind later drawing). */
   async function fillRect(pageIndex: number, rect: RectT, color: [number, number, number]): Promise<boolean> {
     return wrap(await bridge.fillRect(pageIndex, rect, color), 'fillRect', pageIndex)
@@ -409,6 +414,7 @@ export function usePDFEngine() {
     updateAnnotation,
     // page management
     rotatePage,
+    drawImageInContent,
     fillRect,
     mergePages,
     insertBlankPage,

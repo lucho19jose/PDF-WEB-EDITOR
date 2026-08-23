@@ -190,6 +190,11 @@ export class MuPDFBridge {
     return this.send('mergePages', { bytes, atIndex }, [bytes])
   }
 
+  /** Draw an image into the page content — behind everything, or over everything. */
+  async drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<{ success: boolean; name?: string; error?: string }> {
+    return this.send('drawImageInContent', { pageIndex, rect, bytes, behind }, [bytes])
+  }
+
   /** Paint a filled rectangle into the page content, behind anything drawn after it. */
   async fillRect(pageIndex: number, rect: RectT, color: [number, number, number]): Promise<{ success: boolean; error?: string }> {
     return this.send('fillRect', { pageIndex, rect, color })

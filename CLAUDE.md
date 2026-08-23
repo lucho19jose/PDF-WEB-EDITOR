@@ -899,6 +899,37 @@ Verified at 350% zoom on a 2005px-wide line: the viewer's `scrollLeft` stays at
 0, the whole 111-character line is selected, and the selection focus is at
 offset 0.
 
+### An image can go in front of the text, behind it, or in the flow
+`editorStore.imageWrap` picks one of three, and the third could not exist while
+the picture was an annotation: annotations paint above ALL page content whatever
+order they were created in, so a Stamp can only ever be in FRONT. That is the
+same rule the OCR patch ran into.
+
+- `inline` — a Stamp annotation, with the text pushed aside to make room. Word
+  calls this "top and bottom". Selectable and resizable afterwards.
+- `front` — a Stamp annotation and nothing moves. Selectable and resizable.
+- `behind` — drawn into the CONTENT STREAM, prepended, so everything already on
+  the page paints over it. The cost is that it is then part of the page: there
+  is no annotation left to select or resize, and the status line says so rather
+  than leaving the user hunting for handles. Ctrl+Z is how you change it.
+
+Word's "square" and "tight" — text flowing around the SIDES of a picture — are
+deliberately absent. A content stream has no flow: every line is drawn at an
+absolute position, so wrapping text around a shape means re-breaking and
+re-justifying every affected paragraph, which cannot be done to a table or a
+form without destroying it.
+
+`drawImageInContent` picks an XObject name nothing else on the page is using.
+Reusing one would silently replace whatever it pointed at — a logo, or the scan
+behind an OCR page.
+
+Only an in-flow image asks the text to move. Over or under it the picture is
+MEANT to overlap what is there, so making room would defeat the mode.
+
+**`setTool` writes its own status line**, so any message about what an insertion
+did has to be set AFTER it. Every account of what the image did to the page was
+being replaced by "Tool: select" before the user could read it.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

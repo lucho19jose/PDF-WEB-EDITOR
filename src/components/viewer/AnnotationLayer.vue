@@ -497,6 +497,8 @@ async function onImagePicked(e: Event) {
   const buf = await file.arrayBuffer()
   const aspect = await imgAspect(file)
   const below = editorStore.imagePlacement === 'below'
+  const wrap = editorStore.imageWrap
+  const inFlow = wrap === 'inline'
 
   // One undo point for the whole insertion: making room mutates the document
   // too, so the snapshot has to be taken before ANY of it.
@@ -513,22 +515,42 @@ async function onImagePicked(e: Event) {
   const h = Math.max(w / (aspect || 1), 8)
   const x = column.left + (columnWidth - w) / 2
 
-  // With Reflow off the image is placed where it was asked for and nothing is
-  // moved. On a form — the case that made this necessary — pushing the text
-  // aside tears labels from their values and ruins the page.
-  const room = editorStore.reflowOnEdit
+  // Only an in-flow image asks the text to move. Over or under it, the picture
+  // is meant to overlap what is there — that is the whole point of the mode —
+  // so pushing the text away would defeat it.
+  const room = inFlow && editorStore.reflowOnEdit
     ? await makeRoomInText(dropY, h + IMAGE_GAP * 2, below)
     : probe
   const top = below ? room.y + IMAGE_GAP : Math.max(room.y - IMAGE_GAP - h, 0)
 
   const rect: RectT = [x, top, x + w, top + h]
-  const note = editorStore.reflowOnEdit
-    ? [
-        `Image inserted — ${room.moved} block(s) moved to make room`,
-        room.spilled > 0 ? `${room.spilled} line(s) moved to the next page` : null
-      ].filter(Boolean).join(' — ')
-    : 'Image inserted — the text was left as it was (turn on Reflow to move it aside)'
-  await annotOp(note, () => pdfEngine.addImageStamp(docStore.currentPage - 1, rect, buf), false)
+  const pageIndex = docStore.currentPage - 1
+
+  if (wrap === 'behind') {
+    // Behind the text it CANNOT be an annotation: annotations paint above all
+    // page content whatever order they were made in. It goes into the content
+    // stream instead, and so becomes part of the page — there is no annotation
+    // left to select or resize, which the message says rather than leaving the
+    // user looking for handles that are not there.
+    const behindNote = 'Image inserted behind the text — it is part of the page now, so Ctrl+Z to change it'
+    await annotOp(behindNote, () => pdfEngine.drawImageInContent(pageIndex, rect, buf, true), false)
+    // Switching tool writes its own status line, so the note is put back after
+    // it — otherwise the only explanation of what just happened is replaced by
+    // "Tool: select" before the user can read it.
+    editorStore.setTool('select')
+    editorStore.setStatus(behindNote)
+    return
+  }
+
+  const note = wrap === 'front'
+    ? 'Image inserted in front of the text — drag its handles to move or resize it'
+    : editorStore.reflowOnEdit
+      ? [
+          `Image inserted in the text — ${room.moved} block(s) moved to make room`,
+          room.spilled > 0 ? `${room.spilled} line(s) moved to the next page` : null
+        ].filter(Boolean).join(' — ')
+      : 'Image inserted — the text was left as it was (turn on Reflow to move it aside)'
+  await annotOp(note, () => pdfEngine.addImageStamp(pageIndex, rect, buf), false)
 
   // Hand the user the select tool: staying on 'image' means the next click on
   // the page opens the file chooser again, so the image they just placed can
@@ -538,6 +560,9 @@ async function onImagePicked(e: Event) {
   await loadAnnotations()
   const placed = annotations.value.find(a => Math.abs(a.rect[0] - rect[0]) < 1 && Math.abs(a.rect[1] - rect[1]) < 1)
   if (placed) selectedIndex.value = placed.index
+  // Last word, for the same reason as above: `setTool` overwrote the only
+  // account of what the insertion actually did to the page.
+  editorStore.setStatus(note)
 }
 function imgAspect(file: File): Promise<number> {
   return new Promise(resolve => {
