@@ -930,6 +930,44 @@ MEANT to overlap what is there, so making room would defeat the mode.
 did has to be set AFTER it. Every account of what the image did to the page was
 being replaced by "Tool: select" before the user could read it.
 
+### Why a LaTeX PDF could not be edited
+pdfTeX output has two traits that no other generator combines, and each on its
+own was enough to make every such document read as uneditable.
+
+**Its spaces are not characters.** TeX sets inter-word space as a KERN inside a
+TJ array — `[(This)-333(is)]TJ` — so the engine's own decode of the stream came
+back "Thisis…" while MuPDF's extraction, which turns wide gaps into spaces,
+reported "This is…". The two disagreed and nothing could be matched against
+anything. `decodeBtBlockText` now consumes TJ arrays WHOLE, ahead of the
+bare-literal alternatives, and emits a space for any kern past `KERN_SPACE`
+(180 thousandths of an em — ordinary kerning pairs are well under a tenth of an
+em, so the threshold sits between the two rather than near either).
+
+**Its fonts name their glyphs.** LaTeX ships an /Encoding dictionary with a
+/Differences array that remaps the low codes: byte 12 is the "fi" ligature, not
+a form feed, and the Greek capitals sit where control characters would be. Three
+things had to change for that to be read at all:
+
+- `/StandardEncoding` was not accepted as a /BaseEncoding, only MacRoman and
+  WinAnsi, so the font stayed 'Unknown' and its bytes were passed through raw;
+- /Differences was never parsed. It is now, into `SimpleFontInfo.differences`,
+  and `mapPlainBytes` consults it FIRST — overriding the base table code by code
+  is the entire point of it;
+- a named encoding now survives the symbolic flag. LaTeX marks its fonts
+  symbolic and still names every glyph it draws, and the flag was demoting them
+  back to 'Unknown'.
+
+`glyphNames.ts` maps those names to Unicode. It is not the full Adobe Glyph
+List — it covers Latin text plus the ligatures, accents and Greek capitals that
+make LaTeX different, and handles `uniXXXX`/`uXXXX` by rule. OT1 puts
+`/suppress` where a space would be; it draws nothing and a gap is what it means,
+so it reads back as a space rather than as an unknown glyph.
+
+Measured on a page built to pdfTeX's shape: all four blocks edit, including the
+line carrying an "fi" ligature that used to fail outright with "Could not find
+matching text in content stream". Plain and clipped documents were re-checked
+for regressions, since the kern rule changes how EVERY stream decodes.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

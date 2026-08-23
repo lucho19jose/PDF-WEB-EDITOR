@@ -1,6 +1,7 @@
 /// <reference lib="webworker" />
 
 import type { WorkerRequest, WorkerResponse } from './worker-protocol'
+import { glyphNameToUnicode } from './glyphNames'
 import type {
   TextBlock, TextChar, TextLine, PageTextData,
   BlockTransformOp, BlockStyleOp, BlockTransformResult
@@ -419,6 +420,17 @@ const PAGE_RIGHT_MARGIN = 20
  * Mirrored by `lineStep` in TextBlockOverlay — see the note at `tdStep`.
  */
 const LINE_LEADING = 1.4
+
+/**
+ * A TJ kern at least this wide, in thousandths of an em, is a word space.
+ *
+ * TeX draws inter-word space as a kern jump rather than as a space character —
+ * `[(This)-333(is)]TJ` — so a paragraph decoded without this reads "Thisis…",
+ * which never matches the text the page actually shows. Ordinary kerning pairs
+ * are well under a tenth of an em, so the threshold sits between the two rather
+ * than near either.
+ */
+const KERN_SPACE = 180
 
 function splitBlocksAtGaps(blocks: TextBlock[], pageIndex: number): TextBlock[] {
   let subIndex = 0
@@ -1102,6 +1114,15 @@ interface SimpleFontInfo {
   /** /MissingWidth from the FontDescriptor (PDF default 0). */
   missingWidth: number
   isType0: boolean
+  /**
+   * Byte code -> glyph NAME, from the font's /Encoding /Differences array.
+   *
+   * This is what makes a LaTeX document readable. pdfTeX names every character
+   * it uses and remaps the low codes, so byte 12 is the "fi" ligature and not a
+   * form feed; decoded through a plain WinAnsi table the words come out as
+   * control characters and nothing on the page can be matched.
+   */
+  differences: Map<number, string> | null
 }
 
 const simpleFontInfoCache = new Map<string, SimpleFontInfo | null>()
@@ -1137,6 +1158,11 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
           const baseEnc = String(encObj.resolve().get('BaseEncoding') || '')
           if (baseEnc.includes('MacRoman')) encodingName = 'MacRoman'
           else if (baseEnc.includes('WinAnsi')) encodingName = 'WinAnsi'
+          // Standard was missing here, and it is the one LaTeX uses: an
+          // /Encoding dictionary over /StandardEncoding left the font
+          // 'Unknown', so its bytes were passed through raw and every such
+          // document read as uneditable.
+          else if (baseEnc.includes('Standard')) encodingName = 'Standard'
         } catch (_) { /* keep Unknown */ }
       } else if (encStr === 'null' && subtype !== '/Type0') {
         // No /Encoding: only NON-symbolic fonts default to StandardEncoding.
@@ -1144,6 +1170,29 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
         // glyph indices 1..N) must NOT be treated as ASCII — flagged below
         // once Flags is read.
         encodingName = 'Standard'
+      }
+
+      // /Differences: [code /name /name ... code /name ...]
+      let differences: Map<number, string> | null = null
+      if (encObj && encStr !== 'null' && !encStr.startsWith('/')) {
+        try {
+          const arr = encObj.resolve().get('Differences')
+          if (arr && String(arr) !== 'null' && typeof arr.length === 'number') {
+            const map = new Map<number, string>()
+            let code = 0
+            for (let i = 0; i < arr.length; i++) {
+              const str = String(arr.get(i))
+              if (/^-?[\d.]+$/.test(str)) code = Math.round(parseFloat(str))
+              else if (str.startsWith('/')) map.set(code++, str.slice(1))
+            }
+            if (map.size > 0) {
+              differences = map
+              // A font that NAMES its glyphs is not an opaque symbolic subset,
+              // whatever its flags say — the names are the encoding.
+              if (encodingName === 'Unknown') encodingName = 'Standard'
+            }
+          }
+        } catch (_) { /* a font with no usable Differences array is not an error */ }
       }
 
       const firstChar = parseInt(String(r.get('FirstChar') || '0')) || 0
@@ -1174,11 +1223,14 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
 
       // Symbolic font (Flags bit 3) with no explicit /Encoding → the byte
       // codes are font-internal glyph indices, not any standard encoding
-      if (encodingName === 'Standard' && (flags & 4) !== 0) {
+      // A named encoding survives the symbolic flag: LaTeX marks its fonts
+      // symbolic and still names every glyph it draws.
+      if (encodingName === 'Standard' && (flags & 4) !== 0 && !differences) {
         encodingName = 'Unknown'
       }
 
       info = {
+        differences,
         encodingName,
         firstChar,
         lastChar,
@@ -3739,12 +3791,29 @@ function decodeBtBlockText(
   let text = ''
   let stride = (encoding?.codeBytes === 1 ? 1 : 2) * 2
 
-  // Map raw plain-string bytes through the font's simple encoding (MacRoman/WinAnsi)
+  // Map raw plain-string bytes through the font's own encoding.
+  //
+  // /Differences comes FIRST, because it overrides the base table code by code
+  // — that is the entire point of it. LaTeX remaps the low codes to ligatures
+  // and Greek capitals, so reading byte 12 out of a WinAnsi table gives a form
+  // feed where the page plainly shows "fi".
   function mapPlainBytes(s: string): string {
-    if (!simpleInfo || simpleInfo.encodingName === 'Unknown') return s
+    const diffs = simpleInfo?.differences ?? null
+    if (!simpleInfo || (simpleInfo.encodingName === 'Unknown' && !diffs)) return s
     let out = ''
     for (let i = 0; i < s.length; i++) {
-      out += String.fromCodePoint(byteToUnicode(s.charCodeAt(i), simpleInfo.encodingName))
+      const byte = s.charCodeAt(i)
+      const name = diffs?.get(byte)
+      if (name !== undefined) {
+        const cp = glyphNameToUnicode(name)
+        // A name this table does not know is not a licence to emit rubbish:
+        // '?' is what every other unmapped glyph decodes to, and the fuzzy
+        // matcher already knows to discount it.
+        out += cp >= 0 ? String.fromCodePoint(cp) : '?'
+        continue
+      }
+      if (simpleInfo.encodingName === 'Unknown') { out += s[i]; continue }
+      out += String.fromCodePoint(byteToUnicode(byte, simpleInfo.encodingName))
     }
     return out
   }
@@ -3771,13 +3840,60 @@ function decodeBtBlockText(
 
   // Walk literals AND Tf operators in order, so a font switch inside the block
   // takes effect for the runs that follow it.
+  //
+  // TJ arrays are consumed WHOLE, ahead of the bare-literal alternatives, so
+  // the kerns between their pieces can be read. TeX writes an inter-word space
+  // as a kern jump and not as a space character — `[(This)-333(is)]TJ` — so
+  // without this a LaTeX paragraph decodes as "Thisis...", disagrees with the
+  // text the page shows, and can never be matched against it.
   const litRe = new RegExp(
-    `(${STR_LIT_SRC})|(${HEX_LIT_SRC})|\/([^\s<>\[\]()/%]+)\s+[\d.-]+\s+Tf`, 'g')
+    `(\\[(?:${STR_LIT_SRC}|${HEX_LIT_SRC}|[^\\]])*\\]\\s*TJ)` + '|' +
+    `(${STR_LIT_SRC})|(${HEX_LIT_SRC})|\\/([^\\s<>\\[\\]()/%]+)\\s+[\\d.-]+\\s+Tf`, 'g')
+  const innerRe = new RegExp(`(${STR_LIT_SRC})|(${HEX_LIT_SRC})|(-?[\\d.]+)`, 'g')
+
+  /** One piece of a show operation, plain or hex. */
+  const takePlain = (raw: string): string => {
+    if (glyphCodedPlain) {
+      let out = ''
+      for (let i = 0; i + plainCodeBytes - 1 < raw.length; i += plainCodeBytes) {
+        let code = 0
+        for (let k = 0; k < plainCodeBytes; k++) code = (code << 8) | raw.charCodeAt(i + k)
+        out += decodeGlyph(code)
+      }
+      return out
+    }
+    return mapPlainBytes(raw)
+  }
+  const takeHex = (hex: string): string => {
+    let out = ''
+    for (let i = 0; i + stride - 1 < hex.length; i += stride) {
+      out += decodeGlyph(parseInt(hex.substring(i, i + stride), 16))
+    }
+    return out
+  }
+
   let m: RegExpExecArray | null
   while ((m = litRe.exec(block)) !== null) {
-    if (m[3] !== undefined) {
+    if (m[1] !== undefined) {
+      // A TJ array: its pieces in order, with wide kerns turned into spaces.
+      innerRe.lastIndex = 0
+      let im: RegExpExecArray | null
+      while ((im = innerRe.exec(m[1])) !== null) {
+        if (im[1] !== undefined) text += takePlain(unescapePdfString(im[1].slice(1, -1)))
+        else if (im[2] !== undefined) text += takeHex(im[2].slice(1, -1).replace(/\s+/g, ''))
+        else {
+          // Thousandths of an em, negative meaning a gap. Ordinary kerning
+          // pairs live well under a tenth of an em; anything past KERN_SPACE is
+          // a word gap, which is how TeX and several other engines set spaces.
+          const kern = parseFloat(im[3])
+          if (kern <= -KERN_SPACE && text.length > 0 && !/\s$/.test(text)) text += ' '
+        }
+      }
+      continue
+    }
+    if (m[4] !== undefined) {
       if (resolveFont) {
-        const next = resolveFont(m[3])
+        const next = resolveFont(m[4])
         encoding = next.encoding
         simpleInfo = next.simpleInfo
         stride = (encoding?.codeBytes === 1 ? 1 : 2) * 2
@@ -3786,23 +3902,8 @@ function decodeBtBlockText(
       }
       continue
     }
-    if (m[1] !== undefined) {
-      const raw = unescapePdfString(m[1].slice(1, -1))
-      if (glyphCodedPlain) {
-        for (let i = 0; i + plainCodeBytes - 1 < raw.length; i += plainCodeBytes) {
-          let code = 0
-          for (let k = 0; k < plainCodeBytes; k++) code = (code << 8) | raw.charCodeAt(i + k)
-          text += decodeGlyph(code)
-        }
-      } else {
-        text += mapPlainBytes(raw)
-      }
-    } else {
-      const hex = m[2].slice(1, -1).replace(/\s+/g, '')
-      for (let i = 0; i + stride - 1 < hex.length; i += stride) {
-        text += decodeGlyph(parseInt(hex.substring(i, i + stride), 16))
-      }
-    }
+    if (m[2] !== undefined) text += takePlain(unescapePdfString(m[2].slice(1, -1)))
+    else text += takeHex(m[3].slice(1, -1).replace(/\s+/g, ''))
   }
 
   return text
