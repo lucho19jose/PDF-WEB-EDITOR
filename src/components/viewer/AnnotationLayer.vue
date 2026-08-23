@@ -493,6 +493,19 @@ async function onImagePicked(e: Event) {
   const file = input.files?.[0]
   input.value = ''
   if (!file) return
+  try {
+    await insertImage(file)
+  } catch (err: any) {
+    // An async handler that throws rejects a promise nobody is holding, so the
+    // failure is completely silent — the user clicks, picks a file, and nothing
+    // happens with nothing to explain it. That is how a broken ref went
+    // unnoticed. Anything that goes wrong here is reported.
+    console.error('[Image] insert failed', err)
+    editorStore.setStatus(`Could not insert the image: ${err?.message || err}`)
+  }
+}
+
+async function insertImage(file: File) {
 
   const buf = await file.arrayBuffer()
   const aspect = await imgAspect(file)

@@ -27,7 +27,7 @@
       -->
       <template v-if="page === docStore.currentPage">
         <TextBlockOverlay
-          ref="textBlockOverlayRef"
+          :ref="setTextOverlay"
           :page-width="pageWidth"
           :page-height="pageHeight"
           :pdf-width="pdfPageWidth"
@@ -35,7 +35,7 @@
           @text-changed="onTextChanged"
         />
         <AnnotationLayer
-          ref="annotationLayerRef"
+          :ref="setAnnotLayer"
           :page-width="pageWidth"
           :page-height="pageHeight"
           :pdf-width="pdfPageWidth"
@@ -117,6 +117,21 @@ function setCanvasRef(el: any, page: number) {
 function setWrapperRef(el: any, page: number) {
   if (el) wrappers.set(page, el as HTMLElement)
   else wrappers.delete(page)
+}
+
+/**
+ * The overlays are addressed by FUNCTION refs, not by name.
+ *
+ * A `ref="name"` written inside a `v-for` collects into an ARRAY, even when the
+ * loop renders exactly one of them. `makeRoomInText` then called `makeRoomAt`
+ * on an array, threw inside an async event handler, and the whole image
+ * insertion vanished without a message: the picture simply never appeared.
+ */
+function setTextOverlay(el: any) {
+  textBlockOverlayRef.value = el || null
+}
+function setAnnotLayer(el: any) {
+  annotationLayerRef.value = el || null
 }
 
 /**

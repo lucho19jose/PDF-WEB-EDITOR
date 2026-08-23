@@ -1002,6 +1002,20 @@ Single-page mode is kept because it renders exactly one page: on a very long
 document that is the difference between paging instantly and waiting for a
 rasteriser.
 
+### A `ref="name"` inside a `v-for` is an ARRAY
+Even when the loop renders exactly one of them. Moving the editing layers inside
+the per-page loop for continuous scrolling turned `textBlockOverlayRef` into a
+one-element array, so `makeRoomInText` called `makeRoomAt` on an array and threw
+— and because it threw inside an ASYNC EVENT HANDLER, the rejection had no
+owner: inserting an image did nothing at all, with no error, no status line and
+nothing in the console. The overlays are addressed by function refs
+(`setTextOverlay`, `setAnnotLayer`) for that reason.
+
+The silence is the part worth remembering. `onImagePicked` now wraps its work
+and reports whatever goes wrong, because a feature that fails without saying so
+is indistinguishable from one that was never wired up — and that is exactly how
+it was reported: "I insert an image and nothing shows".
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
