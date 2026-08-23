@@ -710,6 +710,23 @@ document leaves both correct instead of cropping one to the other (measured:
 Pages land after the one being viewed, and the thumbnail panel's existing
 drag-to-reorder (`movePage`) is what organises them afterwards.
 
+### An annotation is ALWAYS above page content
+The patch that hides replaced text on a scan was drawn with `addShape('Square')`,
+i.e. as an annotation, and the replacement text with `addText`, i.e. into the
+content stream. Annotations are painted after all page content whatever order
+they were created in, so the patch covered the very text it existed to sit
+behind: "TITULO EDITADO" exported as "TADO", with the first half hidden under
+its own white box.
+
+`fillRect` writes the rectangle into the CONTENT STREAM instead (`re f` wrapped
+in `q`/`Q`, y flipped from the UI's top-left space), so the two are in the same
+paint order and appending the text after the patch puts it on top. It also keeps
+the export free of annotations, which matters when the file is printed or
+flattened elsewhere.
+
+Ordering the two calls differently cannot fix this. Nothing drawn into a content
+stream can ever be above an annotation.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

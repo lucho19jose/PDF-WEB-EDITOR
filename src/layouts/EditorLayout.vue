@@ -77,6 +77,9 @@ import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
 import { useSearchStore } from '@/stores/search'
+import { useOcrStore } from '@/stores/ocr'
+import { useOCR } from '@/composables/useOCR'
+import { planOcrExport } from '@/utils/ocr/ocrExport'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
 import { enqueueOp } from '@/utils/opQueue'
@@ -90,6 +93,8 @@ const docStore = useDocumentStore()
 const editorStore = useEditorStore()
 const historyStore = useHistoryStore()
 const searchStore = useSearchStore()
+const ocrStore = useOcrStore()
+const ocr = useOCR()
 const pdfViewer = usePDFViewer()
 const pdfEngine = usePDFEngine()
 const sidebarOpen = ref(true)
@@ -125,6 +130,102 @@ onUnmounted(() => {
   window.removeEventListener('beforeunload', handleBeforeUnload)
 })
 
+// ===== SCANNED PAGES (OCR) =====
+/**
+ * Recognise the text on the page being viewed.
+ *
+ * Reads the page the viewer has ALREADY rendered rather than rasterising it
+ * again: that canvas is the same pixels the user is looking at, so the boxes
+ * that come back line up with what they see.
+ *
+ * Nothing is written to the document. Recognition is a guess, and a guess must
+ * not rewrite anyone's file just by being made — only the runs the user then
+ * edits are ever drawn, and only at export.
+ */
+async function runOcrOnPage(lang = 'spa') {
+  if (!docStore.loaded || ocr.busy.value) return
+  const pageIndex = docStore.currentPage - 1
+
+  // Say plainly when the page does not need this.
+  let chars = 0
+  try {
+    const blocks = await pdfEngine.getTextBlocks(pageIndex)
+    chars = blocks.reduce((n, b) => n + b.text.trim().length, 0)
+  } catch (_) { /* unreadable text layer counts as none */ }
+
+  const verdict = ocr.judgeScanned(chars)
+  if (!verdict.scanned) {
+    $q.dialog({
+      title: 'This page already has text',
+      message: `${verdict.reason}. Running OCR would add a second, guessed copy on top of it. Recognise it anyway?`,
+      cancel: true, persistent: true, dark: true
+    }).onOk(() => runOcrNow(pageIndex, lang))
+    return
+  }
+  await runOcrNow(pageIndex, lang)
+}
+
+async function runOcrNow(pageIndex: number, lang: string) {
+  const canvas = document.querySelector('canvas.pdf-canvas') as HTMLCanvasElement | null
+  if (!canvas) { editorStore.setStatus('The page is not rendered yet'); return }
+
+  const size = await pdfEngine.getPageSize(pageIndex).catch(() => ({ width: 612, height: 792 }))
+  editorStore.setStatus('Recognising text on this page...')
+
+  const result = await ocr.recognizePage(canvas, pageIndex, size.width, size.height, lang)
+  if (!result) {
+    editorStore.setStatus(`OCR failed: ${ocr.error.value || 'unknown error'}`)
+    return
+  }
+  ocrStore.setResult(result)
+  editorStore.setStatus(result.items.length === 0
+    ? 'No text was recognised on this page'
+    : `${result.items.length} text areas detected — ${result.confidence}% average confidence. Double-click one to edit it.`)
+}
+
+/**
+ * Write the edited OCR runs into the document.
+ *
+ * Run just before saving, so what is exported matches what is on screen. Each
+ * edited area becomes a filled rectangle in the colour of its surrounding paper
+ * plus the new text on top; everything else on the page is left completely
+ * alone, which is what preserves the scan.
+ */
+async function bakeOcrEdits(): Promise<number> {
+  if (!ocrStore.hasEdits) return 0
+  let written = 0
+
+  for (const [pageIndex, page] of ocrStore.pages) {
+    const plan = planOcrExport(page.items)
+    if (plan.patches.length === 0 && plan.texts.length === 0) continue
+
+    await exclusiveOp(async () => {
+      // Into the content stream, not as an annotation: annotations paint over
+      // page content whatever order they were made in, so a patch drawn as one
+      // covered the replacement text and it came out with its start missing.
+      for (const patch of plan.patches) {
+        await pdfEngine.fillRect(pageIndex, patch.rect, patch.color)
+      }
+      for (const t of plan.texts) {
+        // addText takes a bottom-left origin baseline; OCR works top-left.
+        await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color)
+        written++
+      }
+    })
+  }
+
+  if (written > 0 || ocrStore.hasEdits) {
+    docStore.markModified()
+    await syncAfterEdit()
+    // The runs are in the document now; drawing them again on the next save
+    // would stack a second copy on the first.
+    for (const [, page] of ocrStore.pages) {
+      for (const item of page.items) { item.edited = false; item.removed = false; item.originalText = item.text }
+    }
+  }
+  return written
+}
+
 // ===== FILE =====
 /**
  * Load a document into BOTH engines, and report the truth if either refuses.
@@ -143,6 +244,7 @@ async function loadBytes(bytes: Uint8Array, name: string) {
 
   historyStore.clear()
   searchStore.clear()
+  ocrStore.clear()
 
   const rendered = await pdfViewer.loadDocument(bytes, name)
   if (!rendered?.success) {
@@ -261,6 +363,8 @@ async function pickSaveTarget(suggestedName: string): Promise<FileSystemFileHand
 async function saveFile() {
   if (!docStore.loaded) return
   await flushOpenEditor()
+  // What is on screen for a scanned page is only a preview until this runs.
+  await bakeOcrEdits()
 
   const name = (docStore.fileName || 'document.pdf').replace(/ \*$/, '')
   const target = await pickSaveTarget(name)
@@ -715,6 +819,7 @@ async function handleDrop(e: DragEvent) {
 }
 
 // ===== PROVIDE to whole tree =====
+provide('runOcrOnPage', runOcrOnPage)
 provide('openFile', openFile)
 provide('openPdfFile', openPdfFile)
 provide('mergePdfFile', mergePdfFile)

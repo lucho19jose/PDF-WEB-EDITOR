@@ -203,6 +203,12 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         respond({ id: req.id, type: 'success', data: rotatePage(req.data.pageIndex, req.data.degrees) })
         break
       }
+      case 'fillRect': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: fillRect(req.data.pageIndex, req.data.rect, req.data.color) })
+        break
+      }
+
       case 'mergePages': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({ id: req.id, type: 'success', data: mergePages(req.data.bytes, req.data.atIndex) })
@@ -4591,6 +4597,62 @@ function mergePages(bytes: ArrayBuffer, atIndex: number): {
     return { success: false, error: err.message || String(err) }
   } finally {
     try { src?.destroy() } catch (_) { /* already gone */ }
+  }
+}
+
+/**
+ * Paint a filled rectangle into the page's CONTENT STREAM.
+ *
+ * Not an annotation. Annotations are drawn on top of page content whatever
+ * order they were created in, so a patch made with `addShape` covered the very
+ * text it was supposed to sit behind — the replacement came out with its first
+ * half missing. Content is drawn in the order it appears, so a rectangle
+ * appended before the text is behind it, which is the whole point of a patch.
+ *
+ * `rect` is in PDF page space (top-left origin, y down), like everything else
+ * the UI works in; the flip to PDF's bottom-left origin happens here.
+ */
+function fillRect(
+  pageIndex: number,
+  rect: [number, number, number, number],
+  color: [number, number, number]
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+    const bounds = page.getBounds()
+    const pageHeight = bounds[3] - bounds[1]
+
+    const x = Math.min(rect[0], rect[2])
+    const w = Math.abs(rect[2] - rect[0])
+    const top = Math.min(rect[1], rect[3])
+    const h = Math.abs(rect[3] - rect[1])
+    const y = pageHeight - top - h
+
+    const r = color[0] ?? 1, g = color[1] ?? 1, b = color[2] ?? 1
+    // q/Q so the fill colour does not leak into whatever is drawn next.
+    const op = `
+q ${fmtNum(r)} ${fmtNum(g)} ${fmtNum(b)} rg ` +
+               `${fmtNum(x)} ${fmtNum(y)} ${fmtNum(w)} ${fmtNum(h)} re f Q
+`
+
+    const existing = readContentStream(pageIndex)
+    const combined = existing + op
+    const bytes = new Uint8Array(combined.length)
+    for (let i = 0; i < combined.length; i++) bytes[i] = combined.charCodeAt(i) & 0xFF
+
+    const contents = pageObj.get('Contents')
+    const isStream = !!contents && String(contents) !== 'null' &&
+      typeof contents.isStream === 'function' && contents.isStream()
+    if (isStream) contents.writeStream(bytes)
+    else pageObj.put('Contents', pdfDoc.addStream(bytes, {}))
+
+    page.destroy()
+    invalidateContentSources(pageIndex)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
   }
 }
 

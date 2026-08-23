@@ -35,6 +35,21 @@
         <q-separator vertical inset class="q-mx-xs" />
       </template>
 
+      <!-- Scanned pages: recover the text before any of the tools above can touch it -->
+      <q-btn
+        flat dense no-caps
+        icon="document_scanner"
+        label="Detectar texto (OCR)"
+        size="sm"
+        :loading="ocr.busy.value"
+        :disable="!docStore.loaded || ocr.busy.value"
+        @click="runOcr"
+      >
+        <q-tooltip>Recognise the text on a scanned page and make it editable</q-tooltip>
+      </q-btn>
+
+      <q-separator vertical inset class="q-mx-xs" />
+
       <!-- Zoom -->
       <q-btn flat dense icon="remove" @click="zoomOut" size="sm" :disable="!docStore.loaded" />
       <span class="text-caption q-mx-xs" style="min-width: 40px; text-align: center">{{ zoomPercent }}%</span>
@@ -94,6 +109,44 @@
         <q-slider v-model="editorStore.opacity" :min="0.1" :max="1" :step="0.1" style="width: 90px" dense />
       </template>
 
+      <!-- OCR: what to do with the recognised run that is selected -->
+      <template v-if="ctx === 'ocr'">
+        <span class="text-caption q-mr-sm">{{ ocrStore.selected ? 'Selected text' : 'Click a detected box' }}</span>
+        <template v-if="ocrStore.selected">
+          <q-separator vertical inset class="q-mx-sm" />
+          <q-select :model-value="ocrStore.selected.fontFamily" :options="fonts" dense options-dense borderless
+                    class="font-select" style="min-width: 110px"
+                    @update:model-value="(v: string) => patchOcr({ fontFamily: v })" />
+          <q-separator vertical inset class="q-mx-sm" />
+          <span class="text-caption q-mr-xs">Size</span>
+          <q-input :model-value="ocrStore.selected.fontSize" type="number" dense borderless style="width: 56px"
+                   :min="4" :max="200" @update:model-value="(v: any) => patchOcr({ fontSize: Number(v) || 4 })" />
+          <q-separator vertical inset class="q-mx-sm" />
+          <q-btn flat dense size="sm" icon="format_bold" :color="ocrStore.selected.bold ? 'primary' : undefined"
+                 @click="patchOcr({ bold: !ocrStore.selected!.bold })"><q-tooltip>Bold</q-tooltip></q-btn>
+          <q-btn flat dense size="sm" icon="format_italic" :color="ocrStore.selected.italic ? 'primary' : undefined"
+                 @click="patchOcr({ italic: !ocrStore.selected!.italic })"><q-tooltip>Italic</q-tooltip></q-btn>
+          <q-separator vertical inset class="q-mx-sm" />
+          <ColorSwatch :model-value="ocrHex" label="Text" @update:model-value="(v: string) => patchOcr({ color: hexToRgb01(v) })" />
+          <q-separator vertical inset class="q-mx-sm" />
+          <q-btn-toggle
+            :model-value="ocrStore.selected.align"
+            :options="[{ value:'left', icon:'format_align_left' }, { value:'center', icon:'format_align_center' }, { value:'right', icon:'format_align_right' }]"
+            dense unelevated size="sm" toggle-color="primary" color="grey-9" text-color="grey-4"
+            @update:model-value="(v: any) => patchOcr({ align: v })"
+          />
+          <q-separator vertical inset class="q-mx-sm" />
+          <q-btn flat dense size="sm" color="red-4" icon="delete" @click="ocrStore.removeItem(ocrStore.selected!.id)">
+            <q-tooltip>Delete this text — the area is painted out on export</q-tooltip>
+          </q-btn>
+          <q-btn flat dense size="sm" color="grey-4" icon="restart_alt" @click="ocrStore.revertItem(ocrStore.selected!.id)">
+            <q-tooltip>Back to what OCR read</q-tooltip>
+          </q-btn>
+        </template>
+        <q-space />
+        <q-toggle v-model="ocrStore.layerVisible" label="Show boxes" dense size="sm" color="primary" />
+      </template>
+
       <!-- Image: how it sits in the text -->
       <template v-else-if="ctx === 'image'">
         <span class="text-caption q-mr-sm">Place</span>
@@ -125,7 +178,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, ref } from 'vue'
+import { computed, inject, ref, watch } from 'vue'
+import { useOcrStore } from '@/stores/ocr'
+import { useOCR } from '@/composables/useOCR'
+import { hexToRgb01, rgb01ToHex } from '@/utils/color'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, type Tool } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
@@ -154,6 +210,25 @@ const rotatePage = inject<(d: number) => void>('rotatePage', () => {})
 const openFind = inject<() => void>('openFind', () => {})
 
 const ctx = computed(() => editorStore.propertyContext)
+
+// ── Scanned pages ──
+const ocrStore = useOcrStore()
+const ocr = useOCR()
+const runOcrOnPage = inject<(lang: string) => Promise<void>>('runOcrOnPage', async () => {})
+
+/** The OCR row owns the properties bar while a recognised page is on screen. */
+watch(() => ocrStore.layerVisible, v => { editorStore.ocrMode = v }, { immediate: true })
+
+const ocrHex = computed(() => rgb01ToHex(ocrStore.selected?.color ?? [0, 0, 0]))
+
+function patchOcr(patch: Record<string, unknown>) {
+  const id = ocrStore.selectedId
+  if (id) ocrStore.updateItem(id, patch as any)
+}
+
+async function runOcr() {
+  await runOcrOnPage('spa')
+}
 const fonts = ['Helvetica', 'Times-Roman', 'Courier']
 
 const toolGroups: { label: string; tools: { name: Tool; label: string; icon: string; shortcut?: string }[] }[] = [

@@ -22,6 +22,16 @@
         :pdf-height="pdfPageHeight"
         @changed="onTextChanged"
       />
+      <!--
+        Over the scan, under nothing: the OCR layer only appears for pages that
+        were recognised, and never replaces the rendered page beneath it.
+      -->
+      <OcrTextLayer
+        :page-width="pageWidth"
+        :page-height="pageHeight"
+        :pdf-width="pdfPageWidth"
+        :pdf-height="pdfPageHeight"
+      />
       <SearchHighlights
         :page-width="pageWidth"
         :page-height="pageHeight"
@@ -41,6 +51,7 @@ import type { usePDFEngine } from '@/composables/usePDFEngine'
 import TextBlockOverlay from './TextBlockOverlay.vue'
 import AnnotationLayer from './AnnotationLayer.vue'
 import SearchHighlights from './SearchHighlights.vue'
+import OcrTextLayer from './OcrTextLayer.vue'
 import { enqueueOp } from '@/utils/opQueue'
 
 const docStore = useDocumentStore()

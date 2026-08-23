@@ -189,6 +189,11 @@ export class MuPDFBridge {
     return this.send('mergePages', { bytes, atIndex }, [bytes])
   }
 
+  /** Paint a filled rectangle into the page content, behind anything drawn after it. */
+  async fillRect(pageIndex: number, rect: RectT, color: [number, number, number]): Promise<{ success: boolean; error?: string }> {
+    return this.send('fillRect', { pageIndex, rect, color })
+  }
+
   /**
    * Debug: inspect font encodings on a page.
    */

@@ -300,6 +300,11 @@ export function usePDFEngine() {
   /**
    * Splice another PDF's pages in. Returns the new page count, or false.
    */
+  /** Paint a filled rectangle into the page content stream (behind later drawing). */
+  async function fillRect(pageIndex: number, rect: RectT, color: [number, number, number]): Promise<boolean> {
+    return wrap(await bridge.fillRect(pageIndex, rect, color), 'fillRect', pageIndex)
+  }
+
   async function mergePages(bytes: ArrayBuffer, atIndex: number): Promise<{ pages: number; added: number } | false> {
     const r = await bridge.mergePages(bytes, atIndex)
     pageTextCache.clear()
@@ -403,6 +408,7 @@ export function usePDFEngine() {
     updateAnnotation,
     // page management
     rotatePage,
+    fillRect,
     mergePages,
     insertBlankPage,
     deletePage,

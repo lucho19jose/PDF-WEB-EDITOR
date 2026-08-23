@@ -57,7 +57,13 @@ export const useEditorStore = defineStore('editor', () => {
   const isMarkupTool = computed(() => MARKUP_TOOLS.includes(currentTool.value))
 
   /** Which property controls to show in the properties bar for the active tool. */
-  const propertyContext = computed<'text' | 'markup' | 'shape' | 'draw' | 'image' | 'none'>(() => {
+  /** Set while the OCR layer owns the properties row. */
+  const ocrMode = ref(false)
+
+  const propertyContext = computed<'text' | 'markup' | 'shape' | 'draw' | 'image' | 'ocr' | 'none'>(() => {
+    // OCR wins: while a scanned page's recognised text is on screen, the row
+    // has to act on THAT, not on whatever tool happens to be selected.
+    if (ocrMode.value) return 'ocr'
     const t = currentTool.value
     // 'select' too: restyling text you have selected is a text operation, and
     // it is the only tool where clicking a block selects it without opening the
@@ -81,7 +87,7 @@ export const useEditorStore = defineStore('editor', () => {
 
   return {
     currentTool, statusMessage, fontFamily, fontSize, textColor,
-    imagePlacement, imageWidthPct, reflowOnEdit,
+    imagePlacement, imageWidthPct, reflowOnEdit, ocrMode,
     highlightColor, strokeColor, fillColor, fillEnabled, strokeWidth, opacity,
     isAnnotationTool, isMarkupTool, propertyContext,
     setTool, setStatus
