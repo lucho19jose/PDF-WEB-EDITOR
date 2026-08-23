@@ -881,6 +881,24 @@ FOOT of the box because reading goes upwards. The patch's padding has to swap
 axes with it, or a tall narrow run gets a wide band across the page with the old
 ink still showing at the ends.
 
+### Opening an editor must not move the page under the user
+A selection is scrolled to its FOCUS end, and `range.selectNodeContents` puts
+that end after the last character. Opening a line wider than the window
+therefore threw the view to the right — the start of the line, which is where
+anyone begins reading and editing, went off-screen, and the user was left
+looking at its last word.
+
+The line is still selected in full, so typing still replaces it. The selection
+is just made BACKWARDS (`setBaseAndExtent(end, …, start, …)`), which puts the
+focus on the first character. `focus({ preventScroll: true })` stops the focus
+itself from scrolling, and `scrollAncestor()`'s position is restored afterwards
+for anything that slips past both. The OCR editor does the same with
+`setSelectionRange(0, len, 'backward')`.
+
+Verified at 350% zoom on a 2005px-wide line: the viewer's `scrollLeft` stays at
+0, the whole 111-character line is selected, and the selection focus is at
+offset 0.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

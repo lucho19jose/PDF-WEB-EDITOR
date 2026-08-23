@@ -9,6 +9,9 @@ for (let p = 1; p <= PAGES; p++) {
   const lines = []
   let y = 700
   lines.push(`BT /F1 20 Tf 0 0 0 rg 1 0 0 1 60 740 Tm (Page ${p} heading) Tj ET`)
+  // One deliberately long line: wider than the window at any useful zoom, which
+  // is the case where opening the editor used to throw the view to its end.
+  lines.push(`BT /F1 11 Tf 0 0 0 rg 1 0 0 1 40 725 Tm (START-OF-LINE alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau END) Tj ET`)
   for (let i = 1; i <= 8; i++) {
     lines.push(`BT /F1 12 Tf 0 0 0 rg 1 0 0 1 60 ${y} Tm (Page ${p} line ${i} of body text here) Tj ET`)
     y -= 40

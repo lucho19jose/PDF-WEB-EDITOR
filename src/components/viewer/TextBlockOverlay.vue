@@ -595,6 +595,18 @@ function resolveSelection() {
  * the lines of one paragraph — what a multi-line selection nearly always is —
  * they were already the same.
  */
+/** The nearest ancestor that actually scrolls, or the document. */
+function scrollAncestor(from: HTMLElement | null): HTMLElement | null {
+  let el: HTMLElement | null = from
+  while (el && el !== document.body) {
+    const style = getComputedStyle(el)
+    if (/(auto|scroll)/.test(style.overflowY + style.overflowX) &&
+        (el.scrollHeight - el.clientHeight > 2 || el.scrollWidth - el.clientWidth > 2)) return el
+    el = el.parentElement
+  }
+  return document.scrollingElement as HTMLElement | null
+}
+
 function openInlineEditor(block: TextBlock, group: TextBlock[] = []) {
   editingGroup.value = group.length > 1 ? group : []
   editingBlock.value = block
@@ -613,13 +625,32 @@ function openInlineEditor(block: TextBlock, group: TextBlock[] = []) {
       editorRef.value!.appendChild(document.createTextNode(t))
     })
     editorPopulated = true
-    editorRef.value.focus()
-    // Select all text
+
+    // Opening an editor must not move the page under the user.
+    //
+    // A selection is scrolled to its FOCUS end, and the obvious way to select
+    // everything puts that end after the last word — so opening a line that is
+    // wider than the window threw the view to the right and the start of the
+    // line, which is where anyone begins reading and editing, went off-screen.
+    //
+    // The whole line is still selected, so typing still replaces it; the
+    // selection is just made BACKWARDS, with its focus at the first character.
+    // `preventScroll` stops the focus itself from scrolling, and the scroller's
+    // position is put back afterwards for anything that slips past both.
+    const scroller = scrollAncestor(editorRef.value)
+    const keepLeft = scroller?.scrollLeft ?? 0
+    const keepTop = scroller?.scrollTop ?? 0
+
+    editorRef.value.focus({ preventScroll: true })
     const range = document.createRange()
     range.selectNodeContents(editorRef.value)
     const sel = window.getSelection()
     sel?.removeAllRanges()
     sel?.addRange(range)
+    sel?.setBaseAndExtent(range.endContainer, range.endOffset, range.startContainer, range.startOffset)
+
+    editorRef.value.scrollLeft = 0
+    if (scroller) { scroller.scrollLeft = keepLeft; scroller.scrollTop = keepTop }
   })
 }
 

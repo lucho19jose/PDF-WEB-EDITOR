@@ -204,7 +204,16 @@ function beginEdit(id: string) {
   ocrStore.selectedId = id
   editing.value = id
   draft.value = item.text
-  nextTick(() => { editorRef.value?.focus(); editorRef.value?.select() })
+  nextTick(() => {
+    const el = editorRef.value
+    if (!el) return
+    // Selected backwards, so the view lands on the START of the run rather than
+    // on its last word — see the same fix in TextBlockOverlay.
+    el.focus({ preventScroll: true })
+    el.setSelectionRange(0, el.value.length, 'backward')
+    el.scrollLeft = 0
+    el.scrollTop = 0
+  })
 }
 
 function commitEdit() {
