@@ -1,5 +1,16 @@
 <template>
-  <q-page class="flex flex-center" style="overflow: auto">
+  <!--
+    The page is exactly the height left over by the header and the footer, and
+    it does not scroll: the viewer inside it does.
+
+    Letting the WINDOW scroll instead is what a continuous document does by
+    default, and it breaks the shell around it. The left drawer sizes itself to
+    the layout, so on a forty-page document it became forty pages TALL — its
+    thumbnails scrolled away with the paper and the panel could no longer show
+    you where you were. Bounding the page keeps the drawer a screen high with a
+    scroll of its own, which is what it was written against.
+  -->
+  <q-page class="flex flex-center" :style-fn="pageHeight" style="overflow: hidden">
     <!-- Welcome Screen -->
     <div v-if="!docStore.loaded" class="text-center text-grey-5">
       <q-icon name="picture_as_pdf" size="80px" color="grey-7" />
@@ -37,6 +48,11 @@ import { useDocumentStore } from '@/stores/document'
 import PDFViewer from '@/components/viewer/PDFViewer.vue'
 
 const docStore = useDocumentStore()
+
+/** Quasar hands us the space the header and footer already take. */
+function pageHeight(offset: number) {
+  return { height: offset ? `calc(100vh - ${offset}px)` : '100vh' }
+}
 const openPdfFile = inject<(f: File) => void>('openPdfFile', () => {})
 const pickRef = ref<HTMLInputElement | null>(null)
 

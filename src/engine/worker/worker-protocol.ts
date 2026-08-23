@@ -15,6 +15,7 @@ export type WorkerRequest =
   | { id: number; type: 'transformTextBlocks'; data: { pageIndex: number; ops: BlockTransformOp[] } }
   | { id: number; type: 'restyleTextBlocks'; data: { pageIndex: number; ops: BlockStyleOp[] } }
   | { id: number; type: 'mergePages'; data: { bytes: ArrayBuffer; atIndex: number } }
+  | { id: number; type: 'flattenAnnotationBehind'; data: { pageIndex: number; annotIndex: number } }
   | { id: number; type: 'drawImageInContent'; data: { pageIndex: number; rect: RectT; bytes: ArrayBuffer; behind: boolean } }
   | { id: number; type: 'fillRect'; data: { pageIndex: number; rect: RectT; color: [number, number, number] } }
   | { id: number; type: 'debugFonts'; data: { pageIndex: number } }

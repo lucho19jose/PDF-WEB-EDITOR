@@ -19,6 +19,47 @@
         :style="h.style"
         @mousedown.stop.prevent="onAnnotResizeDown($event, h.pos)"
       />
+      <!--
+        Layout options, ON the picture — where Word puts them.
+
+        How an image sits with the text is a property OF THAT IMAGE, so the
+        control belongs beside it and not in a toolbar at the top of the window:
+        up there it applies to the next insertion rather than to the thing you
+        are looking at, which is the wrong mental model and a long way from the
+        picture you are trying to arrange.
+      -->
+      <div v-if="selectedIsImage" class="annot-layout" :style="layoutBtnStyle" @mousedown.stop.prevent>
+        <q-btn dense round size="sm" color="primary" icon="wrap_text" @click.stop>
+          <q-tooltip>How this image sits with the text</q-tooltip>
+          <q-menu anchor="bottom right" self="top right" class="bg-grey-10">
+            <q-list dense style="min-width: 230px">
+              <q-item-label header class="text-grey-5 q-py-xs">Position of this image</q-item-label>
+              <q-item clickable v-close-popup @click="applyWrap('front')">
+                <q-item-section avatar><q-icon name="flip_to_front" size="20px" /></q-item-section>
+                <q-item-section>
+                  <q-item-label>In front of the text</q-item-label>
+                  <q-item-label caption class="text-grey-6">Over it. Stays selectable</q-item-label>
+                </q-item-section>
+              </q-item>
+              <q-item clickable v-close-popup @click="applyWrap('inline')">
+                <q-item-section avatar><q-icon name="vertical_align_center" size="20px" /></q-item-section>
+                <q-item-section>
+                  <q-item-label>In the text</q-item-label>
+                  <q-item-label caption class="text-grey-6">The text moves aside to make room</q-item-label>
+                </q-item-section>
+              </q-item>
+              <q-item clickable v-close-popup @click="applyWrap('behind')">
+                <q-item-section avatar><q-icon name="flip_to_back" size="20px" /></q-item-section>
+                <q-item-section>
+                  <q-item-label>Behind the text</q-item-label>
+                  <q-item-label caption class="text-grey-6">Like a watermark. Becomes part of the page</q-item-label>
+                </q-item-section>
+              </q-item>
+            </q-list>
+          </q-menu>
+        </q-btn>
+      </div>
+
       <!-- Delete button for selected annotation -->
       <div v-if="selectedAnnot" class="annot-delete" :style="deleteBtnStyle" @mousedown.prevent>
         <q-btn dense round size="xs" color="negative" icon="delete" @click.stop="deleteSelected">
@@ -267,6 +308,70 @@ const deleteBtnStyle = computed(() => {
     position: 'absolute' as const, zIndex: 30, pointerEvents: 'auto' as const
   }
 })
+
+/** Only a picture has a layout to choose; a highlight or a note does not. */
+const selectedIsImage = computed(() => {
+  const a = selectedAnnot.value
+  if (!a) return false
+  const kind = String((a as any).type || (a as any).subtype || '').toLowerCase()
+  return kind.includes('stamp')
+})
+
+/**
+ * Just outside the picture's top-left corner, clamped onto the page.
+ *
+ * Word puts it at the top RIGHT; here the right-hand side already carries the
+ * delete button and the resize handles, and two controls fighting over one
+ * corner is how a button ends up unclickable.
+ */
+const layoutBtnStyle = computed(() => {
+  const a = selectedAnnot.value
+  if (!a) return {}
+  const left = Math.max(2, a.rect[0] * scaleX.value - 34)
+  const top = Math.max(2, a.rect[1] * scaleY.value - 4)
+  return {
+    left: `${left}px`,
+    top: `${top}px`,
+    position: 'absolute' as const, zIndex: 31, pointerEvents: 'auto' as const
+  }
+})
+
+/**
+ * Change how the picture already on the page sits with the text.
+ *
+ * "Behind" is the one that costs something: an annotation is painted above all
+ * page content whatever order it was made in, so the only way under the text is
+ * to stop being an annotation. It becomes part of the page and there is nothing
+ * left to select — said plainly, with Ctrl+Z as the way back.
+ */
+async function applyWrap(mode: 'front' | 'inline' | 'behind') {
+  const a = selectedAnnot.value
+  if (!a) return
+  const pageIndex = docStore.currentPage - 1
+
+  if (mode === 'front') {
+    editorStore.setStatus('This image is in front of the text — drag its handles to move or resize it')
+    return
+  }
+
+  if (mode === 'inline') {
+    const height = Math.abs(a.rect[3] - a.rect[1])
+    pushUndo()
+    const room = await makeRoomInText(a.rect[1], height + IMAGE_GAP * 2, false)
+    editorStore.setStatus(room.moved > 0
+      ? `The text moved aside — ${room.moved} block(s) shifted around the image`
+      : 'There was nothing under the image to move aside')
+    return
+  }
+
+  const index = a.index
+  selectedIndex.value = null
+  await annotOp(
+    'This image is behind the text now — it is part of the page, so Ctrl+Z to change it',
+    () => pdfEngine.flattenAnnotationBehind(pageIndex, index),
+    true
+  )
+}
 
 const previewBoxStyle = computed(() => {
   if (!drag.value) return {}
@@ -709,6 +814,10 @@ defineExpose({ loadAnnotations, deleteSelected })
 .annot-preview.circle { border-radius: 50%; }
 .annot-preview.markup { border-style: none; }
 .annot-svg { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 17; pointer-events: none; overflow: visible; }
+.annot-layout {
+  /* On the picture, not in a toolbar — see the template. */
+  display: flex;
+}
 .annot-delete { }
 .annot-handle {
   position: absolute; width: 10px; height: 10px; z-index: 22;

@@ -1016,6 +1016,72 @@ and reports whatever goes wrong, because a feature that fails without saying so
 is indistinguishable from one that was never wired up — and that is exactly how
 it was reported: "I insert an image and nothing shows".
 
+### The layout control belongs ON the picture
+How an image sits with the text is a property OF THAT IMAGE, so the control is a
+button beside it, the way Word does it — not a toggle in the toolbar, where it
+applies to the NEXT insertion rather than to the thing being looked at. The
+toolbar keeps only what genuinely concerns the next one: where to place it and
+how wide.
+
+Switching an existing picture to "behind" is `flattenAnnotationBehind`. It
+cannot be done by reordering anything, because an annotation is painted above
+all page content whatever order it was made in — the only way under the text is
+to stop being an annotation. The annotation's own /AP /N appearance stream is
+invoked with `Do` rather than the original image being hunted down and
+re-embedded: the form already draws the thing correctly inside its own BBox, so
+what lands is exactly what was on screen, and it works for any annotation.
+
+The matrix is the one PDF 32000-1 12.5.5 specifies: transform the BBox by the
+form's /Matrix, then map that box onto the annotation's /Rect. Getting it wrong
+does not fail loudly; it puts the picture somewhere else at the wrong size.
+Verified by pixel count — 6618 before and after the switch, and 6464 in the
+exported file at a different rasterisation.
+
+**`isStream()` must be asked of the INDIRECT reference.** Asked of the resolved
+object MuPDF answers false, so every appearance stream was reported as "more
+than one appearance" and nothing could be moved. This is the same quirk already
+recorded for ToUnicode streams, met in a second place.
+
+### The document scrolls inside the page, not by growing the window
+The obvious way to make a continuous document is to let the WINDOW scroll, and
+it breaks the shell around it: the left drawer sizes itself to the layout, so on
+a forty-page document it became forty pages TALL — its thumbnails scrolled away
+with the paper and the panel could no longer show where you were. `q-page` is
+bounded with a `style-fn` and the viewer scrolls inside it.
+
+Two things follow from that:
+
+- **`flex: 0 0 auto` on the page wrappers.** A flex item shrinks to fit by
+  default, and the container is now a bounded height, so forty pages were
+  squeezed between them into one screen's worth. The height on each wrapper is
+  the page's real size and has to be kept.
+- **Measure against the VIEWER's box, not the window's.** It sits under a header
+  and over a footer, so the middle of "the screen" is a good sixty pixels off —
+  enough to hand the current page to the wrong one when two meet near the centre.
+
+### Paint what can be seen, and only repaint what changed
+Three pieces of work that scaled with the length of the document rather than
+with what was on screen:
+
+- **Thumbnails were all redrawn on every edit.** Forty rasterisations per
+  keystroke-level edit, all but two of them for pictures nobody was looking at,
+  and the byte array COPIED for the parse each time. Now an edit only
+  invalidates; what is visible is redrawn at once and the rest as they are
+  scrolled to. Measured: 9 of 40 drawn on load instead of 40.
+- **Every painted page was repainted after every edit.** An edit rewrites ONE
+  page's content stream; the other pages' pixels are still correct.
+  `repaintAround` does the edited page and its neighbours — neighbours because
+  text pushed off the foot of a page is redrawn on the next one.
+- **The scroll handler measured every page, every frame.** It now measures the
+  current page's neighbourhood, so the per-frame cost stops depending on the
+  length of the document.
+
+That last one needs an escape hatch. The neighbourhood is centred on the current
+page and the current page is decided by what is on screen, so after a JUMP —
+dragging the scrollbar — each waits for the other and the panel sticks on page 1
+however far you scroll. When nothing nearby is on screen, one full scan
+re-anchors it; a jump is not something that happens every frame.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

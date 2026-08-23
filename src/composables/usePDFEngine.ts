@@ -301,6 +301,11 @@ export function usePDFEngine() {
   /**
    * Splice another PDF's pages in. Returns the new page count, or false.
    */
+  /** Move an annotation into the page content, behind everything already there. */
+  async function flattenAnnotationBehind(pageIndex: number, annotIndex: number): Promise<boolean> {
+    return wrap(await bridge.flattenAnnotationBehind(pageIndex, annotIndex), 'flattenAnnotationBehind', pageIndex)
+  }
+
   /** Draw an image into the page content — behind everything, or over everything. */
   async function drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<boolean> {
     return wrap(await bridge.drawImageInContent(pageIndex, rect, bytes, behind), 'drawImageInContent', pageIndex)
@@ -414,6 +419,7 @@ export function usePDFEngine() {
     updateAnnotation,
     // page management
     rotatePage,
+    flattenAnnotationBehind,
     drawImageInContent,
     fillRect,
     mergePages,

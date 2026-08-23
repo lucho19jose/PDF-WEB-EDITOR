@@ -21,7 +21,7 @@
       </q-btn>
     </div>
 
-    <q-scroll-area ref="scrollRef" class="col">
+    <q-scroll-area ref="scrollRef" class="col" @scroll="scheduleVisible">
       <div class="q-pa-sm">
         <div
           v-for="page in docStore.totalPages"
@@ -112,20 +112,76 @@ function revealCurrent() {
   area.setScrollPosition('vertical', Math.max(0, top - target.clientHeight / 2 + el.offsetHeight / 2), 150)
 }
 
+/**
+ * Thumbnails are drawn only when they can be SEEN.
+ *
+ * Every edit bumps `renderVersion`, and this used to answer by re-parsing the
+ * whole PDF and re-rendering every page in the panel. On a forty-page document
+ * that is forty rasterisations per keystroke-level edit, all but two of them
+ * for pictures nobody is looking at — and the byte array is COPIED for the
+ * parse, so a large document pays for that too, every time.
+ *
+ * Now an edit only invalidates: what is on screen is redrawn at once, and the
+ * rest as they are scrolled to.
+ */
+const painted = new Set<number>()
+
+async function ensureDoc(): Promise<any | null> {
+  if (thumbDoc) return thumbDoc
+  if (!docStore.pdfBytes) return null
+  const token = renderToken
+  const task = pdfjsLib.getDocument({ data: docStore.pdfBytes.slice() })
+  const doc = await task.promise
+  if (token !== renderToken) { await doc.destroy().catch(() => {}); return null }
+  thumbDoc = doc
+  return doc
+}
+
+/** Everything on screen is stale — the document changed under us. */
 async function renderThumbnails() {
-  if (!docStore.pdfBytes) return
-  const token = ++renderToken
+  renderToken++
+  painted.clear()
+  if (thumbDoc) { await thumbDoc.destroy().catch(() => {}); thumbDoc = null }
+  await nextTick()
+  scheduleVisible()
+}
+
+/**
+ * Check again once the panel has finished moving.
+ *
+ * `revealCurrent` scrolls with an animation, so asking what is visible in the
+ * same tick measures where the list USED to be: every thumbnail below the fold
+ * stayed blank however far you scrolled. Checking now and again shortly after
+ * covers both the immediate case and the animated one.
+ */
+let settleTimer: any = null
+function scheduleVisible() {
+  renderVisible()
+  if (settleTimer) clearTimeout(settleTimer)
+  settleTimer = setTimeout(() => { settleTimer = null; renderVisible() }, 300)
+}
+
+let visibleBusy = false
+async function renderVisible() {
+  if (visibleBusy) return
+  visibleBusy = true
   try {
-    if (thumbDoc) { await thumbDoc.destroy().catch(() => {}); thumbDoc = null }
-    const task = pdfjsLib.getDocument({ data: docStore.pdfBytes.slice() })
-    const doc = await task.promise
-    if (token !== renderToken) { await doc.destroy().catch(() => {}); return }
-    thumbDoc = doc
-    await nextTick()
-    for (let p = 1; p <= doc.numPages; p++) {
+    const token = renderToken
+    const wanted: number[] = []
+    for (const [page, el] of items) {
+      if (painted.has(page)) continue
+      const r = el.getBoundingClientRect()
+      // One panel-height of margin, so scrolling meets drawn thumbnails.
+      if (r.bottom > -window.innerHeight && r.top < window.innerHeight * 2) wanted.push(page)
+    }
+    if (!wanted.length) return
+    const doc = await ensureDoc()
+    if (!doc || token !== renderToken) return
+
+    for (const p of wanted.sort((a, b) => a - b)) {
       if (token !== renderToken) return
       const canvas = canvases.get(p)
-      if (!canvas) continue
+      if (!canvas || painted.has(p)) continue
       const pdfPage = await doc.getPage(p)
       const baseVp = pdfPage.getViewport({ scale: 1 })
       const scale = 150 / baseVp.width
@@ -134,9 +190,12 @@ async function renderThumbnails() {
       canvas.height = vp.height
       const ctx = canvas.getContext('2d')!
       await pdfPage.render({ canvasContext: ctx, viewport: vp, canvas } as any).promise
+      painted.add(p)
     }
   } catch (err) {
     console.error('[Thumbnails] render error', err)
+  } finally {
+    visibleBusy = false
   }
 }
 
@@ -154,7 +213,7 @@ function onDrop(targetPage: number) {
   draggedPage.value = null
 }
 
-watch(() => docStore.currentPage, () => nextTick(revealCurrent))
+watch(() => docStore.currentPage, () => nextTick(() => { revealCurrent(); scheduleVisible() }))
 watch(() => docStore.renderVersion, renderThumbnails)
 watch(() => docStore.loaded, (l) => { if (l) renderThumbnails() })
 watch(() => docStore.totalPages, () => nextTick(renderThumbnails))

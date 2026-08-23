@@ -183,9 +183,15 @@ async function pump() {
       const result = await pdfViewer.renderPage(canvas, page)
       if (!result) continue
       painted.add(page)
-      const next = new Map(sizes.value)
-      next.set(page, { w: result.width, h: result.height })
-      sizes.value = next
+      // Replacing the Map is what makes Vue notice, and that re-runs every
+      // page's style. Nearly every page in a document is the same size as the
+      // last, so only a page that is actually a different size pays for it.
+      const known = sizes.value.get(page)
+      if (!known || Math.abs(known.w - result.width) > 0.5 || Math.abs(known.h - result.height) > 0.5) {
+        const next = new Map(sizes.value)
+        next.set(page, { w: result.width, h: result.height })
+        sizes.value = next
+      }
       if (page === 1) fallbackSize.value = { w: result.width, h: result.height }
       if (page === docStore.currentPage) adoptCurrentGeometry(result)
     }
@@ -201,19 +207,34 @@ function adoptCurrentGeometry(result: { width: number; height: number; viewport:
   pdfPageHeight.value = result.viewport.height / docStore.scale
 }
 
+/** The pages worth measuring: the current one and its neighbours. */
+const NEIGHBOURHOOD = 6
+function neighbourhood(): number[] {
+  const first = Math.max(1, docStore.currentPage - NEIGHBOURHOOD)
+  const last = Math.min(docStore.totalPages, docStore.currentPage + NEIGHBOURHOOD)
+  const out: number[] = []
+  for (let p = first; p <= last; p++) out.push(p)
+  return out
+}
+
 /** Queue the current page first, then whatever is on or near the screen. */
 function requestVisible() {
   if (!docStore.loaded) return
   const wanted = new Set<number>()
   if (pageList.value.includes(docStore.currentPage)) wanted.add(docStore.currentPage)
 
-  const viewH = window.innerHeight
-  for (const page of pageList.value) {
+  // Only the pages AROUND the current one are measured. The current page
+  // follows the scroll, so the window always contains the viewport, and the
+  // work per frame stops depending on how long the document is — a scroll
+  // handler that measures three hundred pages measures them every frame.
+  const view = viewportBox()
+  const viewH = view.height
+  for (const page of neighbourhood()) {
     const el = wrappers.get(page)
     if (!el) continue
     const r = el.getBoundingClientRect()
     // One screen of margin either way, so scrolling meets painted pages.
-    if (r.bottom > -viewH && r.top < viewH * 2) wanted.add(page)
+    if (r.bottom > view.top - viewH && r.top < view.bottom + viewH) wanted.add(page)
   }
   for (const page of wanted) {
     if (!painted.has(page) && !renderQueue.includes(page)) renderQueue.push(page)
@@ -229,6 +250,24 @@ async function repaintAll() {
   requestVisible()
 }
 
+/**
+ * Repaint the pages an EDIT could have changed, and leave the rest alone.
+ *
+ * An edit rewrites one page's content stream. Every other page's pixels are
+ * still correct, so clearing them all and re-rasterising whatever is on screen
+ * is work with no result — and on a long document at a wide zoom, several
+ * pages are on screen.
+ *
+ * The neighbours go too, because text pushed off the foot of a page is redrawn
+ * on the next one, and an undo can put it back on the previous.
+ */
+async function repaintAround(page: number) {
+  for (const p of [page - 1, page, page + 1]) painted.delete(p)
+  renderQueue = renderQueue.filter(p => p < page - 1 || p > page + 1)
+  await nextTick()
+  requestVisible()
+}
+
 // ── Which page is being looked at ──
 //
 // The current page follows the scroll, which is what makes the editing tools
@@ -237,15 +276,42 @@ let syncingFromScroll = false
 /** Set while scrolling TO a page, so arriving does not re-decide where we are. */
 let scrollingToPage = 0
 
+/**
+ * The box the pages are seen through.
+ *
+ * The viewer's own rectangle, not the window's: it sits under a header and
+ * over a footer, and measuring against the window puts the middle of "the
+ * screen" a good sixty pixels off — enough to hand the current page to the
+ * wrong one when two meet near the centre.
+ */
+function viewportBox(): { top: number; bottom: number; height: number } {
+  const el = containerRef.value
+  if (!el) return { top: 0, bottom: window.innerHeight, height: window.innerHeight }
+  const r = el.getBoundingClientRect()
+  return { top: r.top, bottom: r.bottom, height: r.height || window.innerHeight }
+}
+
 function pageInView(): number {
-  const middle = window.innerHeight / 2
-  let best = docStore.currentPage
+  const near = scanForPage(neighbourhood())
+  // Nothing nearby is on screen, so the scroll JUMPED — dragging the bar, or
+  // landing from a link. The neighbourhood cannot walk to the new position on
+  // its own: it is centred on the current page, and the current page is decided
+  // by what is on screen, so each waits for the other and the panel sticks on
+  // page 1 however far you scroll. One full scan re-anchors it, which costs
+  // nothing because a jump is not something that happens every frame.
+  return near ?? scanForPage(pageList.value) ?? docStore.currentPage
+}
+
+function scanForPage(pages: number[]): number | null {
+  const view = viewportBox()
+  const middle = (view.top + view.bottom) / 2
+  let best: number | null = null
   let bestDist = Infinity
-  for (const page of pageList.value) {
+  for (const page of pages) {
     const el = wrappers.get(page)
     if (!el) continue
     const r = el.getBoundingClientRect()
-    if (r.bottom < 0 || r.top > window.innerHeight) continue
+    if (r.bottom < view.top || r.top > view.bottom) continue
     // Distance from the page's own middle to the middle of the screen; a page
     // taller than the window scores by its nearest edge instead.
     const centre = (r.top + r.bottom) / 2
@@ -260,16 +326,19 @@ function onScroll() {
   if (scrollFrame) return
   scrollFrame = requestAnimationFrame(() => {
     scrollFrame = 0
-    requestVisible()
-    if (!continuous.value || scrollingToPage) return
-    const page = pageInView()
-    if (page !== docStore.currentPage) {
+    // The page first, then what to paint: the paint window is centred on the
+    // current page, so asking in the other order paints where we just left.
+    if (continuous.value && !scrollingToPage) {
+      const page = pageInView()
+      if (page !== docStore.currentPage) {
       // An open editor belongs to the page it was opened on; committing it
       // against another page is how an edit lands in the wrong place.
-      syncingFromScroll = true
-      docStore.setPage(page)
-      syncingFromScroll = false
+        syncingFromScroll = true
+        docStore.setPage(page)
+        syncingFromScroll = false
+      }
     }
+    requestVisible()
   })
 }
 
@@ -301,10 +370,10 @@ async function onTextChanged() {
       // Also reload into MuPDF with the saved bytes
       await pdfEngine.loadDocument(savedBytes)
       docStore.markModified()
-      await repaintAll()
+      await repaintAround(docStore.currentPage)
     } catch (err: any) {
       console.error('Failed to re-render after edit:', err)
-      await repaintAll()
+      await repaintAround(docStore.currentPage)
     }
   })
 }
@@ -330,7 +399,9 @@ watch(() => docStore.currentPage, async (page) => {
 })
 
 watch(() => docStore.scale, repaintAll)
-watch(() => docStore.renderVersion, repaintAll)
+// A version bump is nearly always one page being rewritten. Page inserts,
+// deletions and reorders change the COUNT, and that watcher repaints the lot.
+watch(() => docStore.renderVersion, () => repaintAround(docStore.currentPage))
 watch(() => docStore.totalPages, repaintAll)
 watch(continuous, repaintAll)
 
@@ -370,6 +441,14 @@ defineExpose({ textBlockOverlayRef, annotationLayerRef })
 }
 .pdf-canvas {
   display: block;
+}
+/*
+  A flex item shrinks to fit by default, and the container is now a bounded
+  height — so forty pages were squeezed into one screen's worth between them.
+  The height set on each wrapper is the page's real size and must be kept.
+*/
+.pdf-page-wrapper {
+  flex: 0 0 auto;
 }
 /* Which page the tools are on is worth seeing — it is decided by the scroll,
    so without a mark there is nothing to tell you where an edit will land. */

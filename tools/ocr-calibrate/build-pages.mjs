@@ -1,6 +1,6 @@
 /** A plain multi-page text document, for testing paging and move collisions. */
 import fs from 'fs'
-const PAGES = 6
+const PAGES = parseInt(process.argv[2] || "6", 10)
 const objs = []
 const kids = []
 let n = 3

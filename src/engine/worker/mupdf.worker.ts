@@ -205,6 +205,15 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         respond({ id: req.id, type: 'success', data: rotatePage(req.data.pageIndex, req.data.degrees) })
         break
       }
+      case 'flattenAnnotationBehind': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({
+          id: req.id, type: 'success',
+          data: flattenAnnotationBehind(req.data.pageIndex, req.data.annotIndex)
+        })
+        break
+      }
+
       case 'drawImageInContent': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({
@@ -4672,6 +4681,159 @@ function addStickyNote(
  * page afterwards — there is no annotation left to select, drag or resize. The
  * caller says so rather than leaving the user hunting for handles.
  */
+/**
+ * Move an annotation into the page CONTENT, behind everything already there.
+ *
+ * This is how a picture already on the page becomes a picture BEHIND the text.
+ * It cannot be done by reordering anything: an annotation is painted above all
+ * page content whatever order it was made in, so the only way under the text is
+ * to stop being an annotation.
+ *
+ * The annotation's own appearance stream is reused rather than the original
+ * image being hunted down and re-embedded. /AP /N is a Form XObject that
+ * already draws the thing correctly inside its own BBox, so invoking it with
+ * `Do` gives exactly what was on screen — and works for any annotation, not
+ * just images.
+ *
+ * The matrix is the one PDF 32000-1 12.5.5 specifies for appearance streams:
+ * transform the BBox by the form's Matrix, then map that box onto the
+ * annotation's Rect. Getting this wrong does not fail loudly — it puts the
+ * picture somewhere else on the page at the wrong size.
+ */
+function flattenAnnotationBehind(
+  pageIndex: number,
+  annotIndex: number
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  let page: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    const annots = page.getAnnotations()
+    const annot = annots[annotIndex]
+    if (!annot) { page.destroy(); return { success: false, error: `Annotation ${annotIndex} not found` } }
+
+    // Make sure the appearance is up to date before it is borrowed.
+    try { annot.update() } catch (_) {}
+
+    const aobj = annot.getObject()
+    const apDict = aobj.get('AP')
+    if (!apDict || String(apDict) === 'null') {
+      page.destroy()
+      return { success: false, error: 'That annotation has no appearance to move' }
+    }
+    let form = apDict.resolve().get('N')
+    if (!form || String(form) === 'null') {
+      page.destroy()
+      return { success: false, error: 'That annotation has no appearance to move' }
+    }
+    // `isStream()` has to be asked of the INDIRECT reference. MuPDF answers
+    // false once the object is resolved — the same quirk that makes a ToUnicode
+    // stream unreadable if you resolve it first — so checking the resolved form
+    // reported every appearance as "not a stream" and nothing could be moved.
+    const isStreamAp = (o: any) => typeof o?.isStream === 'function' && o.isStream()
+    if (!isStreamAp(form)) {
+      // /N may be a dictionary of appearance STATES rather than one stream.
+      // /AS names the one in force; failing that, the first stream in it will
+      // do, since an annotation with states normally has only one that draws.
+      const states = form.resolve()
+      const as = aobj.get('AS')
+      let chosen: any = null
+      if (as && String(as) !== 'null') {
+        const key = String(as).replace(/^\//, '')
+        const candidate = states.get(key)
+        if (isStreamAp(candidate)) chosen = candidate
+      }
+      if (!chosen) {
+        try {
+          states.forEach((_key: any, value: any) => {
+            if (!chosen && isStreamAp(value)) chosen = value
+          })
+        } catch (_) { /* not a dictionary we can walk */ }
+      }
+      if (!chosen) {
+        page.destroy()
+        return { success: false, error: 'That annotation has no appearance this can move' }
+      }
+      form = chosen
+    }
+    const formRef = form
+    const resolvedForm = form.resolve()
+
+    const rect = annot.getRect()
+    const num = (v: any, fallback: number) => {
+      const n = Number(String(v))
+      return Number.isFinite(n) ? n : fallback
+    }
+    const bboxArr = resolvedForm.get('BBox')
+    if (!bboxArr || String(bboxArr) === 'null') {
+      page.destroy()
+      return { success: false, error: 'That annotation has no bounding box' }
+    }
+    const bb = [0, 1, 2, 3].map(i => num(bboxArr.get(i), 0))
+    const mtxArr = resolvedForm.get('Matrix')
+    const mtx = mtxArr && String(mtxArr) !== 'null'
+      ? [0, 1, 2, 3, 4, 5].map(i => num(mtxArr.get(i), i === 0 || i === 3 ? 1 : 0))
+      : [1, 0, 0, 1, 0, 0]
+
+    // The BBox's four corners through the form's own Matrix, then their bounds.
+    const xs: number[] = []
+    const ys: number[] = []
+    for (const [cx, cy] of [[bb[0], bb[1]], [bb[2], bb[1]], [bb[2], bb[3]], [bb[0], bb[3]]]) {
+      xs.push(mtx[0] * cx + mtx[2] * cy + mtx[4])
+      ys.push(mtx[1] * cx + mtx[3] * cy + mtx[5])
+    }
+    const bx0 = Math.min(...xs), bx1 = Math.max(...xs)
+    const by0 = Math.min(...ys), by1 = Math.max(...ys)
+    const sx = (bx1 - bx0) > 1e-6 ? (rect[2] - rect[0]) / (bx1 - bx0) : 1
+    const sy = (by1 - by0) > 1e-6 ? (rect[3] - rect[1]) / (by1 - by0) : 1
+    const tx = rect[0] - bx0 * sx
+    const ty = rect[1] - by0 * sy
+
+    const pageObj = page.getObject()
+    let resources = pageObj.get('Resources')
+    if (!resources || String(resources) === 'null') {
+      resources = pdfDoc.newDictionary()
+      pageObj.put('Resources', resources)
+    }
+    resources = resources.resolve()
+    let xobjects = resources.get('XObject')
+    if (!xobjects || String(xobjects) === 'null') {
+      xobjects = pdfDoc.newDictionary()
+      resources.put('XObject', xobjects)
+    }
+    xobjects = xobjects.resolve()
+
+    let name = ''
+    for (let i = 0; i < 500; i++) {
+      const candidate = `ImEd${i}`
+      const existing = xobjects.get(candidate)
+      if (!existing || String(existing) === 'null') { name = candidate; break }
+    }
+    if (!name) { page.destroy(); return { success: false, error: 'No free image slot on this page' } }
+    xobjects.put(name, formRef)
+
+    const op = `\nq ${fmtNum(sx)} 0 0 ${fmtNum(sy)} ${fmtNum(tx)} ${fmtNum(ty)} cm /${name} Do Q\n`
+    const existing = readContentStream(pageIndex)
+    const combined = op + existing
+    const bytes = new Uint8Array(combined.length)
+    for (let i = 0; i < combined.length; i++) bytes[i] = combined.charCodeAt(i) & 0xFF
+
+    const contents = pageObj.get('Contents')
+    const isStream = !!contents && String(contents) !== 'null' &&
+      typeof contents.isStream === 'function' && contents.isStream()
+    if (isStream) contents.writeStream(bytes)
+    else pageObj.put('Contents', pdfDoc.addStream(bytes, {}))
+
+    page.deleteAnnotation(annot)
+    invalidateContentSources(pageIndex)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  } finally {
+    try { page?.destroy() } catch (_) {}
+  }
+}
+
 function drawImageInContent(
   pageIndex: number,
   rect: number[],
