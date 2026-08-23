@@ -33,3 +33,6 @@ tools/pdf-sweep/aggregate.json
 tools/ocr-calibrate/*.pdf
 tools/ocr-calibrate/*.json
 tools/ocr-calibrate/*.png
+
+# Scratch PDFs built by the tools in tools/ for testing.
+public/_*.pdf

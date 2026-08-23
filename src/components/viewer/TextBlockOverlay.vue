@@ -815,7 +815,14 @@ async function commitGroupEdit(group: TextBlock[], newText: string) {
 
       const delta = (result.lines ?? 1) - group.length
       const shift = delta === guess ? plannedFor : planReplacementShift(first, (result.lines ?? 1), group.length, first.fontSize)
-      const moved = delta !== 0 && editorStore.reflowOnEdit ? await applyReflow(pageIndex, shift) : 0
+      // A line the user ADDED has to be given room, toggle or no toggle.
+      //
+      // This is the same distinction the drag makes: rearranging a page as a
+      // side effect of an edit is what the toggle governs, but pressing Enter
+      // IS a request for another line, and a content stream has no flow to make
+      // room by itself. Gated, the new line was drawn on top of the one below
+      // it — or, inside a one-line clip, not visibly drawn at all.
+      const moved = delta !== 0 ? await applyReflow(pageIndex, shift) : 0
 
       emit('textChanged')
       await loadBlocks()
@@ -870,7 +877,14 @@ async function commitEdit(block: TextBlock, newText: string) {
 
         const delta = (result.lines ?? 1) - 1
         const shift = delta === guess ? plannedFor : planReplacementShift(block, (result.lines ?? 1), 1, block.fontSize)
-        const moved = delta !== 0 && editorStore.reflowOnEdit ? await applyReflow(pageIndex, shift) : 0
+        // A line the user ADDED has to be given room, toggle or no toggle.
+      //
+      // This is the same distinction the drag makes: rearranging a page as a
+      // side effect of an edit is what the toggle governs, but pressing Enter
+      // IS a request for another line, and a content stream has no flow to make
+      // room by itself. Gated, the new line was drawn on top of the one below
+      // it — or, inside a one-line clip, not visibly drawn at all.
+      const moved = delta !== 0 ? await applyReflow(pageIndex, shift) : 0
 
         emit('textChanged')
         await loadBlocks()
@@ -995,16 +1009,35 @@ function planReplacementShift(
 
   const end = Math.min(at + Math.max(spans, 1), rows.length)
   const after = rows[end]
-  const currentSpan = after
+
+  // What the replaced rows OCCUPIED — their own leading, not the whitespace
+  // that happens to follow them.
+  //
+  // Measuring "occupied" as the distance to the next row is right only when
+  // that next row is the following LINE. When it is the next paragraph, or the
+  // row under a heading, that distance is mostly deliberate white space, and
+  // charging it to the rows being replaced makes two new lines look like they
+  // need less room than the one they came from: a cell 60pt above its
+  // neighbour gained a line and the whole page below it was pulled UP 26pt.
+  //
+  // With two or more rows the leading can be measured from the rows themselves.
+  // With one there is nothing to measure it against, so it is the gap capped at
+  // what a single line can plausibly occupy — beyond that is white space, and
+  // white space is not the edit's to spend.
+  const gapBelow = after
     ? after.rect[1] - rows[at].rect[1]
     : rows[end - 1].rect[3] - rows[at].rect[1]
+  const pitch = spans >= 2
+    ? (rows[end - 1].rect[1] - rows[at].rect[1]) / (spans - 1)
+    : Math.min(gapBelow, fontSize * 1.6)
+  const occupied = Math.max(spans, 1) * pitch
 
   // Anchored on the LAST row being replaced, because what has to move is
   // everything below the group, not everything below its first line.
   const lastId = rows[end - 1].blockIds[0]
   const anchorBlock = blocks.value.find(b => b.id === lastId) ?? block
 
-  return planRowShift(anchorBlock, drawnLines * lineStep(fontSize) - currentSpan)
+  return planRowShift(anchorBlock, drawnLines * lineStep(fontSize) - occupied)
 }
 
 function planRowShift(block: TextBlock, amount: number): RowShiftPlan {

@@ -1648,13 +1648,20 @@ function replaceTextInStream(
         // only reveals more of the group the clip bounds, which is the text run
         // itself, so erring high is free.
         const needed = avgCharWidth * newText.length * 1.6 + 8
+
+        // How much DEEPER the replacement is than what it replaced. The engine
+        // decides the line count — the user's own breaks plus whatever the
+        // right margin forced — so it is read back from the outcome rather than
+        // counted from the text.
+        const drawnLines = Math.max(1, outcome.lines ?? 1)
+        const extraHeight = (drawnLines - 1) * targetBlock.fontSize * LINE_LEADING
         // Every clip in force, highest offset first so each splice leaves the
         // earlier offsets valid.
         const clips = getActiveClipsAtOffset(src.stream, outcome.anchorOffset)
           .filter(c => c.index < outcome.anchorOffset!)
           .sort((a, b) => b.index - a.index)
         for (const clip of clips) {
-          const widened = widenClipForText(src.stream, clip, targetBlock, needed, pageHeight)
+          const widened = widenClipForText(src.stream, clip, targetBlock, needed, extraHeight, pageHeight)
           if (widened) {
             streamStr = streamStr.slice(0, clip.index) + widened +
                         streamStr.slice(clip.index + clip.length)
@@ -1670,8 +1677,16 @@ function replaceTextInStream(
         // that to the page is not tracked here, so the box is grown by the same
         // RATIO the text grew by. Widening a form's BBox can only reveal more of
         // that form's own content, so a generous, capped factor is safe.
-        if (src.formDict && needed > targetBlock.width) {
-          widenFormBBox(src.formDict, Math.min(needed / Math.max(targetBlock.width, 1), 3))
+        const wider = needed > targetBlock.width
+        const deeper = extraHeight > 0
+        if (src.formDict && (wider || deeper)) {
+          widenFormBBox(
+            src.formDict,
+            wider ? Math.min(needed / Math.max(targetBlock.width, 1), 3) : 1,
+            deeper
+              ? Math.min((targetBlock.height + extraHeight) / Math.max(targetBlock.height, 1), 4)
+              : 1
+          )
         }
       }
 
@@ -2595,8 +2610,14 @@ function getActiveClipsAtOffset(
   return current
 }
 
-/** Grow a Form XObject's /BBox to the right by `ratio`, so wider text still shows. */
-function widenFormBBox(formDict: any, ratio: number): void {
+/**
+ * Grow a Form XObject's /BBox so bigger text still shows.
+ *
+ * `ratio` widens it to the right, `heightRatio` deepens it downward — a form
+ * sized to one line hides every line an edit adds below it just as surely as a
+ * `re W n` clip does.
+ */
+function widenFormBBox(formDict: any, ratio: number, heightRatio = 1): void {
   if (!pdfDoc || !(ratio > 1)) return
   try {
     const bbox = formDict.get('BBox')
@@ -2606,13 +2627,19 @@ function widenFormBBox(formDict: any, ratio: number): void {
     const v = [0, 1, 2, 3].map(i => Number(String(arr.get(i))))
     if (v.some(n => !Number.isFinite(n))) return
     const x0 = Math.min(v[0], v[2]), x1 = Math.max(v[0], v[2])
-    const grown = x0 + (x1 - x0) * ratio
-    if (!(grown > x1)) return
+    const y0 = Math.min(v[1], v[3]), y1 = Math.max(v[1], v[3])
+    const grownX = x0 + (x1 - x0) * ratio
+    // Down, not up: a form's own space has y increasing upwards like the page's,
+    // so the lines an edit adds below the first sit at LOWER y.
+    const grownY = y1 - (y1 - y0) * heightRatio
+    const widen = grownX > x1 + 0.01
+    const deepen = grownY < y0 - 0.01
+    if (!widen && !deepen) return
     const out = pdfDoc.newArray()
     out.push(pdfDoc.newReal(x0))
-    out.push(pdfDoc.newReal(Math.min(v[1], v[3])))
-    out.push(pdfDoc.newReal(grown))
-    out.push(pdfDoc.newReal(Math.max(v[1], v[3])))
+    out.push(pdfDoc.newReal(deepen ? grownY : y0))
+    out.push(pdfDoc.newReal(widen ? grownX : x1))
+    out.push(pdfDoc.newReal(y1))
     formDict.put('BBox', out)
   } catch (_) { /* leave the box alone rather than corrupt it */ }
 }
@@ -2626,12 +2653,23 @@ function widenFormBBox(formDict: any, ratio: number): void {
  * "Plataforma" edited to "SWEEPMARK0" came back as "SWEEPMA" — which is silent
  * data loss, since the characters are in the file but can never be seen or
  * found again.
+ *
+ * It has to grow DOWNWARD as well, and for a while it did not. Those same clips
+ * are barely one line TALL, so the moment an edit produced a second line — the
+ * user pressing Enter, or the right margin forcing a wrap — that line was drawn
+ * below the window and clipped away entirely. The text was in the file and
+ * simply could not be seen: "I press Enter and the text disappears".
+ *
+ * Both edges are taken as a UNION with what the clip already covers, the same
+ * as `expandClipForTransform`, because that can only ever reveal more of the
+ * run it bounds and never hide something that was visible.
  */
 function widenClipForText(
   stream: string,
   clip: { index: number; length: number; rect: [number, number, number, number] },
   targetBlock: TextBlock,
   newWidthPage: number,
+  extraHeightPage: number,
   pageHeight: number
 ): string | null {
   const ctm = getCtmAtOffset(stream, clip.index)
@@ -2640,18 +2678,31 @@ function widenClipForText(
   const ia = ctm[3] / det, ib = -ctm[1] / det
   const ic = -ctm[2] / det, id = ctm[0] / det
 
-  // Required right edge, page space (top-left) -> user space -> clip space.
-  const ux = targetBlock.bbox[0] + newWidthPage
-  const uy = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2
-  const ax = ux - ctm[4], ay = uy - ctm[5]
-  const lx = ax * ia + ay * ic
-  const ly = ax * ib + ay * id
-  void ly
+  /** User space (bottom-left origin) -> this clip's own space. */
+  const toClip = (ux: number, uy: number): [number, number] => {
+    const ax = ux - ctm[4], ay = uy - ctm[5]
+    return [ax * ia + ay * ic, ax * ib + ay * id]
+  }
+
+  const midY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2
+  const [needX] = toClip(targetBlock.bbox[0] + newWidthPage, midY)
+  // The foot of the text once the extra lines are under it. The CTM may flip y,
+  // so the mapped point is included in the rect rather than assumed to be below.
+  const footY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3] + extraHeightPage)
+  const [, needY] = toClip(targetBlock.bbox[0], footY)
 
   const [rx, ry, rw, rh] = clip.rect
-  const x0 = Math.min(rx, rx + rw), x1 = Math.max(rx, rx + rw)
-  if (!Number.isFinite(lx) || lx <= x1 + 0.5) return null
-  return `${fmtNum(x0)} ${fmtNum(ry)} ${fmtNum(lx - x0)} ${fmtNum(rh)} re`
+  let x0 = Math.min(rx, rx + rw), x1 = Math.max(rx, rx + rw)
+  let y0 = Math.min(ry, ry + rh), y1 = Math.max(ry, ry + rh)
+  let grew = false
+
+  if (Number.isFinite(needX) && needX > x1 + 0.5) { x1 = needX; grew = true }
+  if (extraHeightPage > 0 && Number.isFinite(needY)) {
+    if (needY < y0 - 0.5) { y0 = needY; grew = true }
+    else if (needY > y1 + 0.5) { y1 = needY; grew = true }
+  }
+  if (!grew) return null
+  return `${fmtNum(x0)} ${fmtNum(y0)} ${fmtNum(x1 - x0)} ${fmtNum(y1 - y0)} re`
 }
 
 /**
