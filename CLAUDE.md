@@ -683,18 +683,50 @@ ratio (~0.97) — so the label won, was rewritten, and the value was left strand
 beside the new text while the edit reported success. Single-block candidates are
 now scored by `matchRatio`, i.e. by how much of the target they actually carry.
 
-### Reflow is OFF by default, and governs every page-rearranging edit
+### Reflow is OFF by default — but a DRAG always makes room
 `editorStore.reflowOnEdit` gates the line-count reflow, the page spill, the
-image room-making, the resize room-making AND the move-collision displacement.
+image room-making and the resize room-making. It does NOT gate the move
+collision, and gating it there was a mistake.
 
-Most documents people edit are not flowing prose. On a form or a table — labels
-and values drawn at fixed coordinates in columns — "push everything below down"
-tears labels away from their values: on a real inscription form one Enter turned
-55 blocks into 68 and left "Teléfono 2" printed over "Teléfono". With the toggle
-off, an edit changes only what was edited (measured: 55 → 56 blocks, 2 moved).
+The toggle is off by default because most documents people edit are not flowing
+prose. On a form or a table — labels and values drawn at fixed coordinates in
+columns — "push everything below down" tears labels away from their values: on a
+real inscription form one Enter turned 55 blocks into 68 and left "Teléfono 2"
+printed over "Teléfono". With the toggle off an edit changes only what was
+edited (measured: 55 → 56 blocks, 2 moved).
 
-The reflow is not wrong, it is wrong BY DEFAULT. Prose is where it helps and it
-is one click away.
+Dropping a paragraph on top of another one is not that case. The user aimed at
+that spot; a content stream has no flow to make room by itself; and leaving the
+two overlaid is not the conservative outcome, it is the unreadable one. Ctrl+Z
+takes back the whole move, displacements included. Sweeping the drag in with the
+typing under one toggle made moving text silently start overlapping it —
+reported as "before this was fine, now it doesn't work".
+
+The distinction is between an edit that rearranges a page as a SIDE EFFECT and a
+gesture whose whole purpose is to put something somewhere.
+
+### Paging keys, and finding the element that actually scrolls
+Up and Down scroll the page they are on first and turn the page only once there
+is nowhere left to scroll — what every PDF reader does, and necessary because on
+a document zoomed past the height of the window, turning on the first press
+skips most of what is being read. PageUp/PageDown and the horizontal arrows
+always turn; Home and End go to the ends.
+
+Which element is scrolling has to be FOUND, not named. `.pdf-viewer-container`
+declares `overflow: auto`, but the Quasar layout above it lets the window scroll
+instead, so the container's `scrollHeight` equals its `clientHeight` and it
+always reports that there is nowhere to go — measured on a page with 1712px of
+scroll left in it. `pageScroller()` walks up from the canvas to the first
+ancestor that both allows overflow and has room in it, and falls back to
+`document.scrollingElement`.
+
+### The page you are on has to be visible in the page list
+`PageThumbnails` scrolls the active thumbnail into view whenever the current
+page changes. Without it the panel never moves: on a document of any length the
+highlighted thumbnail is below the fold, and the only way to see where you are
+is to scroll the list by hand every time — which is what the panel exists to
+save you. It does nothing when the thumbnail is already visible, because
+scrolling the list under someone who is browsing it is its own annoyance.
 
 ### Merging another PDF grafts, it does not append
 `mergePages` uses MuPDF's `graftPage(to, srcDoc, srcPage)`, which copies the

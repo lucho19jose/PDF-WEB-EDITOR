@@ -21,11 +21,12 @@
       </q-btn>
     </div>
 
-    <q-scroll-area class="col">
+    <q-scroll-area ref="scrollRef" class="col">
       <div class="q-pa-sm">
         <div
           v-for="page in docStore.totalPages"
           :key="page + ':' + docStore.renderVersion"
+          :ref="el => setItemRef(el, page)"
           class="thumb-item q-mb-sm"
           :class="{ active: page === docStore.currentPage, dragover: dragOverPage === page }"
           draggable="true"
@@ -69,6 +70,8 @@ const deletePage = inject<() => void>('deletePage', () => {})
 const movePage = inject<(from: number, to: number) => void>('movePage', () => {})
 
 const canvases = new Map<number, HTMLCanvasElement>()
+const items = new Map<number, HTMLElement>()
+const scrollRef = ref<any>(null)
 const dragOverPage = ref<number | null>(null)
 let thumbDoc: pdfjsLib.PDFDocumentProxy | null = null
 let renderToken = 0
@@ -76,6 +79,37 @@ let renderToken = 0
 function setCanvasRef(el: any, page: number) {
   if (el) canvases.set(page, el as HTMLCanvasElement)
   else canvases.delete(page)
+}
+
+function setItemRef(el: any, page: number) {
+  if (el) items.set(page, el as HTMLElement)
+  else items.delete(page)
+}
+
+/**
+ * Keep the page you are on visible in the list.
+ *
+ * Without this the panel simply never moves: on a document of any length the
+ * highlighted thumbnail is somewhere below the fold and the only way to see
+ * which page you are on is to scroll the list by hand, every time. The panel
+ * is meant to say where you are, and it cannot do that off-screen.
+ *
+ * Nothing happens when the thumbnail is already visible — scrolling the list
+ * under someone who is browsing it is its own annoyance.
+ */
+function revealCurrent() {
+  const el = items.get(docStore.currentPage)
+  const area = scrollRef.value
+  if (!el || !area) return
+  const target = area.getScrollTarget?.() as HTMLElement | undefined
+  if (!target) return
+  const top = el.offsetTop
+  const bottom = top + el.offsetHeight
+  const viewTop = target.scrollTop
+  const viewBottom = viewTop + target.clientHeight
+  if (top >= viewTop && bottom <= viewBottom) return
+  // Centre it, clamped by the scroll area itself.
+  area.setScrollPosition('vertical', Math.max(0, top - target.clientHeight / 2 + el.offsetHeight / 2), 150)
 }
 
 async function renderThumbnails() {
@@ -120,6 +154,7 @@ function onDrop(targetPage: number) {
   draggedPage.value = null
 }
 
+watch(() => docStore.currentPage, () => nextTick(revealCurrent))
 watch(() => docStore.renderVersion, renderThumbnails)
 watch(() => docStore.loaded, (l) => { if (l) renderThumbnails() })
 watch(() => docStore.totalPages, () => nextTick(renderThumbnails))

@@ -779,6 +779,29 @@ function openFind() { searchStore.open = true }
 function closeFind() { searchStore.open = false }
 
 // ===== KEYBOARD =====
+/**
+ * Whatever is actually scrolling the page right now.
+ *
+ * Not `.pdf-viewer-container`: it declares `overflow: auto` but the Quasar
+ * layout above it lets the WINDOW scroll instead, so the viewer's own
+ * scrollHeight equals its clientHeight and it always looks like there is
+ * nowhere to scroll. Reading that, Down turned the page on the first press even
+ * on a document zoomed to three times the height of the window.
+ *
+ * The element that scrolls therefore has to be found rather than named: walk up
+ * from the canvas to the first ancestor that both allows overflow and has room
+ * in it, and fall back to the document.
+ */
+function pageScroller(): HTMLElement | null {
+  let el = document.querySelector('.pdf-canvas') as HTMLElement | null
+  while (el && el !== document.body) {
+    const style = getComputedStyle(el)
+    if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight - el.clientHeight > 2) return el
+    el = el.parentElement
+  }
+  return (document.scrollingElement as HTMLElement | null)
+}
+
 function handleKeyDown(e: KeyboardEvent) {
   const tag = (e.target as HTMLElement)?.tagName
   const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable
@@ -799,6 +822,37 @@ function handleKeyDown(e: KeyboardEvent) {
   // not the find bar — the find input closes itself on Escape.
   if (e.key === 'Escape') { if (!isTyping) closeFind(); return }
   if (isTyping || !docStore.loaded) return
+
+  // Paging.
+  //
+  // Up and down scroll the page they are on FIRST and only turn the page once
+  // there is nowhere left to scroll, which is what every PDF reader does: on a
+  // document zoomed past the height of the window, turning the page on the
+  // first press would skip most of what the user was reading. PageUp/PageDown
+  // and the horizontal arrows always turn, because that is all they mean.
+  const viewer = pageScroller()
+  const atTop = !viewer || viewer.scrollTop <= 1
+  const atBottom = !viewer || viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 1
+
+  const turn = (delta: number) => {
+    e.preventDefault()
+    const next = docStore.currentPage + delta
+    if (next >= 1 && next <= docStore.totalPages) {
+      docStore.setPage(next)
+      // Land at the top of a page turned forwards and the foot of one turned
+      // back, so reading carries on from where it left off either way.
+      if (viewer) viewer.scrollTop = delta > 0 ? 0 : viewer.scrollHeight
+    }
+  }
+
+  switch (e.key) {
+    case 'ArrowDown': if (atBottom) turn(1); return
+    case 'ArrowUp': if (atTop) turn(-1); return
+    case 'PageDown': case 'ArrowRight': turn(1); return
+    case 'PageUp': case 'ArrowLeft': turn(-1); return
+    case 'Home': e.preventDefault(); docStore.setPage(1); return
+    case 'End': e.preventDefault(); docStore.setPage(docStore.totalPages); return
+  }
 
   switch (e.key.toLowerCase()) {
     case 'v': editorStore.setTool('select'); break

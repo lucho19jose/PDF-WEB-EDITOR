@@ -1775,12 +1775,16 @@ async function onDragEnd() {
     ]
   })
 
-  // With Reflow off, a move moves exactly what was dragged. Displacing whatever
-  // it lands near is the same page-rearranging behaviour the toggle governs,
-  // and on a form it pulls labels away from their values.
-  const collision = editorStore.reflowOnEdit
-    ? buildCollisionOps(destRects)
-    : { ops: [] as BlockTransformOp[], rowsPushed: 0, blocked: 0, capped: false }
+  // A DRAG always displaces what it lands on, whatever the Reflow toggle says.
+  //
+  // The toggle exists because an EDIT should not rearrange a page: someone
+  // typing into a form wants that field changed and nothing else, and pushing
+  // every row below it tears labels away from their values. Dropping a
+  // paragraph on top of another one is not that. The user aimed at that spot,
+  // there is no flow in a content stream to make room by itself, and leaving
+  // the two overlaid is not a conservative outcome — it is an unreadable one.
+  // Ctrl+Z takes back the whole move, displacements included.
+  const collision = buildCollisionOps(destRects)
 
   const selOps: BlockTransformOp[] = sel.map(block => ({
     blockId: block.id,
