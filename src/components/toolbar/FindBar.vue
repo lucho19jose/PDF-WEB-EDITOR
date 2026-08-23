@@ -63,8 +63,17 @@ function close() {
 </script>
 
 <style scoped>
+/*
+ * Hung off the BOTTOM of the header (`top: 100%`), which is what keeps it
+ * visible: the bar used to be positioned against the layout root at `top:12px`,
+ * which put it inside the strip the fixed header occupies — and the header's
+ * z-index of 2000 painted straight over it, so the field took focus and
+ * keystrokes while being impossible to see. Anchoring to the header instead of
+ * a fixed offset also means it follows the toolbar down when the
+ * context-sensitive properties row opens.
+ */
 .find-bar {
-  position: absolute; top: 12px; right: 24px; z-index: 1000;
+  position: absolute; top: calc(100% + 8px); right: 24px;
   background: #2d2d2d; border: 1px solid #444; border-radius: 8px;
   padding: 6px 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.5);
 }

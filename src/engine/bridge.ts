@@ -1,4 +1,4 @@
-import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit } from './types'
+import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult } from './types'
 import type { WorkerResponse } from './worker/worker-protocol'
 
 /**
@@ -120,7 +120,7 @@ export class MuPDFBridge {
     pageIndex: number,
     blockId: string,
     newText: string
-  ): Promise<{ success: boolean; error?: string; substitutedFont?: string; strategy?: string }> {
+  ): Promise<{ success: boolean; error?: string; substitutedFont?: string; strategy?: string; lines?: number }> {
     return this.send('replaceText', { pageIndex, blockId, newText })
   }
 
@@ -156,6 +156,37 @@ export class MuPDFBridge {
     anchorY: number
   ): Promise<{ success: boolean; error?: string; strategy?: string; clipAdjusted?: boolean }> {
     return this.send('transformTextBlock', { pageIndex, blockId, dx, dy, sx, sy, anchorX, anchorY })
+  }
+
+  /**
+   * Move/scale several blocks in ONE engine round-trip.
+   *
+   * Block ids are extraction indices, so a page can only be renumbered between
+   * calls, never inside one: a multi-block move has to go through here rather
+   * than looping transformTextBlock, or ops after the first address stale ids.
+   */
+  async transformTextBlocks(
+    pageIndex: number,
+    ops: BlockTransformOp[]
+  ): Promise<{ results: BlockTransformResult[]; applied: number }> {
+    return this.send('transformTextBlocks', { pageIndex, ops })
+  }
+
+  /**
+   * Change font family / size / colour of blocks already on the page, in ONE
+   * round-trip — same id-stability reason as transformTextBlocks.
+   */
+  async restyleTextBlocks(
+    pageIndex: number,
+    ops: BlockStyleOp[]
+  ): Promise<{ results: BlockTransformResult[]; applied: number }> {
+    return this.send('restyleTextBlocks', { pageIndex, ops })
+  }
+
+  /** Splice another PDF's pages into this document at `atIndex`. */
+  async mergePages(bytes: ArrayBuffer, atIndex: number): Promise<{
+    success: boolean; pageCount?: number; added?: number; error?: string }> {
+    return this.send('mergePages', { bytes, atIndex }, [bytes])
   }
 
   /**

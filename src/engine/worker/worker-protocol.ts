@@ -1,4 +1,4 @@
-import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit } from '../types'
+import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp } from '../types'
 
 // Messages from main thread -> worker
 export type WorkerRequest =
@@ -12,6 +12,9 @@ export type WorkerRequest =
   | { id: number; type: 'replaceText'; data: { pageIndex: number; blockId: string; newText: string } }
   | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number] } }
   | { id: number; type: 'transformTextBlock'; data: { pageIndex: number; blockId: string; dx: number; dy: number; sx: number; sy: number; anchorX: number; anchorY: number } }
+  | { id: number; type: 'transformTextBlocks'; data: { pageIndex: number; ops: BlockTransformOp[] } }
+  | { id: number; type: 'restyleTextBlocks'; data: { pageIndex: number; ops: BlockStyleOp[] } }
+  | { id: number; type: 'mergePages'; data: { bytes: ArrayBuffer; atIndex: number } }
   | { id: number; type: 'debugFonts'; data: { pageIndex: number } }
   // --- Annotations ---
   | { id: number; type: 'getAnnotations'; data: { pageIndex: number } }
@@ -41,4 +44,4 @@ export type WorkerResponse =
   | { id: number; type: 'error'; error: string }
   | { id: number; type: 'progress'; progress: number }
 
-export type { PageTextData, Quad, Pt, RectT, AnnotationInfo, SearchHit }
+export type { PageTextData, Quad, Pt, RectT, AnnotationInfo, SearchHit, BlockTransformOp }

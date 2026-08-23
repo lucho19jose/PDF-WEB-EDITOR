@@ -11,6 +11,14 @@
         :title="a.title"
         @mousedown.stop="onAnnotMouseDown($event, a.index)"
       />
+      <!-- Resize handles for the selected annotation -->
+      <div
+        v-for="h in annotHandles"
+        :key="h.pos"
+        class="annot-handle"
+        :style="h.style"
+        @mousedown.stop.prevent="onAnnotResizeDown($event, h.pos)"
+      />
       <!-- Delete button for selected annotation -->
       <div v-if="selectedAnnot" class="annot-delete" :style="deleteBtnStyle" @mousedown.prevent>
         <q-btn dense round size="xs" color="negative" icon="delete" @click.stop="deleteSelected">
@@ -60,7 +68,15 @@
       </div>
     </div>
 
-    <input ref="imgInputRef" type="file" accept="image/png,image/jpeg,image/jpg" style="display:none" @change="onImagePicked" />
+    <!-- Off-screen, NOT display:none: a hidden input is the one some browsers
+         refuse to open a chooser for — the same trap `openFile` documents. -->
+    <input
+      ref="imgInputRef"
+      type="file"
+      accept="image/png,image/jpeg,image/jpg"
+      class="offscreen-input"
+      @change="onImagePicked"
+    />
   </div>
 </template>
 
@@ -106,6 +122,13 @@ const freeTextValue = ref('')
 const ftRect = ref<RectT>([0, 0, 0, 0])
 const ftRef = ref<HTMLTextAreaElement | null>(null)
 const imgInputRef = ref<HTMLInputElement | null>(null)
+/** Page-space Y of the click that started an image insertion. */
+const imageDropY = ref<number | null>(null)
+
+/** Provided by PDFViewer — the text layer is a sibling, not a child. */
+const makeRoomInText = inject<(y: number, amount: number, below: boolean) => Promise<{
+  column: { left: number; right: number } | null; y: number; moved: number; spilled: number; capped: boolean
+}>>('makeRoomInText', async (y: number) => ({ column: null, y, moved: 0, spilled: 0, capped: false }))
 
 const scaleX = computed(() => props.pageWidth / props.pdfWidth)
 const scaleY = computed(() => props.pageHeight / props.pdfHeight)
@@ -123,11 +146,7 @@ const selectedAnnot = computed(() => annotations.value.find(a => a.index === sel
 
 // --- existing annotation rendering ---
 const scaledAnnots = computed(() => annotations.value.map(a => {
-  let r = a.rect
-  if (moveState.value?.index === a.index && moveState.value.moved) {
-    r = [r[0] + moveState.value.dx / scaleX.value, r[1] + moveState.value.dy / scaleY.value,
-         r[2] + moveState.value.dx / scaleX.value, r[3] + moveState.value.dy / scaleY.value]
-  }
+  const r = liveAnnotRect(a)
   return {
     index: a.index,
     title: `${a.type}${a.contents ? ': ' + a.contents : ''}`,
@@ -139,6 +158,105 @@ const scaledAnnots = computed(() => annotations.value.map(a => {
     }
   }
 }))
+
+type AnnotHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+
+interface AnnotResize { index: number; handle: AnnotHandle; startX: number; startY: number; rect: RectT; moved: boolean }
+const annotResize = ref<AnnotResize | null>(null)
+
+/**
+ * Eight grips around the selected annotation.
+ *
+ * Without them an image could be placed and moved but never sized, and the only
+ * way to change one was to delete it and insert again at a different width.
+ */
+const annotHandles = computed(() => {
+  const a = selectedAnnot.value
+  if (!a || editorStore.currentTool !== 'select') return []
+  const r = liveAnnotRect(a)
+  const x0 = r[0] * scaleX.value, y0 = r[1] * scaleY.value
+  const x1 = r[2] * scaleX.value, y1 = r[3] * scaleY.value
+  const mx = (x0 + x1) / 2, my = (y0 + y1) / 2
+  const spots: [AnnotHandle, number, number, string][] = [
+    ['nw', x0, y0, 'nwse-resize'], ['n', mx, y0, 'ns-resize'], ['ne', x1, y0, 'nesw-resize'],
+    ['e', x1, my, 'ew-resize'], ['se', x1, y1, 'nwse-resize'], ['s', mx, y1, 'ns-resize'],
+    ['sw', x0, y1, 'nesw-resize'], ['w', x0, my, 'ew-resize']
+  ]
+  return spots.map(([pos, x, y, cursor]) => ({
+    pos,
+    style: { left: `${x - 5}px`, top: `${y - 5}px`, cursor }
+  }))
+})
+
+/** The annotation's rect including any drag or resize in progress. */
+function liveAnnotRect(a: AnnotationInfo): RectT {
+  const rz = annotResize.value
+  if (rz?.index === a.index && rz.moved) return resizedRect(rz)
+  const m = moveState.value
+  if (m?.index === a.index && m.moved) {
+    return [m.rect[0] + m.dx / scaleX.value, m.rect[1] + m.dy / scaleY.value,
+            m.rect[2] + m.dx / scaleX.value, m.rect[3] + m.dy / scaleY.value]
+  }
+  return a.rect
+}
+
+/** Apply a resize drag to its starting rect, keeping it at least a few points wide. */
+function resizedRect(rz: AnnotResize): RectT {
+  const dx = rz.startX === 0 && rz.startY === 0 ? 0 : (annotResizeDelta.value.dx) / scaleX.value
+  const dy = (annotResizeDelta.value.dy) / scaleY.value
+  let [x0, y0, x1, y1] = rz.rect
+  if (rz.handle.includes('w')) x0 += dx
+  if (rz.handle.includes('e')) x1 += dx
+  if (rz.handle.includes('n')) y0 += dy
+  if (rz.handle.includes('s')) y1 += dy
+  if (x1 - x0 < 8) { if (rz.handle.includes('w')) x0 = x1 - 8; else x1 = x0 + 8 }
+  if (y1 - y0 < 8) { if (rz.handle.includes('n')) y0 = y1 - 8; else y1 = y0 + 8 }
+  return [x0, y0, x1, y1]
+}
+
+const annotResizeDelta = ref({ dx: 0, dy: 0 })
+
+function onAnnotResizeDown(e: MouseEvent, handle: AnnotHandle) {
+  const a = selectedAnnot.value
+  if (!a) return
+  annotResizeDelta.value = { dx: 0, dy: 0 }
+  annotResize.value = { index: a.index, handle, startX: e.clientX, startY: e.clientY, rect: [...a.rect] as RectT, moved: false }
+  window.addEventListener('mousemove', onAnnotResizeMove)
+  window.addEventListener('mouseup', onAnnotResizeUp)
+}
+function onAnnotResizeMove(e: MouseEvent) {
+  const rz = annotResize.value
+  if (!rz) return
+  annotResizeDelta.value = { dx: e.clientX - rz.startX, dy: e.clientY - rz.startY }
+  if (Math.abs(annotResizeDelta.value.dx) > 2 || Math.abs(annotResizeDelta.value.dy) > 2) rz.moved = true
+}
+async function onAnnotResizeUp() {
+  window.removeEventListener('mousemove', onAnnotResizeMove)
+  window.removeEventListener('mouseup', onAnnotResizeUp)
+  const rz = annotResize.value
+  annotResize.value = null
+  if (!rz || !rz.moved) return
+  const rect = resizedRect({ ...rz, moved: true })
+
+  // An image that grew taller needs the room, exactly as it did when it was
+  // inserted — otherwise resizing it puts it back on top of the text the
+  // insertion had carefully moved aside.
+  const grewBy = (rect[3] - rect[1]) - (rz.rect[3] - rz.rect[1])
+  let note = 'Annotation resized'
+  if (grewBy > 1 && editorStore.reflowOnEdit) {
+    pushUndo()   // one undo point covering the room and the resize
+    const room = await makeRoomInText(rz.rect[3], grewBy, true)
+    if (room.moved > 0 || room.spilled > 0) {
+      note = [
+        `Annotation resized — ${room.moved} block(s) moved`,
+        room.spilled > 0 ? `${room.spilled} line(s) moved to the next page` : null
+      ].filter(Boolean).join(' — ')
+    }
+    await annotOp(note, () => pdfEngine.updateAnnotation(docStore.currentPage - 1, rz.index, { rect }), false)
+    return
+  }
+  await annotOp(note, () => pdfEngine.updateAnnotation(docStore.currentPage - 1, rz.index, { rect }))
+}
 
 const deleteBtnStyle = computed(() => {
   const a = selectedAnnot.value
@@ -202,7 +320,7 @@ function onCaptureDown(e: MouseEvent) {
   const tool = editorStore.currentTool
   const { sx, sy, px, py } = pageCoords(e)
 
-  if (tool === 'image') { imgInputRef.value?.click(); return }
+  if (tool === 'image') { imageDropY.value = py; imgInputRef.value?.click(); return }
   if (tool === 'note') { placeNote(px, py); return }
 
   drag.value = { tool, startSx: sx, startSy: sy, curSx: sx, curSy: sy, inkPts: [[px, py]], moved: false }
@@ -354,18 +472,72 @@ async function commitFreeText() {
 function cancelFreeText() { freeTextEditing.value = false; freeTextValue.value = '' }
 
 // --- Image ---
+/** Clearance left between an inserted image and the text it sits between. */
+const IMAGE_GAP = 8
+
+/**
+ * Insert an image INTO the flow of the text rather than on top of it.
+ *
+ * A PDF has no flow, so "make room" is a real edit: the lines below (or, for an
+ * "above" placement, from that line down) are moved out of the way first, and
+ * only then is the image stamped into the gap. Doing it the other way round
+ * would put the picture on the page and then slide the text out from under it,
+ * which flickers and — if the reflow fails — leaves the image on top of the
+ * text with no way to tell.
+ *
+ * It is centred on the TEXT COLUMN, not the paper: an image centred on the page
+ * looks off-centre on any document whose margins are not symmetric.
+ */
 async function onImagePicked(e: Event) {
-  const file = (e.target as HTMLInputElement).files?.[0]
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
   if (!file) return
+
   const buf = await file.arrayBuffer()
-  // place a default-sized image near top-left of the visible page
-  const w = Math.min(props.pdfWidth * 0.4, 250)
   const aspect = await imgAspect(file)
-  const h = w / aspect
-  const x = props.pdfWidth * 0.1
-  const y = props.pdfHeight * 0.1
-  await annotOp('Image inserted', () => pdfEngine.addImageStamp(docStore.currentPage - 1, [x, y, x + w, y + h], buf))
-  ;(e.target as HTMLInputElement).value = ''
+  const below = editorStore.imagePlacement === 'below'
+
+  // One undo point for the whole insertion: making room mutates the document
+  // too, so the snapshot has to be taken before ANY of it.
+  pushUndo()
+  const dropY = imageDropY.value ?? props.pdfHeight * 0.2
+  imageDropY.value = null
+
+  // Ask the text where its column is before sizing anything to it.
+  const probe = await makeRoomInText(dropY, 0, below)
+  const column = probe.column ?? { left: props.pdfWidth * 0.1, right: props.pdfWidth * 0.9 }
+  const columnWidth = Math.max(column.right - column.left, 1)
+
+  const w = Math.max(columnWidth * (editorStore.imageWidthPct / 100), 8)
+  const h = Math.max(w / (aspect || 1), 8)
+  const x = column.left + (columnWidth - w) / 2
+
+  // With Reflow off the image is placed where it was asked for and nothing is
+  // moved. On a form — the case that made this necessary — pushing the text
+  // aside tears labels from their values and ruins the page.
+  const room = editorStore.reflowOnEdit
+    ? await makeRoomInText(dropY, h + IMAGE_GAP * 2, below)
+    : probe
+  const top = below ? room.y + IMAGE_GAP : Math.max(room.y - IMAGE_GAP - h, 0)
+
+  const rect: RectT = [x, top, x + w, top + h]
+  const note = editorStore.reflowOnEdit
+    ? [
+        `Image inserted — ${room.moved} block(s) moved to make room`,
+        room.spilled > 0 ? `${room.spilled} line(s) moved to the next page` : null
+      ].filter(Boolean).join(' — ')
+    : 'Image inserted — the text was left as it was (turn on Reflow to move it aside)'
+  await annotOp(note, () => pdfEngine.addImageStamp(docStore.currentPage - 1, rect, buf), false)
+
+  // Hand the user the select tool: staying on 'image' means the next click on
+  // the page opens the file chooser again, so the image they just placed can
+  // never be picked up and resized.
+  editorStore.setTool('select')
+  await nextTick()
+  await loadAnnotations()
+  const placed = annotations.value.find(a => Math.abs(a.rect[0] - rect[0]) < 1 && Math.abs(a.rect[1] - rect[1]) < 1)
+  if (placed) selectedIndex.value = placed.index
 }
 function imgAspect(file: File): Promise<number> {
   return new Promise(resolve => {
@@ -383,14 +555,20 @@ function imgAspect(file: File): Promise<number> {
  * finished, so the op can't be silently discarded by a concurrent document
  * reload and the snapshot reads the true pre-edit bytes.
  */
-async function annotOp(msg: string, mutate: () => Promise<boolean>) {
+async function annotOp(msg: string, mutate: () => Promise<boolean>, pushSnapshot = true) {
   await enqueueOp(async () => {
     const ok = await mutate()
     if (ok) {
       // Snapshot the pre-edit bytes ONLY on success (docStore.pdfBytes is still the
       // pre-edit state until emit('changed') -> onTextChanged reloads it). This avoids
       // polluting undo/redo history when an annotation op fails.
-      pushUndo()
+      //
+      // A caller that already changed the document before getting here (the
+      // image tool moves text out of the way first) owns the undo point and
+      // passes false: snapshotting again here would capture the half-done state
+      // and make one action take two Ctrl+Z, the first of which leaves the page
+      // rearranged around an image that is no longer there.
+      if (pushSnapshot) pushUndo()
       docStore.markModified()
       editorStore.setStatus(msg)
       emit('changed')
@@ -466,6 +644,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', onCaptureUp)
   window.removeEventListener('mousemove', onMoveMove)
   window.removeEventListener('mouseup', onMoveUp)
+  window.removeEventListener('mousemove', onAnnotResizeMove)
+  window.removeEventListener('mouseup', onAnnotResizeUp)
 })
 
 defineExpose({ loadAnnotations, deleteSelected })
@@ -492,6 +672,14 @@ defineExpose({ loadAnnotations, deleteSelected })
 .annot-preview.markup { border-style: none; }
 .annot-svg { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 17; pointer-events: none; overflow: visible; }
 .annot-delete { }
+.annot-handle {
+  position: absolute; width: 10px; height: 10px; z-index: 22;
+  background: #4285f4; border: 1.5px solid #fff; border-radius: 2px;
+  pointer-events: auto; box-shadow: 0 0 0 1px rgba(0,0,0,0.35);
+}
+.offscreen-input {
+  position: fixed; left: -9999px; top: 0;
+}
 .ft-editor-wrap { position: absolute; z-index: 20; pointer-events: auto; display: flex; flex-direction: column; }
 .ft-editor {
   width: 100%; border: 1.5px solid #e53935; background: rgba(255,255,255,0.97);

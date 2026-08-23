@@ -1,7 +1,10 @@
 /// <reference lib="webworker" />
 
 import type { WorkerRequest, WorkerResponse } from './worker-protocol'
-import type { TextBlock, TextChar, TextLine, PageTextData } from '../types'
+import type {
+  TextBlock, TextChar, TextLine, PageTextData,
+  BlockTransformOp, BlockStyleOp, BlockTransformResult
+} from '../types'
 
 // MuPDF module — loaded dynamically to catch errors
 let mupdf: typeof import('mupdf') | null = null
@@ -108,6 +111,26 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      case 'transformTextBlocks': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({
+          id: req.id,
+          type: 'success',
+          data: transformTextBlocks(req.data.pageIndex, req.data.ops)
+        })
+        break
+      }
+
+      case 'restyleTextBlocks': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({
+          id: req.id,
+          type: 'success',
+          data: restyleTextBlocks(req.data.pageIndex, req.data.ops)
+        })
+        break
+      }
+
       case 'debugFonts': {
         if (!pdfDoc) throw new Error('No document loaded')
         const debugInfo = debugPageFonts(req.data.pageIndex)
@@ -180,6 +203,12 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         respond({ id: req.id, type: 'success', data: rotatePage(req.data.pageIndex, req.data.degrees) })
         break
       }
+      case 'mergePages': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: mergePages(req.data.bytes, req.data.atIndex) })
+        break
+      }
+
       case 'insertBlankPage': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({ id: req.id, type: 'success', data: insertBlankPage(req.data.atIndex, req.data.width, req.data.height) })
@@ -303,7 +332,10 @@ function extractPageText(pageIndex: number): PageTextData {
         origin: [origin[0], origin[1]],
         quad: [quad[0], quad[1], quad[2], quad[3], quad[4], quad[5], quad[6], quad[7]],
         size,
-        fontName: font.getName()
+        fontName: font.getName(),
+        color: color && color.length >= 3
+          ? [color[0] ?? 0, color[1] ?? 0, color[2] ?? 0]
+          : undefined
       }
 
       if (currentLine) {
@@ -359,6 +391,15 @@ function extractPageText(pageIndex: number): PageTextData {
  * MuPDF groups all text on the same line into one block, but for
  * move/resize we need finer granularity (like Adobe Acrobat).
  */
+/** Room kept between wrapped text and the right edge of the page, in points. */
+const PAGE_RIGHT_MARGIN = 20
+
+/**
+ * Leading given to lines this engine emits, as a multiple of the font size.
+ * Mirrored by `lineStep` in TextBlockOverlay — see the note at `tdStep`.
+ */
+const LINE_LEADING = 1.4
+
 function splitBlocksAtGaps(blocks: TextBlock[], pageIndex: number): TextBlock[] {
   let subIndex = 0
 
@@ -383,7 +424,11 @@ function splitBlocksAtGaps(blocks: TextBlock[], pageIndex: number): TextBlock[] 
       fontSize: firstChar.size,
       isBold: parentBlock.isBold,
       isItalic: parentBlock.isItalic,
-      color: parentBlock.color,
+      // The parent's colour is only a fallback. MuPDF merges a paragraph into
+      // one block and its colour is the first LINE's, so a line recoloured on
+      // its own would report the paragraph's — which is what made the toolbar
+      // show black for text the user had just turned blue.
+      color: firstChar.color ?? parentBlock.color,
       chars
     }
   }
@@ -474,7 +519,17 @@ function readContentStream(pageIndex: number): string {
   // as "not a stream", so multi-stream pages (Ghostscript output) appeared
   // EMPTY and nothing on them could be edited.
   function readChunk(obj: any): Uint8Array | null {
-    for (const target of [obj, obj?.resolve?.()]) {
+    // The candidates are built INSIDE the try: `resolve()` on MuPDF's null
+    // object throws (it carries no document), and evaluating it while building
+    // the array threw outside every guard — which is how an empty page took the
+    // whole read down with it.
+    let candidates: any[] = []
+    try {
+      candidates = [obj, obj?.resolve?.()]
+    } catch (_) {
+      candidates = [obj]
+    }
+    for (const target of candidates) {
       if (!target) continue
       try {
         const buf = target.readStream()
@@ -486,12 +541,16 @@ function readContentStream(pageIndex: number): string {
     return null
   }
 
-  if (contents.isArray()) {
+  // A page created blank has /Contents set to MuPDF's NULL object — not JS
+  // null, so a truthiness check waves it through. It is an empty stream, not an
+  // error; treating it as one made every caller believe the page was unreadable.
+  const hasContents = !!contents && String(contents) !== 'null'
+  if (hasContents && typeof contents.isArray === 'function' && contents.isArray()) {
     for (let i = 0; i < contents.length; i++) {
       const bytes = readChunk(contents.get(i))
       if (bytes) chunks.push(bytes)
     }
-  } else {
+  } else if (hasContents) {
     const bytes = readChunk(contents)
     if (bytes) chunks.push(bytes)
   }
@@ -1222,11 +1281,17 @@ function rebuildBtContent(
   content: string,
   encodedLines: string[],
   newFontRef: string | null,
-  hex = false
+  hex = false,
+  overrideSize?: number,
+  overrideColorOp?: string | null
 ): string {
   const tfMatch = content.match(/\/([A-Za-z0-9_.+-]+)\s+([\d.]+)\s+Tf/)
-  const tfSize = tfMatch ? tfMatch[2] : '12'
-  const tfPart = newFontRef ? `/${newFontRef} ${tfSize} Tf` : (tfMatch ? tfMatch[0] : '')
+  const tfSize = overrideSize !== undefined ? fmtNum(overrideSize) : (tfMatch ? tfMatch[2] : '12')
+  const tfPart = newFontRef
+    ? `/${newFontRef} ${tfSize} Tf`
+    : (tfMatch
+        ? (overrideSize !== undefined ? `/${tfMatch[1]} ${tfSize} Tf` : tfMatch[0])
+        : '')
 
   const tmMatch = content.match(/(-?[\d.]+\s+){5}-?[\d.]+\s+Tm/)
   const tmPart = tmMatch ? tmMatch[0] : ''
@@ -1239,11 +1304,17 @@ function rebuildBtContent(
   const tdPart = tdMatches ? tdMatches.join('\n') : ''
 
   const colorMatch = content.match(/[\d.]+(?:\s+[\d.]+){0,3}\s+(?:rg|g|k|sc|scn)\b/)
-  const colorPart = colorMatch ? colorMatch[0] : ''
+  const colorPart = overrideColorOp != null ? overrideColorOp : (colorMatch ? colorMatch[0] : '')
 
   // Td moves in text space (before Tm scaling), so the per-line step is the
   // raw Tf size — the Tm matrix applies any page-space scaling on top of it.
-  const tdStep = (parseFloat(tfSize) || 12) * 1.2
+  //
+  // LINE_LEADING, not 1.2: the base-14 faces this path substitutes to have an
+  // ink box about 1.37em tall, so lines set at 1.2 overlapped the one under
+  // them by ~2pt. The client sizes the room it makes with the same constant —
+  // they have to agree or the page reflows by a different amount than the text
+  // actually takes.
+  const tdStep = (parseFloat(tfSize) || 12) * LINE_LEADING
 
   const tjParts: string[] = []
   for (let i = 0; i < encodedLines.length; i++) {
@@ -1406,12 +1477,16 @@ function addTextToPage(
       streamBytes[i] = combined.charCodeAt(i) & 0xFF
     }
 
-    // 5. Write back
+    // 5. Write back.
+    //
+    // A page created by `insertBlankPage` has NO /Contents at all, and calling
+    // `.isArray()` on that null threw — which the catch below turned into a
+    // plain `success: false`. Text spilled onto a fresh page was silently
+    // dropped that way. Anything that is not already a single stream gets one.
     const contents = pageObj.get('Contents')
-    if (contents.isArray()) {
-      const newStreamObj = pdfDoc.addStream(streamBytes, {})
-      pageObj.put('Contents', newStreamObj)
-    } else if (contents.isStream()) {
+    const isStream = !!contents && String(contents) !== 'null' &&
+      typeof contents.isStream === 'function' && contents.isStream()
+    if (isStream) {
       contents.writeStream(streamBytes)
     } else {
       const newStreamObj = pdfDoc.addStream(streamBytes, {})
@@ -1491,7 +1566,7 @@ function replaceTextInStream(
   pageIndex: number,
   blockId: string,
   newText: string
-): { success: boolean; error?: string; substitutedFont?: string; strategy?: string } {
+): { success: boolean; error?: string; substitutedFont?: string; strategy?: string; lines?: number } {
   if (!pdfDoc) return { success: false, error: 'No document' }
 
   try {
@@ -1592,7 +1667,10 @@ function replaceTextInStream(
       return {
         success: true,
         substitutedFont: outcome.substitutedFont,
-        strategy: (src.key === 'page' ? '' : src.key + ':') + (outcome.strategy ?? '')
+        strategy: (src.key === 'page' ? '' : src.key + ':') + (outcome.strategy ?? ''),
+        // How many lines this run now draws. The caller needs it to make room:
+        // extra lines are painted straight over the next paragraph otherwise.
+        lines: outcome.lines ?? 1
       }
     }
 
@@ -1642,6 +1720,82 @@ function transformTextBlock(
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
   }
+}
+
+/**
+ * Move/scale SEVERAL blocks as one operation.
+ *
+ * Doing this as N separate `transformTextBlock` calls does not work: each call
+ * re-extracts the page, block ids are extraction indices, and moving a block
+ * changes where it sorts — so call #2 addresses a page that call #1 already
+ * renumbered, and the wrong paragraph gets dragged. Here the extraction happens
+ * ONCE and every op is resolved against that single snapshot.
+ *
+ * The `targetBlock` bboxes therefore stay the pre-move ones for the whole
+ * batch, which is exactly what position-based matching needs: a block that has
+ * not been rewritten yet is still where the snapshot says it is.
+ *
+ * Ops are applied in the order given. The caller sends the collision pushes
+ * BEFORE the dragged selection so obstacles have vacated their old coordinates
+ * by the time the dragged text is matched — otherwise two blocks with the same
+ * text can sit close enough for the distance ranking to pick the wrong one.
+ */
+function transformTextBlocks(
+  pageIndex: number,
+  ops: BlockTransformOp[]
+): { results: BlockTransformResult[]; applied: number } {
+  if (!pdfDoc) {
+    return {
+      results: ops.map(o => ({ blockId: o.blockId, success: false, error: 'No document' })),
+      applied: 0
+    }
+  }
+
+  let pageData: PageTextData
+  try {
+    pageData = extractPageText(pageIndex)
+  } catch (err: any) {
+    return {
+      results: ops.map(o => ({ blockId: o.blockId, success: false, error: err.message || String(err) })),
+      applied: 0
+    }
+  }
+
+  const results: BlockTransformResult[] = []
+  let applied = 0
+
+  for (const op of ops) {
+    const targetBlock = pageData.blocks.find(b => b.id === op.blockId)
+    if (!targetBlock) {
+      results.push({ blockId: op.blockId, success: false, error: `Block ${op.blockId} not found` })
+      continue
+    }
+
+    // A no-op push (the caller found nothing to move it by) must not rewrite
+    // the stream at all — every rewrite is a chance to match the wrong block.
+    if (op.dx === 0 && op.dy === 0 && op.sx === 1 && op.sy === 1) {
+      results.push({ blockId: op.blockId, success: true, strategy: 'noop' })
+      continue
+    }
+
+    let outcome: { success: boolean; error?: string; strategy?: string; clipAdjusted?: boolean } | null = null
+    try {
+      // Text may live in the page stream or in a Form XObject it invokes.
+      for (const src of getContentSources(pageIndex)) {
+        outcome = withSource(src, () => transformInSource(
+          src, pageIndex, targetBlock, op.dx, op.dy, op.sx, op.sy, op.anchorX, op.anchorY))
+        if (outcome) break
+      }
+    } catch (err: any) {
+      outcome = { success: false, error: err.message || String(err) }
+    }
+
+    if (!outcome) outcome = { success: false, error: 'Could not find matching text in content stream' }
+    if (outcome.success) applied++
+    results.push({ blockId: op.blockId, ...outcome })
+  }
+
+  return { results, applied }
 }
 
 /** Transform work for ONE content stream. Returns null when it holds no match. */
@@ -1826,6 +1980,388 @@ function transformInSource(
       success: true,
       strategy: (src.key === 'page' ? '' : src.key + ':') + (usedStrategy ?? ''),
       clipAdjusted
+    }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Pick the base-14 face for a family, keeping the block's existing weight and
+ * slant — the user chose a typeface, not a reset to regular.
+ */
+function styledBase14(family: string, block: TextBlock): string {
+  const bold = block.isBold
+  const italic = block.isItalic
+  if (/courier|mono/i.test(family)) {
+    return bold && italic ? 'Courier-BoldOblique' : bold ? 'Courier-Bold' : italic ? 'Courier-Oblique' : 'Courier'
+  }
+  if (/times|serif|roman/i.test(family)) {
+    return bold && italic ? 'Times-BoldItalic' : bold ? 'Times-Bold' : italic ? 'Times-Italic' : 'Times-Roman'
+  }
+  return bold && italic ? 'Helvetica-BoldOblique' : bold ? 'Helvetica-Bold' : italic ? 'Helvetica-Oblique' : 'Helvetica'
+}
+
+/**
+ * Restyle text that is already on the page — font family, size, fill colour.
+ *
+ * Extraction happens ONCE for the whole batch, for the same reason
+ * `transformTextBlocks` does it: block ids are extraction indices, and a
+ * rewrite renumbers everything after it.
+ */
+function restyleTextBlocks(
+  pageIndex: number,
+  ops: BlockStyleOp[]
+): { results: BlockTransformResult[]; applied: number } {
+  if (!pdfDoc) {
+    return {
+      results: ops.map(o => ({ blockId: o.blockId, success: false, error: 'No document' })),
+      applied: 0
+    }
+  }
+
+  let pageData: PageTextData
+  try {
+    pageData = extractPageText(pageIndex)
+  } catch (err: any) {
+    return {
+      results: ops.map(o => ({ blockId: o.blockId, success: false, error: err.message || String(err) })),
+      applied: 0
+    }
+  }
+
+  const results: BlockTransformResult[] = []
+  let applied = 0
+
+  for (const op of ops) {
+    const targetBlock = pageData.blocks.find(b => b.id === op.blockId)
+    if (!targetBlock) {
+      results.push({ blockId: op.blockId, success: false, error: `Block ${op.blockId} not found` })
+      continue
+    }
+
+    // Nothing asked for is not an edit. Every stream rewrite is a chance to
+    // match the wrong block, so it has to be earned.
+    if (op.fontName === undefined && op.fontSize === undefined && op.color === undefined) {
+      results.push({ blockId: op.blockId, success: true, strategy: 'noop' })
+      continue
+    }
+
+    let outcome: { success: boolean; error?: string; strategy?: string; lines?: number; baselineDrop?: number } | null = null
+    try {
+      for (const src of getContentSources(pageIndex)) {
+        outcome = withSource(src, () => restyleInSource(src, pageIndex, targetBlock, op))
+        if (outcome) break
+      }
+    } catch (err: any) {
+      outcome = { success: false, error: err.message || String(err) }
+    }
+
+    if (!outcome) outcome = { success: false, error: 'Could not find matching text in content stream' }
+    if (outcome.success) applied++
+    results.push({ blockId: op.blockId, ...outcome })
+  }
+
+  return { results, applied }
+}
+
+/**
+ * Restyle work for ONE content stream. Returns null when it holds no match.
+ *
+ * Two rewrites, because they carry very different risk:
+ *
+ * - Size and colour are applied SURGICALLY: the `Tf` operand and the fill
+ *   colour operator are rewritten in place and every show op, TJ kern array and
+ *   Td offset is left exactly as the generator wrote it. The text's encoding
+ *   never changes, so nothing can be garbled — and justified text stays
+ *   justified, which a rebuild cannot promise.
+ * - A font FAMILY change cannot be surgical: the bytes in the string literals
+ *   are codes into the OLD font's encoding, and pointing them at a different
+ *   font renders mojibake. The run is decoded, re-encoded as WinAnsi and the BT
+ *   block rebuilt around a freshly registered base-14 face — which costs the
+ *   original kerning, the price of changing typeface at all.
+ *
+ * Either way the block is wrapped in `q`/`Q`. Font, size and colour are all
+ * graphics state that outlives `ET`, so without the save/restore, restyling one
+ * line silently restyles every later line that inherited its state — the same
+ * trap `rebuildBtContent` documents for `Tf`, and it applies to colour too.
+ */
+/**
+ * Move a block's text matrix down the page by `dropPagePts`.
+ *
+ * The delta arrives in PAGE space and the Tm lives inside the enclosing CTM, so
+ * it goes through the inverse the same way `transformInSource` does it — a page
+ * that wraps text in `0.24 0 0 -0.24 cm` would otherwise move by a quarter of
+ * what was asked, in the wrong direction.
+ */
+function dropBaselineInBlock(inner: string, stream: string, blockStart: number, dropPagePts: number): string {
+  if (!(dropPagePts > 0.05)) return inner
+
+  // Page space is y-down; Tm space is y-up.
+  const dy = -dropPagePts
+  let dxL = 0
+  let dyL = dy
+  const ctm = getCtmAtOffset(stream, blockStart)
+  const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
+  if (Math.abs(det) > 1e-9) {
+    const ib = -ctm[1] / det
+    const ic = -ctm[2] / det
+    const id = ctm[0] / det
+    dxL = dy * ic
+    dyL = dy * id
+  }
+
+  const tmRegex = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/
+  // Masked so digits inside "(1 0 0 1 5 5 Tm)" cannot be mistaken for the
+  // operator; the mask preserves length, so the offset is valid in `inner`.
+  const hit = maskStreamLiterals(inner).match(tmRegex)
+  if (!hit || hit.index === undefined) return inner
+  const real = inner.slice(hit.index, hit.index + hit[0].length).match(tmRegex)
+  if (!real) return inner
+
+  const n = real.slice(1, 7).map(parseFloat)
+  const rewritten =
+    `${fmtNum(n[0])} ${fmtNum(n[1])} ${fmtNum(n[2])} ${fmtNum(n[3])} ` +
+    `${fmtNum(n[4] + dxL)} ${fmtNum(n[5] + dyL)} Tm`
+  return inner.slice(0, hit.index) + rewritten + inner.slice(hit.index + hit[0].length)
+}
+
+function restyleInSource(
+  src: ContentSource,
+  pageIndex: number,
+  targetBlock: TextBlock,
+  op: BlockStyleOp
+): { success: boolean; error?: string; strategy?: string; lines?: number; baselineDrop?: number } | null {
+  try {
+    const stream = src.stream
+
+    const fontRefs = [...new Set([...stream.matchAll(/\/([A-Za-z0-9_.+-]+)\s+[\d.]+\s+Tf/g)].map(m => m[1]))]
+    const fontRefToBaseName = new Map<string, string>()
+    for (const fontRef of fontRefs) {
+      getFontEncoding(pageIndex, fontRef)
+      let page2: any = null
+      try {
+        page2 = pdfDoc!.loadPage(pageIndex)
+        const fDict = resolveResources(page2.getObject())?.get('Font')?.get(fontRef)
+        if (fDict) {
+          const baseFontStr = fDict.resolve().get('BaseFont')?.toString?.() || ''
+          fontRefToBaseName.set(fontRef, baseFontStr.replace(/^\//, ''))
+        }
+      } catch (_) {
+      } finally {
+        try { page2?.destroy() } catch (_) { /* already destroyed */ }
+      }
+    }
+
+    const targetFontRef = findMatchingFontRef(targetBlock.fontName, fontRefToBaseName)
+    const pageHeight = getPageSize(pageIndex).height
+    const matchedBlocks = findBtBlocksByPosition(stream, pageIndex, targetBlock, targetFontRef, pageHeight)
+    if (!matchedBlocks || matchedBlocks.length === 0) return null
+
+    // The face is registered once for the whole op, not per BT block: every
+    // matched block is the same run of text and wants the same resource.
+    let newFontRef: string | null = null
+    let newFontName: string | null = null
+    if (op.fontName) {
+      newFontName = styledBase14(op.fontName, targetBlock)
+      const page = pdfDoc!.loadPage(pageIndex)
+      try {
+        newFontRef = ensureStandardFont(page.getObject(), newFontName)
+      } finally {
+        try { page.destroy() } catch (_) { /* already destroyed */ }
+      }
+    }
+
+    const colorOp = op.color
+      ? `${fmtNum(op.color[0])} ${fmtNum(op.color[1])} ${fmtNum(op.color[2])} rg`
+      : null
+
+    interface Splice { start: number; end: number; text: string }
+    const splices: Splice[] = []
+    let usedStrategy: string | undefined
+
+    /**
+     * The `Tf` operand is NOT the visible size.
+     *
+     * Quartz and Distiller draw with `/F3.0 1 Tf` and keep the scale in the
+     * text matrix (`12 0 0 -12 … Tm`); writing 24 into that Tf renders at
+     * 24 × 12 = 288pt. What IS well defined is the ratio between the size the
+     * user asked for and the size MuPDF reports for this block — the product of
+     * both — so the ratio is what gets applied, to whatever operand is there.
+     */
+    const sizeRatio = op.fontSize !== undefined && targetBlock.fontSize > 0.01
+      ? op.fontSize / targetBlock.fontSize
+      : null
+    if (op.fontSize !== undefined && sizeRatio === null) {
+      return { success: false, error: 'Cannot resize: the engine reports no font size for this text' }
+    }
+    // Font-ref names are among the tokens `maskStreamLiterals` blanks out, so a
+    // Tf lookup has to run on the raw content — the same way `transformInSource`
+    // and `rebuildBtContent` do it. Colour operators are pure numbers and are
+    // matched on the masked copy, where "(1 0 0 rg)" as literal text cannot lie.
+    const TF_RE = /(\/[A-Za-z0-9_.+-]+\s+)([\d.]+)(\s+Tf)/g
+
+    /**
+     * Does the text still fit between its left edge and the right margin?
+     *
+     * Growing a font grows the run by the same ratio, and a content stream has
+     * no margin of its own: the glyphs are simply drawn past the edge of the
+     * paper, where they are neither visible nor recoverable. When that would
+     * happen the run is re-emitted wrapped, which needs the rebuild path — the
+     * surgical Tf rewrite cannot produce a second line.
+     */
+    const pageWidth = getPageSize(pageIndex).width
+    const available = pageWidth - targetBlock.x - PAGE_RIGHT_MARGIN
+    const overflows = sizeRatio !== null && sizeRatio > 1 &&
+      targetBlock.width * sizeRatio > available && available > 0
+    let drawnLines = 1
+
+    /**
+     * A bigger font grows UPWARD from the baseline as well as down, so a resized
+     * run climbs straight into the line above it — at 30pt over a 12pt page the
+     * two were fully interleaved. The run descends by the ascent it gained,
+     * which is done HERE rather than as a follow-up move because wrapping
+     * changes the block's text and it could not be re-found afterwards.
+     *
+     * The drop is the WHOLE em gained, not just the ascent: 0.8em cleared the
+     * cap height but still let a 30pt ascender into the descender zone of the
+     * 12pt line above. Erring high only adds leading, and the caller makes the
+     * same room below, so the run stays centred in the space it was given.
+     */
+    const baselineDrop = op.fontSize !== undefined && targetBlock.fontSize > 0.01
+      ? Math.max(0, op.fontSize - targetBlock.fontSize)
+      : 0
+
+    for (const block of matchedBlocks) {
+      let inner: string
+      /** Emitted between the `q` and the `BT` when the block sets no colour of its own. */
+      let colorPrefix = ''
+
+      if (!newFontRef && overflows && sizeRatio !== null) {
+        if (matchLength(block.decodedText) > matchLength(targetBlock.text) * 1.4 + 4) {
+          return {
+            success: false,
+            error: 'Cannot resize: the text would run past the margin and this run shares its BT block with other text'
+          }
+        }
+        // Measured at the size the text will BE — the same routine the
+        // replacement path uses, so a resize and a retype wrap identically.
+        const wrapped = layoutReplacementLines(block.decodedText, targetBlock, pageWidth, sizeRatio)
+
+        const plan = planTextEncoding(
+          pageIndex,
+          { mode: block.mode, fontRef: block.fontRef, encoding: block.encoding },
+          wrapped,
+          targetBlock
+        )
+        if (plan.kind === 'error') return { success: false, error: plan.error }
+
+        const tf = block.content.match(/\/[A-Za-z0-9_.+-]+\s+([\d.]+)\s+Tf/)
+        const cur = tf ? parseFloat(tf[1]) : NaN
+        const sizeOverride = Number.isFinite(cur) ? cur * sizeRatio : undefined
+
+        inner = plan.kind === 'keep-hex'
+          ? rebuildBtContent(block.content, plan.hexLines, null, true, sizeOverride, colorOp)
+          : plan.kind === 'keep-plain'
+            ? rebuildBtContent(block.content, plan.byteLines, null, false, sizeOverride, colorOp)
+            : rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, sizeOverride, colorOp)
+
+        inner = stripActualText(inner)
+        inner = dropBaselineInBlock(inner, stream, block.start, baselineDrop)
+        drawnLines = Math.max(drawnLines, wrapped.length)
+        usedStrategy ??= 'tf_scale_wrapped'
+        splices.push({ start: block.start, end: block.end, text: `q${colorPrefix} BT${inner}ET Q` })
+        continue
+      }
+
+      if (newFontRef) {
+        // Re-encoding rewrites every glyph in the block, so a block that draws
+        // more than the target would lose the rest of its text to this edit —
+        // the same trap the replacement path guards against.
+        if (matchLength(block.decodedText) > matchLength(targetBlock.text) * 1.4 + 4) {
+          return {
+            success: false,
+            error: 'Cannot change the font: this run shares its BT block with other text'
+          }
+        }
+        const enc = encodeWinAnsiText(block.decodedText)
+        if ('missing' in enc) {
+          return {
+            success: false,
+            error: `Cannot switch font: ${enc.missing.join(', ')} is not available in ${newFontName}`
+          }
+        }
+        let sizeOverride: number | undefined
+        if (sizeRatio !== null) {
+          const tf = block.content.match(/\/[A-Za-z0-9_.+-]+\s+([\d.]+)\s+Tf/)
+          const cur = tf ? parseFloat(tf[1]) : NaN
+          if (Number.isFinite(cur)) sizeOverride = cur * sizeRatio
+        }
+        inner = rebuildBtContent(block.content, [enc.bytes], newFontRef, false, sizeOverride, colorOp)
+        usedStrategy ??= 'rebuild_font'
+      } else {
+        inner = block.content
+        if (sizeRatio !== null) {
+          const hits = [...inner.matchAll(TF_RE)]
+          if (hits.length === 0) {
+            return {
+              success: false,
+              error: 'Cannot resize: this run inherits its font size from outside its own BT block'
+            }
+          }
+          for (const h of hits.reverse()) {
+            const scaled = (parseFloat(h[2]) || 0) * sizeRatio
+            inner = inner.slice(0, h.index!) + h[1] + fmtNum(scaled) + h[3] + inner.slice(h.index! + h[0].length)
+          }
+          usedStrategy ??= 'tf_scale'
+        }
+        if (colorOp) {
+          const hits = [...maskStreamLiterals(inner).matchAll(/[\d.]+(?:\s+[\d.]+){0,3}\s+(?:rg|g|k|sc|scn)\b/g)]
+          for (const h of hits.reverse()) {
+            inner = inner.slice(0, h.index!) + colorOp + inner.slice(h.index! + h[0].length)
+          }
+          // Nothing to overwrite: this run inherits its colour from before the
+          // BT (Quartz sets `0.3 sc` outside it). The new one goes in the same
+          // place — ahead of the text object — because that is where MuPDF's
+          // extractor picks the fill colour up from. Emitting it INSIDE renders
+          // correctly but reports back as black, so the toolbar would show the
+          // wrong swatch the next time the block was selected.
+          if (hits.length === 0) colorPrefix = ` ${colorOp}`
+          usedStrategy ??= 'color_rewrite'
+        }
+      }
+
+      inner = dropBaselineInBlock(inner, stream, block.start, baselineDrop)
+      splices.push({ start: block.start, end: block.end, text: `q${colorPrefix} BT${inner}ET Q` })
+    }
+
+    if (splices.length === 0) return null
+
+    let modifiedStream = stream
+    for (const sp of splices.sort((a, b) => b.start - a.start)) {
+      modifiedStream = modifiedStream.slice(0, sp.start) + sp.text + modifiedStream.slice(sp.end)
+    }
+
+    // A rewrite that changed nothing is a failure, not a success. Reporting it
+    // as applied is worse than reporting the error: the status bar says the
+    // style landed, the page plainly disagrees, and the user has no idea which
+    // to believe.
+    if (modifiedStream === stream) {
+      return { success: false, error: 'The style operators for this text could not be located' }
+    }
+
+    const streamBytes = new Uint8Array(modifiedStream.length)
+    for (let i = 0; i < modifiedStream.length; i++) {
+      streamBytes[i] = modifiedStream.charCodeAt(i) & 0xFF
+    }
+
+    src.write(streamBytes)
+    invalidateContentSources(pageIndex)
+    return {
+      success: true,
+      strategy: (src.key === 'page' ? '' : src.key + ':') + (usedStrategy ?? ''),
+      lines: drawnLines,
+      baselineDrop
     }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
@@ -2469,7 +3005,7 @@ function replaceTextInContentStreamFontAware(
   targetFontRef: string | null,
   pageWidth?: number,
   pageHeight?: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
   // Step 1: Parse all BT blocks with position and text info
   const allBlocks = scanBtBlocks(stream, pageIndex)
 
@@ -2548,8 +3084,15 @@ function replaceTextInContentStreamFontAware(
 
     const exact = normalizedDecoded === normalizedTarget
     if (exact || fuzzyTextMatch(normalizedDecoded, normalizedTarget)) {
+      // Score by how much of the target this block actually CARRIES, not a flat
+      // 1 for "fuzzy matched". A form draws "Código de Postulante" and its value
+      // "70492487" as two runs that extraction reports as one line; the label
+      // alone fuzzy-matches the whole line, and a flat 1 beat the line group
+      // that covered both (≈0.97). The label was rewritten, the value was left
+      // stranded beside the new text, and the edit reported success.
       candidates.push({
-        blocks: [block], score: exact ? 2 : 1,
+        blocks: [block],
+        score: exact ? 2 : matchRatio(normalizedDecoded, normalizedTarget),
         dist: distOf(block), line: false, order: candidates.length
       })
     }
@@ -2652,7 +3195,7 @@ function applyBlockReplacement(
   targetBlock?: TextBlock,
   pageWidth?: number,
   pageHeight?: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
   const block = blocks[0]
 
   // If this BT block holds much MORE text than the target (one BT drawing
@@ -2675,17 +3218,20 @@ function applyBlockReplacement(
     }
   }
 
-  // Check if we need line wrapping
-  const needsWrap = targetBlock && pageWidth && newText.length > 0 &&
-    shouldWrapText(newText, targetBlock, pageWidth)
+  // How many lines this text actually needs — explicit breaks plus whatever the
+  // right margin forces. Anything past one goes down the rebuild path, which is
+  // the only one that can emit a second line at all.
+  const laidOut = targetBlock && pageWidth && newText.length > 0
+    ? layoutReplacementLines(newText, targetBlock, pageWidth)
+    : [newText]
 
-  if (needsWrap && targetBlock && pageWidth) {
-    const wrappedResult = applyWrappedReplacement(stream, block, newText, targetBlock, pageWidth, pageIndex)
+  if (laidOut.length > 1 && targetBlock) {
+    const wrappedResult = applyWrappedReplacement(stream, block, laidOut, targetBlock, pageIndex)
     if (wrappedResult) return wrappedResult
   }
 
   // Standard single-line replacement
-  const plan = planTextEncoding(pageIndex, block, [newText], targetBlock)
+  const plan = planTextEncoding(pageIndex, block, [laidOut[0] ?? newText], targetBlock)
   if (plan.kind === 'error') return { error: plan.error }
 
   let newContent: string
@@ -2705,51 +3251,135 @@ function applyBlockReplacement(
     newContent = stripActualText(newContent)
     const result = stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
                    stream.substring(block.end)
-    return { stream: result, substitutedFont }
+    return { stream: result, substitutedFont, lines: 1 }
   }
   return null
 }
 
-/**
- * Check if text needs wrapping based on estimated width.
- */
-function shouldWrapText(newText: string, targetBlock: TextBlock, pageWidth: number): boolean {
-  const origText = targetBlock.text
-  const blockWidth = targetBlock.width
-  if (blockWidth <= 0 || origText.length === 0) return false
-
-  // Estimate average char width from the original block
-  const avgCharWidth = blockWidth / origText.length
-  const estimatedNewWidth = newText.length * avgCharWidth
-  // Available width: from block's left edge to right margin (with 20pt margin)
-  const availableWidth = pageWidth - targetBlock.x - 20
-
-  return estimatedNewWidth > availableWidth * 1.1 // 10% tolerance
-}
 
 /**
  * Apply text replacement with automatic line wrapping.
  * Generates multiple Tj + Td operators for multi-line text.
  */
-function applyWrappedReplacement(
-  stream: string,
-  block: BtInfo,
+/** Base-14 faces kept around for measuring; MuPDF resolves the standard names. */
+const measureFaceCache = new Map<string, any>()
+
+function measureFace(name: string): any | null {
+  if (!mupdf) return null
+  if (!measureFaceCache.has(name)) {
+    let f: any = null
+    try { f = new mupdf.Font(name) } catch (_) { f = null }
+    measureFaceCache.set(name, f)
+  }
+  return measureFaceCache.get(name)
+}
+
+/**
+ * Width of `text` in em units — multiply by the font size for points.
+ *
+ * Real glyph advances, not a character count. Wrapping on an average char width
+ * taken from the ORIGINAL text overflows the page the moment the replacement is
+ * wider than what was there: "MMMM WWWW" is nearly twice the width of the same
+ * number of lowercase letters, and the excess is drawn off the edge of the
+ * paper, where it is neither visible nor recoverable.
+ */
+function measureEm(text: string, faceName: string): number {
+  const font = measureFace(faceName)
+  if (!font) return text.length * 0.5
+  let w = 0
+  for (const ch of text) {
+    try {
+      w += font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0)!))
+    } catch (_) {
+      w += 0.5
+    }
+  }
+  return w
+}
+
+/** Greedy word wrap on MEASURED width, breaking a word too long to ever fit. */
+function wrapToWidth(text: string, maxEm: number, faceName: string): string[] {
+  if (!(maxEm > 0)) return [text]
+  const words = text.split(/\s+/).filter(w => w.length > 0)
+  if (words.length === 0) return ['']
+
+  const lines: string[] = []
+  let line = ''
+
+  for (const word of words) {
+    if (line && measureEm(`${line} ${word}`, faceName) <= maxEm) {
+      line = `${line} ${word}`
+      continue
+    }
+    if (line) { lines.push(line); line = '' }
+
+    if (measureEm(word, faceName) <= maxEm) { line = word; continue }
+
+    // A word wider than the whole line still has to go somewhere. Breaking it
+    // mid-word is ugly; letting it run off the paper loses it.
+    let chunk = ''
+    for (const ch of word) {
+      if (chunk && measureEm(chunk + ch, faceName) > maxEm) { lines.push(chunk); chunk = ch }
+      else chunk += ch
+    }
+    line = chunk
+  }
+  if (line) lines.push(line)
+  return lines.length > 0 ? lines : ['']
+}
+
+/**
+ * Break replacement text into the lines that will actually be drawn.
+ *
+ * Explicit newlines come first and are never merged away — a break the user
+ * typed is an instruction, not a hint — and each of the resulting paragraphs is
+ * then wrapped to the room left between the block's left edge and the right
+ * margin. Doing both here is what makes "typed a line break" and "text outgrew
+ * the page" one code path instead of two that disagree.
+ *
+ * `sizeRatio` is how much the font is growing, for the restyle path: the room
+ * has to be measured at the size the text will BE, not the size it was.
+ */
+function layoutReplacementLines(
   newText: string,
   targetBlock: TextBlock,
   pageWidth: number,
+  sizeRatio = 1
+): string[] {
+  const available = pageWidth - targetBlock.x - PAGE_RIGHT_MARGIN
+  if (!(available > 0)) return newText.split('\n')
+
+  const face = pickSubstituteFont(null, targetBlock)
+  const size = Math.max(targetBlock.fontSize * sizeRatio, 0.01)
+
+  // The face measured with is a base-14 stand-in for whatever the page really
+  // uses, so it is calibrated against the one width known for certain: what this
+  // block ACTUALLY occupies today. Clamped, because a wild ratio means the
+  // stand-in was a bad guess and the raw metrics are the better bet.
+  const referenceEm = measureEm(targetBlock.text, face)
+  const raw = referenceEm > 0.01 && targetBlock.width > 0.01 && targetBlock.fontSize > 0.01
+    ? targetBlock.width / (referenceEm * targetBlock.fontSize)
+    : 1
+  const calibration = Math.min(Math.max(raw, 0.5), 2)
+
+  const maxEm = available / (size * calibration)
+
+  const out: string[] = []
+  for (const para of newText.split('\n')) {
+    if (para.length === 0) { out.push(''); continue }
+    out.push(...wrapToWidth(para, maxEm, face))
+  }
+  return out
+}
+
+function applyWrappedReplacement(
+  stream: string,
+  block: BtInfo,
+  lines: string[],
+  targetBlock: TextBlock,
   pageIndex: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
-  const origText = targetBlock.text
-  const blockWidth = targetBlock.width
-  const avgCharWidth = blockWidth / Math.max(origText.length, 1)
-  const availableWidth = pageWidth - targetBlock.x - 20
-
-  // Max chars per line
-  const maxCharsPerLine = Math.max(Math.floor(availableWidth / avgCharWidth), 10)
-
-  // Word-wrap the text
-  const lines = wordWrap(newText, maxCharsPerLine)
-  if (lines.length <= 1) return null // No wrapping needed, fall through to standard
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
+  if (lines.length <= 1) return null // Single line — the surgical path is safer
 
   const plan = planTextEncoding(pageIndex, block, lines, targetBlock)
   if (plan.kind === 'error') return { error: plan.error }
@@ -2770,40 +3400,11 @@ function applyWrappedReplacement(
   return {
     stream: stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
             stream.substring(block.end),
-    substitutedFont
+    substitutedFont,
+    lines: lines.length
   }
 }
 
-/**
- * Word-wrap text to fit within maxCharsPerLine.
- */
-function wordWrap(text: string, maxCharsPerLine: number): string[] {
-  const words = text.split(/\s+/)
-  const lines: string[] = []
-  let currentLine = ''
-
-  for (const word of words) {
-    if (currentLine.length === 0) {
-      currentLine = word
-    } else if (currentLine.length + 1 + word.length <= maxCharsPerLine) {
-      currentLine += ' ' + word
-    } else {
-      lines.push(currentLine)
-      currentLine = word
-    }
-    // Handle very long words that exceed maxCharsPerLine
-    while (currentLine.length > maxCharsPerLine) {
-      lines.push(currentLine.substring(0, maxCharsPerLine))
-      currentLine = currentLine.substring(maxCharsPerLine)
-    }
-  }
-
-  if (currentLine.length > 0) {
-    lines.push(currentLine)
-  }
-
-  return lines
-}
 
 /**
  * Apply replacement across multiple BT blocks on the same line.
@@ -2816,7 +3417,7 @@ function applyLineReplacement(
   pageIndex: number,
   targetBlock?: TextBlock,
   pageWidth?: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
   // Sort by position in stream (ascending)
   const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
 
@@ -2849,6 +3450,7 @@ function applyLineReplacement(
   // Build replacements (process from end to start to preserve offsets)
   const replacements: { start: number; end: number; newContent: string }[] = []
   let substitutedFont: string | undefined
+  let drawnLines = 1
 
   for (let i = sorted.length - 1; i >= 0; i--) {
     const block = sorted[i]
@@ -2856,13 +3458,10 @@ function applyLineReplacement(
 
     if (i === primaryIdx) {
       // Primary block: insert the new text, word-wrapped if it won't fit the line
-      let lines = [newText]
-      if (targetBlock && pageWidth && newText.length > 0 && shouldWrapText(newText, targetBlock, pageWidth)) {
-        const avgCharWidth = targetBlock.width / Math.max(targetBlock.text.length, 1)
-        const availableWidth = pageWidth - targetBlock.x - 20
-        const maxCharsPerLine = Math.max(Math.floor(availableWidth / avgCharWidth), 10)
-        lines = wordWrap(newText, maxCharsPerLine)
-      }
+      const lines = targetBlock && pageWidth && newText.length > 0
+        ? layoutReplacementLines(newText, targetBlock, pageWidth)
+        : [newText]
+      drawnLines = lines.length
 
       const plan = planTextEncoding(pageIndex, block, lines, targetBlock)
       if (plan.kind === 'error') return { error: plan.error }
@@ -2898,7 +3497,7 @@ function applyLineReplacement(
     result = result.substring(0, rep.start) + 'BT' + rep.newContent + 'ET' + result.substring(rep.end)
   }
 
-  return result !== stream ? { stream: result, substitutedFont } : null
+  return result !== stream ? { stream: result, substitutedFont, lines: drawnLines } : null
 }
 
 /**
@@ -3390,7 +3989,7 @@ function applyPartialBlockReplacement(
   pageIndex: number,
   targetBlock: TextBlock,
   pageHeight?: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
   const simpleInfo = getSimpleFontInfo(pageIndex, block.fontRef)
   const ops = scanShowOps(block.content, block.encoding, simpleInfo)
   if (ops.length < 1) return null
@@ -3960,6 +4559,38 @@ function rotatePage(pageIndex: number, degrees: number): {
     return { success: true, rotation: next }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Splice every page of ANOTHER PDF into this one at `atIndex`.
+ *
+ * `graftPage` copies the page together with the objects it depends on — fonts,
+ * images, colour spaces — into this document's object graph. Appending the raw
+ * bytes, or copying the page dictionary alone, produces a page whose resources
+ * point at objects that do not exist here: a blank sheet, or a viewer error.
+ *
+ * Each grafted page keeps its own size, so merging an A4 form into a Letter
+ * document leaves both correct rather than cropping one to the other.
+ */
+function mergePages(bytes: ArrayBuffer, atIndex: number): {
+  success: boolean; pageCount?: number; added?: number; error?: string } {
+  if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
+  let src: any = null
+  try {
+    src = new mupdf.PDFDocument(new Uint8Array(bytes))
+    const n = src.countPages()
+    if (n === 0) return { success: false, error: 'That file has no pages' }
+
+    invalidateContentSources() // page indices shift
+    const at = Math.max(0, Math.min(atIndex, pdfDoc.countPages()))
+    for (let i = 0; i < n; i++) pdfDoc.graftPage(at + i, src, i)
+
+    return { success: true, pageCount: pdfDoc.countPages(), added: n }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  } finally {
+    try { src?.destroy() } catch (_) { /* already gone */ }
   }
 }
 

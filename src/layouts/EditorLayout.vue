@@ -14,6 +14,14 @@
         </q-btn>
       </div>
       <MainToolbar />
+      <!--
+        Inside the header, not the page container: the header is the only
+        element in the layout that is guaranteed to sit above the page, and
+        anchoring to it means the bar follows the toolbar down when the
+        context-sensitive properties row appears instead of needing a height
+        hardcoded here and kept in sync by hand.
+      -->
+      <FindBar />
     </q-header>
 
     <!-- Left Sidebar: Page Thumbnails -->
@@ -24,8 +32,36 @@
     <!-- Main Content -->
     <q-page-container>
       <router-view />
-      <FindBar />
     </q-page-container>
+
+    <!--
+      Permanent file inputs, rendered by Vue and living for the whole session.
+
+      They replace inputs that were created, appended and removed on every
+      click. That worked in every test here and still failed for the user, and
+      the created-per-click design is the part with failure modes that cannot be
+      ruled out from the outside: an element that has just been inserted, a
+      listener whose only reference is the closure that made it, and one orphan
+      left behind per cancelled dialog. A permanent element has none of them —
+      it is in the document before any click, it survives hot reloads, and its
+      handler is bound by the framework, not by hand.
+    -->
+    <input
+      id="app-open-pdf"
+      ref="openInputRef"
+      type="file"
+      accept="application/pdf,.pdf"
+      class="offscreen-file-input"
+      @change="onOpenPicked"
+    />
+    <input
+      id="app-merge-pdf"
+      ref="mergeInputRef"
+      type="file"
+      accept="application/pdf,.pdf"
+      class="offscreen-file-input"
+      @change="onMergePicked"
+    />
 
     <!-- Footer: Status Bar -->
     <q-footer class="bg-grey-10 q-px-md" style="height: 28px">
@@ -81,6 +117,7 @@ onMounted(async () => {
   window.addEventListener('beforeunload', handleBeforeUnload)
 })
 onUnmounted(() => {
+  printCleanup?.()
   pdfEngine.destroyEngine()
   document.removeEventListener('keydown', handleKeyDown)
   document.body.removeEventListener('dragover', handleDragOver)
@@ -89,39 +126,149 @@ onUnmounted(() => {
 })
 
 // ===== FILE =====
+/**
+ * Load a document into BOTH engines, and report the truth if either refuses.
+ *
+ * `pdfViewer.loadDocument` swallows its own errors and returns `{success:false}`
+ * — which used to be ignored here, so a PDF that PDF.js could not render was
+ * announced as "N pages (ready)" over a blank canvas, with the real error
+ * already overwritten in the status bar. A file that does not open has to say
+ * so, and it has to leave the previous document alone rather than half-replace
+ * it: the old bytes are put back so the app is never left showing one document
+ * and holding another.
+ */
 async function loadBytes(bytes: Uint8Array, name: string) {
+  const previous = docStore.pdfBytes ? new Uint8Array(docStore.pdfBytes) : null
+  const previousName = docStore.fileName ?? 'document.pdf'
+
   historyStore.clear()
   searchStore.clear()
-  await pdfViewer.loadDocument(bytes, name)
+
+  const rendered = await pdfViewer.loadDocument(bytes, name)
+  if (!rendered?.success) {
+    const why = rendered?.error || 'the file is not a readable PDF'
+    // Put the old document back FIRST — its own load writes a status line, so
+    // saying why the new one failed before that would be overwritten by it, and
+    // the user would be told the file loaded when it did not.
+    if (previous) await pdfViewer.loadDocument(previous, previousName).catch(() => {})
+    editorStore.setStatus(
+      previous
+        ? `Could not open ${name}: ${why} — ${previousName} is still open`
+        : `Could not open ${name}: ${why}`
+    )
+    return
+  }
+
   try {
+    // A copy: the bridge transfers this buffer to the worker, and `bytes` is
+    // what docStore now holds for saving and undo.
     const pageCount = await pdfEngine.loadDocument(bytes.buffer.slice(0) as ArrayBuffer)
     editorStore.setStatus(`${name} — ${pageCount} pages (ready)`)
   } catch (err: any) {
-    editorStore.setStatus(`MuPDF load error: ${err.message}`)
+    // It renders but cannot be edited — say exactly that instead of a bare
+    // error, because the pages ARE on screen and the user can still print/save.
+    editorStore.setStatus(`${name} opened for viewing — editing unavailable: ${err.message}`)
   }
 }
 
-async function openFile() {
-  const input = document.createElement('input')
-  input.type = 'file'
-  input.accept = '.pdf'
-  input.onchange = async (e: Event) => {
-    const file = (e.target as HTMLInputElement).files?.[0]
-    if (!file) return
-    await loadBytes(new Uint8Array(await file.arrayBuffer()), file.name)
-  }
+const openInputRef = ref<HTMLInputElement | null>(null)
+const mergeInputRef = ref<HTMLInputElement | null>(null)
+
+/**
+ * Open the chooser on the permanent input.
+ *
+ * The value is cleared FIRST: a file input fires `change` only when the
+ * selection actually changes, so re-opening the same document twice in a row
+ * would be silently ignored on a persistent element.
+ */
+function openFile() {
+  const input = openInputRef.value
+  if (!input) { editorStore.setStatus('Cannot open the file chooser — please reload the page'); return }
   input.click()
+}
+
+/**
+ * Open a File the user picked. Takes the File, not a click.
+ *
+ * Every button site owns its own <input type=file> laid over the control, so
+ * the user's click lands ON the input and the browser opens the chooser itself.
+ * Nothing here has to reach an element, keep user activation alive across a
+ * handler chain, or be wired through provide/inject in time.
+ */
+async function openPdfFile(file: File) {
+  try {
+    editorStore.setStatus(`Opening ${file.name}...`)
+    await loadBytes(new Uint8Array(await file.arrayBuffer()), file.name)
+  } catch (err: any) {
+    // A file that cannot be read is not a silent no-op.
+    editorStore.setStatus(`Could not open ${file.name}: ${err?.message || err}`)
+  }
+}
+
+async function onOpenPicked(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  // Cleared straight after the File is captured, so the SAME document can be
+  // opened again: a file input fires `change` only when the selection changes.
+  input.value = ''
+  if (file) await openPdfFile(file)
+}
+
+/** Commit whatever the inline editor is holding before the document is read. */
+async function flushOpenEditor() {
+  const active = document.activeElement as HTMLElement | null
+  if (active && (active.isContentEditable || active.tagName === 'TEXTAREA')) {
+    active.blur()
+    // blur triggers the editor's commit on a 150 ms timer.
+    await new Promise(r => setTimeout(r, 250))
+  }
+}
+
+/**
+ * Ask the browser where to put the file — BEFORE the engine save, not after.
+ *
+ * `showSaveFilePicker` needs transient user activation just like a programmatic
+ * download does, and that activation expires about five seconds after the click.
+ * Saving a real document routinely takes longer than that (the op queue may
+ * still be finishing an edit's save→reload), so asking afterwards throws
+ * NotAllowedError and the file silently never lands. Asking first spends the
+ * activation while it is still fresh, and the handle stays valid for as long as
+ * the save needs.
+ *
+ * Returns null when the API is unavailable (Firefox) — the caller falls back to
+ * a download — and 'cancelled' when the user dismissed the dialog.
+ */
+async function pickSaveTarget(suggestedName: string): Promise<FileSystemFileHandle | null | 'cancelled'> {
+  const picker = (window as any).showSaveFilePicker as
+    | ((opts: any) => Promise<FileSystemFileHandle>)
+    | undefined
+  if (typeof picker !== 'function') return null
+
+  try {
+    return await picker({
+      suggestedName,
+      types: [{ description: 'PDF document', accept: { 'application/pdf': ['.pdf'] } }]
+    })
+  } catch (err: any) {
+    if (err?.name === 'AbortError') return 'cancelled'
+    // SecurityError/NotAllowedError (activation gone, cross-origin frame, policy):
+    // fall back to a download rather than failing the save outright.
+    console.warn('[Save] File picker unavailable, falling back to download:', err)
+    return null
+  }
 }
 
 async function saveFile() {
   if (!docStore.loaded) return
-  // Flush any open inline editor: blur triggers its commit (150 ms timer),
-  // so wait for it to land before snapshotting the document.
-  const active = document.activeElement as HTMLElement | null
-  if (active && (active.isContentEditable || active.tagName === 'TEXTAREA')) {
-    active.blur()
-    await new Promise(r => setTimeout(r, 250))
+  await flushOpenEditor()
+
+  const name = (docStore.fileName || 'document.pdf').replace(/ \*$/, '')
+  const target = await pickSaveTarget(name)
+  if (target === 'cancelled') {
+    editorStore.setStatus('Save cancelled — the document is still open and unsaved')
+    return
   }
+
   editorStore.setStatus('Saving PDF...')
   try {
     const bytes = await enqueueOp(() => pdfEngine.saveDocument())
@@ -130,10 +277,29 @@ async function saveFile() {
       return
     }
     const blob = new Blob([bytes], { type: 'application/pdf' })
-    const name = (docStore.fileName || 'document.pdf').replace(/ \*$/, '')
+
+    if (target) {
+      // The write is awaited to completion, so "saved" is a fact here, not a
+      // hope — unlike a download, which the browser can drop without telling us.
+      const writable = await target.createWritable()
+      await writable.write(blob)
+      await writable.close()
+      docStore.markSaved()
+      editorStore.setStatus(`Saved ${target.name} — ${(blob.size / 1024).toFixed(0)} KB`)
+      return
+    }
+
     offerDownload(blob, name)
   } catch (err: any) {
     editorStore.setStatus(`Save error: ${err.message}`)
+    $q.notify({
+      message: 'The PDF could not be written.',
+      caption: err.message,
+      color: 'negative',
+      icon: 'error',
+      timeout: 8000,
+      multiLine: true
+    })
   }
 }
 
@@ -147,7 +313,9 @@ function triggerDownload(url: string, fileName: string) {
   // Firefox ignores a click on an anchor that is not in the document.
   document.body.appendChild(a)
   a.click()
-  a.remove()
+  // Removing the anchor in the same tick as the click has been observed to
+  // cancel the transfer in Chromium; let the current task finish first.
+  setTimeout(() => a.remove(), 0)
 }
 
 /**
@@ -209,7 +377,121 @@ function offerDownload(blob: Blob, fileName: string) {
   triggerDownload(url, fileName)
   scheduleRevoke()
   docStore.markSaved()
-  editorStore.setStatus('PDF saved successfully')
+  // A download is fire-and-forget: the browser reports nothing back, so this
+  // says what was handed over rather than claiming the file is on disk.
+  editorStore.setStatus(`Download started: ${fileName} — check your Downloads folder`)
+}
+
+// ===== PRINT =====
+
+/** Keeps the print frame and its object URL alive until printing is done. */
+let printCleanup: (() => void) | null = null
+
+/**
+ * Print the document as it stands, edits included.
+ *
+ * The bytes come from the engine rather than from the on-screen canvas, so what
+ * prints is the real PDF at full resolution — printing the rendered canvas would
+ * output a screen-resolution bitmap.
+ *
+ * A hidden same-origin iframe is used because `iframe.contentWindow.print()`
+ * needs no user activation, and the save can easily outlive the ~5s activation
+ * window that `window.open` would require. When the embedded viewer refuses to
+ * load (some COEP/plugin configurations block PDF embedding), the fallback is a
+ * new tab — offered as a BUTTON, so the click that opens it supplies its own
+ * fresh activation.
+ */
+async function printFile() {
+  if (!docStore.loaded) return
+  await flushOpenEditor()
+
+  editorStore.setStatus('Preparing document for printing...')
+  let blob: Blob
+  try {
+    const bytes = await enqueueOp(() => pdfEngine.saveDocument())
+    if (!bytes || bytes.byteLength === 0) {
+      editorStore.setStatus('Print failed: the engine produced an empty document')
+      return
+    }
+    blob = new Blob([bytes], { type: 'application/pdf' })
+  } catch (err: any) {
+    editorStore.setStatus(`Print error: ${err.message}`)
+    return
+  }
+
+  printCleanup?.()
+
+  const url = URL.createObjectURL(blob)
+  const frame = document.createElement('iframe')
+  frame.setAttribute('aria-hidden', 'true')
+  frame.style.cssText = 'position:fixed;right:0;bottom:0;width:1px;height:1px;border:0;opacity:0'
+
+  let settled = false
+  const cleanup = () => {
+    if (printCleanup !== cleanup) return
+    printCleanup = null
+    clearTimeout(watchdog)
+    frame.remove()
+    URL.revokeObjectURL(url)
+  }
+  printCleanup = cleanup
+
+  function offerNewTab(reason: string) {
+    if (settled) return
+    settled = true
+    editorStore.setStatus(`Could not open the print dialog (${reason})`)
+    $q.notify({
+      message: 'The print dialog could not be opened here.',
+      caption: 'Open the PDF in a new tab and print it from there.',
+      color: 'warning',
+      icon: 'print_disabled',
+      timeout: 0,
+      multiLine: true,
+      actions: [
+        {
+          label: 'Open in new tab',
+          color: 'white',
+          handler: () => {
+            // This handler runs from a real click, so the popup is allowed.
+            const tab = window.open(url, '_blank')
+            if (!tab) {
+              editorStore.setStatus('The browser blocked the new tab — allow pop-ups for this site')
+              return
+            }
+            editorStore.setStatus('PDF opened in a new tab — press Ctrl+P there to print')
+            // The tab now owns the URL; give it time to load before releasing.
+            setTimeout(cleanup, 60_000)
+          }
+        },
+        { label: 'Dismiss', color: 'white', handler: cleanup }
+      ]
+    })
+  }
+
+  // The viewer can fail to load without firing `error` — a timer is the only
+  // signal that nothing is going to happen.
+  const watchdog = setTimeout(() => offerNewTab('the embedded viewer did not load'), 10_000)
+
+  frame.onerror = () => offerNewTab('the embedded viewer refused to load')
+  frame.onload = () => {
+    clearTimeout(watchdog)
+    try {
+      const win = frame.contentWindow
+      if (!win) { offerNewTab('no print context'); return }
+      win.focus()
+      win.print()
+      settled = true
+      editorStore.setStatus('Print dialog opened')
+      // The dialog is modal in most browsers but not guaranteed to be, so the
+      // frame is kept alive well past it rather than pulled out from under it.
+      setTimeout(cleanup, 120_000)
+    } catch (err: any) {
+      offerNewTab(err?.message || 'print() was refused')
+    }
+  }
+
+  frame.src = url
+  document.body.appendChild(frame)
 }
 
 // ===== shared re-render after a document-level edit =====
@@ -273,6 +555,48 @@ async function rotatePage(degrees: number) {
     else editorStore.setStatus(`Rotate failed: ${pdfEngine.error.value}`)
   })
 }
+/**
+ * Merge another PDF into this one, after the page being viewed.
+ *
+ * Same permanent-input reasoning as `openFile`.
+ */
+function insertFile() {
+  if (!docStore.loaded) return
+  const input = mergeInputRef.value
+  if (!input) { editorStore.setStatus('Cannot open the file chooser — please reload the page'); return }
+  input.click()
+}
+
+async function onMergePicked(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (file) await mergePdfFile(file)
+}
+
+/** Merge a File the user picked into this document, after the current page. */
+async function mergePdfFile(file: File) {
+  if (!docStore.loaded) return
+  const at = docStore.currentPage      // insert AFTER the current page
+  try {
+    editorStore.setStatus(`Merging ${file.name}...`)
+    const bytes = await file.arrayBuffer()
+    await exclusiveOp(async () => {
+      const r = await pdfEngine.mergePages(bytes, at)
+      if (r === false) {
+        editorStore.setStatus(`Could not merge ${file.name}: ${pdfEngine.error.value || 'unreadable PDF'}`)
+        return
+      }
+      pushUndo()
+      await syncAfterEdit()
+      docStore.setPage(at + 1)
+      editorStore.setStatus(`${file.name} merged — ${r.added} page(s) added after page ${at}, ${r.pages} in total`)
+    })
+  } catch (err: any) {
+    editorStore.setStatus(`Could not merge ${file.name}: ${err?.message || err}`)
+  }
+}
+
 async function insertBlankPage() {
   if (!docStore.loaded) return
   await exclusiveOp(async () => {
@@ -360,6 +684,9 @@ function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 's') { e.preventDefault(); saveFile(); return }
     if (e.key === 'o') { e.preventDefault(); openFile(); return }
     if (e.key === 'f') { e.preventDefault(); openFind(); return }
+    // Ctrl+P must print the EDITED document, not the browser's view of the app
+    // shell — the default would print the toolbar and a screen-resolution page.
+    if (e.key === 'p') { e.preventDefault(); printFile(); return }
   }
   // Escape inside an editor/input cancels THAT editor (handled locally),
   // not the find bar — the find input closes itself on Escape.
@@ -389,10 +716,14 @@ async function handleDrop(e: DragEvent) {
 
 // ===== PROVIDE to whole tree =====
 provide('openFile', openFile)
+provide('openPdfFile', openPdfFile)
+provide('mergePdfFile', mergePdfFile)
 provide('saveFile', saveFile)
+provide('printFile', printFile)
 provide('undo', undo)
 provide('redo', redo)
 provide('rotatePage', rotatePage)
+provide('insertFile', insertFile)
 provide('insertBlankPage', insertBlankPage)
 provide('deletePage', deletePage)
 provide('duplicatePage', duplicatePage)
@@ -403,3 +734,15 @@ provide('searchPrev', searchPrev)
 provide('openFind', openFind)
 provide('closeFind', closeFind)
 </script>
+
+<style scoped>
+/*
+ * Off-screen, NOT hidden. `display:none`, `visibility:hidden` and a zero-size
+ * box are the states a browser can refuse to open a file chooser from.
+ */
+.offscreen-file-input {
+  position: fixed;
+  left: -9999px;
+  top: 0;
+}
+</style>

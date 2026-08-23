@@ -33,7 +33,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, inject, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, inject, nextTick, provide } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 import type { usePDFViewer } from '@/composables/usePDFViewer'
@@ -45,6 +45,15 @@ import { enqueueOp } from '@/utils/opQueue'
 
 const docStore = useDocumentStore()
 const editorStore = useEditorStore()
+
+/**
+ * The annotation layer needs the text layer to open space for an image, but the
+ * two are siblings. PDFViewer owns both refs, so it is the only place that can
+ * hand one to the other.
+ */
+provide('makeRoomInText', (pdfY: number, amount: number, below: boolean) =>
+  textBlockOverlayRef.value?.makeRoomAt(pdfY, amount, below)
+    ?? Promise.resolve({ column: null, y: pdfY, moved: 0, spilled: 0, capped: false }))
 const pdfViewer = inject<ReturnType<typeof usePDFViewer>>('pdfViewer')!
 const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
 

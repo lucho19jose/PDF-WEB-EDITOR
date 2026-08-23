@@ -3,8 +3,12 @@
     <!-- Main tool row -->
     <q-toolbar class="bg-grey-9 q-px-sm" style="min-height: 42px">
       <!-- File -->
-      <q-btn flat dense icon="folder_open" @click="openFile" size="sm"><q-tooltip>Open (Ctrl+O)</q-tooltip></q-btn>
+      <span style="position:relative;display:inline-flex">
+        <q-btn flat dense icon="folder_open" size="sm" @click="openViaInput"><q-tooltip>Open (Ctrl+O)</q-tooltip></q-btn>
+        <input ref="openPickRef" type="file" accept="application/pdf,.pdf" style="position:absolute;left:0;top:0;width:100%;height:100%;opacity:0;cursor:pointer;z-index:1" @change="onOpenPicked" />
+      </span>
       <q-btn flat dense icon="save" :disable="!docStore.loaded" @click="saveFile" size="sm"><q-tooltip>Save (Ctrl+S)</q-tooltip></q-btn>
+      <q-btn flat dense icon="print" :disable="!docStore.loaded" @click="printFile" size="sm"><q-tooltip>Print (Ctrl+P)</q-tooltip></q-btn>
 
       <q-separator vertical inset class="q-mx-xs" />
 
@@ -59,6 +63,13 @@
         <q-input v-model.number="editorStore.fontSize" type="number" dense borderless style="width: 56px" :min="4" :max="200" />
         <q-separator vertical inset class="q-mx-sm" />
         <ColorSwatch v-model="editorStore.textColor" label="Text" />
+        <q-separator vertical inset class="q-mx-sm" />
+        <q-toggle v-model="editorStore.reflowOnEdit" label="Reflow" dense size="sm" color="primary">
+          <q-tooltip>
+            Move the rest of the page when an edit changes how many lines the text takes.
+            Leave it off for forms and tables — it pulls labels away from their values.
+          </q-tooltip>
+        </q-toggle>
       </template>
 
       <!-- Markup -->
@@ -83,6 +94,22 @@
         <q-slider v-model="editorStore.opacity" :min="0.1" :max="1" :step="0.1" style="width: 90px" dense />
       </template>
 
+      <!-- Image: how it sits in the text -->
+      <template v-else-if="ctx === 'image'">
+        <span class="text-caption q-mr-sm">Place</span>
+        <q-btn-toggle
+          v-model="editorStore.imagePlacement"
+          :options="[{ label: 'Above the line', value: 'above' }, { label: 'Below the line', value: 'below' }]"
+          dense unelevated no-caps size="sm" toggle-color="primary" color="grey-9" text-color="grey-4"
+        />
+        <q-separator vertical inset class="q-mx-sm" />
+        <span class="text-caption q-mr-sm">Width</span>
+        <q-slider v-model="editorStore.imageWidthPct" :min="10" :max="100" :step="5" style="width: 110px" dense />
+        <span class="text-caption q-ml-xs" style="min-width: 34px">{{ editorStore.imageWidthPct }}%</span>
+        <q-separator vertical inset class="q-mx-sm" />
+        <span class="text-caption text-grey-5">click a line to place it, centred on the text</span>
+      </template>
+
       <!-- Draw -->
       <template v-else-if="ctx === 'draw'">
         <ColorSwatch v-model="editorStore.strokeColor" label="Color" />
@@ -98,7 +125,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject } from 'vue'
+import { computed, inject, ref } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, type Tool } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
@@ -108,8 +135,19 @@ const docStore = useDocumentStore()
 const editorStore = useEditorStore()
 const historyStore = useHistoryStore()
 
-const openFile = inject<() => void>('openFile', () => {})
+const openPdfFile = inject<(f: File) => void>('openPdfFile', () => {})
+
+const openPickRef = ref<HTMLInputElement | null>(null)
+function openViaInput() { openPickRef.value?.click() }
+
+function onOpenPicked(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (file) openPdfFile(file)
+}
 const saveFile = inject<() => void>('saveFile', () => {})
+const printFile = inject<() => void>('printFile', () => {})
 const undo = inject<() => void>('undo', () => {})
 const redo = inject<() => void>('redo', () => {})
 const rotatePage = inject<(d: number) => void>('rotatePage', () => {})
@@ -120,7 +158,7 @@ const fonts = ['Helvetica', 'Times-Roman', 'Courier']
 
 const toolGroups: { label: string; tools: { name: Tool; label: string; icon: string; shortcut?: string }[] }[] = [
   { label: 'select', tools: [
-    { name: 'select', label: 'Select', icon: 'arrow_selector_tool', shortcut: 'V' },
+    { name: 'select', label: 'Select', icon: 'near_me', shortcut: 'V' },
     { name: 'edit', label: 'Edit Text', icon: 'edit', shortcut: 'E' },
     { name: 'addText', label: 'Add Text', icon: 'text_fields', shortcut: 'T' },
   ]},
@@ -149,5 +187,15 @@ function fitPage() { docStore.setScale(1.5) }
 </script>
 
 <style scoped>
+
 .font-select :deep(.q-field__native) { font-size: 12px; }
+
+/*
+ * A Material Icons ligature the bundled font does not carry renders as literal
+ * text — ~170px of it — which overflows the 17px icon box and, because the
+ * overflow still takes hit-tests, swallows clicks meant for the buttons to its
+ * left. `pointer-events: none` keeps every hit on the button itself, so a bad
+ * icon name can only ever look wrong, never steal a neighbour's click.
+ */
+:deep(.q-btn .q-icon) { pointer-events: none; }
 </style>

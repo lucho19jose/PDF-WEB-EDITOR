@@ -7,6 +7,12 @@
       <q-btn flat dense round size="sm" icon="note_add" :disable="!docStore.loaded" @click="insertBlankPage">
         <q-tooltip>Insert blank page</q-tooltip>
       </q-btn>
+      <span style="position:relative;display:inline-flex">
+        <q-btn flat dense round size="sm" icon="library_add" :disable="!docStore.loaded" @click="mergeViaInput">
+          <q-tooltip>Insert another PDF after this page — drag the thumbnails to reorder</q-tooltip>
+        </q-btn>
+        <input v-if="docStore.loaded" ref="mergePickRef" type="file" accept="application/pdf,.pdf" style="position:absolute;left:0;top:0;width:100%;height:100%;opacity:0;cursor:pointer;z-index:1" @change="onMergePicked" />
+      </span>
       <q-btn flat dense round size="sm" icon="content_copy" :disable="!docStore.loaded" @click="duplicatePage">
         <q-tooltip>Duplicate current page</q-tooltip>
       </q-btn>
@@ -46,6 +52,17 @@ import * as pdfjsLib from 'pdfjs-dist'
 import { useDocumentStore } from '@/stores/document'
 
 const docStore = useDocumentStore()
+const mergePdfFile = inject<(f: File) => void>('mergePdfFile', () => {})
+
+const mergePickRef = ref<HTMLInputElement | null>(null)
+function mergeViaInput() { mergePickRef.value?.click() }
+
+function onMergePicked(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (file) mergePdfFile(file)
+}
 const insertBlankPage = inject<() => void>('insertBlankPage', () => {})
 const duplicatePage = inject<() => void>('duplicatePage', () => {})
 const deletePage = inject<() => void>('deletePage', () => {})
@@ -111,6 +128,7 @@ onBeforeUnmount(() => { renderToken++; if (thumbDoc) thumbDoc.destroy().catch(()
 </script>
 
 <style scoped>
+
 .thumb-panel { background: #1d1d1d; }
 .thumb-item {
   border: 2px solid transparent; border-radius: 4px; padding: 4px; cursor: pointer;

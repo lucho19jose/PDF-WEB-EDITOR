@@ -40,6 +40,15 @@ export interface TextChar {
   size: number
   /** Font name */
   fontName: string
+  /**
+   * Fill colour as [r, g, b] normalized 0-1.
+   *
+   * Per CHARACTER, not per block: MuPDF merges a whole paragraph into one
+   * structured-text block, so a block-level colour is whatever its first line
+   * happened to be. A line recoloured on its own would report the paragraph's
+   * colour and the toolbar would show the wrong swatch for it.
+   */
+  color?: [number, number, number]
 }
 
 /** A line of text (group of chars on the same baseline) */
@@ -80,6 +89,66 @@ export interface AnnotationInfo {
   contents: string
   author: string
   hasQuadPoints: boolean
+}
+
+/**
+ * One block's share of a batched transform.
+ *
+ * Moving a multi-block selection — and pushing whatever it would have landed
+ * on out of the way — has to be ONE engine call: every separate call re-extracts
+ * the page, and block ids are extraction indices, so the second call in a pair
+ * would be addressing a page that the first one already renumbered.
+ *
+ * dx/dy are in PDF Tm space (bottom-left origin, y up); anchorX/anchorY too.
+ */
+export interface BlockTransformOp {
+  blockId: string
+  dx: number
+  dy: number
+  sx: number
+  sy: number
+  anchorX: number
+  anchorY: number
+}
+
+/**
+ * Restyle one already-drawn text block. Every field is optional: an absent one
+ * means "leave this as the page has it", which is what makes changing only the
+ * colour of text in a font this engine cannot re-encode still work.
+ */
+export interface BlockStyleOp {
+  blockId: string
+  /** Base-14 family name — 'Helvetica' | 'Times-Roman' | 'Courier'. */
+  fontName?: string
+  fontSize?: number
+  /** Fill colour as [r, g, b] normalized 0-1. */
+  color?: [number, number, number]
+}
+
+/** Per-op outcome of a batched transform, in the order the ops were given. */
+export interface BlockTransformResult {
+  blockId: string
+  success: boolean
+  error?: string
+  /**
+   * Lines the block draws after the op. Grows when a bigger font no longer fits
+   * between its left edge and the right margin and has to wrap — the caller
+   * needs it to push the rest of the page down, or the extra lines are painted
+   * over the next paragraph.
+   */
+  lines?: number
+  /**
+   * Points the block's own baseline was moved down, in page space.
+   *
+   * A bigger font grows UPWARD from the baseline as well as down, so a resized
+   * run climbs into the line above it unless it descends by the ascent it
+   * gained. The engine does that as part of the same rewrite — the block's text
+   * changes when it wraps, so it cannot be re-found and moved afterwards — and
+   * reports it, because the room made below has to include it.
+   */
+  baselineDrop?: number
+  strategy?: string
+  clipAdjusted?: boolean
 }
 
 /** A text search hit: one match made of one or more quads (multi-line). */

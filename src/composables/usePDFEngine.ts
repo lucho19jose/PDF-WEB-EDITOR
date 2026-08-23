@@ -1,6 +1,6 @@
 import { ref, readonly } from 'vue'
 import { getMuPDFBridge } from '@/engine/bridge'
-import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit } from '@/engine/types'
+import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult } from '@/engine/types'
 
 /**
  * Composable for interacting with the MuPDF editing engine.
@@ -116,7 +116,7 @@ export function usePDFEngine() {
     pageIndex: number,
     blockId: string,
     newText: string
-  ): Promise<{ success: boolean; substitutedFont?: string; strategy?: string }> {
+  ): Promise<{ success: boolean; substitutedFont?: string; strategy?: string; lines: number }> {
     try {
       const result = await bridge.replaceText(pageIndex, blockId, newText)
       if (result.success) {
@@ -127,7 +127,12 @@ export function usePDFEngine() {
         error.value = result.error || 'Unknown error replacing text'
         console.warn('[PDFEngine]', error.value)
       }
-      return { success: result.success, substitutedFont: result.substitutedFont, strategy: result.strategy }
+      return {
+        success: result.success,
+        substitutedFont: result.substitutedFont,
+        strategy: result.strategy,
+        lines: result.lines ?? 1
+      }
     } catch (err: any) {
       error.value = `Failed to replace text: ${err.message}`
       throw err
@@ -189,6 +194,53 @@ export function usePDFEngine() {
     }
   }
 
+  /**
+   * Move/scale several blocks at once (multi-block drag + collision pushes).
+   *
+   * Returns how many ops the engine actually applied. A partial result is
+   * reported rather than swallowed: the caller tells the user "moved 3 of 4"
+   * instead of claiming a success that half happened.
+   */
+  async function transformTextBlocks(
+    pageIndex: number,
+    ops: BlockTransformOp[]
+  ): Promise<{ applied: number; total: number; results: BlockTransformResult[] }> {
+    if (ops.length === 0) return { applied: 0, total: 0, results: [] }
+    try {
+      const result = await bridge.transformTextBlocks(pageIndex, ops)
+      if (result.applied > 0) pageTextCache.delete(pageIndex)
+      const failed = result.results.find(r => !r.success)
+      if (failed) error.value = failed.error || 'Unknown error transforming text blocks'
+      return { applied: result.applied, total: ops.length, results: result.results }
+    } catch (err: any) {
+      error.value = `Failed to transform text blocks: ${err.message}`
+      throw err
+    }
+  }
+
+  /**
+   * Restyle blocks already on the page (font family / size / colour).
+   *
+   * Batched for the same reason the transform is: ids are extraction indices,
+   * so the page must not be renumbered between the ops of one user action.
+   */
+  async function restyleTextBlocks(
+    pageIndex: number,
+    ops: BlockStyleOp[]
+  ): Promise<{ applied: number; total: number; results: BlockTransformResult[] }> {
+    if (ops.length === 0) return { applied: 0, total: 0, results: [] }
+    try {
+      const result = await bridge.restyleTextBlocks(pageIndex, ops)
+      if (result.applied > 0) pageTextCache.delete(pageIndex)
+      const failed = result.results.find(r => !r.success)
+      if (failed) error.value = failed.error || 'Unknown error restyling text blocks'
+      return { applied: result.applied, total: ops.length, results: result.results }
+    } catch (err: any) {
+      error.value = `Failed to restyle text blocks: ${err.message}`
+      throw err
+    }
+  }
+
   // ===== ANNOTATIONS =====
 
   async function getPageSize(pageIndex: number) {
@@ -245,6 +297,17 @@ export function usePDFEngine() {
   async function rotatePage(pageIndex: number, degrees: number): Promise<boolean> {
     return wrap(await bridge.rotatePage(pageIndex, degrees), 'rotatePage', pageIndex)
   }
+  /**
+   * Splice another PDF's pages in. Returns the new page count, or false.
+   */
+  async function mergePages(bytes: ArrayBuffer, atIndex: number): Promise<{ pages: number; added: number } | false> {
+    const r = await bridge.mergePages(bytes, atIndex)
+    pageTextCache.clear()
+    if (r.success) return { pages: r.pageCount ?? 0, added: r.added ?? 0 }
+    error.value = r.error || 'merge failed'
+    return false
+  }
+
   async function insertBlankPage(atIndex: number, width: number, height: number): Promise<number | false> {
     const r = await bridge.insertBlankPage(atIndex, width, height)
     pageTextCache.clear()
@@ -321,6 +384,8 @@ export function usePDFEngine() {
     replaceText,
     addText,
     transformTextBlock,
+    transformTextBlocks,
+    restyleTextBlocks,
     lastTransform,
     saveDocument,
     destroyEngine,
@@ -338,6 +403,7 @@ export function usePDFEngine() {
     updateAnnotation,
     // page management
     rotatePage,
+    mergePages,
     insertBlankPage,
     deletePage,
     duplicatePage,
