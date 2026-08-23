@@ -7,6 +7,17 @@ export const useDocumentStore = defineStore('document', () => {
   const totalPages = ref(0)
   const currentPage = ref(1)
   const scale = ref(1.5)
+  /**
+   * Show the whole document as one scrolling column, rather than a page at a
+   * time. On by default: a reader scrolls, and having to click the next
+   * thumbnail to see what comes after the line they are reading is not how any
+   * PDF is read.
+   *
+   * The single-page mode is kept because it renders exactly one page — on a
+   * very long document that is the difference between paging instantly and
+   * waiting for a rasteriser.
+   */
+  const continuousScroll = ref(true)
   const isModified = ref(false)
   const pdfBytes = ref<Uint8Array | null>(null)
   const renderVersion = ref(0)
@@ -68,6 +79,7 @@ export const useDocumentStore = defineStore('document', () => {
   }
 
   return {
+    continuousScroll,
     loaded, fileName, totalPages, currentPage, scale,
     isModified, pdfBytes, fileSizeFormatted, renderVersion,
     setDocument, reloadBytes, setPage, setScale, markModified, markSaved, reset

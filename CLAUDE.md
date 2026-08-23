@@ -968,6 +968,40 @@ line carrying an "fi" ligature that used to fail outright with "Could not find
 matching text in content stream". Plain and clipped documents were re-checked
 for regressions, since the kern rule changes how EVERY stream decodes.
 
+### The whole document scrolls; the tools follow the page you are on
+`docStore.continuousScroll` (on by default) renders every page as its own canvas
+in one column. Having to click the next thumbnail to see what comes after the
+line you are reading is not how anyone reads a PDF.
+
+**The editing layers still live on ONE page** — the current one. They are
+written against "the current page" throughout, the overlay alone being some 1800
+lines of it, and giving every page its own set would mean N text extractions, N
+annotation loads and N sets of selection state for no gain: a person edits one
+page at a time. What changed is that the current page now follows the SCROLL, so
+the tools appear on the page being looked at without the reader having to select
+it. Clicking a page also claims it, for the moment before the scroll detector
+catches up.
+
+Three things this has to get right:
+
+- **Rendering is sequential.** `renderPage` supersedes any render already
+  running — it must, or a stale page paints over the latest — so firing one per
+  page paints only the last. Pages are queued, current page first, and drawn one
+  at a time, one screen either side of the viewport.
+- **Sizes are guessed, then corrected.** A page that has not been painted still
+  has to occupy the right amount of the scroll bar. Measuring every page up
+  front is one `getPage` per page before anything appears; page 1 is measured
+  and stands in for the rest, and each page corrects its own entry as it is
+  painted, so a merged A4-into-Letter document settles as the reader reaches it.
+- **The two directions must not fight.** A page reached by scrolling is already
+  where it should be; one chosen from the thumbnails or the keyboard has to be
+  scrolled to. `syncingFromScroll` and `scrollingToPage` keep each from
+  re-triggering the other — without them the view snaps back the moment it moves.
+
+Single-page mode is kept because it renders exactly one page: on a very long
+document that is the difference between paging instantly and waiting for a
+rasteriser.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

@@ -55,6 +55,15 @@
       <span class="text-caption q-mx-xs" style="min-width: 40px; text-align: center">{{ zoomPercent }}%</span>
       <q-btn flat dense icon="add" @click="zoomIn" size="sm" :disable="!docStore.loaded" />
       <q-btn flat dense icon="fit_screen" @click="fitPage" size="sm" :disable="!docStore.loaded"><q-tooltip>Reset zoom</q-tooltip></q-btn>
+      <q-btn
+        flat dense size="sm"
+        :icon="docStore.continuousScroll ? 'view_day' : 'crop_portrait'"
+        :color="docStore.continuousScroll ? 'primary' : undefined"
+        :disable="!docStore.loaded"
+        @click="docStore.continuousScroll = !docStore.continuousScroll"
+      >
+        <q-tooltip>{{ docStore.continuousScroll ? 'Scrolling the whole document — click for one page at a time' : 'One page at a time — click to scroll the whole document' }}</q-tooltip>
+      </q-btn>
 
       <q-separator vertical inset class="q-mx-xs" />
 
