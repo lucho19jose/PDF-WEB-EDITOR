@@ -134,9 +134,10 @@ export class MuPDFBridge {
     text: string,
     fontSize: number,
     fontName: string,
-    color?: [number, number, number]
+    color?: [number, number, number],
+    rotation?: number
   ): Promise<{ success: boolean; error?: string }> {
-    return this.send('addText', { pageIndex, x, y, text, fontSize, fontName, color })
+    return this.send('addText', { pageIndex, x, y, text, fontSize, fontName, color, rotation })
   }
 
   /**

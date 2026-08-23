@@ -35,6 +35,8 @@ export interface TextOp {
   /** A base-14 name the engine can register. */
   fontName: string
   color: [number, number, number]
+  /** Degrees counter-clockwise. 90 for a run that reads up the page. */
+  rotation: number
 }
 
 export interface OcrExportPlan {
@@ -72,8 +74,13 @@ function approxWidth(text: string, fontSize: number, family: string): number {
  * them, and a patch flush with the box leaves a grey outline of the old word.
  */
 function patchRect(item: OcrTextItem): RectT {
-  const padY = Math.max(1, item.rect.height * 0.12)
-  const padX = Math.max(1, item.rect.height * 0.15)
+  // The padding is around the RUN, not around the axes: a vertical run is tall
+  // and narrow, so the generous pad has to go on x and the tight one on y or
+  // the patch is a wide band across the page with the old ink still showing at
+  // the ends of it.
+  const across = item.vertical ? item.rect.width : item.rect.height
+  const padY = item.vertical ? Math.max(1, across * 0.15) : Math.max(1, across * 0.12)
+  const padX = item.vertical ? Math.max(1, across * 0.12) : Math.max(1, across * 0.15)
   return [
     item.rect.x - padX,
     item.rect.y - padY,
@@ -109,6 +116,24 @@ export function planOcrExport(items: OcrTextItem[]): OcrExportPlan {
     if (item.removed) continue
 
     const fontName = base14(item.fontFamily, item.bold, item.italic)
+
+    if (item.vertical) {
+      // Rotated a quarter turn anti-clockwise, the glyphs' own "up" points LEFT
+      // across the page, so the ascenders are at the box's left edge and the
+      // baseline runs down its right-hand side. Reading goes UP, so the run
+      // starts at the foot of the box, not its head.
+      texts.push({
+        text: String(item.text),
+        x: Number(item.rect.x + item.rect.width * 0.8),
+        y: Number(item.rect.y + item.rect.height),
+        fontSize: Number(item.fontSize),
+        fontName,
+        color: plainColor(item.color),
+        rotation: 90
+      })
+      continue
+    }
+
     // The baseline sits about four fifths of the way down the em from the top
     // of the box — placing text at the box top would print it a whole line high.
     const baselineY = item.rect.y + item.rect.height - Math.max(1, item.rect.height * 0.2)
@@ -129,7 +154,8 @@ export function planOcrExport(items: OcrTextItem[]): OcrExportPlan {
       y: Number(baselineY),
       fontSize: Number(item.fontSize),
       fontName,
-      color: plainColor(item.color)
+      color: plainColor(item.color),
+      rotation: 0
     })
   }
 

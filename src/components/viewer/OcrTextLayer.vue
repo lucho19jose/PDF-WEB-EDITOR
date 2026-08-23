@@ -19,7 +19,8 @@
         selected: item.id === ocrStore.selectedId,
         edited: item.edited,
         removed: item.removed,
-        unsure: item.confidence < 70
+        unsure: item.confidence < 70,
+        vertical: item.vertical
       }"
       :style="item.boxStyle"
       :title="item.tooltip"
@@ -31,7 +32,7 @@
       <div v-if="item.edited" class="ocr-replacement" :style="item.textStyle">{{ item.text }}</div>
     </div>
 
-    <!-- In-place editor, positioned on the run it is editing. -->
+    <!-- In-place editor, positioned and turned the same way as its run. -->
     <textarea
       v-if="editing"
       ref="editorRef"
@@ -71,8 +72,27 @@ const editing = ref<string | null>(null)
 const draft = ref('')
 const editorRef = ref<HTMLTextAreaElement | null>(null)
 
-/** CSS for one run, in screen pixels. */
+/**
+ * CSS for one run, in screen pixels.
+ *
+ * A vertical run is laid out in its OWN frame and then turned, rather than
+ * being drawn upright inside a tall box: the text has to read up the page, and
+ * a rotated element is the only way the letters, the caret and the selection
+ * all follow it. The element is anchored at the FOOT of the box because a
+ * quarter turn anti-clockwise about the top-left corner sends it upwards from
+ * there, which lands it exactly over the box it belongs to.
+ */
 function styleFor(item: OcrTextItem) {
+  if (item.vertical) {
+    return {
+      left: `${item.rect.x * scaleX.value}px`,
+      top: `${(item.rect.y + item.rect.height) * scaleY.value}px`,
+      width: `${item.rect.height * scaleY.value}px`,
+      height: `${item.rect.width * scaleX.value}px`,
+      transform: 'rotate(-90deg)',
+      transformOrigin: 'left top'
+    }
+  }
   return {
     left: `${item.rect.x * scaleX.value}px`,
     top: `${item.rect.y * scaleY.value}px`,
@@ -83,19 +103,26 @@ function styleFor(item: OcrTextItem) {
   }
 }
 
+/** The size of a run ACROSS its reading direction — its line height. */
+function acrossPx(item: OcrTextItem): number {
+  return item.vertical ? item.rect.width * scaleX.value : item.rect.height * scaleY.value
+}
+
 const scaled = computed(() =>
   ocrStore.itemsFor(pageIndex.value).map(item => ({
     id: item.id,
     text: item.text,
     edited: item.edited,
     removed: item.removed,
+    vertical: item.vertical,
     confidence: item.confidence,
     boxStyle: styleFor(item),
     // The patch is grown slightly: anti-aliased glyph edges reach a little past
-    // the box OCR reports, and a patch flush with it leaves a grey fringe.
+    // the box OCR reports, and a patch flush with it leaves a grey fringe. The
+    // padding is in the ELEMENT's frame, so it follows a rotated run round.
     patchStyle: {
       background: rgb01ToCss(item.background),
-      inset: `${-Math.max(1, item.rect.height * 0.08) * scaleY.value}px ${-2 * scaleX.value}px`
+      inset: `${-Math.max(1, acrossPx(item) * 0.08)}px ${-2 * scaleX.value}px`
     },
     textStyle: {
       fontSize: `${item.fontSize * scaleY.value}px`,
@@ -108,7 +135,9 @@ const scaled = computed(() =>
     },
     tooltip: item.removed
       ? 'Deleted — it will be painted out on export'
-      : `${item.confidence}% confident · ${item.fontSize}pt · double-click to edit`
+      : `${item.confidence}% confident · ${item.fontSize}pt` +
+        `${item.bold ? ' · bold' : ''}${item.italic ? ' · italic' : ''}` +
+        `${item.vertical ? ' · sideways' : ''} · double-click to edit`
   }))
 )
 
@@ -210,6 +239,10 @@ defineExpose({ beginEdit })
 /* Low confidence is worth seeing: it is where a reader should check the words. */
 .ocr-item.unsure { border-color: rgba(251, 140, 0, 0.75); }
 .ocr-item.removed { border-style: dotted; border-color: rgba(229, 57, 53, 0.8); }
+/* Sideways runs are worth telling apart at a glance — they were read by a
+   separate, more speculative pass and are the ones most worth checking. */
+.ocr-item.vertical { border-color: rgba(156, 39, 176, 0.65); border-style: dashed; }
+.ocr-item.vertical.selected { border-color: #9c27b0; }
 .ocr-patch { position: absolute; z-index: 0; }
 .ocr-replacement {
   position: absolute; inset: 0; z-index: 1;

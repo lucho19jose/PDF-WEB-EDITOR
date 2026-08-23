@@ -27,3 +27,9 @@ tools/pdf-sweep/dataset.jsonl
 tools/pdf-sweep/partial.json
 tools/pdf-sweep/tmp.txt
 tools/pdf-sweep/aggregate.json
+
+# OCR calibration output. The scripts are the evidence for the constants in
+# ocrFontDetect and useOCR and are tracked; what they render is not.
+tools/ocr-calibrate/*.pdf
+tools/ocr-calibrate/*.json
+tools/ocr-calibrate/*.png

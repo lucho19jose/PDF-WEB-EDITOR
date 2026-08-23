@@ -93,7 +93,8 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         if (!pdfDoc) throw new Error('No document loaded')
         const addResult = addTextToPage(
           req.data.pageIndex, req.data.x, req.data.y,
-          req.data.text, req.data.fontSize, req.data.fontName, req.data.color
+          req.data.text, req.data.fontSize, req.data.fontName, req.data.color,
+          req.data.rotation
         )
         respond({ id: req.id, type: 'success', data: addResult })
         break
@@ -1448,7 +1449,9 @@ function addTextToPage(
   text: string,
   fontSize: number,
   fontName: string,
-  color?: [number, number, number]
+  color?: [number, number, number],
+  /** Degrees counter-clockwise. 90 sets the text reading up the page. */
+  rotation = 0
 ): { success: boolean; error?: string } {
   if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
 
@@ -1474,7 +1477,15 @@ function addTextToPage(
     const b = color?.[2] ?? 0
     const escaped = escapePdfString(winAnsi.bytes)
 
-    const newBlock = `\nBT\n${r} ${g} ${b} rg\n/${fontRefName} ${fontSize} Tf\n1 0 0 1 ${x.toFixed(2)} ${y.toFixed(2)} Tm\n(${escaped}) Tj\nET\n`
+    // Rotation lives in the TEXT MATRIX, not in the font size: `a b c d` is
+    // the rotation and `e f` the origin, so vertical text is the same code
+    // path as horizontal with a different pair of cosines.
+    const rad = (rotation * Math.PI) / 180
+    const upright = Math.abs(rotation) < 0.01
+    const ca = upright ? 1 : Math.cos(rad)
+    const sa = upright ? 0 : Math.sin(rad)
+    const fmt = (n: number) => (Math.abs(n) < 1e-6 ? '0' : n.toFixed(4))
+    const newBlock = `\nBT\n${r} ${g} ${b} rg\n/${fontRefName} ${fontSize} Tf\n${fmt(ca)} ${fmt(sa)} ${fmt(-sa)} ${fmt(ca)} ${x.toFixed(2)} ${y.toFixed(2)} Tm\n(${escaped}) Tj\nET\n`
 
     // 4. Append to content stream
     const combined = existingStream + newBlock

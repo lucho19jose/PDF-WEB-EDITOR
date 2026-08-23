@@ -149,10 +149,11 @@ export function usePDFEngine() {
     text: string,
     fontSize: number,
     fontName: string,
-    color?: [number, number, number]
+    color?: [number, number, number],
+    rotation?: number
   ): Promise<boolean> {
     try {
-      const result = await bridge.addText(pageIndex, x, y, text, fontSize, fontName, color)
+      const result = await bridge.addText(pageIndex, x, y, text, fontSize, fontName, color, rotation)
       if (result.success) {
         pageTextCache.delete(pageIndex)
       } else {

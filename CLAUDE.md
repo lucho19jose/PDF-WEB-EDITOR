@@ -727,6 +727,128 @@ flattened elsewhere.
 Ordering the two calls differently cannot fix this. Nothing drawn into a content
 stream can ever be above an annotation.
 
+### A recognised LINE is not a unit of text
+Tesseract groups by visual row, so five column headings printed side by side
+come back as one line. Editing that rewrote all five: the user changed one
+heading and the whole row was redrawn as a single run, in one font, on one
+baseline. `splitRuns` cuts a line back into the pieces it is really made of,
+judging each gap between words three ways:
+
+- **wider than 2.5 em** — unmistakable on its own, no word space is that wide;
+- **wider than an em AND several times this line's median gap** — the relative
+  test, which protects letter-spaced text from being shredded into words;
+- **every gap on the line is wider than 1.2 em** — then the line contains no
+  word space at all, so every gap separates two pieces of text.
+
+The first version required the absolute AND the relative test together, which
+fails on precisely the case it exists for: when every gap is a column gap, they
+ARE the median, the relative threshold climbs above all of them and the row
+stays whole. The relative test can only ever ADD splits.
+
+The third rule is what catches a row of ONE-word headings, where no single gap
+is wide enough to be obvious. Prose can never trigger it — a line of prose
+always contains a real word space, and a word space is about a third of an em.
+
+A run split out of a line takes `align: 'left'`: it IS its own box now, so there
+is nothing left for it to be aligned within.
+
+### What a typeface can be read from ink, and what cannot
+`ocrFontDetect` measures the face from the pixels, because the LSTM engine
+reports no font attributes at all and the `font_name` it occasionally carries
+names a face that is not in the document and could not be embedded anyway.
+Every threshold comes from `tools/ocr-calibrate`, which renders the base-14
+faces at 12pt and 24pt at OCR resolution and prints the cues.
+
+Measurable, with clean separation:
+- **Weight** — median horizontal ink run over the em. Regular 0.055–0.095, bold
+  0.136–0.150 across Helvetica, Times and Courier at both sizes. Threshold 0.115.
+- **Slant** — the shear that packs the column histogram tightest. Upright
+  −0.02..0.00, oblique and italic 0.22..0.26. Threshold 0.10.
+
+NOT measurable, and therefore not guessed:
+- **Serif against sans.** Three cues were calibrated and all three fail: stroke
+  contrast (Helvetica 1.60–1.70, Times 1.30–1.50 — a 0.1 gap, inverted from
+  theory), the flare at the foot of a stem (1.00–1.33 for BOTH), and ink density
+  on the baseline (Helvetica 1.11–1.39, Times 0.90–1.41 — total overlap). Sans
+  is the default and OCR's `font_name` is consulted only when it says something.
+  A coin flip that changes the typeface of a document is worse than a consistent
+  default the user can change in one click.
+
+Two cues that measure something real but must NOT decide:
+- Slant by centroids — where the ink sits high against where it sits low reads
+  which LETTERS are in the run, not how they lean: upright "Hamburgefonstiv"
+  scored 0.165 that way, well into italic territory. Hence the shear search.
+- Stroke contrast for monospace — it separates Courier cleanly on a clean render
+  (2.50–3.25 against 1.30–1.70) and not at all on a scan, where blurred bold
+  capitals read high because the crossbars fall inside the stem window. It set a
+  row of Helvetica-Bold headings in Courier at half again their size. It is
+  reported for inspection and nothing else.
+
+Monospace is decided ONLY by `advancesAreUniform`, measured between glyph
+CENTRES — a recognition box hugs the ink, and in a monospaced face a narrow
+glyph sits centred in a wide cell, so left edges look irregular where the cells
+are identical. It is undecidable, and returns `null`, unless the run holds both
+a narrow glyph and a wide one: every face sets capitals at almost the same
+width, so "PROCESS" reads as uniform in any of them.
+
+### Point size depends on whether anything descends
+The em is derived from the tallest glyph box, and how much of an em that box is
+depends on the run. A line WITH descenders gives 0.95 (measured: a 12pt line at
+220 DPI has a 36.7px em and a 35.1px tallest box). A line with none — a row of
+capitals — gives its cap height instead, and dividing that by 0.95 came out a
+fifth short: an 11pt row of headings read as 9pt, and the replacement was
+visibly smaller than the untouched headings either side of it. `DESCENDERS`
+picks 0.76 for those (measured: 11pt "DATA" and "DETAIL" gave 0.74 and 0.78).
+
+J is deliberately left out of `DESCENDERS`: it descends in some faces and not
+others, and guessing high here shrinks text, which is the failure being fixed.
+
+**Known limitation:** a monospaced face has shorter ascenders again (Courier
+0.63 em against Helvetica 0.72) and reads about 30% low. The correction exists
+(`GLYPH_BOX_PER_EM_MONO`) but only applies once the face is known to be Courier,
+which needs the advances test to fire. On a blurred scan it often does not, and
+the line comes back as Helvetica at three quarters of its size. It fails toward
+the default rather than toward a wrong typeface, and both are one click to fix.
+
+### Reading text that is set on its side
+Tesseract reads a line left to right. A label printed up the side of a chart is
+not a line to it: it comes back as nothing, or as a column of unrelated single
+letters. The only way to read it is to turn the page — `addVerticalRuns` rotates
+the raster a quarter turn clockwise, which stands bottom-to-top text up
+horizontally, and recognises it again. `OcrTextItem.vertical` carries the result,
+as its own flag rather than as `rotation: -90`, because the two mean different
+things: rotation is a scan's few degrees of skew, and every consumer has to lay
+a vertical run out differently rather than just tilting it.
+
+Everything that pass finds is speculative, so three tests gate it. Two are
+obvious — confidence, and being taller than it is wide once mapped back. The
+third is the one that matters:
+
+**The overlap test is CUMULATIVE, over every upright run at once.** Comparing
+against one at a time let THIRTEEN false runs through on a page with one real
+one: a tall narrow box laid over a paragraph crosses six lines and covers barely
+a sixth of each, so no single comparison ever looks like a clash while the box
+is plainly sitting on top of the paragraph. Summing the intersections double-
+counts overlapping boxes, which can only make the answer larger — and the answer
+is used to REJECT, so the error costs a doubtful run rather than admitting a
+wrong one.
+
+Only SUBSTANTIAL upright runs count towards it (4+ characters, 60%+ confidence).
+The upright pass reads a sideways label as a column of single letters, and
+letting those count would have the misreading of a label veto the correct
+reading of it. Once a vertical run is accepted those misreadings are DROPPED —
+they are the same ink read the wrong way round, and leaving them puts a dozen
+meaningless boxes over the one box that says what the label is.
+
+On export the rotation goes in the TEXT MATRIX (`0 1 -1 0 e f`), not anywhere
+else, so vertical text is the same code path as horizontal with a different pair
+of cosines. Turned a quarter turn anti-clockwise the glyphs' own "up" points
+LEFT across the page, so the ascenders sit at the box's left edge, the baseline
+runs down its right-hand side at 0.8 of the width, and the run starts at the
+FOOT of the box because reading goes upwards. The patch's padding has to swap
+axes with it, or a tall narrow run gets a wide band across the page with the old
+ink still showing at the ends.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

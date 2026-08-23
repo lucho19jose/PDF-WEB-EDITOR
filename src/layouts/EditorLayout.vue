@@ -178,9 +178,12 @@ async function runOcrNow(pageIndex: number, lang: string) {
     return
   }
   ocrStore.setResult(result)
+  const sideways = result.verticalCount
+    ? `, ${result.verticalCount} of them sideways`
+    : ''
   editorStore.setStatus(result.items.length === 0
     ? 'No text was recognised on this page'
-    : `${result.items.length} text areas detected — ${result.confidence}% average confidence. Double-click one to edit it.`)
+    : `${result.items.length} text areas detected${sideways} — ${result.confidence}% average confidence. Double-click one to edit it.`)
 }
 
 /**
@@ -208,7 +211,7 @@ async function bakeOcrEdits(): Promise<number> {
       }
       for (const t of plan.texts) {
         // addText takes a bottom-left origin baseline; OCR works top-left.
-        await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color)
+        await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation)
         written++
       }
     })

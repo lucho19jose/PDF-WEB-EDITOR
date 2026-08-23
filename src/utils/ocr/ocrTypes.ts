@@ -55,6 +55,16 @@ export interface OcrTextItem {
   align: OcrAlign
   /** Degrees clockwise from horizontal, from the OCR baseline. */
   rotation: number
+  /**
+   * True for a run that reads bottom-to-top up the page.
+   *
+   * Its `rect` is the upright box the text occupies — tall and narrow — while
+   * the text inside runs along the box's HEIGHT. Kept as its own flag rather
+   * than as `rotation: -90`, because the two mean different things: rotation is
+   * a scan's few degrees of skew, and every consumer has to lay a vertical run
+   * out differently rather than just tilting it.
+   */
+  vertical: boolean
 
   /** 0-100 from OCR. Low confidence is worth showing rather than hiding. */
   confidence: number
@@ -75,6 +85,8 @@ export interface OcrPageResult {
   /** Mean confidence, for telling the user how much to trust it. */
   confidence: number
   lang: string
+  /** How many runs were read sideways — worth reporting, it is optional work. */
+  verticalCount?: number
 }
 
 /** Why a page was judged to need OCR — reported so the decision is not a black box. */
