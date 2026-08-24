@@ -640,8 +640,25 @@ async function insertImageSteps(file: File) {
   const column = probe.column ?? { left: props.pdfWidth * 0.1, right: props.pdfWidth * 0.9 }
   const columnWidth = Math.max(column.right - column.left, 1)
 
-  const w = Math.max(columnWidth * (editorStore.imageWidthPct / 100), 8)
-  const h = Math.max(w / (aspect || 1), 8)
+  let w = Math.max(columnWidth * (editorStore.imageWidthPct / 100), 8)
+  let h = Math.max(w / (aspect || 1), 8)
+
+  // The width was chosen; the HEIGHT follows from the picture's own shape, and
+  // nothing was checking it against the paper.
+  //
+  // A portrait photograph — a phone snap of a document, which is the common
+  // case — is two or three times taller than it is wide, so 60% of the column
+  // came out taller than the page: on a Letter sheet it ran 462 points past the
+  // bottom edge, where it cannot be seen, printed or dragged back. Scaled to
+  // fit, the same picture lands whole and can be made bigger by its handles.
+  const usableH = Math.max(props.pdfHeight - IMAGE_GAP * 2, 16)
+  let shrunk = false
+  if (h > usableH) {
+    const fit = usableH / h
+    w *= fit
+    h *= fit
+    shrunk = true
+  }
   const x = column.left + (columnWidth - w) / 2
 
   // Only an in-flow image asks the text to move. Over or under it, the picture
@@ -650,7 +667,16 @@ async function insertImageSteps(file: File) {
   const room = inFlow && editorStore.reflowOnEdit
     ? await makeRoomInText(dropY, h + IMAGE_GAP * 2, below)
     : probe
-  const top = below ? room.y + IMAGE_GAP : Math.max(room.y - IMAGE_GAP - h, 0)
+  // Placed where it was asked for, then slid back onto the page if that would
+  // hang it over an edge. Moving it beats shrinking it further: the size the
+  // user chose is respected wherever there is room for it anywhere on the sheet.
+  const wanted = below ? room.y + IMAGE_GAP : Math.max(room.y - IMAGE_GAP - h, 0)
+  const top = Math.max(IMAGE_GAP, Math.min(wanted, props.pdfHeight - IMAGE_GAP - h))
+  const nudged = Math.abs(top - wanted) > 0.5
+  // Declared before the `behind` branch below, which returns early and needs it.
+  const fitNote = shrunk
+    ? ' — scaled down to fit the page'
+    : nudged ? ' — moved up to keep it on the page' : ''
 
   const rect: RectT = [x, top, x + w, top + h]
   const pageIndex = docStore.currentPage - 1
@@ -661,7 +687,7 @@ async function insertImageSteps(file: File) {
     // stream instead, and so becomes part of the page — there is no annotation
     // left to select or resize, which the message says rather than leaving the
     // user looking for handles that are not there.
-    const behindNote = 'Image inserted behind the text — it is part of the page now, so Ctrl+Z to change it'
+    const behindNote = `Image inserted behind the text${fitNote} — it is part of the page now, so Ctrl+Z to change it`
     await annotOp(behindNote, () => pdfEngine.drawImageInContent(pageIndex, rect, buf, true), false)
     // Switching tool writes its own status line, so the note is put back after
     // it — otherwise the only explanation of what just happened is replaced by
@@ -672,13 +698,13 @@ async function insertImageSteps(file: File) {
   }
 
   const note = wrap === 'front'
-    ? 'Image inserted in front of the text — drag its handles to move or resize it'
+    ? `Image inserted in front of the text${fitNote} — drag its handles to move or resize it`
     : editorStore.reflowOnEdit
       ? [
-          `Image inserted in the text — ${room.moved} block(s) moved to make room`,
+          `Image inserted in the text${fitNote} — ${room.moved} block(s) moved to make room`,
           room.spilled > 0 ? `${room.spilled} line(s) moved to the next page` : null
         ].filter(Boolean).join(' — ')
-      : 'Image inserted — the text was left as it was (turn on Reflow to move it aside)'
+      : `Image inserted${fitNote} — the text was left as it was (turn on Reflow to move it aside)`
   await annotOp(note, () => pdfEngine.addImageStamp(pageIndex, rect, buf), false)
 
   // Hand the user the select tool: staying on 'image' means the next click on

@@ -1164,6 +1164,24 @@ Verified under a storm of twelve overlapping repaints with scale changes every
 90ms — shorter than a single render — with no page left blank and no stale
 scale afterwards.
 
+### An inserted image is fitted to the paper
+The width comes from a percentage the user sets; the HEIGHT follows from the
+picture's own shape, and nothing was checking it against the page. A portrait
+photograph — a phone snap of a document, which is the common case — is two or
+three times taller than it is wide, so 60% of the text column came out taller
+than the sheet: measured at 1375 points on a page of 1188, running 462 past the
+bottom edge, where it cannot be seen, printed, or dragged back.
+
+`insertImage` now scales the picture down, aspect intact, when it is taller than
+the page allows, and slides it back onto the page when the point it was asked
+for would hang it over an edge. Moving beats shrinking where both would work:
+the size chosen is respected wherever there is room for it on the sheet. Either
+adjustment is reported, because a picture that is not the size you asked for
+without explanation reads as a bug.
+
+An image that already fits is not touched — verified alongside, since a fit rule
+that quietly rescales everything would be its own defect.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
