@@ -1136,6 +1136,34 @@ Long runs now report progress. A minute of silence is indistinguishable from a
 hang, and the user's response to a hang is Ctrl+Z — which was the very thing
 corrupting the document.
 
+### Render OFF-SCREEN, then copy — never clear a canvas you cannot refill
+Painting straight onto the visible canvas means clearing it first: setting
+`width` is what resizes it, and that wipes it. From that moment until the render
+finishes the page on screen is blank, and a render that never finishes leaves it
+blank for good — cancelled by the next one, or thrown out because the document
+was reloaded under it. The page then shows white while the thumbnails, which
+read the bytes independently, show the document perfectly well.
+
+`renderPage` draws into a detached canvas and copies the result over only once
+the render has completed. A failed render now costs nothing: the visible canvas
+still holds the last good picture of that page, which for an untouched page is
+still correct and for an edited one is at worst one revision stale. The cost is
+one full-page bitmap copy per render.
+
+Two things go with it:
+
+- **A render that returns nothing is retried**, up to `MAX_RENDER_ATTEMPTS`, at
+  the back of the queue. Superseded and reloaded-under are both ordinary events
+  during editing and neither means the page cannot be drawn; dropping it left a
+  page unpainted with nothing scheduled to try again.
+- **`repaintAround` is awaited**, so the queue slot it runs in is held until the
+  page is actually on screen. Returning early let the next operation reload the
+  document while the render was still going, which cancelled it.
+
+Verified under a storm of twelve overlapping repaints with scale changes every
+90ms — shorter than a single render — with no page left blank and no stale
+scale afterwards.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

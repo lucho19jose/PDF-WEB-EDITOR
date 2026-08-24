@@ -60,6 +60,22 @@ export function usePDFViewer() {
   let renderToken = 0
   let currentRenderTask: any = null
 
+  /**
+   * Draw a page into an OFF-SCREEN canvas, then copy it onto the visible one.
+   *
+   * Painting straight onto the visible canvas means clearing it first — setting
+   * `width` is what resizes it, and that wipes it — and from that moment until
+   * the render finishes, the page on screen is blank. A render that never
+   * finishes leaves it blank for good: cancelled by the next one, or thrown out
+   * because the document was reloaded under it. The page then shows white while
+   * the thumbnails, which read the bytes independently, show the document
+   * perfectly well. That is the "the text disappears on the editing sheet"
+   * report in its second form.
+   *
+   * Off-screen, a failed render costs nothing: the visible canvas still holds
+   * the last good picture of the page, which for an unedited page is still
+   * correct and for an edited one is at worst one revision stale.
+   */
   async function renderPage(canvas: HTMLCanvasElement, pageNum: number) {
     if (!pdfDoc.value) return
 
@@ -75,22 +91,30 @@ export function usePDFViewer() {
       // Render at devicePixelRatio so HiDPI displays get sharp text; the
       // canvas is styled at CSS-pixel size so all overlay math is unchanged.
       const dpr = window.devicePixelRatio || 1
-      canvas.width = Math.floor(viewport.width * dpr)
-      canvas.height = Math.floor(viewport.height * dpr)
-      canvas.style.width = `${viewport.width}px`
-      canvas.style.height = `${viewport.height}px`
+      const w = Math.floor(viewport.width * dpr)
+      const h = Math.floor(viewport.height * dpr)
 
-      const ctx = canvas.getContext('2d')!
+      const offscreen = document.createElement('canvas')
+      offscreen.width = w
+      offscreen.height = h
+      const ctx = offscreen.getContext('2d')!
       const task = page.render({
         canvasContext: ctx,
         viewport,
-        canvas,
+        canvas: offscreen,
         transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined
       } as any)
       currentRenderTask = task
       await task.promise
       if (myToken === renderToken) currentRenderTask = null
       if (myToken !== renderToken) return // superseded during render
+
+      // Only now does the visible canvas change at all.
+      canvas.width = w
+      canvas.height = h
+      canvas.style.width = `${viewport.width}px`
+      canvas.style.height = `${viewport.height}px`
+      canvas.getContext('2d')!.drawImage(offscreen, 0, 0)
 
       return { viewport, width: viewport.width, height: viewport.height }
     } catch (err: any) {

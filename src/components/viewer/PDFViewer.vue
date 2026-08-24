@@ -172,6 +172,17 @@ const painted = new Set<number>()
 let renderQueue: number[] = []
 let renderBusy = false
 
+/**
+ * How many times a page may fail to render before it is left alone.
+ *
+ * A render returns nothing when it was superseded or when the document was
+ * reloaded under it — both of which happen in the ordinary course of editing,
+ * and neither of which means the page cannot be drawn. Dropping it silently
+ * left a page unpainted with nothing scheduled to try again.
+ */
+const MAX_RENDER_ATTEMPTS = 3
+const attempts = new Map<number, number>()
+
 async function pump() {
   if (renderBusy) return
   renderBusy = true
@@ -181,7 +192,14 @@ async function pump() {
       const canvas = canvases.get(page)
       if (!canvas || painted.has(page)) continue
       const result = await pdfViewer.renderPage(canvas, page)
-      if (!result) continue
+      if (!result) {
+        const tried = (attempts.get(page) ?? 0) + 1
+        attempts.set(page, tried)
+        // Back of the queue, so the pages that CAN be drawn are not held up.
+        if (tried < MAX_RENDER_ATTEMPTS) renderQueue.push(page)
+        continue
+      }
+      attempts.delete(page)
       painted.add(page)
       // Replacing the Map is what makes Vue notice, and that re-runs every
       // page's style. Nearly every page in a document is the same size as the
@@ -218,9 +236,10 @@ function neighbourhood(): number[] {
 }
 
 /** Queue the current page first, then whatever is on or near the screen. */
-function requestVisible() {
+async function requestVisible(): Promise<void> {
   if (!docStore.loaded) return
   const wanted = new Set<number>()
+  // eslint-disable-next-line prefer-const
   if (pageList.value.includes(docStore.currentPage)) wanted.add(docStore.currentPage)
 
   // Only the pages AROUND the current one are measured. The current page
@@ -239,15 +258,16 @@ function requestVisible() {
   for (const page of wanted) {
     if (!painted.has(page) && !renderQueue.includes(page)) renderQueue.push(page)
   }
-  pump()
+  await pump()
 }
 
 /** Everything on screen is stale — the document or the scale changed. */
 async function repaintAll() {
   painted.clear()
+  attempts.clear()
   renderQueue = []
   await nextTick()
-  requestVisible()
+  await requestVisible()
 }
 
 /**
@@ -262,10 +282,13 @@ async function repaintAll() {
  * on the next one, and an undo can put it back on the previous.
  */
 async function repaintAround(page: number) {
-  for (const p of [page - 1, page, page + 1]) painted.delete(p)
+  for (const p of [page - 1, page, page + 1]) { painted.delete(p); attempts.delete(p) }
   renderQueue = renderQueue.filter(p => p < page - 1 || p > page + 1)
   await nextTick()
-  requestVisible()
+  // AWAITED, so the queue slot this runs in is held until the page is actually
+  // on screen. Returning early let the next operation reload the document
+  // while the render was still going, which cancelled it.
+  await requestVisible()
 }
 
 // ── Which page is being looked at ──
@@ -408,6 +431,7 @@ watch(continuous, repaintAll)
 watch(() => docStore.loaded, async (loaded) => {
   if (loaded) {
     painted.clear()
+    attempts.clear()
     renderQueue = []
     sizes.value = new Map()
     await nextTick()
