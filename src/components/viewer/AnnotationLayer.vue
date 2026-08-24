@@ -130,7 +130,7 @@ import { useHistoryStore } from '@/stores/history'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
 import type { AnnotationInfo, Quad, Pt, RectT, MarkupType, ShapeType, TextChar } from '@/engine/types'
 import { hexToRgb01, rgb01ToCss } from '@/utils/color'
-import { enqueueOp } from '@/utils/opQueue'
+import { enqueueOp, beginTransaction } from '@/utils/opQueue'
 
 const props = defineProps<{ pageWidth: number; pageHeight: number; pdfWidth: number; pdfHeight: number }>()
 const emit = defineEmits<{ changed: [] }>()
@@ -611,6 +611,17 @@ async function onImagePicked(e: Event) {
 }
 
 async function insertImage(file: File) {
+  // Held for the WHOLE sequence — making room, the save that follows it, and
+  // the stamp — so an undo cannot land between two of its steps.
+  const endTransaction = beginTransaction()
+  try {
+    await insertImageSteps(file)
+  } finally {
+    endTransaction()
+  }
+}
+
+async function insertImageSteps(file: File) {
 
   const buf = await file.arrayBuffer()
   const aspect = await imgAspect(file)

@@ -1101,6 +1101,41 @@ change that moves it inside a `v-if` or a `v-for` breaks that assumption
 silently. `OcrTextLayer` and `SearchHighlights` are safe because they read their
 state from stores through computeds, which do not care when they were created.
 
+### The queue serialises steps; a TRANSACTION holds a sequence
+Inserting an image is not one queued operation but three or four: make room in
+the text, the save-and-reload that follows, then stamp the picture. The queue
+keeps each of those from interleaving with anything else and does nothing about
+the GAPS between them — and an undo landing in a gap replaces the whole document
+underneath an operation that is still running. On a page-filling image over a
+dense document, where making room takes half a minute, that is an easy thing to
+do: it left page 1 blank and the file at a third of its bytes.
+
+`beginTransaction()` in `opQueue` is held across the whole sequence and released
+in a `finally`. It does not block the queue — the operation's own steps still go
+through it — it only lets anything that would REPLACE the document wait. Undo
+and redo call `settleTransactions()` first and say "waiting for the current
+operation to finish" if they have to, because a Ctrl+Z that appears to do
+nothing is its own kind of wrong.
+
+Measured: four undo presses spread across a 17-second insertion, and the
+document comes back byte-identical (16176) with both pages intact. Before, one
+was enough to blank a page and lose 10,000 bytes.
+
+### Deleting many blocks: one extraction, back to front
+A block id is its index in the page's extraction, so emptying one either leaves
+it there or removes it and shifts every LATER index down. Deleting from the LAST
+block to the FIRST therefore keeps every id still to be used valid — they are
+all lower than the one just removed — and one extraction serves the whole set.
+
+Re-extracting before each delete cost 112ms a time on a full page (measured
+against 326ms for a complete edit including the save and reload), and a
+page-filling image spills thirty lines that all have to be cleared. Making room
+for one went from 37 seconds to 17.
+
+Long runs now report progress. A minute of silence is indistinguishable from a
+hang, and the user's response to a hang is Ctrl+Z — which was the very thing
+corrupting the document.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

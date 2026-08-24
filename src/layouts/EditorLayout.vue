@@ -82,7 +82,7 @@ import { useOCR } from '@/composables/useOCR'
 import { planOcrExport } from '@/utils/ocr/ocrExport'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
-import { enqueueOp } from '@/utils/opQueue'
+import { enqueueOp, settleTransactions, transactionOpen } from '@/utils/opQueue'
 import MainToolbar from '@/components/toolbar/MainToolbar.vue'
 import PageThumbnails from '@/components/sidebar/PageThumbnails.vue'
 import StatusBar from '@/components/common/StatusBar.vue'
@@ -627,6 +627,12 @@ function pushUndo() {
 // ===== UNDO / REDO =====
 async function undo() {
   if (!historyStore.canUndo || !docStore.loaded) return
+  // Anything that replaces the whole document has to wait for a multi-step
+  // operation to finish. The queue only serialises single steps, and an undo
+  // between two of them swaps the document out from under the one still
+  // running — which is how a blank page and a third of the bytes went missing.
+  if (transactionOpen()) editorStore.setStatus('Waiting for the current operation to finish...')
+  await settleTransactions()
   await exclusiveOp(async () => {
     editorStore.setStatus('Undoing...')
     if (docStore.pdfBytes) historyStore.pushRedo(new Uint8Array(docStore.pdfBytes))
@@ -639,6 +645,8 @@ async function undo() {
 }
 async function redo() {
   if (!historyStore.canRedo || !docStore.loaded) return
+  if (transactionOpen()) editorStore.setStatus('Waiting for the current operation to finish...')
+  await settleTransactions()
   await exclusiveOp(async () => {
     editorStore.setStatus('Redoing...')
     if (docStore.pdfBytes) historyStore.pushUndoNoClear(new Uint8Array(docStore.pdfBytes))

@@ -681,6 +681,18 @@ function readEditor(el: HTMLElement | null): string {
   return parts.join('').replace(/\r\n?/g, '\n').replace(/\n+$/, '')
 }
 
+/**
+ * A block's place in the page's extraction.
+ *
+ * `TextBlock.id` is `page:index` and the index is exactly that place, which is
+ * what makes deleting back-to-front safe: emptying a block can only renumber
+ * the ones AFTER it.
+ */
+function extractionIndex(block: TextBlock): number {
+  const n = Number(String(block.id).split(':').pop())
+  return Number.isFinite(n) ? n : 0
+}
+
 /** Whitespace-only differences are not edits worth rewriting a page for. */
 function sameText(a: string, b: string): boolean {
   return a.replace(/\s+/g, ' ').trim() === b.replace(/\s+/g, ' ').trim()
@@ -1295,12 +1307,24 @@ async function deleteSelectedBlocks() {
   try {
     await enqueueOp(async () => {
       let snapshotTaken = false
+      // One extraction for the whole set, deleted back to front — see the note
+      // in the spill above for why that is enough.
+      blocks.value = await pdfEngine.getTextBlocks(pageIndex)
+      const taken = new Set<string>()
+      const targets: TextBlock[] = []
       for (const anchor of anchors) {
-        // Re-extract before each delete so the id addresses the CURRENT page.
-        blocks.value = await pdfEngine.getTextBlocks(pageIndex)
-        const block = findByAnchor(anchor, new Set())
+        const block = findByAnchor(anchor, taken)
         if (!block) { failed++; continue }
+        taken.add(block.id)
+        targets.push(block)
+      }
+      targets.sort((a, b) => extractionIndex(b) - extractionIndex(a))
 
+      let done = 0
+      for (const block of targets) {
+        if (targets.length > 3) {
+          editorStore.setStatus(`Deleting ${++done} of ${targets.length}...`)
+        }
         const result = await pdfEngine.replaceText(pageIndex, block.id, '')
         if (result.success) {
           if (!snapshotTaken) { pushUndoSnapshot(); snapshotTaken = true }
@@ -1450,11 +1474,32 @@ async function makeRoomAt(pdfY: number, amount: number, below = true): Promise<{
       spilled = result.landed.length
 
       const landedText = new Set(result.landed.map(l => l.text))
-      for (const { anchor, lineText } of spillAnchors) {
-        if (!landedText.has(lineText)) continue
+      const toClear = spillAnchors.filter(a => landedText.has(a.lineText))
+      if (toClear.length > 0) {
+        // Resolve every anchor against ONE extraction, then delete from the
+        // LAST block to the FIRST.
+        //
+        // A block id is its index in the extraction, so emptying one either
+        // leaves it there or removes it and shifts every LATER index down.
+        // Working backwards, the ids still to be used are all lower than the
+        // one just deleted and cannot have moved — which is what makes a single
+        // extraction enough. Re-extracting per line cost 112ms each on a full
+        // page, and a page-filling image spills thirty of them.
         blocks.value = await pdfEngine.getTextBlocks(pageIndex)
-        const b = findByAnchor(anchor, new Set())
-        if (b) await pdfEngine.replaceText(pageIndex, b.id, '')
+        const taken = new Set<string>()
+        const targets: TextBlock[] = []
+        for (const { anchor } of toClear) {
+          const b = findByAnchor(anchor, taken)
+          if (!b) continue
+          taken.add(b.id)
+          targets.push(b)
+        }
+        targets.sort((a, b) => extractionIndex(b) - extractionIndex(a))
+        let done = 0
+        for (const b of targets) {
+          editorStore.setStatus(`Making room — clearing line ${++done} of ${targets.length}...`)
+          await pdfEngine.replaceText(pageIndex, b.id, '')
+        }
       }
     }
   })
