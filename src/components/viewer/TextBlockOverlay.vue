@@ -1379,6 +1379,11 @@ function editSelection() {
  * @param below   true to open the space UNDER the line at `pdfY`, false to open
  *                it above (the line itself then moves down with the rest).
  */
+/**
+ * Open — or close — a gap in the text at a given height on the page.
+ *
+ * @param amount points to open (positive) or give back (negative)
+ */
 async function makeRoomAt(pdfY: number, amount: number, below = true): Promise<{
   column: { left: number; right: number } | null
   y: number
@@ -1407,33 +1412,42 @@ async function makeRoomAt(pdfY: number, amount: number, below = true): Promise<{
     ? (rows[at] ? rows[at].rect[3] : pdfY)
     : (rows[at] ? rows[at].rect[1] : pdfY)
 
-  if (!(amount > 0.05)) return { column, y, moved: 0, spilled: 0, capped: false }
+  if (Math.abs(amount) <= 0.05) return { column, y, moved: 0, spilled: 0, capped: false }
 
+  // A NEGATIVE amount gives room back — the rows below come up.
+  //
+  // Only growing was handled before, so an image made smaller, or dragged
+  // somewhere else, left the gap it used to need sitting empty in the middle of
+  // the text: "once I shrink the image or move it, the text no longer adjusts".
+  // Pulling up can never run text off the paper, so it has no bottom limit.
+  const opening = amount > 0
   const span = [column.left, 0, column.right, props.pdfHeight] as Rect
-  const { shifts, capped } = planPushDown(rows, Math.max(from, 0), amount, {
+  const { shifts, capped } = planPushDown(rows, Math.max(from, 0), Math.abs(amount), {
     // Not the paper edge: text pushed to the very bottom reads as broken and is
     // one point from being lost entirely.
-    pageHeight: props.pdfHeight - PAGE_BOTTOM_MARGIN,
+    pageHeight: opening ? props.pdfHeight - PAGE_BOTTOM_MARGIN : Infinity,
     maxRows: MAX_PUSHED_ROWS,
     span
   })
   // `planPushDown` starts below `from`; inserting above the first line has to
   // move that line too, which a `from` of -1 cannot express.
-  if (!below && at === 0) shifts.set(0, amount)
+  if (!below && at === 0) shifts.set(0, Math.abs(amount))
 
   const byId = new Map(blocks.value.map(b => [b.id, b]))
+  // Tm space is y-up: opening a gap is a negative dy, closing one a positive.
+  const sign = opening ? -1 : 1
   const moves: { anchor: Anchor; shift: number }[] = []
   for (const [rowIndex, dy] of shifts) {
     for (const id of rows[rowIndex].blockIds) {
       const b = byId.get(id)
-      if (b) moves.push({ anchor: anchorOf(b), shift: -dy })  // page-space DOWN
+      if (b) moves.push({ anchor: anchorOf(b), shift: sign * dy })
     }
   }
 
   // Rows below the insertion that the push could NOT take with it: they would
   // have left the paper. Captured BEFORE anything moves, because that is the
   // only moment their geometry is still true.
-  const leftBehind = capped
+  const leftBehind = capped && opening
     ? rows
         .map((r, i) => ({ r, i }))
         .filter(({ i }) => i > Math.max(from, 0) && !shifts.has(i))
@@ -1512,6 +1526,14 @@ async function makeRoomAt(pdfY: number, amount: number, below = true): Promise<{
   return { column, y, moved, spilled, capped }
 }
 
+/**
+ * Clear space between text that arrives on a page and the text already there.
+ *
+ * Without it the two sets meet exactly, and a descender from one line sits in
+ * the ascenders of the next — legible, but plainly wrong.
+ */
+const SPILL_GAP = 8
+
 /** Margins kept on a page that gives or receives spilled text, in points. */
 const SPILL_TOP_MARGIN = 56
 const PAGE_BOTTOM_MARGIN = 56
@@ -1559,11 +1581,29 @@ async function spillChain(fromPage: number, lines: SpillLine[]): Promise<{ lande
     const rows = groupIntoRows(existing.map(b => ({ id: b.id, bbox: [...b.bbox] as Rect })))
     const byId = new Map(existing.map(b => [b.id, b]))
 
+    // How far this page's own text has to move, measured from where it STARTS.
+    //
+    // Pushing it by the height of what is arriving is not enough, and that was
+    // the bug: the arriving lines are drawn from the top MARGIN downwards, so
+    // they end at `SPILL_TOP_MARGIN + arriving`, while text that began at the
+    // top of the page ends up at `itsTop + arriving`. The difference is the
+    // margin, and the two sets of lines were printed through each other for
+    // exactly that many points — "the letters all mix together" when text moves
+    // to the next page.
+    //
+    // The shift is therefore whatever it takes to put the first existing row
+    // clear of the arriving block, and zero when the page already starts low
+    // enough to have room.
+    const existingTop = rows.length > 0
+      ? Math.min(...rows.map(r => r.rect[1]))
+      : props.pdfHeight
+    const shift = Math.max(0, SPILL_TOP_MARGIN + arriving + SPILL_GAP - existingTop)
+
     const staying: typeof rows = []
     const displaced: SpillLine[] = []
     const displacedAnchors: Anchor[] = []
     for (const row of rows) {
-      if (row.rect[3] + arriving <= limit) { staying.push(row); continue }
+      if (row.rect[3] + shift <= limit) { staying.push(row); continue }
       const rowBlocks = row.blockIds.map(id => byId.get(id)).filter((b): b is TextBlock => !!b)
       const text = rowBlocks.map(b => b.text).join(' ').replace(/\s+/g, ' ').trim()
       if (!text) continue
@@ -1590,11 +1630,11 @@ async function spillChain(fromPage: number, lines: SpillLine[]): Promise<{ lande
     if (arrivedHere.length === 0) break
 
     // Move what stays out of the way of what just arrived.
-    if (staying.length > 0) {
+    if (staying.length > 0 && shift > 0.5) {
       const ops: BlockTransformOp[] = []
       for (const row of staying) {
         for (const id of row.blockIds) {
-          ops.push({ blockId: id, dx: 0, dy: -arriving, sx: 1, sy: 1, anchorX: 0, anchorY: 0 })
+          ops.push({ blockId: id, dx: 0, dy: -shift, sx: 1, sy: 1, anchorX: 0, anchorY: 0 })
         }
       }
       if (ops.length > 0) await pdfEngine.transformTextBlocks(target, ops)

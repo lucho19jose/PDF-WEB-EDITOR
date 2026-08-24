@@ -1182,6 +1182,34 @@ without explanation reads as a bug.
 An image that already fits is not touched — verified alongside, since a fit rule
 that quietly rescales everything would be its own defect.
 
+### Spilled text is pushed clear of what arrives, not merely by its height
+`spillChain` draws the arriving lines from `SPILL_TOP_MARGIN` downwards, so they
+end at `SPILL_TOP_MARGIN + arriving`. The page's own text was then pushed down by
+`arriving` alone — which leaves text that began at the top of the page ending up
+at `itsTop + arriving`, a whole top margin short of clear. The two sets printed
+through each other for exactly that many points: "when it has to go to another
+page the letters all mix together".
+
+The shift is now whatever it takes to put the FIRST existing row below the
+arriving block plus `SPILL_GAP`, measured from where that row actually starts,
+and zero when the page already begins low enough to have room. The same figure
+decides which rows will not survive the push, or the partition is made against a
+distance that is not the one applied.
+
+### `makeRoomAt` takes a SIGNED amount
+Positive opens a gap, negative gives one back. Only opening existed, so an image
+made smaller left the space it no longer needed sitting empty, and one dragged
+elsewhere left its old gap behind AND landed on whatever was at the new place —
+"once I shrink the image or move it, the text no longer adjusts". Closing a gap
+can never run text off the paper, so it has no bottom limit and never spills.
+
+`commitRectChange` in the annotation layer is the single path for both a move
+and a resize. A change of height IN PLACE is one operation for the difference,
+which is cheaper and steadier than closing the old gap and opening a new one —
+every reflow is a chance to match the wrong paragraph, so the fewer the better.
+A move has to be the two, in that order: the rows must be where they belong
+before the second plan is built against them.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

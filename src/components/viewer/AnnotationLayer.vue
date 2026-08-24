@@ -279,24 +279,63 @@ async function onAnnotResizeUp() {
   if (!rz || !rz.moved) return
   const rect = resizedRect({ ...rz, moved: true })
 
-  // An image that grew taller needs the room, exactly as it did when it was
-  // inserted — otherwise resizing it puts it back on top of the text the
-  // insertion had carefully moved aside.
-  const grewBy = (rect[3] - rect[1]) - (rz.rect[3] - rz.rect[1])
-  let note = 'Annotation resized'
-  if (grewBy > 1 && editorStore.reflowOnEdit) {
-    pushUndo()   // one undo point covering the room and the resize
-    const room = await makeRoomInText(rz.rect[3], grewBy, true)
-    if (room.moved > 0 || room.spilled > 0) {
-      note = [
-        `Annotation resized — ${room.moved} block(s) moved`,
-        room.spilled > 0 ? `${room.spilled} line(s) moved to the next page` : null
-      ].filter(Boolean).join(' — ')
-    }
-    await annotOp(note, () => pdfEngine.updateAnnotation(docStore.currentPage - 1, rz.index, { rect }), false)
+  await commitRectChange(rz.index, rz.rect as RectT, rect, 'Annotation resized')
+}
+
+/**
+ * Apply a new rectangle to an annotation, and let the text follow it.
+ *
+ * Both directions, and both kinds of change. Only GROWING was handled before —
+ * so an image made smaller left the gap it no longer needed sitting empty, and
+ * one dragged elsewhere left its old gap behind and landed on whatever was at
+ * the new place. Neither is something a person would call adjusted.
+ *
+ * A change of height in place is one operation for the difference, which is
+ * both cheaper and steadier than closing the old gap and opening a new one:
+ * every reflow is a chance to match the wrong paragraph, so the fewer the
+ * better. A move has to be the two.
+ */
+async function commitRectChange(index: number, oldRect: RectT, newRect: RectT, verb: string) {
+  const apply = () => pdfEngine.updateAnnotation(docStore.currentPage - 1, index, { rect: newRect })
+  const isImage = selectedIsImage.value
+  if (!isImage || !editorStore.reflowOnEdit) {
+    await annotOp(verb, apply)
     return
   }
-  await annotOp(note, () => pdfEngine.updateAnnotation(docStore.currentPage - 1, rz.index, { rect }))
+
+  const oldH = oldRect[3] - oldRect[1]
+  const newH = newRect[3] - newRect[1]
+  const inPlace = Math.abs(newRect[0] - oldRect[0]) < 1 && Math.abs(newRect[1] - oldRect[1]) < 1
+
+  pushUndo()   // one undo point covering the reflow and the change itself
+  let moved = 0
+  let spilled = 0
+
+  if (inPlace) {
+    const delta = newH - oldH
+    if (Math.abs(delta) > 1) {
+      const room = await makeRoomInText(oldRect[3], delta, true)
+      moved += room.moved
+      spilled += room.spilled
+    }
+  } else {
+    // Give back what the old position was holding, then take what the new one
+    // needs. In that order: the rows have to be where they belong before the
+    // second plan is built against them.
+    const gave = await makeRoomInText(oldRect[3], -(oldH + IMAGE_GAP * 2), true)
+    moved += gave.moved
+    const took = await makeRoomInText(newRect[1], newH + IMAGE_GAP * 2, false)
+    moved += took.moved
+    spilled += took.spilled
+  }
+
+  const note = moved > 0 || spilled > 0
+    ? [
+        `${verb} — ${moved} block(s) moved`,
+        spilled > 0 ? `${spilled} line(s) moved to the next page` : null
+      ].filter(Boolean).join(' — ')
+    : verb
+  await annotOp(note, apply, false)
 }
 
 const deleteBtnStyle = computed(() => {
@@ -783,7 +822,7 @@ async function onMoveUp() {
   const dxP = m.dx / scaleX.value
   const dyP = m.dy / scaleY.value
   const newRect: RectT = [m.rect[0] + dxP, m.rect[1] + dyP, m.rect[2] + dxP, m.rect[3] + dyP]
-  await annotOp('Annotation moved', () => pdfEngine.updateAnnotation(docStore.currentPage - 1, m.index, { rect: newRect }))
+  await commitRectChange(m.index, m.rect as RectT, newRect, 'Annotation moved')
 }
 
 async function deleteSelected() {
