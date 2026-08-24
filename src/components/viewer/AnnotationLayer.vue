@@ -122,7 +122,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, inject, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, inject, onMounted, onBeforeUnmount } from 'vue'
 import { useQuasar } from 'quasar'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, MARKUP_TOOLS, type Tool } from '@/stores/editor'
@@ -772,6 +772,16 @@ watch(() => editorStore.currentTool, () => {
   cancelFreeText()
   if (showLayer.value) loadAnnotations()
 })
+/**
+ * Load on MOUNT — same reason as the text overlay.
+ *
+ * Under continuous scrolling this layer is rebuilt on whichever page is being
+ * looked at, and a new instance has missed every change its watchers listen
+ * for. Its annotations were simply absent: nothing to select, nothing to
+ * resize, nothing to delete.
+ */
+onMounted(() => { loadAnnotations() })
+
 watch(() => docStore.currentPage, () => {
   selectedIndex.value = null
   cancelFreeText() // an open freetext editor must not commit onto the NEW page

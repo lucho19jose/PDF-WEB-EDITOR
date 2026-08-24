@@ -1082,6 +1082,25 @@ dragging the scrollbar — each waits for the other and the panel sticks on page
 however far you scroll. When nothing nearby is on screen, one full scan
 re-anchors it; a jump is not something that happens every frame.
 
+### An overlay that can be REMOUNTED must load on mount
+`TextBlockOverlay` and `AnnotationLayer` fetched their data only from watchers —
+tool changed, page changed, document loaded, renderVersion bumped. That was
+sufficient while each was created once and lived for the session.
+
+Continuous scrolling moves them. They are destroyed on the page being left and
+built again on the page arrived at, and a fresh instance has missed every change
+that ever happened: no watcher fires, nothing loads. The editing layer was empty
+on every page except the one that happened to be current when the tool was
+picked — the text was on the paper, the thumbnails showed it, printing showed
+it, and it simply could not be touched. That is the "the text disappears on the
+editing sheet" report.
+
+Both now load in `onMounted`. The rule generalises: a component whose data is
+fetched by a watcher is making an assumption about its own lifetime, and any
+change that moves it inside a `v-if` or a `v-for` breaks that assumption
+silently. `OcrTextLayer` and `SearchHighlights` are safe because they read their
+state from stores through computeds, which do not care when they were created.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

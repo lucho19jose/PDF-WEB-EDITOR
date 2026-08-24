@@ -105,7 +105,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, inject, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, inject, onMounted, onBeforeUnmount } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
@@ -2091,6 +2091,21 @@ onBeforeUnmount(() => {
 })
 
 // ── Watchers ──
+
+/**
+ * Load on MOUNT, not only when something changes.
+ *
+ * Every one of the watchers below fires on a CHANGE, which was enough while
+ * this overlay was created once and lived for the whole session. Continuous
+ * scrolling moves it: it is destroyed on the page being left and built again on
+ * the page arrived at, and a fresh instance has missed every change that ever
+ * happened. Nothing loaded, so the editing layer was empty on every page except
+ * the one that happened to be current when the tool was picked — the text was
+ * on the paper and simply could not be touched.
+ */
+onMounted(() => {
+  if (showOverlay.value && pdfEngine.docLoaded.value) loadBlocks()
+})
 
 watch(() => editorStore.currentTool, (tool) => {
   if (['edit', 'select', 'addText'].includes(tool)) {
