@@ -688,6 +688,10 @@ interface ContentSource {
    * invoked more than once the FIRST invocation's CTM is used.
    */
   invokeCtm?: Mat6
+  /** Key of the source whose stream invokes this form ('page' or an ancestor form). */
+  parentKey?: string
+  /** Offset of this form's first `Do` within the parent's stream. */
+  doOffset?: number
 }
 
 const MAX_XOBJECT_DEPTH = 4
@@ -704,9 +708,20 @@ const MAX_XOBJECT_SOURCES = 64
 
 /** Content sources are re-read only when the document changes underneath us. */
 let contentSourceCache = new Map<number, ContentSource[]>()
+/**
+ * EVERY node of the invocation tree ('page' + each form, text-bearing or not),
+ * so a nested source's ancestors can be reached for clip/BBox widening even
+ * when a wrapper form draws no text itself.
+ */
+let formNodeCache = new Map<number, Map<string, ContentSource>>()
 function invalidateContentSources(pageIndex?: number) {
-  if (pageIndex === undefined) contentSourceCache = new Map()
-  else contentSourceCache.delete(pageIndex)
+  if (pageIndex === undefined) { contentSourceCache = new Map(); formNodeCache = new Map() }
+  else { contentSourceCache.delete(pageIndex); formNodeCache.delete(pageIndex) }
+}
+
+function getFormNode(pageIndex: number, key: string): ContentSource | null {
+  getContentSources(pageIndex) // fills the cache
+  return formNodeCache.get(pageIndex)?.get(key) ?? null
 }
 
 function getContentSources(pageIndex: number): ContentSource[] {
@@ -722,6 +737,8 @@ function getContentSources(pageIndex: number): ContentSource[] {
     resources: null, // null => the page's own Resources
     write: (bytes) => writeContentStream(pageIndex, bytes)
   })
+  const nodes = new Map<string, ContentSource>()
+  nodes.set('page', sources[0])
 
   let page: any = null
   try {
@@ -788,16 +805,20 @@ function getContentSources(pageIndex: number): ContentSource[] {
         } catch (_) { /* no /Matrix — identity */ }
 
         const key = path + '/' + name
+        const target = ref
+        const node: ContentSource = {
+          key: 'xobj:' + key,
+          stream: text,
+          resources: childRes ?? pageRes,
+          write: (bytes) => { target.writeStream(bytes) },
+          formDict: resolved,
+          invokeCtm,
+          parentKey: path === '' ? 'page' : 'xobj:' + path,
+          doOffset: invokedAt.get(name)!
+        }
+        nodes.set(node.key, node)
         if (/(?<![A-Za-z0-9])BT(?![A-Za-z0-9])/.test(text)) {
-          const target = ref
-          sources.push({
-            key: 'xobj:' + key,
-            stream: text,
-            resources: childRes ?? pageRes,
-            write: (bytes) => { target.writeStream(bytes) },
-            formDict: resolved,
-            invokeCtm
-          })
+          sources.push(node)
         }
         walk(text, childRes ?? pageRes, key, depth + 1, invokeCtm)
       }
@@ -813,6 +834,7 @@ function getContentSources(pageIndex: number): ContentSource[] {
     sources.length = MAX_XOBJECT_SOURCES + 1
   }
   contentSourceCache.set(pageIndex, sources)
+  formNodeCache.set(pageIndex, nodes)
   return sources
 }
 
@@ -1586,10 +1608,18 @@ function planTextEncoding(
   const fontName = pickSubstituteFont(info, targetBlock)
 
   try {
-    const page = pdfDoc.loadPage(pageIndex)
-    const pageObj = page.getObject()
-    const fontRef = ensureStandardFont(pageObj, fontName)
-    page.destroy()
+    let fontRef: string
+    if (activeResources) {
+      // Editing inside a Form XObject: the Tf name must resolve against the
+      // FORM's Resources.
+      const dict = activeResources.dict.resolve?.() ?? activeResources.dict
+      fontRef = ensureStandardFontInResources(dict, fontName)
+    } else {
+      const page = pdfDoc.loadPage(pageIndex)
+      const pageObj = page.getObject()
+      fontRef = ensureStandardFont(pageObj, fontName)
+      page.destroy()
+    }
     console.log(`[MuPDF Worker] Substituting font ${info?.baseFont || block.fontRef} → ${fontName} (/${fontRef})`)
     return { kind: 'subst', fontRef, fontName, byteLines }
   } catch (err: any) {
@@ -1690,8 +1720,19 @@ function ensureStandardFont(pageObj: any, fontName: string): string {
     resources = pdfDoc.newDictionary()
     pageObj.put('Resources', resources)
   }
-  resources = resources.resolve()
+  return ensureStandardFontInResources(resources.resolve(), fontName)
+}
 
+/**
+ * Register (or find) a base-14 font in a specific Resources dictionary.
+ *
+ * A name written into a Form XObject's stream resolves against the FORM's
+ * Resources, not the page's. Registering the substitute on the page while the
+ * rewritten run lived inside /X6 made "/F1" resolve to the form's own F1 — a
+ * subsetted CID face whose ToUnicode had no '1' — and the replacement's last
+ * character silently vanished from extraction.
+ */
+function ensureStandardFontInResources(resources: any, fontName: string): string {
   let fontDict = resources.get('Font')
   if (!fontDict || fontDict.toString() === 'null') {
     fontDict = pdfDoc.newDictionary()
@@ -1829,17 +1870,24 @@ function replaceTextInStream(
         const clips = getActiveClipsAtOffset(src.stream, outcome.anchorOffset)
           .filter(c => c.index < outcome.anchorOffset!)
           .sort((a, b) => b.index - a.index)
-        for (const clip of clips) {
-          const widened = widenClipForText(src.stream, clip, targetBlock, needed, extraHeight, pageHeight)
-          // Moved for the same reason the tags are: a line group can rewrite a
-          // block that sits BELOW this clip, and the offset read from the
-          // original stream then points a few bytes short of the rectangle.
-          if (widened) pending.push({
-            start: shiftOffset(clip.index, outcome.applied ?? []),
-            end: shiftOffset(clip.index + clip.length, outcome.applied ?? []),
-            text: widened
-          })
-        }
+        // Under withSource: the clip rectangles live in the SOURCE's space, and
+        // converting the target's page-space box into it needs the invocation
+        // CTM composed in. Widening them with the identity instead computed a
+        // window a quarter the size on a 0.24-scaled form and the replacement
+        // stayed truncated.
+        withSource(src, () => {
+          for (const clip of clips) {
+            const widened = widenClipForText(src.stream, clip, targetBlock, needed, extraHeight, pageHeight)
+            // Moved for the same reason the tags are: a line group can rewrite a
+            // block that sits BELOW this clip, and the offset read from the
+            // original stream then points a few bytes short of the rectangle.
+            if (widened) pending.push({
+              start: shiftOffset(clip.index, outcome.applied ?? []),
+              end: shiftOffset(clip.index + clip.length, outcome.applied ?? []),
+              text: widened
+            })
+          }
+        })
 
         // A Form XObject is clipped to its own /BBox even without a `re W n`.
         // Canva nests its text two forms deep in a box sized to the original
@@ -1860,6 +1908,52 @@ function replaceTextInStream(
               ? Math.min((targetBlock.height + extraHeight) / Math.max(targetBlock.height, 1), 4)
               : 1
           )
+        }
+
+        // A nested form is ALSO cut off by whatever clip is in force at its
+        // `Do` in each ANCESTOR stream, and by each ancestor form's own /BBox.
+        // Canva and pdftools invoke the text's form from inside another form,
+        // and widening only the innermost left the edit truncated — the
+        // long-standing "deeply nested text loses its last characters". Walk
+        // the chain up, growing the clips around each invocation and every
+        // ancestor's box.
+        let child = src
+        const seenAncestors = new Set([src.key])
+        while (child.parentKey !== undefined && child.doOffset !== undefined) {
+          const parent = getFormNode(pageIndex, child.parentKey)
+          if (!parent || seenAncestors.has(parent.key)) break
+          seenAncestors.add(parent.key)
+          const doAt = child.doOffset
+          const pclips = getActiveClipsAtOffset(parent.stream, doAt)
+            .sort((a, b) => b.index - a.index)
+          if (pclips.length) {
+            let pstream = parent.stream
+            let changed = false
+            withSource(parent, () => {
+              for (const clip of pclips) {
+                const widened = widenClipForText(parent.stream, clip, targetBlock, needed, extraHeight, pageHeight)
+                if (widened) {
+                  pstream = pstream.slice(0, clip.index) + widened + pstream.slice(clip.index + clip.length)
+                  changed = true
+                }
+              }
+            })
+            if (changed) {
+              const pbytes = new Uint8Array(pstream.length)
+              for (let i = 0; i < pstream.length; i++) pbytes[i] = pstream.charCodeAt(i) & 0xFF
+              parent.write(pbytes)
+            }
+          }
+          if (parent.formDict && (wider || deeper)) {
+            widenFormBBox(
+              parent.formDict,
+              wider ? Math.min(needed / Math.max(targetBlock.width, 1), 3) : 1,
+              deeper
+                ? Math.min((targetBlock.height + extraHeight) / Math.max(targetBlock.height, 1), 4)
+                : 1
+            )
+          }
+          child = parent
         }
       }
 
