@@ -4941,13 +4941,14 @@ function replaceInsideTjArray(
   if (last.charInItem !== items[last.item].decoded.length - 1) return null
 
   // width compensation
-  let oldW = 0, oldKnown = true
+  let oldW = 0, oldKnown = true, oldGlyphs = 0
   if (simpleInfo?.widths) {
     const w = simpleInfo.widths
     const fc = simpleInfo.firstChar
     for (let k = first.item; k <= last.item; k++) {
       const it = items[k]
       if (it.isLiteral) for (const code of it.codes) {
+        oldGlyphs++
         const cw = w[code - fc]
         if (cw === undefined) { oldKnown = false } else oldW += cw
       } else {
@@ -4962,12 +4963,17 @@ function replaceInsideTjArray(
   if (subst) {
     // A substitute face has different advances, so the pen lands somewhere
     // else after the new run — without a compensating kern every later cell
-    // in the array shifts. The compensation is only trustworthy for a plain
-    // byte-coded simple font, where Widths[code − FirstChar] is meaningful:
-    // a glyph-coded subset's CMap codes index that array as garbage, and the
-    // "known" widths it yields sheared a timesheet by 53 blocks. Refuse
-    // rather than shift the table.
-    if (!oldKnown || !simpleInfo || simpleInfo.encodingName === 'Unknown' || simpleInfo.isType0) return null
+    // in the array shifts. The compensation is only trusted for a plain
+    // byte-coded simple font with a KNOWN encoding, where
+    // Widths[code − FirstChar] provably means something: a glyph-coded
+    // subset's CMap codes can index that array as numbers that are garbage —
+    // plausible-looking averages included — and one such array sheared a
+    // timesheet by 53 blocks while reporting success. Losing the edit is
+    // recoverable; shifting every later cell of a table is not.
+    if (!oldKnown || oldGlyphs === 0) return null
+    if (!simpleInfo || simpleInfo.encodingName === 'Unknown' || simpleInfo.isType0) return null
+    const avgAdvance = oldW / oldGlyphs
+    if (!(avgAdvance >= 150 && avgAdvance <= 1500)) return null
     // Split the array around the run and draw the run in the substitute font.
     const pre = op.raw.slice(0, spliceStart).trimEnd()   // "[ …items-before"
     const post = op.raw.slice(spliceEnd).replace(/^\s*/, '') // "items-after… ] TJ"
