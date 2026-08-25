@@ -3210,12 +3210,21 @@ function findBtBlocksByPosition(
     // would drag the label along.
     const near = lineBlocks.filter(b => distOf(b) <= onTarget)
     // A containment match ("the joined text has the target somewhere in it")
-    // with NO member on the clicked position is a wrong line: a Ghostscript
-    // mega-block whose join contains every cell of the table put "710.00" into
-    // a header-row group, and taking the whole group moved the header. Only an
-    // exact whole-line match may survive without a near member.
-    if (near.length === 0 && !exact) continue
-    const picked = near.length > 0 ? near : lineBlocks
+    // with NO member on the clicked position must keep only the members that
+    // actually CARRY the target. A Ghostscript mega-block whose join contains
+    // every cell of the table put "710.00" into a header-row group, and taking
+    // the whole group moved the header row. Members that merely share the line
+    // are dropped; when none carries it (the target spans blocks), only an
+    // exact whole-line match may survive.
+    let picked: BtInfo[]
+    if (near.length > 0) picked = near
+    else if (exact) picked = lineBlocks
+    else {
+      const compact = (s: string) => foldForMatch(s).replace(/\s+/g, '')
+      const carrying = lineBlocks.filter(b => compact(b.decodedText).includes(compact(normalizedTarget)))
+      if (carrying.length === 0) continue
+      picked = carrying
+    }
     candidates.push({
       blocks: picked,
       score: exact ? 2 : 1,
