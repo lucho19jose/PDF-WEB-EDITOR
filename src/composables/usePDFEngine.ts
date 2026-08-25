@@ -311,6 +311,11 @@ export function usePDFEngine() {
     return wrap(await bridge.flattenAnnotationBehind(pageIndex, annotIndex), 'flattenAnnotationBehind', pageIndex)
   }
 
+  /** Turn a Stamp image a quarter turn clockwise. */
+  async function rotateStampImage(pageIndex: number, annotIndex: number): Promise<boolean> {
+    return wrap(await bridge.rotateStampImage(pageIndex, annotIndex), 'rotateStampImage', pageIndex)
+  }
+
   /** Draw an image into the page content — behind everything, or over everything. */
   async function drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<boolean> {
     return wrap(await bridge.drawImageInContent(pageIndex, rect, bytes, behind), 'drawImageInContent', pageIndex)
@@ -441,6 +446,7 @@ export function usePDFEngine() {
     // page management
     rotatePage,
     flattenAnnotationBehind,
+    rotateStampImage,
     drawImageInContent,
     fillRect,
     shiftGraphicsBelow,

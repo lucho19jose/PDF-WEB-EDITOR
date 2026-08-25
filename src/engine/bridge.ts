@@ -200,6 +200,11 @@ export class MuPDFBridge {
     return this.send('flattenAnnotationBehind', { pageIndex, annotIndex })
   }
 
+  /** Turn a Stamp image a quarter turn clockwise (appearance matrix + rect swap). */
+  async rotateStampImage(pageIndex: number, annotIndex: number): Promise<{ success: boolean; error?: string }> {
+    return this.send('rotateStampImage', { pageIndex, annotIndex })
+  }
+
   /** Draw an image into the page content — behind everything, or over everything. */
   async drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<{ success: boolean; name?: string; error?: string }> {
     return this.send('drawImageInContent', { pageIndex, rect, bytes, behind }, [bytes])

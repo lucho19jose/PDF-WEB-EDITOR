@@ -226,6 +226,11 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         respond({ id: req.id, type: 'success', data: rotatePage(req.data.pageIndex, req.data.degrees) })
         break
       }
+      case 'rotateStampImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: rotateStampImage(req.data.pageIndex, req.data.annotIndex) })
+        break
+      }
       case 'flattenAnnotationBehind': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({
@@ -5534,6 +5539,133 @@ function addStickyNote(
  * annotation's Rect. Getting this wrong does not fail loudly — it puts the
  * picture somewhere else on the page at the wrong size.
  */
+/** The /AP /N form of an annotation, resolved, or null. Handles state dicts. */
+function apFormOf(annot: any): any | null {
+  try {
+    const aobj = annot.getObject()
+    const apDict = aobj.get('AP')
+    if (!apDict || String(apDict) === 'null') return null
+    const isStreamAp = (o: any) => typeof o?.isStream === 'function' && o.isStream()
+    let form = apDict.resolve().get('N')
+    if (!form || String(form) === 'null') return null
+    if (!isStreamAp(form)) {
+      const states = form.resolve()
+      let chosen: any = null
+      try {
+        states.forEach((_key: any, value: any) => { if (!chosen && isStreamAp(value)) chosen = value })
+      } catch (_) { /* not walkable */ }
+      if (!chosen) return null
+      form = chosen
+    }
+    return form.resolve()
+  } catch (_) { return null }
+}
+
+/** The appearance form's /Matrix, or null when absent/unreadable. */
+function readApMatrix(annot: any): Mat6 | null {
+  const form = apFormOf(annot)
+  if (!form) return null
+  const mtx = form.get('Matrix')
+  if (!mtx || String(mtx) === 'null') return null
+  const arr = mtx.resolve ? mtx.resolve() : mtx
+  const v = [0, 1, 2, 3, 4, 5].map(i => Number(String(arr.get(i))))
+  return v.every(n => Number.isFinite(n)) ? (v as Mat6) : null
+}
+
+function writeApMatrix(annot: any, m: Mat6): void {
+  const form = apFormOf(annot)
+  if (!form) return
+  const out = pdfDoc.newArray()
+  for (const n of m) out.push(pdfDoc.newReal(n))
+  form.put('Matrix', out)
+}
+
+/**
+ * Turn a Stamp image a quarter turn clockwise ON SCREEN.
+ *
+ * No pixels are touched: a 90° rotation is composed into the appearance
+ * form's /Matrix and the annotation's /Rect is swapped around its own centre.
+ * The viewer maps the Matrix-transformed BBox onto /Rect (PDF 32000 12.5.5),
+ * so the rotated content fills the swapped rectangle exactly — lossless, and
+ * the same for a JPEG as for a PNG. Four clicks bring it back to the start.
+ *
+ * annot.update() is deliberately NOT called afterwards: MuPDF regenerating
+ * the appearance is exactly what would discard the matrix just written.
+ */
+function rotateStampImage(
+  pageIndex: number,
+  annotIndex: number
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  let page: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    const annot = page.getAnnotations()[annotIndex]
+    if (!annot) return { success: false, error: `Annotation ${annotIndex} not found` }
+
+    const aobj = annot.getObject()
+    const apDict = aobj.get('AP')
+    if (!apDict || String(apDict) === 'null') {
+      return { success: false, error: 'That annotation has no appearance to rotate' }
+    }
+    // Same MuPDF quirk as everywhere: isStream() must be asked of the
+    // INDIRECT reference, never of the resolved object.
+    const isStreamAp = (o: any) => typeof o?.isStream === 'function' && o.isStream()
+    let form = apDict.resolve().get('N')
+    if (!form || String(form) === 'null') {
+      return { success: false, error: 'That annotation has no appearance to rotate' }
+    }
+    if (!isStreamAp(form)) {
+      const states = form.resolve()
+      let chosen: any = null
+      try {
+        states.forEach((_key: any, value: any) => { if (!chosen && isStreamAp(value)) chosen = value })
+      } catch (_) { /* not walkable */ }
+      if (!chosen) return { success: false, error: 'That annotation has no appearance this can rotate' }
+      form = chosen
+    }
+    const resolvedForm = form.resolve()
+
+    // Compose a clockwise quarter turn into the form's /Matrix.
+    let m: Mat6 = [1, 0, 0, 1, 0, 0]
+    const mtx = resolvedForm.get('Matrix')
+    if (mtx && String(mtx) !== 'null') {
+      const arr = mtx.resolve ? mtx.resolve() : mtx
+      const v = [0, 1, 2, 3, 4, 5].map(i => Number(String(arr.get(i))))
+      if (v.every(n => Number.isFinite(n))) m = v as Mat6
+    }
+    const turned = matConcat(m, [0, -1, 1, 0, 0, 0])
+    const mOut = pdfDoc.newArray()
+    for (const n of turned) mOut.push(pdfDoc.newReal(n))
+    resolvedForm.put('Matrix', mOut)
+
+    // Swap the rectangle around its centre so the turned image keeps its size
+    // on the page instead of being squeezed back into the old proportions.
+    const rectArr = aobj.get('Rect')
+    if (rectArr && String(rectArr) !== 'null') {
+      const r = rectArr.resolve ? rectArr.resolve() : rectArr
+      const v = [0, 1, 2, 3].map(i => Number(String(r.get(i))))
+      if (v.every(n => Number.isFinite(n))) {
+        const x0 = Math.min(v[0], v[2]), x1 = Math.max(v[0], v[2])
+        const y0 = Math.min(v[1], v[3]), y1 = Math.max(v[1], v[3])
+        const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2
+        const halfW = (x1 - x0) / 2, halfH = (y1 - y0) / 2
+        const out = pdfDoc.newArray()
+        out.push(pdfDoc.newReal(cx - halfH))
+        out.push(pdfDoc.newReal(cy - halfW))
+        out.push(pdfDoc.newReal(cx + halfH))
+        out.push(pdfDoc.newReal(cy + halfW))
+        aobj.put('Rect', out)
+      }
+    }
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  } finally {
+    try { page?.destroy() } catch (_) { /* already gone */ }
+  }
+}
+
 function flattenAnnotationBehind(
   pageIndex: number,
   annotIndex: number
@@ -5816,7 +5948,16 @@ function updateAnnotationAt(d: {
     if (d.opacity !== undefined) { try { annot.setOpacity(d.opacity) } catch (_) {} }
     if (d.width !== undefined) { try { annot.setBorderWidth(d.width) } catch (_) {} }
     if (d.contents !== undefined) { try { annot.setContents(d.contents) } catch (_) {} }
+    // update() regenerates the appearance with the IDENTITY matrix, and for a
+    // rotated Stamp the matrix IS the rotation — moving or resizing the image
+    // snapped it back upright. Capture it, let update() do its work, put it
+    // back. Restoring an identity is a no-op, so unrotated annotations lose
+    // nothing.
+    const savedMatrix = readApMatrix(annot)
     annot.update()
+    if (savedMatrix && savedMatrix.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
+      writeApMatrix(annot, savedMatrix)
+    }
     page.destroy()
     return { success: true }
   } catch (err: any) {

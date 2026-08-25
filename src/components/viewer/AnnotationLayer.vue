@@ -28,6 +28,13 @@
         are looking at, which is the wrong mental model and a long way from the
         picture you are trying to arrange.
       -->
+      <!-- Rotate, under the layout button: a property of THIS image too. -->
+      <div v-if="selectedIsImage" class="annot-rotate" :style="rotateBtnStyle" @mousedown.stop.prevent>
+        <q-btn dense round size="sm" color="primary" icon="rotate_90_degrees_cw" @click.stop="rotateSelectedImage">
+          <q-tooltip>Rotate 90°</q-tooltip>
+        </q-btn>
+      </div>
+
       <div v-if="selectedIsImage" class="annot-layout" :style="layoutBtnStyle" @mousedown.stop.prevent>
         <q-btn dense round size="sm" color="primary" icon="wrap_text" @click.stop>
           <q-tooltip>How this image sits with the text</q-tooltip>
@@ -396,6 +403,32 @@ const layoutBtnStyle = computed(() => {
     position: 'absolute' as const, zIndex: 31, pointerEvents: 'auto' as const
   }
 })
+
+/** Just below the layout button, same left edge — the corner column of image controls. */
+const rotateBtnStyle = computed(() => {
+  const a = selectedAnnot.value
+  if (!a) return {}
+  const left = Math.max(2, a.rect[0] * scaleX.value - 34)
+  const top = Math.max(2, a.rect[1] * scaleY.value - 4) + 32
+  return {
+    left: `${left}px`,
+    top: `${top}px`,
+    position: 'absolute' as const, zIndex: 31, pointerEvents: 'auto' as const
+  }
+})
+
+/**
+ * Turn the selected image a quarter turn clockwise. Lossless: the appearance
+ * matrix rotates and the rectangle swaps around its centre — no pixels are
+ * re-encoded, so four clicks bring it back exactly. One undo point per turn.
+ */
+async function rotateSelectedImage() {
+  const a = selectedAnnot.value
+  if (!a) return
+  const pageIndex = docStore.currentPage - 1
+  const index = a.index
+  await annotOp('Image rotated 90°', () => pdfEngine.rotateStampImage(pageIndex, index))
+}
 
 /**
  * Change how the picture already on the page sits with the text.
@@ -925,6 +958,7 @@ defineExpose({ loadAnnotations, deleteSelected })
   /* On the picture, not in a toolbar — see the template. */
   display: flex;
 }
+.annot-rotate { display: flex; }
 .annot-delete { }
 .annot-handle {
   position: absolute; width: 10px; height: 10px; z-index: 22;
