@@ -466,22 +466,26 @@ async function loadBlocks(announce = false) {
   try {
     const pageIndex = docStore.currentPage - 1
 
-    // Rotated pages: MuPDF extraction splits rotated glyph runs into
-    // per-character blocks (thousands of useless hitboxes) and the Tm-space
-    // math in move/add-text assumes an unrotated page. Disable text editing
-    // there instead of corrupting the layout.
+    // Rotated pages: the engine now composes /Rotate into every page-space
+    // conversion, so edit and move work in the space the user sees. What can
+    // still go wrong is EXTRACTION — MuPDF occasionally shreds a rotated glyph
+    // run into per-character blocks (thousands of useless hitboxes) — so the
+    // gate is now empirical: only a page whose extraction actually came back
+    // shredded keeps text editing off. Add-text stays disabled on any rotated
+    // page (its coordinate path writes raw Tm values).
     const size = await pdfEngine.getPageSize(pageIndex).catch(() => null)
     pageRotated.value = !!size && size.rotation % 360 !== 0
-    if (pageRotated.value) {
+
+    const data = await pdfEngine.getTextBlocks(pageIndex)
+    if (pageRotated.value && data.length > 200 &&
+        data.filter(b => b.text.trim().length <= 1).length > data.length * 0.7) {
       blocks.value = []
       clearSelection()
       if (editorStore.currentTool === 'edit' || editorStore.currentTool === 'addText') {
-        editorStore.setStatus('Text editing is disabled on rotated pages — rotate back to 0° first')
+        editorStore.setStatus('Text editing is disabled on this rotated page — rotate back to 0° first')
       }
       return
     }
-
-    const data = await pdfEngine.getTextBlocks(pageIndex)
     blocks.value = data
     resolveSelection()
     if (announce && editorStore.currentTool === 'edit') {
@@ -1732,7 +1736,9 @@ function localPoint(event: MouseEvent, el: HTMLElement) {
 }
 
 function onMarqueeStart(event: MouseEvent) {
-  if (pageRotated.value) return
+  // Selection and moves are fine on a rotated page now that the engine
+  // converts through /Rotate; only blocks.length === 0 (shredded extraction)
+  // leaves nothing to select.
   const { x, y } = localPoint(event, event.currentTarget as HTMLElement)
   marquee.value = {
     x0: x, y0: y, x1: x, y1: y,
