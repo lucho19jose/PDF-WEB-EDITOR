@@ -4778,7 +4778,16 @@ function replaceInsideTjArray(
   encoding: ReturnType<typeof getFontEncoding>,
   simpleInfo: SimpleFontInfo | null,
   targetLocalX: number | null,
-  tfSize: number
+  tfSize: number,
+  /**
+   * Substitute a different font for the replaced run. A subsetted cell font
+   * often lacks the replacement's glyphs, and refusing outright left whole
+   * Ghostscript tables uneditable. The array is SPLIT around the target —
+   * `[pre] TJ /Fsub size Tf (new) Tj /Forig size Tf [comp post] TJ` — so every
+   * other cell keeps its font and its position. `newWidthKu` is the new run's
+   * width in thousandths of the drawn size, measured on the substitute face.
+   */
+  subst?: { fontRef: string; origFontRef: string | null; sizeStr: string; newWidthKu: number }
 ): string | null {
   if (op.kind !== 'TJ') return null
   const items = parseTjItems(op.raw, encoding, simpleInfo)
@@ -4840,29 +4849,44 @@ function replaceInsideTjArray(
   if (last.charInItem !== items[last.item].decoded.length - 1) return null
 
   // width compensation
-  let comp = ''
+  let oldW = 0, oldKnown = true
   if (simpleInfo?.widths) {
     const w = simpleInfo.widths
     const fc = simpleInfo.firstChar
-    let oldW = 0, newW = 0, known = true
     for (let k = first.item; k <= last.item; k++) {
       const it = items[k]
       if (it.isLiteral) for (const code of it.codes) {
         const cw = w[code - fc]
-        if (cw === undefined) { known = false } else oldW += cw
+        if (cw === undefined) { oldKnown = false } else oldW += cw
       } else {
         oldW -= (it.value || 0) // keep kerns' displacement accounted
       }
     }
+  } else oldKnown = false
+
+  const spliceStart = items[first.item].start
+  const spliceEnd = items[last.item].end
+
+  if (subst) {
+    // Split the array around the run and draw the run in the substitute font.
+    const pre = op.raw.slice(0, spliceStart).trimEnd()   // "[ …items-before"
+    const post = op.raw.slice(spliceEnd).replace(/^\s*/, '') // "items-after… ] TJ"
+    const comp = oldKnown ? `${fmtNum(subst.newWidthKu - oldW)} ` : ''
+    const restore = subst.origFontRef ? `/${subst.origFontRef} ${subst.sizeStr} Tf ` : ''
+    return `${pre}] TJ /${subst.fontRef} ${subst.sizeStr} Tf ${newLiteral.literal} Tj ${restore}[${comp}${post}`
+  }
+
+  let comp = ''
+  if (oldKnown && simpleInfo?.widths) {
+    const w = simpleInfo.widths
+    const fc = simpleInfo.firstChar
+    let newW = 0, known = true
     for (const code of newLiteral.codes) {
       const cw = w[code - fc]
       if (cw === undefined) { known = false } else newW += cw
     }
     if (known) comp = ` ${fmtNum(newW - oldW)} `
   }
-
-  const spliceStart = items[first.item].start
-  const spliceEnd = items[last.item].end
   return op.raw.slice(0, spliceStart) + newLiteral.literal + comp + ' ' + op.raw.slice(spliceEnd)
 }
 
@@ -4983,13 +5007,27 @@ function applyPartialBlockReplacement(
         { mode: op.isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding },
         [newText], targetBlock)
       if (plan.kind === 'error') return { error: plan.error }
-      if (plan.kind === 'subst') continue // can't switch fonts inside an array
 
-      const newLit = plan.kind === 'keep-hex'
-        ? { literal: `<${plan.hexLines[0]}>`, codes: hexToCodes(plan.hexLines[0], fr.encoding ? (fr.encoding.codeBytes === 1 ? 1 : 2) : 1) }
-        : { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [...plan.byteLines[0]].map(c => c.charCodeAt(0)) }
+      let newRaw: string | null = null
+      let substFont: string | undefined
+      if (plan.kind === 'subst') {
+        // The cell's subsetted font lacks the replacement's glyphs. Split the
+        // array and draw just this run in the substitute face.
+        const newLit = { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [] as number[] }
+        newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, tfSize, {
+          fontRef: plan.fontRef,
+          origFontRef: op.fontRef ?? block.fontRef,
+          sizeStr: fmtNum(tfSize),
+          newWidthKu: Math.round(measureEm(newText, plan.fontName) * 1000)
+        })
+        if (newRaw) substFont = plan.fontName
+      } else {
+        const newLit = plan.kind === 'keep-hex'
+          ? { literal: `<${plan.hexLines[0]}>`, codes: hexToCodes(plan.hexLines[0], fr.encoding ? (fr.encoding.codeBytes === 1 ? 1 : 2) : 1) }
+          : { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [...plan.byteLines[0]].map(c => c.charCodeAt(0)) }
+        newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, tfSize)
+      }
 
-      const newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, tfSize)
       if (newRaw) {
         const content = block.content.slice(0, op.start) + newRaw + block.content.slice(op.end)
         // On a tagged page the span still claims the OLD words — override it
@@ -4998,6 +5036,7 @@ function applyPartialBlockReplacement(
         const tag = retagSpanActualText(stream, block.start, spanText.trim())
         return {
           stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end),
+          substitutedFont: substFont,
           retags: tag ? [tag] : []
         }
       }
