@@ -1,6 +1,6 @@
 import { ref, readonly } from 'vue'
 import { getMuPDFBridge } from '@/engine/bridge'
-import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult } from '@/engine/types'
+import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, ContentImageInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult } from '@/engine/types'
 
 /**
  * Composable for interacting with the MuPDF editing engine.
@@ -321,6 +321,16 @@ export function usePDFEngine() {
     return wrap(await bridge.moveAnnotationToPage(pageIndex, annotIndex, targetPage, rect), 'moveAnnotationToPage', pageIndex)
   }
 
+  /** Images drawn by the page CONTENT (logos, photos, scans), with their rects. */
+  async function listContentImages(pageIndex: number): Promise<ContentImageInfo[]> {
+    try { return await bridge.listContentImages(pageIndex) } catch (_) { return [] }
+  }
+
+  /** Move/resize a content-drawn image to `rect` (page space, y-down). */
+  async function transformContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, rect: RectT): Promise<boolean> {
+    return wrap(await bridge.transformContentImage(pageIndex, sourceKey, doOffset, name, rect), 'transformContentImage', pageIndex)
+  }
+
   /** Draw an image into the page content — behind everything, or over everything. */
   async function drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<boolean> {
     return wrap(await bridge.drawImageInContent(pageIndex, rect, bytes, behind), 'drawImageInContent', pageIndex)
@@ -453,6 +463,8 @@ export function usePDFEngine() {
     flattenAnnotationBehind,
     rotateStampImage,
     moveAnnotationToPage,
+    listContentImages,
+    transformContentImage,
     drawImageInContent,
     fillRect,
     shiftGraphicsBelow,

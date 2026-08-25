@@ -4,7 +4,7 @@ import type { WorkerRequest, WorkerResponse } from './worker-protocol'
 import { glyphNameToUnicode } from './glyphNames'
 import type {
   TextBlock, TextChar, TextLine, PageTextData,
-  BlockTransformOp, BlockStyleOp, BlockTransformResult
+  BlockTransformOp, BlockStyleOp, BlockTransformResult, ContentImageInfo
 } from '../types'
 
 // MuPDF module — loaded dynamically to catch errors
@@ -234,6 +234,16 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       case 'moveAnnotationToPage': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({ id: req.id, type: 'success', data: moveAnnotationToPage(req.data.pageIndex, req.data.annotIndex, req.data.targetPage, req.data.rect) })
+        break
+      }
+      case 'listContentImages': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: listContentImages(req.data.pageIndex) })
+        break
+      }
+      case 'transformContentImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: transformContentImage(req.data.pageIndex, req.data.sourceKey, req.data.doOffset, req.data.name, req.data.rect) })
         break
       }
       case 'flattenAnnotationBehind': {
@@ -5668,6 +5678,138 @@ function rotateStampImage(
     return { success: false, error: err.message || String(err) }
   } finally {
     try { page?.destroy() } catch (_) { /* already gone */ }
+  }
+}
+
+/** Names in a source's XObject dict whose target is an /Image. */
+function imageNamesOf(src: ContentSource, pageIndex: number): Set<string> {
+  const names = new Set<string>()
+  let page: any = null
+  try {
+    let resources: any = src.resources
+    if (!resources) {
+      page = pdfDoc.loadPage(pageIndex)
+      resources = page.getObject().get('Resources')
+    }
+    const xo = resources?.resolve?.()?.get?.('XObject') ?? resources?.get?.('XObject')
+    if (!xo || String(xo) === 'null') return names
+    const dict = xo.resolve ? xo.resolve() : xo
+    // mupdf.js calls the callback as (value, key) — reading them the other way
+    // round resolves the KEY and silently yields an empty set.
+    dict.forEach((value: any, key: any) => {
+      try {
+        const sub = String(value.resolve().get('Subtype') || '')
+        if (sub === '/Image') names.add(String(key).replace(/^\//, ''))
+      } catch (_) { /* not resolvable — skip */ }
+    })
+  } catch (_) { /* no resources — empty set */ }
+  finally { try { page?.destroy() } catch (_) {} }
+  return names
+}
+
+/**
+ * Every image the page CONTENT draws — the logos, photos and scans that are
+ * part of the page rather than stamped on it — with the rectangle each one
+ * occupies in visible page space. Acrobat lets you grab these; before this,
+ * only annotation images were reachable and a document's own logo was not.
+ */
+function listContentImages(pageIndex: number): ContentImageInfo[] {
+  const out: ContentImageInfo[] = []
+  if (!pdfDoc) return out
+  let pageH = 0
+  try { pageH = getPageSize(pageIndex).height } catch (_) { return out }
+
+  let id = 0
+  for (const src of getContentSources(pageIndex)) {
+    const images = imageNamesOf(src, pageIndex)
+    if (!images.size) continue
+    const masked = maskStreamLiterals(src.stream)
+    const re = /\/[ ]*\s+Do(?![A-Za-z0-9])/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(masked)) !== null) {
+      const nameMatch = src.stream.slice(m.index).match(/^\/([^\s<>[\]()/%]+)/)
+      if (!nameMatch || !images.has(nameMatch[1])) continue
+      const ctm = withSource(src, () => getFullCtmAtOffset(src.stream, m!.index))
+      // The image fills the unit square through the CTM in force at its Do.
+      const xs: number[] = [], ys: number[] = []
+      for (const [ux, uy] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) {
+        xs.push(ux * ctm[0] + uy * ctm[2] + ctm[4])
+        ys.push(ux * ctm[1] + uy * ctm[3] + ctm[5])
+      }
+      const x0 = Math.min(...xs), x1 = Math.max(...xs)
+      const y0 = Math.min(...ys), y1 = Math.max(...ys)
+      if (!(x1 - x0 > 1 && y1 - y0 > 1)) continue // degenerate
+      out.push({
+        id: id++, sourceKey: src.key, doOffset: m.index, name: nameMatch[1],
+        rect: [x0, pageH - y1, x1, pageH - y0]
+      })
+    }
+  }
+  return out
+}
+
+/**
+ * Move/resize an image the page content draws, to `rect` (page space, y-down).
+ *
+ * The CTM chain that places the image can be arbitrarily deep, so it is not
+ * edited — a correction matrix is INJECTED around the Do instead:
+ * `q M cm /Name Do Q` with M = F·T·F⁻¹, where F is the full CTM in force at
+ * the Do and T the visible-space map from the old rectangle to the new one.
+ * Wrapping in q/Q keeps the correction from leaking into anything after it.
+ */
+function transformContentImage(
+  pageIndex: number,
+  sourceKey: string,
+  doOffset: number,
+  name: string,
+  rect: number[]
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  try {
+    const src = getContentSources(pageIndex).find(s => s.key === sourceKey)
+    if (!src) return { success: false, error: `Source ${sourceKey} not found` }
+    // The offset must still point at this image's Do — the stream may have
+    // been rewritten since the caller listed it.
+    const at = src.stream.slice(doOffset)
+    const nm = at.match(/^\/([^\s<>[\]()/%]+)(\s+)Do(?![A-Za-z0-9])/)
+    if (!nm || nm[1] !== name) {
+      return { success: false, error: 'The image is no longer where it was listed — reload and try again' }
+    }
+    const doEnd = doOffset + nm[0].length
+
+    const F = withSource(src, () => getFullCtmAtOffset(src.stream, doOffset))
+    const Finv = matInvert(F)
+    if (!Finv) return { success: false, error: 'The image is drawn under a degenerate matrix' }
+
+    const pageH = getPageSize(pageIndex).height
+    const xs: number[] = [], ys: number[] = []
+    for (const [ux, uy] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) {
+      xs.push(ux * F[0] + uy * F[2] + F[4])
+      ys.push(ux * F[1] + uy * F[3] + F[5])
+    }
+    const ox0 = Math.min(...xs), ox1 = Math.max(...xs)
+    const oy0 = Math.min(...ys), oy1 = Math.max(...ys)
+    if (!(ox1 - ox0 > 0.01 && oy1 - oy0 > 0.01)) {
+      return { success: false, error: 'The image is drawn degenerate' }
+    }
+
+    // Target in bottom-up user space.
+    const nx0 = rect[0], nx1 = rect[2]
+    const ny0 = pageH - rect[3], ny1 = pageH - rect[1]
+    const sx = (nx1 - nx0) / (ox1 - ox0)
+    const sy = (ny1 - ny0) / (oy1 - oy0)
+    const T: Mat6 = [sx, 0, 0, sy, nx0 - ox0 * sx, ny0 - oy0 * sy]
+    const M = matConcat(matConcat(F, T), Finv)
+
+    const inject = `q ${M.map(fmtNum).join(' ')} cm /${name} Do Q`
+    const newStream = src.stream.slice(0, doOffset) + inject + src.stream.slice(doEnd)
+    const bytes = new Uint8Array(newStream.length)
+    for (let i = 0; i < newStream.length; i++) bytes[i] = newStream.charCodeAt(i) & 0xFF
+    src.write(bytes)
+    invalidateContentSources(pageIndex)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
   }
 }
 

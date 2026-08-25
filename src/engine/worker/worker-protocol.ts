@@ -18,6 +18,8 @@ export type WorkerRequest =
   | { id: number; type: 'flattenAnnotationBehind'; data: { pageIndex: number; annotIndex: number } }
   | { id: number; type: 'rotateStampImage'; data: { pageIndex: number; annotIndex: number } }
   | { id: number; type: 'moveAnnotationToPage'; data: { pageIndex: number; annotIndex: number; targetPage: number; rect: RectT } }
+  | { id: number; type: 'listContentImages'; data: { pageIndex: number } }
+  | { id: number; type: 'transformContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string; rect: RectT } }
   | { id: number; type: 'drawImageInContent'; data: { pageIndex: number; rect: RectT; bytes: ArrayBuffer; behind: boolean } }
   | { id: number; type: 'fillRect'; data: { pageIndex: number; rect: RectT; color: [number, number, number] } }
   | { id: number; type: 'shiftGraphicsBelow'; data: { pageIndex: number; thresholdY: number; dy: number } }

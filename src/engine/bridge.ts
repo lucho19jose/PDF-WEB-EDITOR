@@ -210,6 +210,16 @@ export class MuPDFBridge {
     return this.send('moveAnnotationToPage', { pageIndex, annotIndex, targetPage, rect })
   }
 
+  /** Images drawn by the page CONTENT (logos, photos, scans), with their rects. */
+  async listContentImages(pageIndex: number): Promise<any[]> {
+    return this.send('listContentImages', { pageIndex })
+  }
+
+  /** Move/resize a content-drawn image to `rect` (page space, y-down). */
+  async transformContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, rect: RectT): Promise<{ success: boolean; error?: string }> {
+    return this.send('transformContentImage', { pageIndex, sourceKey, doOffset, name, rect })
+  }
+
   /** Draw an image into the page content — behind everything, or over everything. */
   async drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<{ success: boolean; name?: string; error?: string }> {
     return this.send('drawImageInContent', { pageIndex, rect, bytes, behind }, [bytes])

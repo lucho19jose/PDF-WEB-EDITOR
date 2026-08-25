@@ -77,6 +77,23 @@ export type MarkupType = 'Highlight' | 'Underline' | 'StrikeOut' | 'Squiggly'
 export type ShapeType = 'Square' | 'Circle' | 'Line'
 
 /** Summary of an existing annotation on a page (index is positional within the page). */
+/**
+ * An image drawn by the page CONTENT (an /Image XObject invoked with Do) —
+ * a logo, a photo, a scan — as opposed to an image the user stamped as an
+ * annotation. Identified by where its Do sits, since the same XObject can be
+ * invoked more than once.
+ */
+export interface ContentImageInfo {
+  id: number
+  /** Content source that invokes it ('page' or 'xobj:/…'). */
+  sourceKey: string
+  /** Offset of the `/Name Do` in that source's stream. */
+  doOffset: number
+  name: string
+  /** Bounds in page space (top-left origin, y-down), rotation included. */
+  rect: RectT
+}
+
 export interface AnnotationInfo {
   index: number
   type: string

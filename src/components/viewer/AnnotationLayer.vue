@@ -2,6 +2,18 @@
   <div class="annot-layer-container" v-if="showLayer">
     <!-- Existing annotations: selectable / movable hit-targets (select mode) -->
     <template v-if="editorStore.currentTool === 'select'">
+      <!-- Images drawn by the page content (logos, photos, scans). UNDER the
+           annotation hits: an annotation stamped over a scan must still win
+           the click. -->
+      <div
+        v-for="img in scaledContentImgs"
+        :key="'ci' + img.id"
+        class="cimg-hit"
+        :class="{ selected: selectedImgId === img.id }"
+        :style="img.style"
+        title="Image in the page — drag to move, handles to resize"
+        @mousedown.stop="onImgMouseDown($event, img.id)"
+      />
       <div
         v-for="a in scaledAnnots"
         :key="a.index"
@@ -135,7 +147,7 @@ import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, MARKUP_TOOLS, type Tool } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
-import type { AnnotationInfo, Quad, Pt, RectT, MarkupType, ShapeType, TextChar } from '@/engine/types'
+import type { AnnotationInfo, ContentImageInfo, Quad, Pt, RectT, MarkupType, ShapeType, TextChar } from '@/engine/types'
 import { hexToRgb01, rgb01ToCss } from '@/utils/color'
 import { enqueueOp, beginTransaction } from '@/utils/opQueue'
 
@@ -151,6 +163,17 @@ const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
 const annotations = ref<AnnotationInfo[]>([])
 const selectedIndex = ref<number | null>(null)
 
+/**
+ * Images the page CONTENT draws — the document's own logos, photos and scans.
+ * Acrobat lets you grab these; here they were untouchable while only
+ * annotation images had handles. Selecting one deselects any annotation and
+ * vice versa: two selections with two behaviours under one set of handles is
+ * how the wrong thing gets dragged.
+ */
+const contentImages = ref<ContentImageInfo[]>([])
+const selectedImgId = ref<number | null>(null)
+const selectedImg = computed(() => contentImages.value.find(i => i.id === selectedImgId.value) || null)
+
 interface DragState {
   tool: Tool
   startSx: number; startSy: number   // screen (relative to layer)
@@ -160,8 +183,8 @@ interface DragState {
 }
 const drag = ref<DragState | null>(null)
 
-// Move-existing-annotation drag
-interface MoveState { index: number; startX: number; startY: number; dx: number; dy: number; moved: boolean; rect: RectT }
+// Move-existing-annotation (or content-image) drag
+interface MoveState { kind: 'annot' | 'cimg'; index: number; startX: number; startY: number; dx: number; dy: number; moved: boolean; rect: RectT }
 const moveState = ref<MoveState | null>(null)
 
 // FreeText editing
@@ -209,19 +232,22 @@ const scaledAnnots = computed(() => annotations.value.map(a => {
 
 type AnnotHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
 
-interface AnnotResize { index: number; handle: AnnotHandle; startX: number; startY: number; rect: RectT; moved: boolean }
+interface AnnotResize { kind: 'annot' | 'cimg'; index: number; handle: AnnotHandle; startX: number; startY: number; rect: RectT; moved: boolean }
 const annotResize = ref<AnnotResize | null>(null)
 
 /**
- * Eight grips around the selected annotation.
+ * Eight grips around the selected annotation — or the selected content image,
+ * which resizes through the same hands.
  *
  * Without them an image could be placed and moved but never sized, and the only
  * way to change one was to delete it and insert again at a different width.
  */
 const annotHandles = computed(() => {
+  if (editorStore.currentTool !== 'select') return []
   const a = selectedAnnot.value
-  if (!a || editorStore.currentTool !== 'select') return []
-  const r = liveAnnotRect(a)
+  const img = selectedImg.value
+  if (!a && !img) return []
+  const r = a ? liveAnnotRect(a) : liveImgRect(img!)
   const x0 = r[0] * scaleX.value, y0 = r[1] * scaleY.value
   const x1 = r[2] * scaleX.value, y1 = r[3] * scaleY.value
   const mx = (x0 + x1) / 2, my = (y0 + y1) / 2
@@ -239,14 +265,40 @@ const annotHandles = computed(() => {
 /** The annotation's rect including any drag or resize in progress. */
 function liveAnnotRect(a: AnnotationInfo): RectT {
   const rz = annotResize.value
-  if (rz?.index === a.index && rz.moved) return resizedRect(rz)
+  if (rz?.kind === 'annot' && rz.index === a.index && rz.moved) return resizedRect(rz)
   const m = moveState.value
-  if (m?.index === a.index && m.moved) {
+  if (m?.kind === 'annot' && m.index === a.index && m.moved) {
     return [m.rect[0] + m.dx / scaleX.value, m.rect[1] + m.dy / scaleY.value,
             m.rect[2] + m.dx / scaleX.value, m.rect[3] + m.dy / scaleY.value]
   }
   return a.rect
 }
+
+/** Same, for a content-drawn image. */
+function liveImgRect(img: ContentImageInfo): RectT {
+  const rz = annotResize.value
+  if (rz?.kind === 'cimg' && rz.index === img.id && rz.moved) return resizedRect(rz)
+  const m = moveState.value
+  if (m?.kind === 'cimg' && m.index === img.id && m.moved) {
+    return [m.rect[0] + m.dx / scaleX.value, m.rect[1] + m.dy / scaleY.value,
+            m.rect[2] + m.dx / scaleX.value, m.rect[3] + m.dy / scaleY.value]
+  }
+  return img.rect
+}
+
+/** Content-image hit targets, scaled to the canvas. */
+const scaledContentImgs = computed(() => contentImages.value.map(img => {
+  const r = liveImgRect(img)
+  return {
+    id: img.id,
+    style: {
+      left: `${r[0] * scaleX.value}px`,
+      top: `${r[1] * scaleY.value}px`,
+      width: `${Math.max(2, (r[2] - r[0]) * scaleX.value)}px`,
+      height: `${Math.max(2, (r[3] - r[1]) * scaleY.value)}px`
+    }
+  }
+}))
 
 /** Apply a resize drag to its starting rect, keeping it at least a few points wide. */
 function resizedRect(rz: AnnotResize): RectT {
@@ -266,9 +318,12 @@ const annotResizeDelta = ref({ dx: 0, dy: 0 })
 
 function onAnnotResizeDown(e: MouseEvent, handle: AnnotHandle) {
   const a = selectedAnnot.value
-  if (!a) return
+  const img = selectedImg.value
+  if (!a && !img) return
   annotResizeDelta.value = { dx: 0, dy: 0 }
-  annotResize.value = { index: a.index, handle, startX: e.clientX, startY: e.clientY, rect: [...a.rect] as RectT, moved: false }
+  annotResize.value = a
+    ? { kind: 'annot', index: a.index, handle, startX: e.clientX, startY: e.clientY, rect: [...a.rect] as RectT, moved: false }
+    : { kind: 'cimg', index: img!.id, handle, startX: e.clientX, startY: e.clientY, rect: [...img!.rect] as RectT, moved: false }
   window.addEventListener('mousemove', onAnnotResizeMove)
   window.addEventListener('mouseup', onAnnotResizeUp)
 }
@@ -286,7 +341,23 @@ async function onAnnotResizeUp() {
   if (!rz || !rz.moved) return
   const rect = resizedRect({ ...rz, moved: true })
 
+  if (rz.kind === 'cimg') {
+    await commitImgRect(rz.index, rect, 'Image resized')
+    return
+  }
   await commitRectChange(rz.index, rz.rect as RectT, rect, 'Annotation resized')
+}
+
+/** Apply a new rectangle to a content-drawn image, clamped onto the page. */
+async function commitImgRect(id: number, rect: RectT, verb: string) {
+  const img = contentImages.value.find(i => i.id === id)
+  if (!img) return
+  const w = rect[2] - rect[0], h = rect[3] - rect[1]
+  const x0 = Math.max(-w * 0.9, Math.min(rect[0], props.pdfWidth - w * 0.1))
+  const y0 = Math.max(-h * 0.9, Math.min(rect[1], props.pdfHeight - h * 0.1))
+  const target: RectT = [x0, y0, x0 + w, y0 + h]
+  await annotOp(verb, () => pdfEngine.transformContentImage(
+    docStore.currentPage - 1, img.sourceKey, img.doOffset, img.name, target))
 }
 
 /**
@@ -507,10 +578,20 @@ function pushUndo() {
 }
 
 async function loadAnnotations() {
-  if (!pdfEngine.isReady.value || !pdfEngine.docLoaded.value || !docStore.loaded) { annotations.value = []; return }
+  if (!pdfEngine.isReady.value || !pdfEngine.docLoaded.value || !docStore.loaded) {
+    annotations.value = []
+    contentImages.value = []
+    return
+  }
   try {
     annotations.value = await pdfEngine.getAnnotations(docStore.currentPage - 1)
   } catch { annotations.value = [] }
+  try {
+    contentImages.value = await pdfEngine.listContentImages(docStore.currentPage - 1)
+  } catch { contentImages.value = [] }
+  if (selectedImgId.value !== null && !contentImages.value.some(i => i.id === selectedImgId.value)) {
+    selectedImgId.value = null
+  }
 }
 
 // --- creation ---
@@ -855,9 +936,20 @@ async function annotOp(msg: string, mutate: () => Promise<boolean>, pushSnapshot
 // --- select / move / delete existing annotations ---
 function onAnnotMouseDown(e: MouseEvent, index: number) {
   selectedIndex.value = index
+  selectedImgId.value = null
   const a = annotations.value.find(x => x.index === index)
   if (!a) return
-  moveState.value = { index, startX: e.clientX, startY: e.clientY, dx: 0, dy: 0, moved: false, rect: a.rect }
+  moveState.value = { kind: 'annot', index, startX: e.clientX, startY: e.clientY, dx: 0, dy: 0, moved: false, rect: a.rect }
+  window.addEventListener('mousemove', onMoveMove)
+  window.addEventListener('mouseup', onMoveUp)
+}
+
+function onImgMouseDown(e: MouseEvent, id: number) {
+  selectedImgId.value = id
+  selectedIndex.value = null
+  const img = contentImages.value.find(i => i.id === id)
+  if (!img) return
+  moveState.value = { kind: 'cimg', index: id, startX: e.clientX, startY: e.clientY, dx: 0, dy: 0, moved: false, rect: img.rect }
   window.addEventListener('mousemove', onMoveMove)
   window.addEventListener('mouseup', onMoveUp)
 }
@@ -876,6 +968,14 @@ async function onMoveUp() {
   const dxP = m.dx / scaleX.value
   const dyP = m.dy / scaleY.value
   const newRect: RectT = [m.rect[0] + dxP, m.rect[1] + dyP, m.rect[2] + dxP, m.rect[3] + dyP]
+
+  // A content-drawn image moves within its page: it lives in THIS page's
+  // content stream, so crossing to another sheet would mean re-embedding, not
+  // moving. Clamped instead.
+  if (m.kind === 'cimg') {
+    await commitImgRect(m.index, newRect, 'Image moved')
+    return
+  }
 
   // Dragged past the foot (or head) of the sheet in continuous scroll: the
   // user is aiming at the NEXT page, not at the margin of this one. Decide by
@@ -943,6 +1043,7 @@ function onKeyDown(e: KeyboardEvent) {
 // --- lifecycle ---
 watch(() => editorStore.currentTool, () => {
   selectedIndex.value = null
+  selectedImgId.value = null
   cancelFreeText()
   if (showLayer.value) loadAnnotations()
 })
@@ -992,6 +1093,13 @@ defineExpose({ loadAnnotations, deleteSelected })
 }
 .annot-hit:hover { border-color: rgba(66,133,244,0.6); background: rgba(66,133,244,0.05); }
 .annot-hit.selected { border: 1.5px solid #4285f4; background: rgba(66,133,244,0.08); }
+/* Content-drawn images: below annotations, dashed so the two read differently. */
+.cimg-hit {
+  position: absolute; pointer-events: auto; z-index: 15;
+  border: 1px dashed transparent; box-sizing: border-box; cursor: move;
+}
+.cimg-hit:hover { border-color: rgba(52,168,83,0.7); background: rgba(52,168,83,0.05); }
+.cimg-hit.selected { border: 1.5px dashed #34a853; background: rgba(52,168,83,0.08); }
 .annot-preview {
   position: absolute; border: 2px solid; box-sizing: border-box; z-index: 17; pointer-events: none;
 }
