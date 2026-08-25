@@ -876,7 +876,51 @@ async function onMoveUp() {
   const dxP = m.dx / scaleX.value
   const dyP = m.dy / scaleY.value
   const newRect: RectT = [m.rect[0] + dxP, m.rect[1] + dyP, m.rect[2] + dxP, m.rect[3] + dyP]
+
+  // Dragged past the foot (or head) of the sheet in continuous scroll: the
+  // user is aiming at the NEXT page, not at the margin of this one. Decide by
+  // the rect's centre — half-way across is where "still on this page" stops
+  // being what the gesture means.
+  const centerY = (newRect[1] + newRect[3]) / 2
+  const pageIdx = docStore.currentPage - 1
+  if (centerY > props.pdfHeight && pageIdx + 1 < docStore.totalPages) {
+    await transferToPage(m.index, newRect, pageIdx, pageIdx + 1)
+    return
+  }
+  if (centerY < 0 && pageIdx > 0) {
+    await transferToPage(m.index, newRect, pageIdx, pageIdx - 1)
+    return
+  }
+
   await commitRectChange(m.index, m.rect as RectT, newRect, 'Annotation moved')
+}
+
+/**
+ * Carry an annotation onto the page above or below, continuing the drag: how
+ * far the rect crossed this page's edge is where it enters the next one. The
+ * engine reparents the same object — appearance, image and rotation travel
+ * untouched — and the view then follows it, because a drop you have to go
+ * hunting for reads as a disappearance.
+ */
+async function transferToPage(index: number, rect: RectT, from: number, to: number) {
+  const w = rect[2] - rect[0]
+  const h = rect[3] - rect[1]
+  const size = await pdfEngine.getPageSize(to).catch(() => null)
+  const tw = size?.width ?? props.pdfWidth
+  const th = size?.height ?? props.pdfHeight
+
+  let y0 = to > from
+    ? rect[1] - props.pdfHeight   // downward: overflow past this page's foot
+    : th + rect[1]                // upward: rect[1] is negative past the head
+  y0 = Math.max(4, Math.min(y0, th - h - 4))
+  const x0 = Math.max(2, Math.min(rect[0], tw - w - 2))
+  const target: RectT = [x0, y0, x0 + w, y0 + h]
+
+  selectedIndex.value = null
+  await annotOp(`Moved to page ${to + 1}`, () => pdfEngine.moveAnnotationToPage(from, index, to, target))
+  // Follow the annotation: the editing layers live on the current page, so
+  // staying behind would leave it unselectable until the user scrolled.
+  docStore.setPage(to + 1)
 }
 
 async function deleteSelected() {

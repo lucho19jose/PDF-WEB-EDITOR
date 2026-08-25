@@ -316,6 +316,11 @@ export function usePDFEngine() {
     return wrap(await bridge.rotateStampImage(pageIndex, annotIndex), 'rotateStampImage', pageIndex)
   }
 
+  /** Reparent an annotation onto another page, with a new rect in that page's space. */
+  async function moveAnnotationToPage(pageIndex: number, annotIndex: number, targetPage: number, rect: RectT): Promise<boolean> {
+    return wrap(await bridge.moveAnnotationToPage(pageIndex, annotIndex, targetPage, rect), 'moveAnnotationToPage', pageIndex)
+  }
+
   /** Draw an image into the page content — behind everything, or over everything. */
   async function drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<boolean> {
     return wrap(await bridge.drawImageInContent(pageIndex, rect, bytes, behind), 'drawImageInContent', pageIndex)
@@ -447,6 +452,7 @@ export function usePDFEngine() {
     rotatePage,
     flattenAnnotationBehind,
     rotateStampImage,
+    moveAnnotationToPage,
     drawImageInContent,
     fillRect,
     shiftGraphicsBelow,

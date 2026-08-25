@@ -231,6 +231,11 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         respond({ id: req.id, type: 'success', data: rotateStampImage(req.data.pageIndex, req.data.annotIndex) })
         break
       }
+      case 'moveAnnotationToPage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: moveAnnotationToPage(req.data.pageIndex, req.data.annotIndex, req.data.targetPage, req.data.rect) })
+        break
+      }
       case 'flattenAnnotationBehind': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({
@@ -5663,6 +5668,87 @@ function rotateStampImage(
     return { success: false, error: err.message || String(err) }
   } finally {
     try { page?.destroy() } catch (_) { /* already gone */ }
+  }
+}
+
+/**
+ * Reparent an annotation onto ANOTHER page — dragging an image past the foot
+ * of the sheet in continuous scroll drops it on the page below.
+ *
+ * The annotation's indirect reference is moved from the source page's /Annots
+ * into the target's, so the object itself — appearance stream, stamp image,
+ * rotation matrix — travels untouched. Only /Rect is rewritten, in the TARGET
+ * page's coordinates, through MuPDF's setRect so page rotation is honoured.
+ * The stale /P back-pointer is dropped rather than rewritten (it is optional,
+ * and naming the OLD page would be worse than naming none).
+ */
+function moveAnnotationToPage(
+  pageIndex: number,
+  annotIndex: number,
+  targetPage: number,
+  rect: number[]
+): { success: boolean; index?: number; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  if (targetPage === pageIndex) return { success: false, error: 'Same page' }
+  let src: any = null
+  let dst: any = null
+  try {
+    src = pdfDoc.loadPage(pageIndex)
+    const annot = src.getAnnotations()[annotIndex]
+    if (!annot) return { success: false, error: `Annotation ${annotIndex} not found` }
+
+    // The appearance matrix carries the image's rotation; keep it across the trip.
+    const savedMatrix = readApMatrix(annot)
+
+    const srcObj = src.getObject()
+    let srcAnnots = srcObj.get('Annots')
+    if (!srcAnnots || String(srcAnnots) === 'null') return { success: false, error: 'Page has no annotations' }
+    srcAnnots = srcAnnots.resolve ? srcAnnots.resolve() : srcAnnots
+
+    // /Annots order and getAnnotations() order agree in MuPDF, but verify the
+    // entry really is this annotation before surgery — /Rect is as good an
+    // identity as is reachable from both sides.
+    const ref = srcAnnots.get(annotIndex)
+    const sameRect = String(ref?.resolve?.()?.get?.('Rect') ?? '') === String(annot.getObject().get('Rect') ?? '')
+    if (!ref || String(ref) === 'null' || !sameRect) {
+      return { success: false, error: 'Annotation list and /Annots disagree — refusing to move' }
+    }
+
+    dst = pdfDoc.loadPage(targetPage)
+    const dstObj = dst.getObject()
+    let dstAnnots = dstObj.get('Annots')
+    if (!dstAnnots || String(dstAnnots) === 'null') {
+      dstAnnots = pdfDoc.newArray()
+      dstObj.put('Annots', dstAnnots)
+    } else {
+      dstAnnots = dstAnnots.resolve ? dstAnnots.resolve() : dstAnnots
+    }
+    dstAnnots.push(ref)
+    srcAnnots.delete(annotIndex)
+    try {
+      const r = ref.resolve()
+      if (r.get('P') && String(r.get('P')) !== 'null') r.delete('P')
+    } catch (_) { /* no /P — fine */ }
+
+    // A fresh page handle sees the annotation it now owns; the old handles are
+    // stale. setRect converts through the target page's own rotation.
+    try { dst.destroy() } catch (_) {}
+    dst = pdfDoc.loadPage(targetPage)
+    const movedList = dst.getAnnotations()
+    const newIdx = movedList.length - 1
+    const moved = movedList[newIdx]
+    if (moved) {
+      try { moved.setRect(rect as any) } catch (_) { /* keep the old rect */ }
+      if (savedMatrix && savedMatrix.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
+        writeApMatrix(moved, savedMatrix)
+      }
+    }
+    return { success: true, index: newIdx }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  } finally {
+    try { src?.destroy() } catch (_) {}
+    try { dst?.destroy() } catch (_) {}
   }
 }
 

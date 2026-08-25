@@ -205,6 +205,11 @@ export class MuPDFBridge {
     return this.send('rotateStampImage', { pageIndex, annotIndex })
   }
 
+  /** Reparent an annotation onto another page, with a new rect in that page's space. */
+  async moveAnnotationToPage(pageIndex: number, annotIndex: number, targetPage: number, rect: RectT): Promise<{ success: boolean; index?: number; error?: string }> {
+    return this.send('moveAnnotationToPage', { pageIndex, annotIndex, targetPage, rect })
+  }
+
   /** Draw an image into the page content — behind everything, or over everything. */
   async drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<{ success: boolean; name?: string; error?: string }> {
     return this.send('drawImageInContent', { pageIndex, rect, bytes, behind }, [bytes])
