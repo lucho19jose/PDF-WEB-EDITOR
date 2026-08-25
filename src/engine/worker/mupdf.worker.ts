@@ -3625,23 +3625,49 @@ const ACCENT_MARKS = /[´`¨ˆ˜¯˘˚¸ˇ^~̀-ͯ]/g
  * "comprehension ?rst" while extraction reports "comprehension first"; a plain
  * .includes() then never matches and the paragraph cannot be edited at all.
  */
+/**
+ * Footnote/affiliation markers an academic PDF sets as superscripts. The
+ * extraction splits them into their own blocks while the BT block carries
+ * them inline ("Cruz-Moran 1,*" against a target of "Cruz-Moran *"), so
+ * containment must be allowed to step over them — but ONLY directly after a
+ * letter, and never when the target expects a digit there, or "18.00" would
+ * quietly contain "1.00".
+ */
+const SUPERSCRIPT_MARKS = /[0-9*†‡§]/
+const MAX_MARK_SKIPS = 4
+
 function wildcardIncludes(hay: string, needle: string): boolean {
   if (!needle) return true
   if (hay.includes(needle)) return true
-  if (!hay.includes('?')) return false
+  const letter = (c: string | undefined) => !!c && /[a-zá-úñä-ü]/i.test(c)
+  const canSkip = (i: number, j: number) => {
+    if (j < needle.length && /[0-9]/.test(needle[j])) return false
+    if (SUPERSCRIPT_MARKS.test(hay[i]) && letter(hay[i - 1])) return true
+    // The comma the marker drags along: "Cruz-Moran 1," against "Cruz-Moran ,"
+    // needs the pair stepped over, not just the digit.
+    return hay[i] === ',' && i > 1 && SUPERSCRIPT_MARKS.test(hay[i - 1]) && letter(hay[i - 2]) &&
+      needle[j] !== ','
+  }
+  if (!hay.includes('?') && !SUPERSCRIPT_MARKS.test(hay)) return false
   const n = needle.length
   for (let s = 0; s < hay.length; s++) {
     if (hay[s] !== '?' && hay[s] !== needle[0]) continue
-    let frontier: number[] = [0]
-    for (let i = s; i < hay.length && frontier.length; i++) {
-      const next: number[] = []
-      const c = hay[i]
-      for (const j of frontier) {
-        if (c === '?') { next.push(j + 1, j + 2) }
-        else if (c === needle[j]) next.push(j + 1)
+    // frontier: needle position -> fewest mark-skips spent reaching it
+    let frontier = new Map<number, number>([[0, 0]])
+    for (let i = s; i < hay.length && frontier.size; i++) {
+      const next = new Map<number, number>()
+      const put = (j: number, k: number) => {
+        const cur = next.get(j)
+        if (cur === undefined || k < cur) next.set(j, k)
       }
-      if (next.some(j => j >= n)) return true
-      frontier = [...new Set(next.filter(j => j < n))]
+      const c = hay[i]
+      for (const [j, k] of frontier) {
+        if (c === '?') { put(j + 1, k); put(j + 2, k) }
+        else if (c === needle[j]) put(j + 1, k)
+        if (k < MAX_MARK_SKIPS && canSkip(i, j)) put(j, k + 1)
+      }
+      for (const j of next.keys()) if (j >= n) return true
+      frontier = new Map([...next].filter(([j]) => j < n))
     }
   }
   return false
@@ -4934,10 +4960,18 @@ function replaceInsideTjArray(
   const spliceEnd = items[last.item].end
 
   if (subst) {
+    // A substitute face has different advances, so the pen lands somewhere
+    // else after the new run — without a compensating kern every later cell
+    // in the array shifts. The compensation is only trustworthy for a plain
+    // byte-coded simple font, where Widths[code − FirstChar] is meaningful:
+    // a glyph-coded subset's CMap codes index that array as garbage, and the
+    // "known" widths it yields sheared a timesheet by 53 blocks. Refuse
+    // rather than shift the table.
+    if (!oldKnown || !simpleInfo || simpleInfo.encodingName === 'Unknown' || simpleInfo.isType0) return null
     // Split the array around the run and draw the run in the substitute font.
     const pre = op.raw.slice(0, spliceStart).trimEnd()   // "[ …items-before"
     const post = op.raw.slice(spliceEnd).replace(/^\s*/, '') // "items-after… ] TJ"
-    const comp = oldKnown ? `${fmtNum(subst.newWidthKu - oldW)} ` : ''
+    const comp = `${fmtNum(subst.newWidthKu - oldW)} `
     const restore = subst.origFontRef ? `/${subst.origFontRef} ${subst.sizeStr} Tf ` : ''
     return `${pre}] TJ /${subst.fontRef} ${subst.sizeStr} Tf ${newLiteral.literal} Tj ${restore}[${comp}${post}`
   }
