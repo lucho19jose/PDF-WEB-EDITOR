@@ -140,6 +140,27 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      // Triage aid: the BT blocks each content source scans, as the matchers
+      // see them. Read-only; drives no editing path.
+      case 'debugBtBlocks': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const out: any[] = []
+        for (const s of getContentSources(req.data.pageIndex)) {
+          const blocks = withSource(s, () => scanBtBlocks(s.stream, req.data.pageIndex))
+          out.push({
+            key: s.key,
+            invokeCtm: s.invokeCtm ?? null,
+            blocks: blocks.map(b => ({
+              start: b.start, end: b.end, xPos: b.xPos, yPos: b.yPos,
+              hasPos: b.hasPos, hasTm: b.hasTm, fontRef: b.fontRef,
+              text: b.decodedText.slice(0, 60)
+            }))
+          })
+        }
+        respond({ id: req.id, type: 'success', data: out })
+        break
+      }
+
       case 'getPageSize': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({ id: req.id, type: 'success', data: getPageSize(req.data.pageIndex) })
@@ -3296,22 +3317,34 @@ function replaceTextInContentStreamFontAware(
     // the target — never treat the whole group as the match. Some generators
     // give EVERY block on a page the same Tm y and position lines via Td;
     // whole-group matching then blanks the entire page on a single edit.
-    const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
+    //
+    // The run is read BOTH ways round: a content stream is under no obligation
+    // to draw a line left-to-right, and one producer emits "  S/" before the
+    // "TOTAL" it belongs after — stream order alone read "S/ TOTAL", matched
+    // nothing, and a partial single-block match won and left the " S/" glyphs
+    // stranded next to the replacement. (Same rule the move matcher already
+    // applies; trying both can only ever ADD a candidate.)
+    const byStart = [...lineBlocks].sort((a, b) => a.start - b.start)
+    const byX = [...lineBlocks].sort((a, b) => a.xPos - b.xPos)
+    const orderings = byX.every((b, i) => b === byStart[i]) ? [byStart] : [byStart, byX]
+
     let best: { blocks: BtInfo[]; score: number } | null = null
-    for (let i = 0; i < sorted.length; i++) {
-      let acc = ''
-      for (let j = i; j < sorted.length; j++) {
-        acc += sorted[j].decodedText
-        const norm = acc.replace(/\s+/g, ' ').trim()
-        if (norm.length > normalizedTarget.length * 1.5 + 8) break // overshot the target
-        if (!norm) continue
-        const ratio = matchRatio(norm, normalizedTarget)
-        if (ratio < 0.7) continue
-        let score = 0
-        if (norm === normalizedTarget) score = 2
-        else if (fuzzyTextMatch(norm, normalizedTarget)) score = ratio
-        if (score > 0 && (!best || score > best.score)) {
-          best = { blocks: sorted.slice(i, j + 1), score }
+    for (const sorted of orderings) {
+      for (let i = 0; i < sorted.length; i++) {
+        let acc = ''
+        for (let j = i; j < sorted.length; j++) {
+          acc += sorted[j].decodedText
+          const norm = acc.replace(/\s+/g, ' ').trim()
+          if (norm.length > normalizedTarget.length * 1.5 + 8) break // overshot the target
+          if (!norm) continue
+          const ratio = matchRatio(norm, normalizedTarget)
+          if (ratio < 0.7) continue
+          let score = 0
+          if (norm === normalizedTarget) score = 2
+          else if (fuzzyTextMatch(norm, normalizedTarget)) score = ratio
+          if (score > 0 && (!best || score > best.score)) {
+            best = { blocks: sorted.slice(i, j + 1), score }
+          }
         }
       }
     }
@@ -3683,10 +3716,18 @@ function applyLineReplacement(
   // line came out as "LZZZ." instead of "ZZZ".
   const contributes = (b: BtInfo) => b.decodedText.trim().length > 0
 
-  // Find the first block with visible text to put the replacement in
-  const primaryIdx = sorted.findIndex(contributes)
-  if (primaryIdx === -1) return null
-  const primary = sorted[primaryIdx]
+  // The replacement goes into the block that STARTS the line visually — the
+  // leftmost one — not the first one in the stream. A producer that draws a
+  // field's value before its label ("  S/" at x=463 emitted before "TOTAL" at
+  // x=437) would otherwise get the new text at the value's position, 26pt to
+  // the right of where the line begins. Stream order remains the tiebreak and
+  // the fallback when any position is unknown.
+  const contributing = sorted.filter(contributes)
+  if (contributing.length === 0) return null
+  const primary = contributing.every(b => b.hasPos)
+    ? contributing.reduce((min, b) => b.xPos < min.xPos ? b : min)
+    : contributing[0]
+  const primaryIdx = sorted.indexOf(primary)
 
   // Every block here except the primary gets blanked, so refuse when the run
   // carries far more text than the target: a bad line-group match on a Corel

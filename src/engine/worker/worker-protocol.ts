@@ -20,6 +20,7 @@ export type WorkerRequest =
   | { id: number; type: 'fillRect'; data: { pageIndex: number; rect: RectT; color: [number, number, number] } }
   | { id: number; type: 'shiftGraphicsBelow'; data: { pageIndex: number; thresholdY: number; dy: number } }
   | { id: number; type: 'debugFonts'; data: { pageIndex: number } }
+  | { id: number; type: 'debugBtBlocks'; data: { pageIndex: number } }
   // --- Annotations ---
   | { id: number; type: 'getAnnotations'; data: { pageIndex: number } }
   | { id: number; type: 'addTextMarkup'; data: { pageIndex: number; markupType: MarkupType; quads: Quad[]; color: [number, number, number]; opacity?: number } }

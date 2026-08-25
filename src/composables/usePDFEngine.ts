@@ -95,6 +95,11 @@ export function usePDFEngine() {
     return data.blocks
   }
 
+  /** Triage aid: BT blocks per content source, as the worker's matchers see them. */
+  async function debugBtBlocks(pageIndex: number): Promise<any[]> {
+    return bridge.debugBtBlocks(pageIndex)
+  }
+
   /**
    * Read the raw content stream for a page (for debugging/inspection).
    */
@@ -411,6 +416,7 @@ export function usePDFEngine() {
     loadDocument,
     getPageText,
     getTextBlocks,
+    debugBtBlocks,
     readContentStream,
     replaceText,
     addText,

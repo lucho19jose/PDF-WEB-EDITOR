@@ -106,6 +106,11 @@ export class MuPDFBridge {
     return this.send('readContentStream', { pageIndex })
   }
 
+  /** Triage aid: BT blocks per content source, as the matchers see them. */
+  async debugBtBlocks(pageIndex: number): Promise<any[]> {
+    return this.send('debugBtBlocks', { pageIndex })
+  }
+
   /**
    * Write raw content stream bytes to a page.
    */
