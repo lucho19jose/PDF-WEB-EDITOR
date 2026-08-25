@@ -3427,6 +3427,24 @@ function findBtBlocksByPosition(
     }
   }
 
+  // Fake-bold double draws (see the replace matcher): the target reads
+  // doubled because the same run is drawn twice. Move BOTH copies.
+  const halvedT = undouble(normalizedTarget)
+  if (halvedT) {
+    for (const block of allBlocks) {
+      if (targetFontRef && !blockUsesFont(block, targetFontRef)) continue
+      const nd = block.decodedText.replace(/\s+/g, ' ').trim()
+      if (nd !== halvedT) continue
+      const twin = allBlocks.find(o => o !== block &&
+        o.decodedText.replace(/\s+/g, ' ').trim() === halvedT &&
+        Math.abs(o.xPos - block.xPos) < 3 && Math.abs(o.yPos - block.yPos) < 3)
+      candidates.push({
+        blocks: twin ? [block, twin] : [block],
+        score: 1.5, dist: distOf(block), order: candidates.length
+      })
+    }
+  }
+
   // Last resort: ONE LINE of a block that draws several.
   //
   // Both passes above ask whether a block's WHOLE text reads as the target, so
@@ -3510,6 +3528,29 @@ interface BtInfo {
 /** Does the block draw anything in this font? (a BT can switch fonts per run) */
 function blockUsesFont(b: BtInfo, ref: string): boolean {
   return b.fontRef === ref || b.fonts.includes(ref)
+}
+
+/**
+ * The single-drawn text behind a fake-bold double draw, or null.
+ *
+ * Canva embolds by drawing the same run TWICE a fraction of a point apart;
+ * extraction interleaves the copies and reports "AUTO" as "AAUUTTOO". A
+ * target whose characters all come in adjacent pairs is undoubled so the
+ * matchers can find the run each copy actually draws.
+ */
+function undouble(s: string): string | null {
+  // Whitespace arrives already collapsed, so a single space stands for the
+  // doubled pair the draw produced.
+  const t = s.replace(/\s+/g, ' ').trim()
+  if (t.length < 4) return null
+  let out = ''
+  let pairs = 0
+  for (let i = 0; i < t.length; ) {
+    if (t[i] === ' ') { out += ' '; i += 1; continue }
+    if (t[i + 1] !== t[i]) return null
+    out += t[i]; i += 2; pairs++
+  }
+  return pairs >= 2 ? out : null
 }
 
 /**
@@ -3661,6 +3702,25 @@ function replaceTextInContentStreamFontAware(
         blocks: [block],
         score: exact ? 2 : matchRatio(normalizedDecoded, normalizedTarget),
         dist: distOf(block), line: false, order: candidates.length
+      })
+    }
+  }
+
+  // Fake-bold DOUBLE DRAWS: Canva writes the same run twice a fraction of a
+  // point apart, so extraction reports "AUTO" as "AAUUTTOO" and nothing above
+  // matches. Match the halved text; when the twin copy sits on the same spot,
+  // take both as a line group so the primary gets the new text and the twin
+  // is blanked instead of shining through behind it.
+  const halved = undouble(normalizedTarget)
+  if (halved) {
+    const normOf = (s: string) => s.replace(/\s+/g, ' ').trim()
+    for (const block of allBlocks) {
+      if (normOf(block.decodedText) !== halved) continue
+      const twin = allBlocks.find(o => o !== block && normOf(o.decodedText) === halved &&
+        Math.abs(o.xPos - block.xPos) < 3 && Math.abs(o.yPos - block.yPos) < 3)
+      candidates.push({
+        blocks: twin ? [block, twin] : [block],
+        score: 1.5, dist: distOf(block), line: !!twin, order: candidates.length
       })
     }
   }
