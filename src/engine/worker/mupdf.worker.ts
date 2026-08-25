@@ -3245,11 +3245,35 @@ function findBtBlocksByPosition(
   // with the moved run. A loud "could not find" is the correct outcome there.
 
   for (const [, lineBlocks] of lineGroups) {
+    const byX = [...lineBlocks].sort((a, b) => a.xPos - b.xPos)
     const alongStream = joinOf(lineBlocks)
-    const acrossPage = joinOf([...lineBlocks].sort((a, b) => a.xPos - b.xPos))
+    const acrossPage = joinOf(byX)
     const orders = acrossPage === alongStream ? [acrossPage] : [acrossPage, alongStream]
-    const exact = orders.some(o => o === normalizedTarget)
-    const isMatch = exact || orders.some(readsAs)
+    let exact = orders.some(o => o === normalizedTarget)
+    let isMatch = exact || orders.some(readsAs)
+    let runBlocks: BtInfo[] | null = null
+
+    // A contiguous RUN of the line's blocks. Extraction merges adjacent cells —
+    // "SI" and "NO" a few points apart read back as one "SINO" block — and no
+    // whole-line join matches that. Same search the replace matcher runs.
+    if (!isMatch && lineBlocks.length > 1) {
+      outer:
+      for (const sorted of [byX, [...lineBlocks].sort((a, b) => a.start - b.start)]) {
+        for (let i = 0; i < sorted.length; i++) {
+          let acc = ''
+          for (let j = i; j < sorted.length; j++) {
+            acc += sorted[j].decodedText
+            const norm = acc.replace(/\s+/g, ' ').trim()
+            if (norm.length > normalizedTarget.length * 1.5 + 8) break
+            if (norm === normalizedTarget) {
+              runBlocks = sorted.slice(i, j + 1)
+              exact = true; isMatch = true
+              break outer
+            }
+          }
+        }
+      }
+    }
     if (!isMatch) continue
 
     // Keep only the blocks sitting on the clicked text. A line group can hold
@@ -3264,7 +3288,8 @@ function findBtBlocksByPosition(
     // are dropped; when none carries it (the target spans blocks), only an
     // exact whole-line match may survive.
     let picked: BtInfo[]
-    if (near.length > 0) picked = near
+    if (runBlocks) picked = runBlocks
+    else if (near.length > 0) picked = near
     else if (exact) picked = lineBlocks
     else {
       const compact = (s: string) => foldForMatch(s).replace(/\s+/g, '')
