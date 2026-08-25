@@ -731,11 +731,28 @@ function getContentSources(pageIndex: number): ContentSource[] {
   const sources: ContentSource[] = []
 
   const pageStream = readContentStream(pageIndex)
+
+  // /Rotate turns the page UNDER the content: extraction reports coordinates
+  // in the rotated (visible) space while the stream draws in the raw one.
+  // Composing the rotation into every source's invocation CTM makes deltas,
+  // distance ranking and clip growth all operate in visible space — on a
+  // 90-rotated page a "move right" used to land as "move up" while reporting
+  // success. (getBounds()/getPageSize are already rotated, so width here is
+  // the VISIBLE width.)
+  let baseCtm: Mat6 | undefined
+  try {
+    const size = getPageSize(pageIndex)
+    if (size.rotation === 90) baseCtm = [0, -1, 1, 0, 0, size.height]
+    else if (size.rotation === 270) baseCtm = [0, 1, -1, 0, size.width, 0]
+    else if (size.rotation === 180) baseCtm = [-1, 0, 0, -1, size.width, size.height]
+  } catch (_) { /* unrotated */ }
+
   sources.push({
     key: 'page',
     stream: pageStream,
     resources: null, // null => the page's own Resources
-    write: (bytes) => writeContentStream(pageIndex, bytes)
+    write: (bytes) => writeContentStream(pageIndex, bytes),
+    invokeCtm: baseCtm
   })
   const nodes = new Map<string, ContentSource>()
   nodes.set('page', sources[0])
@@ -824,7 +841,7 @@ function getContentSources(pageIndex: number): ContentSource[] {
       }
     }
 
-    walk(pageStream, pageRes, '', 1, [1, 0, 0, 1, 0, 0])
+    walk(pageStream, pageRes, '', 1, baseCtm ?? [1, 0, 0, 1, 0, 0])
   } catch (_) { /* fall back to the page stream alone */ }
   finally { try { page?.destroy() } catch (_) { /* already gone */ } }
 
