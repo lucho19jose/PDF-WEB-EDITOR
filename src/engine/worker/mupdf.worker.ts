@@ -1512,6 +1512,25 @@ function planTextEncoding(
       hexLines.push(res.hex)
     }
     if (ok) return { kind: 'keep-hex', hexLines }
+  } else if (block.mode === 'hex' && !block.encoding) {
+    // Hex strings, no ToUnicode: a simple font whose hex pairs are its own
+    // byte codes (pdf-lib writes every string that way). Re-encode through the
+    // font's byte encoding and emit 1-byte hex — the font is kept.
+    const info = getSimpleFontInfo(pageIndex, block.fontRef)
+    if (info && !info.isType0 && info.encodingName !== 'Unknown') {
+      const hexLines: string[] = []
+      let ok = true
+      for (const line of lines) {
+        const res = encodeForSimpleFont(line, info)
+        if ('missing' in res) { ok = false; break }
+        let hex = ''
+        for (let i = 0; i < res.bytes.length; i++) {
+          hex += res.bytes.charCodeAt(i).toString(16).padStart(2, '0').toUpperCase()
+        }
+        hexLines.push(hex)
+      }
+      if (ok) return { kind: 'keep-hex', hexLines }
+    }
   } else if (block.mode === 'plain') {
     if (isEmpty) return { kind: 'keep-plain', byteLines: lines.map(() => '') }
     const info = getSimpleFontInfo(pageIndex, block.fontRef)
@@ -4208,6 +4227,18 @@ function decodeBtBlockText(
     return mapPlainBytes(raw)
   }
   const takeHex = (hex: string): string => {
+    // A simple font with no ToUnicode draws hex strings whose PAIRS are the
+    // same byte codes its plain strings use — pdf-lib writes every show string
+    // as hex, so <46445341> is "FDSA" through the font's own encoding. The
+    // 2-byte default here turned it into CJK garbage that matched nothing and
+    // made the whole document uneditable.
+    if (!encoding && simpleInfo) {
+      let raw = ''
+      for (let i = 0; i + 1 < hex.length; i += 2) {
+        raw += String.fromCharCode(parseInt(hex.substring(i, i + 2), 16))
+      }
+      return mapPlainBytes(raw)
+    }
     let out = ''
     for (let i = 0; i + stride - 1 < hex.length; i += stride) {
       out += decodeGlyph(parseInt(hex.substring(i, i + stride), 16))
@@ -4367,7 +4398,8 @@ function parseTjItems(
     const codes: number[] = []
     if (m[2] !== undefined) {
       const hex = m[2].slice(1, -1).replace(/\s+/g, '')
-      const stride = (encoding?.codeBytes === 1 ? 1 : 2) * 2
+      // No ToUnicode + a simple font = hex pairs are byte codes (pdf-lib).
+      const stride = (encoding ? (encoding.codeBytes === 1 ? 1 : 2) : (simpleInfo ? 1 : 2)) * 2
       for (let i = 0; i + stride - 1 < hex.length; i += stride) codes.push(parseInt(hex.substring(i, i + stride), 16))
     } else {
       const rawBytes = unescapePdfString(m[1].slice(1, -1))
@@ -4575,7 +4607,7 @@ function applyPartialBlockReplacement(
     if (plan.kind === 'subst') return null // can't switch fonts inside an array
 
     const newLit = plan.kind === 'keep-hex'
-      ? { literal: `<${plan.hexLines[0]}>`, codes: hexToCodes(plan.hexLines[0], block.encoding?.codeBytes === 1 ? 1 : 2) }
+      ? { literal: `<${plan.hexLines[0]}>`, codes: hexToCodes(plan.hexLines[0], block.encoding ? (block.encoding.codeBytes === 1 ? 1 : 2) : 1) }
       : { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [...plan.byteLines[0]].map(c => c.charCodeAt(0)) }
 
     const tfMatch = block.content.match(/\/(?:[^\s<>[\]()/%]+)\s+([\d.]+)\s+Tf/)
