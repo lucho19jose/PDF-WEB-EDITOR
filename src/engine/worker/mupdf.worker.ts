@@ -3073,12 +3073,21 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
     {
       const tfAll = /\/[ ]*\s+[\d.-]+\s+Tf/g
       let fm: RegExpExecArray | null
+      let firstTfAt = -1
       while ((fm = tfAll.exec(maskedContent)) !== null) {
+        if (firstTfAt < 0) firstTfAt = fm.index
         const nm = content.slice(fm.index).match(/^\/([^\s<>[\]()/%]+)/)
         if (nm && !fonts.includes(nm[1])) fonts.push(nm[1])
       }
-      const inherited = fontAt(start)
-      if (inherited && !fonts.includes(inherited)) fonts.push(inherited)
+      // The font inherited from outside the BT only DRAWS something here when a
+      // show op precedes the block's first Tf (or it has none). Listing it
+      // unconditionally made a bold "18.00" cell claim the regular font of the
+      // stream above it and slip through the font filter for a "10.00" edit.
+      const firstLit = maskedContent.search(/\(|<[^<]/)
+      if (firstTfAt < 0 || (firstLit >= 0 && firstLit < firstTfAt)) {
+        const inherited = fontAt(start)
+        if (inherited && !fonts.includes(inherited)) fonts.push(inherited)
+      }
     }
     // No Tf inside: inherit whatever was in force when the block opened.
     if (!fontRef) fontRef = fontAt(start)
@@ -3396,7 +3405,7 @@ function replaceTextInContentStreamFontAware(
   // the nearest one is applied. Returning the first textual match instead used
   // to silently rewrite a different paragraph while the clicked one appeared
   // not to be editable at all.
-  interface Candidate { blocks: BtInfo[]; score: number; dist: number; line: boolean; order: number }
+  interface Candidate { blocks: BtInfo[]; score: number; dist: number; line: boolean; partial?: boolean; order: number }
   const candidates: Candidate[] = []
   const distCache = new Map<number, number>()
   const distOf = (b: BtInfo) => {
@@ -3488,6 +3497,32 @@ function replaceTextInContentStreamFontAware(
     }
   }
 
+  // Step 4: Target CONTAINED inside a larger BT block (Ghostscript draws a
+  // whole table column as one BT with each cell its own show-op — a short
+  // cell like "16:00" never fuzzy-matches the whole block). These compete in
+  // the SAME ranked list as the line and single-block candidates, not as a
+  // last resort: a containment match sitting ON the click must outrank an
+  // exact-text single block 300pt away (nine occurrences of "10.00" on one
+  // timesheet — the far one used to win just by being tried first).
+  const targetCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '')
+  if (targetCompact.length >= 2) {
+    for (const fontFiltered of [true, false]) {
+      for (const block of allBlocks) {
+        if (fontFiltered && targetFontRef && !blockUsesFont(block, targetFontRef)) continue
+        if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) continue
+        const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '')
+        if (!(decodedCompact.length > targetCompact.length && decodedCompact.includes(targetCompact))) continue
+        // Below every direct fuzzy score (>= 0.7): at equal distance a whole
+        // match still beats a fragment of a bigger block.
+        candidates.push({
+          blocks: [block], score: 0.4, dist: distOf(block),
+          line: false, partial: true, order: candidates.length
+        })
+      }
+      if (!targetFontRef) break // second pass is identical when no font filter exists
+    }
+  }
+
   // Nearest wins. Distances are bucketed so that sub-bucket jitter (a baseline
   // sitting a couple of points off the bbox) does not outrank a better textual
   // match, and so the comparator stays a valid total order. Candidates with no
@@ -3501,45 +3536,17 @@ function replaceTextInContentStreamFontAware(
   )
 
   for (const c of candidates) {
-    const result = c.line
-      ? applyLineReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth)
-      : applyBlockReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth, pageHeight)
+    const result = c.partial
+      ? applyPartialBlockReplacement(stream, c.blocks[0], newText, pageIndex, targetBlock, pageHeight)
+      : c.line
+        ? applyLineReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth)
+        : applyBlockReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth, pageHeight)
     if (result) {
       if (!('error' in result)) {
-        result.strategy = c.line ? 'line_group' : 'single_block'
+        result.strategy = c.partial ? 'partial_block' : c.line ? 'line_group' : 'single_block'
         result.anchorOffset = c.blocks[0].start
       }
       return result
-    }
-  }
-
-  // Step 4: Target CONTAINED inside a larger BT block (Ghostscript draws a
-  // whole table column as one BT with each cell its own show-op — a short
-  // cell like "16:00" never fuzzy-matches the whole block). Replace just the
-  // matching show-ops, picking the occurrence nearest the clicked position.
-  const targetCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '')
-  if (targetCompact.length >= 2) {
-    for (const fontFiltered of [true, false]) {
-      const containing = allBlocks.filter(block => {
-        if (fontFiltered && targetFontRef && !blockUsesFont(block, targetFontRef)) return false
-        if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) return false
-        const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '')
-        return decodedCompact.length > targetCompact.length && decodedCompact.includes(targetCompact)
-      })
-      // Same reasoning as above: a repeated string must resolve to the copy the
-      // user clicked, not to whichever block comes first in the stream.
-      containing.sort((a, b) => distOf(a) - distOf(b))
-      for (const block of containing) {
-        const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
-        if (partial) {
-          if (!('error' in partial)) {
-            partial.strategy = 'partial_block'
-            partial.anchorOffset = block.start
-          }
-          return partial
-        }
-      }
-      if (!targetFontRef) break // second pass is identical when no font filter exists
     }
   }
 
