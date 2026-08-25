@@ -732,6 +732,9 @@ function describeEdit(
   if ((result.lines ?? 1) > askedLines) parts.push('wrapped to fit the margin')
   if (result.substitutedFont) parts.push(`substituted ${result.substitutedFont} (the original font lacks some characters)`)
   if (moved > 0) parts.push(`${moved} block(s) moved to keep the layout`)
+  if (lastGraphicsSkipped.value > 0) {
+    parts.push(`${lastGraphicsSkipped.value} drawn shape(s) span the line and were left where they are`)
+  }
   if (capped) parts.push('the foot of the page could not move down without running off it, so it overlaps')
   if (!editorStore.reflowOnEdit && (result.lines ?? 1) !== askedLines) {
     parts.push('the rest of the page was left as it was (turn on Reflow to move it)')
@@ -955,6 +958,7 @@ async function applyReflow(
 
   const taken = new Set<string>()
   const ops: BlockTransformOp[] = []
+  const resolved: { shift: number; top: number }[] = []
   for (const { anchor, shift } of plan.moves) {
     const block = findByAnchor(anchor, taken)
     if (!block) continue
@@ -962,12 +966,44 @@ async function applyReflow(
     // Page space is y-down, Tm space is y-up, so a POSITIVE shift here pulls the
     // row up and a negative one pushes it down.
     ops.push({ blockId: block.id, dx: 0, dy: shift, sx: 1, sy: 1, anchorX: 0, anchorY: 0 })
+    resolved.push({ shift, top: block.bbox[1] })
   }
   if (ops.length === 0) return 0
 
   const result = await pdfEngine.transformTextBlocks(pageIndex, ops)
-  return result.results.filter(r => r.success).length
+  const applied = result.results.filter(r => r.success).length
+
+  // Take the page's rules and fills along.
+  //
+  // Text on its own is not what a reader sees: on a page with a table the words
+  // in every cell would slide down and the box around them would not, which
+  // reads as the table falling apart. The geometry below the highest row that
+  // moved travels the same distance.
+  //
+  // Only when every row moves by the SAME amount — which is what a push down or
+  // a pull up produces. A plan with mixed shifts has no single distance for the
+  // rules between those rows to travel, and picking one would tear the table
+  // rather than move it, so those are left alone.
+  const distances = [...new Set(resolved.map(r => Math.round(r.shift * 100) / 100))]
+  if (applied > 0 && distances.length === 1 && Math.abs(distances[0]) > 0.05) {
+    // The threshold sits at the TOP of the highest row that moved, in the y-up
+    // space the engine draws in. A rule under the paragraph that grew stays put;
+    // the border above the first cell that moved comes with it.
+    const topMoved = Math.min(...resolved.map(r => r.top))
+    lastGraphicsSkipped.value =
+      (await pdfEngine.shiftGraphicsBelow(pageIndex, props.pdfHeight - topMoved, distances[0])).skipped
+  } else {
+    lastGraphicsSkipped.value = 0
+  }
+  return applied
 }
+
+/**
+ * Paths the last reflow declined to move — straddling the line it grew at, or
+ * drawn under a rotated transform. Read by the status line, because a page that
+ * came back part-moved has to say so.
+ */
+const lastGraphicsSkipped = ref(0)
 
 /**
  * Work out what has to move so an edit that changed a run's line count fits.
@@ -1238,6 +1274,8 @@ async function applyTextStyle(style: Omit<BlockStyleOp, 'blockId'>) {
           : `Applied ${what} to ${result.applied} of ${anchors.length} — the rest could not be matched (Ctrl+Z to undo)`,
         gained > 0 ? 'wrapped to fit the margin' : null,
         moved > 0 ? `${moved} block(s) moved to keep the layout` : null,
+        lastGraphicsSkipped.value > 0
+          ? `${lastGraphicsSkipped.value} drawn shape(s) span the line and were left where they are` : null,
         shift.capped ? 'the foot of the page could not move down without running off it, so it overlaps' : null
       ].filter(Boolean).join(' — '))
 
@@ -1404,9 +1442,21 @@ async function makeRoomAt(pdfY: number, amount: number, below = true): Promise<{
     right: Math.max(...rows.map(r => r.rect[2]))
   }
 
-  // The row the click landed on, or the last one above it.
+  // The row the point landed in. When it landed BETWEEN two lines the two
+  // directions want opposite neighbours: space opened BELOW a point belongs to
+  // the line above it, space opened ABOVE a point belongs to the line below it.
+  //
+  // Both used to resolve to the line above. An image dropped into the gap
+  // between two lines therefore pushed the line ABOVE it downwards — straight
+  // onto the picture — while the lines actually in the way never moved.
   let at = rows.findIndex(r => pdfY >= r.rect[1] && pdfY <= r.rect[3])
-  if (at < 0) at = rows.reduce((best, r, i) => (r.rect[3] <= pdfY ? i : best), -1)
+  if (at < 0) {
+    at = below
+      ? rows.reduce((best, r, i) => (r.rect[3] <= pdfY ? i : best), -1)
+      : rows.findIndex(r => r.rect[1] > pdfY)
+    // Opening space above a point with no line below it: nothing to push.
+    if (!below && at < 0) return { column, y: pdfY, moved: 0, spilled: 0, capped: false }
+  }
   const from = below ? at : at - 1
   const y = below
     ? (rows[at] ? rows[at].rect[3] : pdfY)

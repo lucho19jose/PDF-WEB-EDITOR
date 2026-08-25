@@ -233,6 +233,15 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      case 'shiftGraphicsBelow': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({
+          id: req.id, type: 'success',
+          data: shiftGraphicsBelow(req.data.pageIndex, req.data.thresholdY, req.data.dy)
+        })
+        break
+      }
+
       case 'mergePages': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({ id: req.id, type: 'success', data: mergePages(req.data.bytes, req.data.atIndex) })
@@ -1713,6 +1722,12 @@ function replaceTextInStream(
       // replacement only rewrote bytes at/after that block, so the offset found
       // in the original stream is still valid in the rewritten one.
       let streamStr = outcome.stream
+      // Every remaining edit sits at a LOWER offset than the blocks already
+      // rewritten — a span's dictionary, then its clip window, then its BT —
+      // so they are collected and applied together, highest offset first.
+      // Two passes over the same region is how a clip rectangle ended up
+      // spliced through the middle of an /ActualText.
+      const pending: SpanRetag[] = [...(outcome.retags ?? [])]
       if (outcome.anchorOffset !== undefined && newText.length > 0) {
         const oldLen = Math.max(targetBlock.text.trim().length, 1)
         const avgCharWidth = targetBlock.width / oldLen
@@ -1736,10 +1751,14 @@ function replaceTextInStream(
           .sort((a, b) => b.index - a.index)
         for (const clip of clips) {
           const widened = widenClipForText(src.stream, clip, targetBlock, needed, extraHeight, pageHeight)
-          if (widened) {
-            streamStr = streamStr.slice(0, clip.index) + widened +
-                        streamStr.slice(clip.index + clip.length)
-          }
+          // Moved for the same reason the tags are: a line group can rewrite a
+          // block that sits BELOW this clip, and the offset read from the
+          // original stream then points a few bytes short of the rectangle.
+          if (widened) pending.push({
+            start: shiftOffset(clip.index, outcome.applied ?? []),
+            end: shiftOffset(clip.index + clip.length, outcome.applied ?? []),
+            text: widened
+          })
         }
 
         // A Form XObject is clipped to its own /BBox even without a `re W n`.
@@ -1762,6 +1781,10 @@ function replaceTextInStream(
               : 1
           )
         }
+      }
+
+      for (const sp of pending.sort((a, b) => b.start - a.start)) {
+        streamStr = streamStr.slice(0, sp.start) + sp.text + streamStr.slice(sp.end)
       }
 
       const streamBytes = new Uint8Array(streamStr.length)
@@ -3056,6 +3079,18 @@ function findBtBlocksByPosition(
   const candidates: Candidate[] = []
 
   // Line groups — MuPDF often merges several BT blocks into one TextBlock
+  //
+  // Read ACROSS the line as well as along the stream, because the target text is
+  // in reading order and a content stream is under no obligation to be. One
+  // producer emits a field's VALUE before its label, so the group read back as
+  // "NO" + "Indicador de retorno de vehículo vacío:" and matched nothing at all;
+  // only the label's own block did, so a reflow moved the label down the page
+  // and left the "NO" behind on the old line, beside somebody else's answer.
+  //
+  // Both orders are tried rather than the sorted one alone. Sorting is right far
+  // more often, but it is not always: on one file in the corpus the stream order
+  // was the one that matched, and moving to x order alone turned a working drag
+  // into "could not find matching text". Trying both can only ever add a match.
   const lineGroups = new Map<number, BtInfo[]>()
   for (const block of allBlocks) {
     const yKey = Math.round(block.yPos * 2) / 2
@@ -3063,15 +3098,22 @@ function findBtBlocksByPosition(
     lineGroups.get(yKey)!.push(block)
   }
 
+  const joinOf = (blocks: BtInfo[]) =>
+    blocks.map(b => b.decodedText).join('').replace(/\s+/g, ' ').trim()
+  const foldedTarget = foldForMatch(normalizedTarget)
+  const readsAs = (line: string) => {
+    const foldedLine = foldForMatch(line)
+    return fuzzyTextMatch(line, normalizedTarget) ||
+      (foldedLine.length > 5 && foldedTarget.length > 5 &&
+       (foldedLine.includes(foldedTarget) || foldedTarget.includes(foldedLine)))
+  }
+
   for (const [, lineBlocks] of lineGroups) {
-    const normalizedLine = lineBlocks.map(b => b.decodedText).join('').replace(/\s+/g, ' ').trim()
-    const exact = normalizedLine === normalizedTarget
-    const foldedLine = foldForMatch(normalizedLine)
-    const foldedTarget = foldForMatch(normalizedTarget)
-    const isMatch = exact ||
-                    fuzzyTextMatch(normalizedLine, normalizedTarget) ||
-                    (foldedLine.length > 5 && foldedTarget.length > 5 &&
-                     (foldedLine.includes(foldedTarget) || foldedTarget.includes(foldedLine)))
+    const alongStream = joinOf(lineBlocks)
+    const acrossPage = joinOf([...lineBlocks].sort((a, b) => a.xPos - b.xPos))
+    const orders = acrossPage === alongStream ? [acrossPage] : [acrossPage, alongStream]
+    const exact = orders.some(o => o === normalizedTarget)
+    const isMatch = exact || orders.some(readsAs)
     if (!isMatch) continue
 
     // Keep only the blocks sitting on the clicked text. A line group can hold
@@ -3095,6 +3137,30 @@ function findBtBlocksByPosition(
     const exact = nd === normalizedTarget
     if (exact || fuzzyTextMatch(nd, normalizedTarget)) {
       candidates.push({ blocks: [block], score: exact ? 2 : 1, dist: distOf(block), order: candidates.length })
+    }
+  }
+
+  // Last resort: ONE LINE of a block that draws several.
+  //
+  // Both passes above ask whether a block's WHOLE text reads as the target, so
+  // a single line of a many-line block is only reachable through the
+  // containment test — and that one demands more than five characters on both
+  // sides. Table cells are mostly shorter: "N°", "GTIN", "Bien", "1", "NO".
+  // They matched nothing, and a move that cannot find its text does not fail
+  // loudly; it simply does not happen. That is how a reflowed table came apart,
+  // the long cells moving down and the short ones staying behind on the rules.
+  //
+  // What makes this safe at two characters is that the text is not asked to
+  // carry the identification on its own: the block has to SIT on the target,
+  // and `findGoverningTm` has to find a run inside it that reads as the target.
+  // It only runs when everything else has already come up empty, so no match
+  // that worked before can change.
+  if (candidates.length === 0) {
+    for (const block of allBlocks) {
+      if (targetFontRef && block.fontRef !== targetFontRef) continue
+      if (!(distOf(block) <= onTarget * 2)) continue
+      if (!findGoverningTm(block, targetBlock.text, pageIndex)) continue
+      candidates.push({ blocks: [block], score: 1, dist: distOf(block), order: candidates.length })
     }
   }
 
@@ -3147,7 +3213,7 @@ function replaceTextInContentStreamFontAware(
   targetFontRef: string | null,
   pageWidth?: number,
   pageHeight?: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   // Step 1: Parse all BT blocks with position and text info
   const allBlocks = scanBtBlocks(stream, pageIndex)
 
@@ -3337,7 +3403,7 @@ function applyBlockReplacement(
   targetBlock?: TextBlock,
   pageWidth?: number,
   pageHeight?: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   const block = blocks[0]
 
   // If this BT block holds much MORE text than the target (one BT drawing
@@ -3391,9 +3457,17 @@ function applyBlockReplacement(
     // The whole block was rewritten, so any /ActualText describing the old
     // glyphs is now a lie that extraction would report instead of the new text.
     newContent = stripActualText(newContent)
-    const result = stream.substring(0, block.start) + 'BT' + newContent + 'ET' +
-                   stream.substring(block.end)
-    return { stream: result, substitutedFont, lines: 1 }
+    // Same lie, told from outside the block, on a tagged page. Returned rather
+    // than applied — see the note in applyLineReplacement.
+    const tag = retagSpanActualText(stream, block.start, newText)
+    const text = 'BT' + newContent + 'ET'
+    const result = stream.substring(0, block.start) + text + stream.substring(block.end)
+    // Only ONE block moved, and the tag sits below it, so no offset shifts.
+    return {
+      stream: result, substitutedFont, lines: 1,
+      applied: [{ start: block.start, delta: text.length - (block.end - block.start) }],
+      retags: tag ? [tag] : []
+    }
   }
   return null
 }
@@ -3520,7 +3594,7 @@ function applyWrappedReplacement(
   lines: string[],
   targetBlock: TextBlock,
   pageIndex: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   if (lines.length <= 1) return null // Single line — the surgical path is safer
 
   const plan = planTextEncoding(pageIndex, block, lines, targetBlock)
@@ -3559,7 +3633,7 @@ function applyLineReplacement(
   pageIndex: number,
   targetBlock?: TextBlock,
   pageWidth?: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   // Sort by position in stream (ascending)
   const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
 
@@ -3591,6 +3665,7 @@ function applyLineReplacement(
 
   // Build replacements (process from end to start to preserve offsets)
   const replacements: { start: number; end: number; newContent: string }[] = []
+  const retags = new Map<number, { start: number; end: number; text: string }>()
   let substitutedFont: string | undefined
   let drawnLines = 1
 
@@ -3631,15 +3706,46 @@ function applyLineReplacement(
     newContent = stripActualText(newContent)
 
     replacements.push({ start: block.start, end: block.end, newContent })
+    // On a TAGGED page the words also live outside the BT, in the span this
+    // block sits in. Correct that too, or the page prints one thing and reads
+    // as another. Keyed by the dictionary so a span wrapping several blocks is
+    // retagged once — and by the PRIMARY, which is the block that still draws.
+    const tag = retagSpanActualText(stream, block.start, i === primaryIdx ? newText : '')
+    if (tag && (i === primaryIdx || !retags.has(tag.start))) retags.set(tag.start, tag)
   }
 
   // Apply replacements from end to start
   let result = stream
+  const applied: AppliedEdit[] = []
   for (const rep of replacements) {
-    result = result.substring(0, rep.start) + 'BT' + rep.newContent + 'ET' + result.substring(rep.end)
+    const text = 'BT' + rep.newContent + 'ET'
+    result = result.substring(0, rep.start) + text + result.substring(rep.end)
+    applied.push({ start: rep.start, delta: text.length - (rep.end - rep.start) })
   }
 
-  return result !== stream ? { stream: result, substitutedFont, lines: drawnLines } : null
+  // The retags are RETURNED, not applied. Their dictionaries sit at a LOWER
+  // offset than the block they tag — and so do the clip windows the caller
+  // widens next, off offsets taken from this same original stream. Splicing
+  // them here would move those clips out from under it, and the widened
+  // rectangle would land in the middle of a tag. It did: an /ActualText came
+  // back with a clip rectangle written through it and the page's title vanished
+  // from every extractor.
+  //
+  // Their offsets are moved to where they now sit, because a line group rewrites
+  // blocks THROUGHOUT the run, not only after them.
+  return result !== stream
+    ? {
+        stream: result,
+        substitutedFont,
+        lines: drawnLines,
+        applied,
+        retags: [...retags.values()].map(t => ({
+          start: shiftOffset(t.start, applied),
+          end: shiftOffset(t.end, applied),
+          text: t.text
+        }))
+      }
+    : null
 }
 
 /**
@@ -3694,6 +3800,153 @@ function stripActualText(content: string): string {
     /\/ActualText\s*(?:\((?:\\.|[^()\\])*\)|<[0-9A-Fa-f\s]*>)/g,
     ''
   )
+}
+
+/** A correction to one marked-content span's `/ActualText`, as a stream splice. */
+interface SpanRetag { start: number; end: number; text: string }
+
+/**
+ * Where a rewrite landed and how many bytes it added or removed.
+ *
+ * A replacement rewrites BT blocks, but the clip window that bounds a block and
+ * the marked-content dictionary that tags it both sit at LOWER offsets, and are
+ * spliced afterwards off offsets read from the original stream. That holds only
+ * while nothing below them has moved — and in a line group it does: the primary
+ * block is rewritten in the middle of the run, so every span after it shifts by
+ * the length it gained. One tag came back with the NEXT span's dictionary
+ * spliced through it.
+ */
+interface AppliedEdit { start: number; delta: number }
+
+/** An original-stream offset, moved to where it now sits after `edits`. */
+function shiftOffset(offset: number, edits: AppliedEdit[]): number {
+  let out = offset
+  for (const e of edits) if (e.start < offset) out += e.delta
+  return out
+}
+
+/** A PDF text string in UTF-16BE with the byte-order mark, as hex. */
+function utf16beHex(text: string): string {
+  let out = 'FEFF'
+  for (const unit of text.split('')) {
+    out += unit.charCodeAt(0).toString(16).padStart(4, '0').toUpperCase()
+  }
+  return out
+}
+
+/**
+ * The inline property dictionary of the marked-content span that ENCLOSES an
+ * offset, or null when there is none or it is a named resource.
+ *
+ * Literals are masked first so a `<<` inside a string cannot be counted, and the
+ * dictionaries are balanced rather than matched with a regex — a property list
+ * may hold a nested dictionary, and `/Span <</A <</B 1>> >> BDC` closes twice.
+ */
+function enclosingMarkedContentDict(
+  masked: string,
+  offset: number
+): { start: number; end: number; bdcEnd: number } | null {
+  const open: ({ start: number; end: number; bdcEnd: number } | null)[] = []
+
+  const re = /\b(BDC|BMC|EMC)\b/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m.index >= offset) break
+    if (m[1] === 'EMC') { open.pop(); continue }
+    if (m[1] === 'BMC') { open.push(null); continue }
+
+    // The property list is the operand immediately before BDC. A NAME there
+    // (`/P1 BDC`) points into /Properties, which this cannot edit in place.
+    let i = m.index - 1
+    while (i >= 0 && /\s/.test(masked[i])) i--
+    if (i < 1 || masked[i] !== '>' || masked[i - 1] !== '>') { open.push(null); continue }
+
+    const end = i + 1
+    let depth = 0
+    let found: { start: number; end: number; bdcEnd: number } | null = null
+    for (let k = i; k >= 1; k--) {
+      if (masked[k] === '>' && masked[k - 1] === '>') { depth++; k-- }
+      else if (masked[k] === '<' && masked[k - 1] === '<') {
+        depth--
+        if (depth === 0) { found = { start: k - 1, end, bdcEnd: m.index + 3 }; break }
+        k--
+      }
+    }
+    open.push(found)
+  }
+
+  for (let i = open.length - 1; i >= 0; i--) if (open[i]) return open[i]
+  return null
+}
+
+/** Offset of the EMC that closes the span opened at `bdcEnd`, or -1. */
+function matchingEmc(masked: string, bdcEnd: number): number {
+  const re = /\b(BDC|BMC|EMC)\b/g
+  re.lastIndex = bdcEnd
+  let depth = 1
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m[1] === 'EMC') { depth--; if (depth === 0) return m.index }
+    else depth++
+  }
+  return -1
+}
+
+/** Literal-masked copy of the last stream asked about — masking is not cheap. */
+let maskedCache: { key: string; masked: string } | null = null
+function maskedOnce(stream: string): string {
+  if (maskedCache && maskedCache.key === stream) return maskedCache.masked
+  const masked = maskStreamLiterals(stream)
+  maskedCache = { key: stream, masked }
+  return masked
+}
+
+/**
+ * Tell a TAGGED page what its edited span now says.
+ *
+ * In a tagged PDF every run sits inside `/Span <</MCID n …>> BDC … EMC`, and a
+ * reader takes the words from the structure element that MCID points at, NOT
+ * from the glyphs. Rewriting the glyphs therefore changes what is PRINTED and
+ * nothing else: a SAP deck drew "TB1100 financial" while every extractor still
+ * read "TB1100  Accounting" out of the tag — copy, search and a screen reader
+ * all reporting a sentence the page no longer said. This engine's own
+ * extraction read it too, so the block came back with its OLD text and a second
+ * edit had nothing to match: "I can't edit any more once I have edited."
+ *
+ * `/ActualText` on the span is the standard override and the least invasive fix
+ * there is: the tag, its /MCID and the structure tree are all left alone, so the
+ * document stays tagged and accessible, and only what this one span claims to
+ * say is corrected. Written UTF-16BE, the encoding a text string needs for
+ * anything outside PDFDocEncoding — and an edit is exactly where accented and
+ * non-Latin characters arrive.
+ *
+ * Only the INLINE dictionary form can be corrected. A named property list
+ * (`/P1 BDC`) lives in the page's /Properties, and rewriting a shared resource
+ * would retag every other span that points at it.
+ *
+ * And only a span that holds THIS BLOCK ALONE. `/ActualText` speaks for
+ * everything inside its span, so putting one line's words on a span that also
+ * wraps the next two replaces all three with the one — the corpus caught it at
+ * once, a span losing 103 characters to a shorter override.
+ */
+function retagSpanActualText(
+  stream: string,
+  blockStart: number,
+  text: string
+): { start: number; end: number; text: string } | null {
+  const masked = maskedOnce(stream)
+  const dict = enclosingMarkedContentDict(masked, blockStart)
+  if (!dict) return null
+
+  const emc = matchingEmc(masked, dict.bdcEnd)
+  if (emc < 0) return null
+  const inside = masked.slice(dict.bdcEnd, emc)
+  if ((inside.match(/\bBT\b/g) ?? []).length !== 1) return null
+  const body = stripActualText(stream.slice(dict.start + 2, dict.end - 2))
+  // An emptied span says nothing, and must not go on claiming the words whose
+  // glyphs were just erased.
+  const value = text.length > 0 ? `<${utf16beHex(text)}>` : '()'
+  return { start: dict.start, end: dict.end, text: `<<${body}/ActualText${value}>>` }
 }
 
 /** Size-similarity of a candidate run to the target, ignoring case and '?'. */
@@ -4180,7 +4433,7 @@ function applyPartialBlockReplacement(
   pageIndex: number,
   targetBlock: TextBlock,
   pageHeight?: number
-): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number } | { error: string } | null {
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   const simpleInfo = getSimpleFontInfo(pageIndex, block.fontRef)
   const ops = scanShowOps(block.content, block.encoding, simpleInfo)
   if (ops.length < 1) return null
@@ -4759,11 +5012,28 @@ function flattenAnnotationBehind(
     const formRef = form
     const resolvedForm = form.resolve()
 
-    const rect = annot.getRect()
     const num = (v: any, fallback: number) => {
       const n = Number(String(v))
       return Number.isFinite(n) ? n : fallback
     }
+    // The annotation's OWN /Rect, not `annot.getRect()`. MuPDF answers that one
+    // in its page space, which counts down from the top, while the `cm` written
+    // below lives in PDF user space, which counts up from the bottom. Using it
+    // raw flipped the picture to `pageHeight - top` — on a US Letter page an
+    // image sitting under the first line of text landed at the foot of it.
+    // /Rect is already in the space `Do` is invoked in, so no page height and
+    // no /Rotate guesswork is needed. It is only stored normalised by
+    // convention, so the corners are sorted here.
+    const rectArr = aobj.get('Rect')
+    if (!rectArr || String(rectArr) === 'null') {
+      page.destroy()
+      return { success: false, error: 'That annotation has no rectangle' }
+    }
+    const r = [0, 1, 2, 3].map(i => num(rectArr.get(i), 0))
+    const rect = [
+      Math.min(r[0], r[2]), Math.min(r[1], r[3]),
+      Math.max(r[0], r[2]), Math.max(r[1], r[3])
+    ]
     const bboxArr = resolvedForm.get('BBox')
     if (!bboxArr || String(bboxArr) === 'null') {
       page.destroy()
@@ -5080,6 +5350,191 @@ q ${fmtNum(r)} ${fmtNum(g)} ${fmtNum(b)} rg ` +
     return { success: true }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Move the page's DRAWN geometry — rules, boxes, shaded cells — with the text.
+ *
+ * Reflow moves text and nothing else, which is fine until the page holds a
+ * table. Every cell's words then slide down while the rules they sit inside
+ * stay put, and a document that only needed a longer sentence comes back with
+ * its table in pieces: headers printed across their own borders, the data row
+ * fallen out of the box. Acrobat does not move them either — it declines to
+ * reflow at all. Moving them is the point of this.
+ *
+ * Three rules keep it from doing harm:
+ *
+ *  - A PATH moves whole or not at all. Points are collected until the path is
+ *    painted, and the shift is applied only if EVERY one of them is below the
+ *    line the text grew at. Judging points one at a time would shear a vertical
+ *    rule that straddles it, and a sheared table is worse than an unmoved one.
+ *  - Only under an upright CTM. A rotated or skewed transform has no single
+ *    "down", so those paths are counted and left exactly as they are.
+ *  - Nothing inside BT/ET or an inline image is touched. Text has its own
+ *    mover, and an inline image's bytes are not operators however much a run of
+ *    them may look like one.
+ *
+ * `thresholdY` and `dy` are PDF user space (y-up), the space the text
+ * transforms already use: a push DOWN is a negative `dy`.
+ */
+function shiftGraphicsBelow(
+  pageIndex: number,
+  thresholdY: number,
+  dy: number
+): { success: boolean; moved: number; skipped: number; error?: string } {
+  if (!pdfDoc) return { success: false, moved: 0, skipped: 0, error: 'No document' }
+  if (!(Math.abs(dy) > 0.05)) return { success: true, moved: 0, skipped: 0 }
+
+  // operand count and the indices of the Y operands within it
+  const PATH_OPS: Record<string, { n: number; ys: number[] }> = {
+    m: { n: 2, ys: [1] },
+    l: { n: 2, ys: [1] },
+    c: { n: 6, ys: [1, 3, 5] },
+    v: { n: 4, ys: [1, 3] },
+    y: { n: 4, ys: [1, 3] },
+    re: { n: 4, ys: [1] }
+  }
+  const PAINT_OPS = new Set(['S', 's', 'f', 'F', 'f*', 'B', 'B*', 'b', 'b*', 'n'])
+
+  let moved = 0
+  let skipped = 0
+
+  try {
+    for (const src of getContentSources(pageIndex)) {
+      const stream = src.stream
+      const masked = maskStreamLiterals(stream)
+
+      interface Operand { start: number; end: number; value: number }
+      /** One Y operand of the path being built, and where it sits on the page. */
+      interface Pending { operand: Operand; pageY: number; scaleY: number }
+
+      const splices: { start: number; end: number; text: string }[] = []
+      const ctmStack: Mat6[] = []
+      let ctm: Mat6 = [1, 0, 0, 1, 0, 0]
+      let textDepth = 0
+      let operands: Operand[] = []
+      let pending: Pending[] = []
+      let pathBelow = true
+      let pathUpright = true
+      let pathHasPoints = false
+      let pathIsClip = false
+
+      const endPath = () => {
+        if (pathHasPoints && !pathIsClip) {
+          if (pathBelow && pathUpright) {
+            for (const p of pending) {
+              splices.push({
+                start: p.operand.start,
+                end: p.operand.end,
+                text: fmtNum(p.operand.value + dy / p.scaleY)
+              })
+            }
+            moved++
+          } else if (!pathBelow && pending.some(p => p.pageY < thresholdY)) {
+            // Straddles the line: left alone on purpose, and counted so the
+            // caller can say so rather than quietly present a broken page.
+            skipped++
+          } else if (!pathUpright) {
+            skipped++
+          }
+        }
+        pending = []
+        pathBelow = true
+        pathUpright = true
+        pathHasPoints = false
+        pathIsClip = false
+      }
+
+      const tok = /([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)|([A-Za-z*'"]+)/g
+      let t: RegExpExecArray | null
+      while ((t = tok.exec(masked)) !== null) {
+        if (t[1] !== undefined) {
+          operands.push({ start: t.index, end: t.index + t[1].length, value: parseFloat(t[1]) })
+          if (operands.length > 8) operands.shift()
+          continue
+        }
+        const op = t[2]
+
+        // An inline image's data is raw bytes. Skip from ID to the EI that ends
+        // it, or the scan will read the pixels as a very long path.
+        if (op === 'BI') {
+          const ei = masked.indexOf('EI', t.index)
+          tok.lastIndex = ei < 0 ? masked.length : ei + 2
+          operands = []
+          continue
+        }
+
+        if (op === 'q') { ctmStack.push([...ctm] as Mat6); operands = []; continue }
+        if (op === 'Q') { ctm = ctmStack.pop() || [1, 0, 0, 1, 0, 0]; operands = []; continue }
+        if (op === 'cm') {
+          if (operands.length >= 6) {
+            const o = operands.slice(-6).map(x => x.value) as Mat6
+            ctm = matConcat(o, ctm)
+          }
+          operands = []
+          continue
+        }
+        if (op === 'BT') { textDepth++; operands = []; continue }
+        if (op === 'ET') { textDepth = Math.max(0, textDepth - 1); operands = []; continue }
+
+        if (textDepth === 0) {
+          const spec = PATH_OPS[op]
+          if (spec && operands.length >= spec.n) {
+            const args = operands.slice(-spec.n)
+            const upright = Math.abs(ctm[1]) < 1e-6 && Math.abs(ctm[2]) < 1e-6 && Math.abs(ctm[3]) > 1e-9
+            pathHasPoints = true
+            if (!upright) {
+              pathUpright = false
+            } else {
+              const toPage = (yLocal: number) => ctm[3] * yLocal + ctm[5]
+              for (const yi of spec.ys) {
+                const operand = args[yi]
+                const pageY = toPage(operand.value)
+                if (!(pageY < thresholdY)) pathBelow = false
+                pending.push({ operand, pageY, scaleY: ctm[3] })
+              }
+              // A rectangle's far edge counts too: `re` names only its lower
+              // corner, and a box whose top pokes above the line straddles it.
+              if (op === 're') {
+                const topY = toPage(args[1].value + args[3].value)
+                if (!(topY < thresholdY)) pathBelow = false
+              }
+            }
+          } else if (op === 'W' || op === 'W*') {
+            // A CLIP, not a drawing. Moving the window without moving what it
+            // holds is how a page loses its text: one file in the corpus builds
+            // 477 `re W* n` boxes around its paragraphs, and sliding those down
+            // clipped three quarters of the words off the page — silently, since
+            // the text objects themselves were untouched and still there.
+            //
+            // Not counted as skipped: the text mover already widens the clip
+            // around anything IT moves (`expandClipForTransform`), so the
+            // window is looked after, just not from here.
+            pathIsClip = true
+          } else if (PAINT_OPS.has(op)) {
+            endPath()
+          }
+        }
+        operands = []
+      }
+      endPath()
+
+      if (splices.length === 0) continue
+
+      let out = stream
+      for (const sp of splices.sort((a, b) => b.start - a.start)) {
+        out = out.slice(0, sp.start) + sp.text + out.slice(sp.end)
+      }
+      const bytes = new Uint8Array(out.length)
+      for (let i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 0xFF
+      src.write(bytes)
+    }
+
+    invalidateContentSources(pageIndex)
+    return { success: true, moved, skipped }
+  } catch (err: any) {
+    return { success: false, moved, skipped, error: err.message || String(err) }
   }
 }
 

@@ -10,7 +10,7 @@ export type WorkerRequest =
   | { id: number; type: 'readContentStream'; data: { pageIndex: number } }
   | { id: number; type: 'writeContentStream'; data: { pageIndex: number; streamBytes: ArrayBuffer } }
   | { id: number; type: 'replaceText'; data: { pageIndex: number; blockId: string; newText: string } }
-  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number] } }
+  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number } }
   | { id: number; type: 'transformTextBlock'; data: { pageIndex: number; blockId: string; dx: number; dy: number; sx: number; sy: number; anchorX: number; anchorY: number } }
   | { id: number; type: 'transformTextBlocks'; data: { pageIndex: number; ops: BlockTransformOp[] } }
   | { id: number; type: 'restyleTextBlocks'; data: { pageIndex: number; ops: BlockStyleOp[] } }
@@ -18,6 +18,7 @@ export type WorkerRequest =
   | { id: number; type: 'flattenAnnotationBehind'; data: { pageIndex: number; annotIndex: number } }
   | { id: number; type: 'drawImageInContent'; data: { pageIndex: number; rect: RectT; bytes: ArrayBuffer; behind: boolean } }
   | { id: number; type: 'fillRect'; data: { pageIndex: number; rect: RectT; color: [number, number, number] } }
+  | { id: number; type: 'shiftGraphicsBelow'; data: { pageIndex: number; thresholdY: number; dy: number } }
   | { id: number; type: 'debugFonts'; data: { pageIndex: number } }
   // --- Annotations ---
   | { id: number; type: 'getAnnotations'; data: { pageIndex: number } }

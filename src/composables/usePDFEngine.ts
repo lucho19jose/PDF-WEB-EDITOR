@@ -316,6 +316,21 @@ export function usePDFEngine() {
     return wrap(await bridge.fillRect(pageIndex, rect, color), 'fillRect', pageIndex)
   }
 
+  /**
+   * Move the rules and fills below `thresholdY` down with the text.
+   *
+   * Reported rather than boolean: a page can hold geometry this must decline to
+   * touch — a path straddling the line, a rotated transform — and the caller
+   * says so instead of showing a table it half moved.
+   */
+  async function shiftGraphicsBelow(pageIndex: number, thresholdY: number, dy: number):
+    Promise<{ moved: number; skipped: number }> {
+    const r = await bridge.shiftGraphicsBelow(pageIndex, thresholdY, dy)
+    pageTextCache.delete(pageIndex)
+    if (!r.success) { error.value = r.error || 'shiftGraphicsBelow failed'; return { moved: 0, skipped: 0 } }
+    return { moved: r.moved, skipped: r.skipped }
+  }
+
   async function mergePages(bytes: ArrayBuffer, atIndex: number): Promise<{ pages: number; added: number } | false> {
     const r = await bridge.mergePages(bytes, atIndex)
     pageTextCache.clear()
@@ -422,6 +437,7 @@ export function usePDFEngine() {
     flattenAnnotationBehind,
     drawImageInContent,
     fillRect,
+    shiftGraphicsBelow,
     mergePages,
     insertBlankPage,
     deletePage,

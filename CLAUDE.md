@@ -835,12 +835,123 @@ picks 0.76 for those (measured: 11pt "DATA" and "DETAIL" gave 0.74 and 0.78).
 J is deliberately left out of `DESCENDERS`: it descends in some faces and not
 others, and guessing high here shrinks text, which is the failure being fixed.
 
-**Known limitation:** a monospaced face has shorter ascenders again (Courier
-0.63 em against Helvetica 0.72) and reads about 30% low. The correction exists
-(`GLYPH_BOX_PER_EM_MONO`) but only applies once the face is known to be Courier,
-which needs the advances test to fire. On a blurred scan it often does not, and
-the line comes back as Helvetica at three quarters of its size. It fails toward
-the default rather than toward a wrong typeface, and both are one click to fix.
+The em comes from a TRIMMED maximum, not the plain one. A scan hands back the
+odd swollen box — a smear joining two letters, a speck under a stem, an edge of
+the row beneath — and the plain maximum believes it. One of those on a row of
+11pt capitals reported 18.9pt, and the size was the smaller half of the damage:
+`lineEm` is what `splitRuns` measures its column gaps against, so an em inflated
+by 70% pushed the "unmistakable gap" threshold above three real column gaps and
+three separate headings came back as ONE editable run — the very failure
+`splitRuns` exists to prevent. The tallest box is dropped only when it stands
+apart from the next (a quarter taller again), never more than twice, and never
+on a run of fewer than four glyphs.
+
+A percentile will NOT do this job, and trying p80 first proved it: in prose the
+tall boxes are the minority — ascenders and descenders against a page of
+x-height — so p80 lands in the x-height band and reads a 12pt line as 9pt. What
+is wanted is not a lower rank, it is the outlier gone.
+
+### Monospace is ONE grid, not a string of advances
+`advancesAreUniform` used to score the pairwise gaps between glyph centres.
+Pair by pair, every box's own error lands in two advances and nothing cancels:
+on a 220 DPI scan real Courier scored 0.244 and Helvetica prose 0.284. No
+threshold separates those, so monospaced text was never recognised — which is
+what left a 12pt Courier line reading 8.3pt.
+
+Fitted instead as one least-squares grid over the whole run, the same two score
+**0.019 and 0.333**: a constant pitch is exactly what the fit is looking for, and
+box noise averages out instead of accumulating. Italic prose scores 0.445 and a
+page of OCR rubbish 0.4–0.8, so `MONO_GRID_RESIDUAL = 0.08` sits a factor of
+four clear on both sides. Verified both ways: the Courier line now reads Courier
+at 12.6pt, and a scan of 35 lines of Helvetica prose yields no Courier at all.
+
+Spaces take a cell of their own — a monospaced face sets the blank to a letter's
+width, so the grid only lines up when the gaps are counted, and counting them is
+what lets one fit span a whole line instead of restarting at every word. The
+NARROW/WIDE gate stays: all-caps text fits a grid in any face ("PROCESS" scores
+0.04) and must never be decidable on advances alone.
+
+A monospaced face has shorter ascenders again (Courier 0.63 em against
+Helvetica 0.72), so `GLYPH_BOX_PER_EM_MONO` corrects for it — but only once the
+face is known to be Courier, which needs `advancesAreUniform` to fire. It did
+not, and the line came back as Helvetica at three quarters of its size: a real
+12pt Courier line read 8.3pt. See the grid fit below for why, and what it reads
+now (12.6pt, and 35 lines of Helvetica prose in the same test still read as
+Helvetica).
+
+### On a TAGGED page the words live outside the BT block too
+In a tagged PDF every run sits inside `/Span <</MCID n …>> BDC … EMC`, and a
+reader takes the text from the structure element that MCID points at, NOT from
+the glyphs. Rewriting the glyphs therefore changes what is PRINTED and nothing
+else. A SAP deck drew "TB1100 financial" while every extractor still read
+"TB1100  Accounting" out of the tag — copy, search and a screen reader all
+reporting a sentence the page no longer said. This engine's own extraction read
+it too, so the block came back with its OLD text and a second edit had nothing
+to match: *"I can't edit any more once I have edited."*
+
+`retagSpanActualText` writes `/ActualText` onto the span, UTF-16BE. It is the
+standard override and the least invasive fix available: the tag, its /MCID and
+the structure tree are all left alone, so the document stays tagged and
+accessible, and only what that one span claims to say is corrected. A blanked
+span gets `/ActualText()` — it says nothing now.
+
+Two limits, both learned from the corpus:
+- **Only a span holding ONE BT block.** `/ActualText` speaks for everything
+  inside its span, so putting one line's words on a span that also wraps the
+  next two replaces all three with the one. The sweep caught it immediately: a
+  span lost 103 characters to a shorter override.
+- **Only the inline dictionary form.** A named property list (`/P1 BDC`) lives
+  in the page's /Properties, and rewriting a shared resource would retag every
+  other span pointing at it.
+
+### Offsets below a rewrite are only valid if nothing below them moved
+The clip window that bounds a block and the marked-content dictionary that tags
+it both sit at LOWER offsets than the block, and are spliced afterwards off
+offsets read from the ORIGINAL stream. That holds while nothing below them has
+moved — and in a line group it does not: the primary block is rewritten in the
+MIDDLE of the run, so every span after it shifts by the length it gained. The
+first attempt spliced a widened clip rectangle straight through an `/ActualText`
+and the page's title vanished from every extractor, with `unknown keyword: 'ng'`
+as the only clue.
+
+`applyLineReplacement` therefore returns its `applied` edits — where each rewrite
+landed and how many bytes it moved — and both the clips and the tags are pushed
+through `shiftOffset` before being applied, all of them together, highest offset
+first.
+
+### A patch belongs to the INK, not to the run
+`OcrTextItem` carries two boxes. `rect` is where the run is now and follows a
+drag; `inkRect` is where the scan's own words are and never moves. They were one
+field, and the patch was drawn as a child of the run's box, so dragging a run
+painted over the paper it had moved ONTO and left its photographed words
+uncovered — the same sentence appeared twice, once in the scan and once as the
+replacement, on screen and in the exported PDF. The patch is now its own element
+in the layer, positioned from `inkRect`, and `patchRect` in `ocrExport` reads the
+same field. Only the text follows the box.
+
+`revertItem` puts `rect` back to `inkRect` for the same reason, and an explicit
+`edited: false` in an `updateItem` patch now wins over the "was it edited before"
+term — without that, reverting restored the words but left the run marked
+changed, so export still painted over it.
+
+A drag also refuses a non-finite delta. A page not yet measured gives a zero
+scale, and writing the resulting `NaN` into the rect loses the run for good: it
+then has no position to draw at, to patch out, or to drag back.
+
+### The box OCR measured is the right PLACE to edit, not the right SIZE
+A recognition box hugs the ink, so a short cell is a few pixels high: a run set
+at 17px arrived in a 13px editor with its own text clipped top and bottom and
+nowhere to put another word. The editor keeps its origin, type and colours — it
+still reads as editing in place — but takes a minimum along the reading
+direction and across it. The element's `width` is always the reading direction,
+sideways runs included, so one pair of minimums covers both.
+
+Editing also opens on the SECOND single click, not only on a double click.
+Double-click still works, but requiring it means hitting a target a few pixels
+high twice inside the system's double-click time, and that wait is felt as the
+editor being slow to open. It is not: measured, it appears about ten
+milliseconds after it is asked. A drag still moves the run, because the editor
+only opens when the button came back up without the mouse having moved.
 
 ### Reading text that is set on its side
 Tesseract reads a line left to right. A label printed up the side of a chart is
@@ -1209,6 +1320,97 @@ which is cheaper and steadier than closing the old gap and opening a new one —
 every reflow is a chance to match the wrong paragraph, so the fewer the better.
 A move has to be the two, in that order: the rows must be where they belong
 before the second plan is built against them.
+
+### The rules move with the text, and a clip never does
+Reflow used to move text and nothing else, which is fine until the page has a
+table: every cell's words slid down and the box around them did not, so a
+document that needed one longer sentence came back with its header printed
+across its own borders and its data row outside the frame. Acrobat does not move
+them either — it declines to reflow at all. `shiftGraphicsBelow` in the worker
+moves them, and `applyReflow` calls it with the top of the highest row that
+moved and the distance every row travelled.
+
+Three rules keep it from doing harm, and each of them was a failure first:
+
+- **A path moves whole or not at all.** Points are collected until the path is
+  painted and the shift applied only if EVERY one is below the line the text
+  grew at. Judging points one at a time shears a vertical rule that straddles
+  it, and a sheared table is worse than an unmoved one. What is left behind is
+  counted and said in the status bar.
+- **A CLIP is never moved.** One corpus file builds 477 `re W* n` boxes around
+  its paragraphs; sliding those down clipped three quarters of the words off the
+  page — silently, because the text objects were untouched and still there.
+  Extracted text fell from 1915 characters to 532. The text mover already widens
+  the clip around anything IT moves (`expandClipForTransform`), so the window is
+  looked after, just not from here.
+- **Only under an upright CTM**, and never inside BT/ET or an inline image. A
+  rotated transform has no single "down", and an inline image's bytes are not
+  operators however much a run of them may look like one.
+
+Only when every row moves by the SAME distance, which is what a push down or a
+pull up produces. A plan with mixed shifts has no single distance for the rules
+BETWEEN those rows to travel.
+
+### A line of a many-line block is reachable by position, not by length alone
+`findBtBlocksByPosition` asks whether a block's WHOLE text reads as the target,
+so a single line of a block that draws several was only reachable through the
+containment test — which demanded more than five characters on both sides. Table
+cells are mostly shorter: `N°`, `GTIN`, `Bien`, `1`, `NO`. They matched nothing,
+and a move that cannot find its text does not fail loudly; it just does not
+happen. That is how a reflowed table came apart with its long cells moved and
+its short ones left behind on the rules.
+
+The last-resort pass admits them at two characters because the text is not
+carrying the identification alone: the block has to SIT on the target
+(`distOf <= onTarget * 2`) and `findGoverningTm` has to find a run inside it
+that reads as the target. It runs only when every other pass came up empty, so
+no match that already worked can change.
+
+### A line group is read BOTH ways round
+The target text is in reading order; a content stream is under no obligation to
+be. One producer emits a field's value before its label, so the group read back
+as `NO` + `Indicador de retorno de vehículo vacío:` and matched nothing at all.
+Only the label's own block matched, so a reflow moved the label down the page
+and left the `NO` behind on the old line, beside somebody else's answer.
+
+Sorting by `xPos` fixes that — but sorting INSTEAD OF the stream order is not
+safe: the sweep caught one corpus file where stream order was the one that
+matched, and x order alone turned a working drag into "could not find matching
+text". Both joins are tried. Trying both can only ever add a match, which is why
+the sweep then showed 192 unchanged results, one gained and none lost.
+
+**The sweep's `results.json` is gitignored and does NOT track the branch.** It
+was a snapshot from `421ac5d` while `main` had moved seventeen commits past it,
+so diffing against it reported three regressions that were already there. Always
+regenerate the baseline from a clean tree (`git stash`) before blaming a change
+for anything it shows.
+
+### Making room for a picture already in place is a different sum
+Inserting one opens a gap at the foot of a line and drops the picture INTO it,
+so the picture's own height is exactly the room wanted. `applyWrap('inline')`
+and a move/resize face the opposite case: the picture is fixed and the first
+line that has to move starts wherever it starts, usually some way above the
+picture's top edge. Pushing it down by the height alone left it printed across
+the bottom of the image, half a line inside the ink. `pushTextClearOf` probes
+for the top of the first row that would move and asks for
+`bottom + IMAGE_GAP - thatTop` instead.
+
+Related: `makeRoomAt` resolves its anchor row differently per direction. Space
+opened BELOW a point belongs to the line above it; space opened ABOVE a point
+belongs to the line below. Both used to resolve to the line above, so an image
+dropped into the gap between two lines pushed the line ABOVE it down onto the
+picture while the lines actually in the way never moved.
+
+### `annot.getRect()` is not PDF user space
+MuPDF answers it in its own page space, which counts DOWN from the top, while a
+`cm` written into a content stream counts UP from the bottom.
+`flattenAnnotationBehind` used it raw, so "Behind the text" put the picture at
+`pageHeight - top`: on a Letter page an image sitting under the first line of
+text landed 390 points lower, at the foot of the sheet. Read the annotation's
+own `/Rect` instead — it is already in the space `Do` is invoked in, so no page
+height and no `/Rotate` guesswork is needed. `drawImageInContent` converts
+explicitly (`y = pageHeight - top - h`) and is the model for anything else that
+has to cross between the two.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates

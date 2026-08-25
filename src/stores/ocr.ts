@@ -71,7 +71,12 @@ export const useOcrStore = defineStore('ocr', () => {
       if (idx < 0) continue
       const before = page.items[idx]
       const after: OcrTextItem = { ...before, ...patch }
-      after.edited = after.removed
+      // An explicit `edited: false` is a RESET, and has to win over the "was it
+      // edited before" term below — otherwise reverting a run puts its words
+      // back but leaves it marked as changed, and export still paints over it.
+      after.edited = patch.edited === false
+        ? false
+        : after.removed
         ? false
         : after.text !== after.originalText ||
           after.fontSize !== before.fontSize && patch.fontSize !== undefined ||
@@ -94,11 +99,18 @@ export const useOcrStore = defineStore('ocr', () => {
     updateItem(id, { removed: true, edited: false })
   }
 
-  /** Undo a deletion or an edit, putting the run back to what OCR read. */
+  /** Undo a deletion, an edit or a move, putting the run back to what OCR read. */
   function revertItem(id: string) {
     const item = selectedIn(id)
     if (!item) return
-    updateItem(id, { text: item.originalText, removed: false, edited: false })
+    updateItem(id, {
+      text: item.originalText,
+      // Back onto its own ink, or a run that was dragged reverts its words and
+      // stays where it was dropped.
+      rect: { ...(item.inkRect ?? item.rect) },
+      removed: false,
+      edited: false
+    })
   }
 
   function selectedIn(id: string): OcrTextItem | null {

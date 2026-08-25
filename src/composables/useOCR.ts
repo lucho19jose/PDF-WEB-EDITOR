@@ -204,19 +204,38 @@ export function useOCR() {
   }
 
   /**
-   * The em of a run, from the tallest glyph box in it.
+   * The em of a run, from its tallest glyph boxes — but not from ONE of them.
    *
-   * How much of an em that box is depends on whether anything in the run goes
+   * How much of an em a box is depends on whether anything in the run goes
    * below the baseline, so the text has to be consulted, not just the boxes.
+   *
+   * A scan hands back the odd swollen box — a smear joining two letters, a
+   * speck under a stem, an edge of the row beneath — and the plain maximum
+   * believes it. One of those on a row of 11pt capitals reported 18.9pt, and
+   * the size was not the worst of it: `lineEm` is what `splitRuns` measures its
+   * column gaps against, so an em inflated by 70% pushed the "unmistakable gap"
+   * threshold above three real column gaps and three separate headings came
+   * back as ONE editable run.
+   *
+   * The tallest box is dropped only when it stands APART from the next one — a
+   * quarter taller again — and never more than twice, and never on a run too
+   * short for "apart" to mean anything. A percentile will not do this job: in
+   * prose the tall boxes are the minority (ascenders and descenders against a
+   * page of x-height), so p80 lands in the x-height band and reads a 12pt line
+   * as 9pt. What is wanted is not a lower rank, it is the outlier gone.
    */
   function emOf(words: any[], fallbackHeight: number, text: string): number {
-    let capPx = 0
+    const heights: number[] = []
     for (const word of words) {
       for (const sym of word.symbols ?? []) {
         const h = sym.bbox.y1 - sym.bbox.y0
-        if (h > capPx) capPx = h
+        if (h > 1) heights.push(h)
       }
     }
+    heights.sort((a, b) => b - a)
+    let at = 0
+    while (at < 2 && heights.length - at >= 4 && heights[at] > heights[at + 1] * 1.25) at++
+    const capPx = heights[at] ?? 0
     const perEm = DESCENDERS.test(text) ? GLYPH_BOX_PER_EM : GLYPH_BOX_PER_EM_NO_DESCENDER
     return capPx > 1 ? capPx / perEm : fallbackHeight * 1.05
   }
@@ -379,6 +398,9 @@ export function useOCR() {
               originalText: text,
               text,
               rect: mapBox(bb),
+              // Same box to begin with, and the one that stays put when the run
+              // is dragged — it is where the scan's own ink is.
+              inkRect: mapBox(bb),
               words: run.map((word: any) => mapBox(word.bbox)),
               fontSize: Math.max(4, Math.round(emCorrected * toPt * 10) / 10),
               fontFamily: face.fontFamily,

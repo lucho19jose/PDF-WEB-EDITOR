@@ -11,6 +11,22 @@
     paper around it, so what is on screen is what export will produce.
   -->
   <div v-if="visible" class="ocr-layer">
+    <!--
+      The paper patch sits where the INK is, which stops being where the run is
+      the moment it is dragged. Drawn as its own element in the layer for that
+      reason: nested inside the run's box it travelled with it, covering the
+      paper the words had moved ONTO and leaving the photographed words showing
+      — so they appeared twice, once in the scan and once as the replacement.
+    -->
+    <div
+      v-for="p in patches"
+      :key="p.id"
+      class="ocr-patch-holder"
+      :style="p.holderStyle"
+    >
+      <div class="ocr-patch" :style="p.patchStyle" />
+    </div>
+
     <div
       v-for="item in scaled"
       :key="item.id"
@@ -27,8 +43,6 @@
       @mousedown.stop="onDown($event, item.id)"
       @dblclick.stop="beginEdit(item.id)"
     >
-      <!-- Painted over the scan only where the user changed something. -->
-      <div v-if="item.edited || item.removed" class="ocr-patch" :style="item.patchStyle" />
       <div v-if="item.edited" class="ocr-replacement" :style="item.textStyle">{{ item.text }}</div>
     </div>
 
@@ -51,7 +65,7 @@ import { ref, computed, nextTick, watch } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useOcrStore } from '@/stores/ocr'
 import { rgb01ToCss } from '@/utils/color'
-import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
+import type { OcrTextItem, OcrRect } from '@/utils/ocr/ocrTypes'
 
 const props = defineProps<{
   pageWidth: number
@@ -82,31 +96,56 @@ const editorRef = ref<HTMLTextAreaElement | null>(null)
  * quarter turn anti-clockwise about the top-left corner sends it upwards from
  * there, which lands it exactly over the box it belongs to.
  */
-function styleFor(item: OcrTextItem) {
+function styleFor(item: OcrTextItem, box: OcrRect = item.rect) {
   if (item.vertical) {
     return {
-      left: `${item.rect.x * scaleX.value}px`,
-      top: `${(item.rect.y + item.rect.height) * scaleY.value}px`,
-      width: `${item.rect.height * scaleY.value}px`,
-      height: `${item.rect.width * scaleX.value}px`,
+      left: `${box.x * scaleX.value}px`,
+      top: `${(box.y + box.height) * scaleY.value}px`,
+      width: `${box.height * scaleY.value}px`,
+      height: `${box.width * scaleX.value}px`,
       transform: 'rotate(-90deg)',
       transformOrigin: 'left top'
     }
   }
   return {
-    left: `${item.rect.x * scaleX.value}px`,
-    top: `${item.rect.y * scaleY.value}px`,
-    width: `${item.rect.width * scaleX.value}px`,
-    height: `${item.rect.height * scaleY.value}px`,
+    left: `${box.x * scaleX.value}px`,
+    top: `${box.y * scaleY.value}px`,
+    width: `${box.width * scaleX.value}px`,
+    height: `${box.height * scaleY.value}px`,
     transform: item.rotation ? `rotate(${item.rotation}deg)` : undefined,
     transformOrigin: 'left top'
   }
 }
 
 /** The size of a run ACROSS its reading direction — its line height. */
-function acrossPx(item: OcrTextItem): number {
-  return item.vertical ? item.rect.width * scaleX.value : item.rect.height * scaleY.value
+function acrossPx(item: OcrTextItem, box: OcrRect = item.rect): number {
+  return item.vertical ? box.width * scaleX.value : box.height * scaleY.value
 }
+
+/**
+ * Where the paper has to be painted, for every run the user changed.
+ *
+ * Built from `inkRect` — where the scan's own words are — and never from the
+ * run's current box, which follows a drag.
+ */
+const patches = computed(() =>
+  ocrStore.itemsFor(pageIndex.value)
+    .filter(item => item.edited || item.removed)
+    .map(item => {
+      const ink = item.inkRect ?? item.rect
+      return {
+        id: item.id,
+        holderStyle: styleFor(item, ink),
+        // Grown slightly: anti-aliased glyph edges reach a little past the box
+        // OCR reports, and a patch flush with it leaves a grey fringe. The
+        // padding is in the ELEMENT's frame, so it follows a rotated run round.
+        patchStyle: {
+          background: rgb01ToCss(item.background),
+          inset: `${-Math.max(1, acrossPx(item, ink) * 0.08)}px ${-2 * scaleX.value}px`
+        }
+      }
+    })
+)
 
 const scaled = computed(() =>
   ocrStore.itemsFor(pageIndex.value).map(item => ({
@@ -117,13 +156,6 @@ const scaled = computed(() =>
     vertical: item.vertical,
     confidence: item.confidence,
     boxStyle: styleFor(item),
-    // The patch is grown slightly: anti-aliased glyph edges reach a little past
-    // the box OCR reports, and a patch flush with it leaves a grey fringe. The
-    // padding is in the ELEMENT's frame, so it follows a rotated run round.
-    patchStyle: {
-      background: rgb01ToCss(item.background),
-      inset: `${-Math.max(1, acrossPx(item) * 0.08)}px ${-2 * scaleX.value}px`
-    },
     textStyle: {
       fontSize: `${item.fontSize * scaleY.value}px`,
       fontFamily: cssFamily(item.fontFamily),
@@ -137,7 +169,7 @@ const scaled = computed(() =>
       ? 'Deleted — it will be painted out on export'
       : `${item.confidence}% confident · ${item.fontSize}pt` +
         `${item.bold ? ' · bold' : ''}${item.italic ? ' · italic' : ''}` +
-        `${item.vertical ? ' · sideways' : ''} · double-click to edit`
+        `${item.vertical ? ' · sideways' : ''} · click again to edit, drag to move`
   }))
 )
 
@@ -148,11 +180,28 @@ function cssFamily(family: string): string {
   return 'Helvetica, Arial, sans-serif'
 }
 
+/**
+ * The editor is given room to be READ IN, not just the box OCR measured.
+ *
+ * A recognition box hugs the ink, so a short cell is a few pixels high: a run
+ * set at 17px arrived in a 13px slot, its own text clipped top and bottom, with
+ * nowhere to put another word. The box is the right PLACE to edit, not the right
+ * size. It keeps its origin, its type and its colours — so it still reads as
+ * editing in place — and grows to at least a comfortable line, along the
+ * reading direction and across it. The element's `width` is always the reading
+ * direction, sideways runs included, so one pair of minimums covers both.
+ */
 const editorStyle = computed(() => {
   const item = ocrStore.itemsFor(pageIndex.value).find(i => i.id === editing.value)
   if (!item) return {}
+  const base = styleFor(item)
+  const fs = item.fontSize * scaleY.value
+  const minAlong = Math.max(160, fs * 10, draft.value.length * fs * 0.62)
+  const minAcross = fs * 1.6 + 8
   return {
-    ...styleFor(item),
+    ...base,
+    width: `max(${base.width}, ${Math.round(minAlong)}px)`,
+    height: `max(${base.height}, ${Math.round(minAcross)}px)`,
     fontSize: `${item.fontSize * scaleY.value}px`,
     fontFamily: cssFamily(item.fontFamily),
     fontWeight: item.bold ? '700' : '400',
@@ -163,19 +212,39 @@ const editorStyle = computed(() => {
   }
 })
 
+/**
+ * Click to select; click the SELECTED run again to edit it.
+ *
+ * Double-click still works and is still the tooltip's advice, but it should not
+ * be the only way in: it makes the reader hit a target a few pixels high twice
+ * inside the system's double-click time, and the wait for the second click is
+ * felt as the editor being slow to open — it is not, it opens in about ten
+ * milliseconds once asked. Editing on the second single click asks it sooner and
+ * costs nothing: a drag still moves the run, because the editor only opens when
+ * the mouse came back up without having moved.
+ */
 function onDown(e: MouseEvent, id: string) {
+  const wasSelected = ocrStore.selectedId === id && editing.value !== id
   ocrStore.selectedId = id
-  startDrag(e, id)
+  startDrag(e, id, wasSelected)
 }
 
 // ── Moving a run ──
-interface DragState { id: string; startX: number; startY: number; ox: number; oy: number; moved: boolean }
+interface DragState {
+  id: string; startX: number; startY: number; ox: number; oy: number
+  moved: boolean
+  /** Open the editor if this press turns out to be a click, not a drag. */
+  editOnClick: boolean
+}
 let drag: DragState | null = null
 
-function startDrag(e: MouseEvent, id: string) {
+function startDrag(e: MouseEvent, id: string, editOnClick = false) {
   const item = ocrStore.itemsFor(pageIndex.value).find(i => i.id === id)
   if (!item) return
-  drag = { id, startX: e.clientX, startY: e.clientY, ox: item.rect.x, oy: item.rect.y, moved: false }
+  drag = {
+    id, startX: e.clientX, startY: e.clientY,
+    ox: item.rect.x, oy: item.rect.y, moved: false, editOnClick
+  }
   window.addEventListener('mousemove', onDragMove)
   window.addEventListener('mouseup', onDragEnd)
 }
@@ -184,6 +253,10 @@ function onDragMove(e: MouseEvent) {
   if (!drag) return
   const dx = (e.clientX - drag.startX) / scaleX.value
   const dy = (e.clientY - drag.startY) / scaleY.value
+  // A page not yet measured gives a zero scale and a delta of Infinity or NaN.
+  // Writing that into the rect loses the run for good: it has no position left
+  // to draw at, to patch out, or to drag back.
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return
   if (!drag.moved && Math.abs(dx) * scaleX.value < 3 && Math.abs(dy) * scaleY.value < 3) return
   drag.moved = true
   const item = ocrStore.itemsFor(pageIndex.value).find(i => i.id === drag!.id)
@@ -194,7 +267,9 @@ function onDragMove(e: MouseEvent) {
 function onDragEnd() {
   window.removeEventListener('mousemove', onDragMove)
   window.removeEventListener('mouseup', onDragEnd)
+  const finished = drag
   drag = null
+  if (finished && !finished.moved && finished.editOnClick) beginEdit(finished.id)
 }
 
 // ── Editing the words ──
@@ -252,7 +327,8 @@ defineExpose({ beginEdit })
    separate, more speculative pass and are the ones most worth checking. */
 .ocr-item.vertical { border-color: rgba(156, 39, 176, 0.65); border-style: dashed; }
 .ocr-item.vertical.selected { border-color: #9c27b0; }
-.ocr-patch { position: absolute; z-index: 0; }
+.ocr-patch-holder { position: absolute; pointer-events: none; z-index: 0; }
+.ocr-patch { position: absolute; inset: 0; }
 .ocr-replacement {
   position: absolute; inset: 0; z-index: 1;
   display: flex; align-items: center;

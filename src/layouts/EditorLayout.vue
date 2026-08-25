@@ -183,7 +183,7 @@ async function runOcrNow(pageIndex: number, lang: string) {
     : ''
   editorStore.setStatus(result.items.length === 0
     ? 'No text was recognised on this page'
-    : `${result.items.length} text areas detected${sideways} — ${result.confidence}% average confidence. Double-click one to edit it.`)
+    : `${result.items.length} text areas detected${sideways} — ${result.confidence}% average confidence. Click one to select it, click again to edit, drag to move.`)
 }
 
 /**

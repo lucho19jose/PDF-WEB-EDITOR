@@ -283,6 +283,28 @@ async function onAnnotResizeUp() {
 }
 
 /**
+ * Push the text clear of a picture that is ALREADY in place.
+ *
+ * Not the same sum as making room for one about to be inserted. There the gap
+ * is opened at the foot of a line and the picture is dropped INTO it, so its
+ * own height is exactly the room wanted. Here the picture is fixed and the
+ * first line that has to move starts wherever it starts — usually some way
+ * above the picture's top edge — so pushing it down by the height alone left it
+ * printed across the bottom of the image, half a line inside the ink. What it
+ * needs is the distance from where it is to just below the picture, and every
+ * line under it moves by that same amount so the spacing between them holds.
+ */
+async function pushTextClearOf(rect: RectT) {
+  const top = Math.min(rect[1], rect[3])
+  const bottom = Math.max(rect[1], rect[3])
+  // `y` comes back as the TOP of the first row that would move — the only
+  // number this sum can be built on, and it is not knowable until asked.
+  const probe = await makeRoomInText(top, 0, false)
+  const amount = Math.max(0, bottom + IMAGE_GAP - probe.y)
+  return amount > 0.5 ? await makeRoomInText(top, amount, false) : probe
+}
+
+/**
  * Apply a new rectangle to an annotation, and let the text follow it.
  *
  * Both directions, and both kinds of change. Only GROWING was handled before —
@@ -324,7 +346,7 @@ async function commitRectChange(index: number, oldRect: RectT, newRect: RectT, v
     // second plan is built against them.
     const gave = await makeRoomInText(oldRect[3], -(oldH + IMAGE_GAP * 2), true)
     moved += gave.moved
-    const took = await makeRoomInText(newRect[1], newH + IMAGE_GAP * 2, false)
+    const took = await pushTextClearOf(newRect)
     moved += took.moved
     spilled += took.spilled
   }
@@ -394,9 +416,8 @@ async function applyWrap(mode: 'front' | 'inline' | 'behind') {
   }
 
   if (mode === 'inline') {
-    const height = Math.abs(a.rect[3] - a.rect[1])
     pushUndo()
-    const room = await makeRoomInText(a.rect[1], height + IMAGE_GAP * 2, false)
+    const room = await pushTextClearOf(a.rect)
     editorStore.setStatus(room.moved > 0
       ? `The text moved aside — ${room.moved} block(s) shifted around the image`
       : 'There was nothing under the image to move aside')

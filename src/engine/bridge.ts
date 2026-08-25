@@ -206,6 +206,15 @@ export class MuPDFBridge {
   }
 
   /**
+   * Slide the drawn geometry below `thresholdY` by `dy`, both in PDF user
+   * space (y-up), so a table's rules travel with the text inside them.
+   */
+  async shiftGraphicsBelow(pageIndex: number, thresholdY: number, dy: number):
+    Promise<{ success: boolean; moved: number; skipped: number; error?: string }> {
+    return this.send('shiftGraphicsBelow', { pageIndex, thresholdY, dy })
+  }
+
+  /**
    * Debug: inspect font encodings on a page.
    */
   async debugFonts(pageIndex: number): Promise<any> {

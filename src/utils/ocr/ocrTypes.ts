@@ -38,6 +38,16 @@ export interface OcrTextItem {
   text: string
 
   rect: OcrRect
+  /**
+   * Where the INK is on the scan — the box OCR read, never moved.
+   *
+   * `rect` is where the run is now, and the user may have dragged it. The two
+   * were one field, and a dragged run then patched out the paper it had moved
+   * ONTO while leaving its own photographed ink uncovered: the words appeared
+   * twice, once in the scan and once in the replacement. A patch has to cover
+   * where the ink was; only the text follows the box.
+   */
+  inkRect: OcrRect
   /** Word boxes inside the line, page space — kept for measurement and debugging. */
   words: OcrRect[]
 

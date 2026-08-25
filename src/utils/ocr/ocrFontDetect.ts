@@ -168,30 +168,64 @@ export function detectFace(
  * back as uniform and was set in Courier. Undecidable is reported as `null`,
  * which leaves the decision to the pixel cue, rather than as `false`, which
  * would be a claim the evidence does not support.
+ *
+ * Fitted as ONE GRID over the whole run, not as a string of pairwise advances.
+ * Pair by pair, every box's own error lands in two advances and nothing cancels:
+ * measured on a 220 DPI scan, real Courier scored 0.244 and Helvetica prose
+ * 0.284 — one threshold could not separate them, so monospaced text was never
+ * recognised and came back a third short of its true size. Against a
+ * least-squares grid the same two runs score **0.019 and 0.333**, because a
+ * constant pitch is exactly what the fit is looking for and box noise averages
+ * out instead of accumulating. Italic prose scores 0.445 and a page of OCR
+ * rubbish 0.4–0.8, so 0.08 sits a factor of four clear on both sides.
+ *
+ * Spaces take a cell of their own. A monospaced face sets the blank to the same
+ * width as a letter, so the grid only lines up when the gaps are counted — and
+ * counting them is what lets one fit span a whole line instead of restarting at
+ * every word.
  */
 const NARROW = /[iljtfr1.,;:'!|()[\]]/
 const WIDE = /[mwMW@%]/
+/** Residual of the grid fit, as a fraction of the pitch, that still reads as monospaced. */
+const MONO_GRID_RESIDUAL = 0.08
 
 export function advancesAreUniform(
   boxes: { x0: number; x1: number }[],
   text: string
 ): boolean | null {
-  if (boxes.length < 6) return null
+  if (boxes.length < 8) return null
   if (!NARROW.test(text) || !WIDE.test(text)) return null
-  const centres = boxes.map(b => (b.x0 + b.x1) / 2).sort((a, b) => a - b)
-  const advances: number[] = []
-  for (let i = 1; i < centres.length; i++) {
-    const d = centres[i] - centres[i - 1]
-    // A jump across a word gap is not an advance.
-    if (d > 0) advances.push(d)
+
+  // One cell per character of the run, blanks included. The boxes arrive in
+  // reading order and hold no blanks, so they pair off with the non-space
+  // cells; if they do not pair off — a ligature read as one symbol, a dropped
+  // glyph — the run cannot be laid on a grid and says nothing either way.
+  const cells: number[] = []
+  let cell = 0
+  for (const ch of text) {
+    if (ch !== ' ') cells.push(cell)
+    cell++
   }
-  if (advances.length < 5) return null
-  advances.sort((a, b) => a - b)
-  const median = advances[Math.floor(advances.length / 2)]
-  if (median <= 0) return null
-  const inner = advances.filter(a => a < median * 2.2)
-  if (inner.length < 5) return null
-  const mean = inner.reduce((s, a) => s + a, 0) / inner.length
-  const variance = inner.reduce((s, a) => s + (a - mean) ** 2, 0) / inner.length
-  return Math.sqrt(variance) / mean < 0.14
+  if (cells.length !== boxes.length) return null
+
+  // Sorted, so the pairing with the cells holds however the boxes were handed
+  // over: both run left to right and the nth box is the nth cell.
+  const centres = boxes.map(b => (b.x0 + b.x1) / 2).sort((a, b) => a - b)
+  const n = centres.length
+  const meanCell = cells.reduce((s, v) => s + v, 0) / n
+  const meanCentre = centres.reduce((s, v) => s + v, 0) / n
+  let num = 0
+  let den = 0
+  for (let i = 0; i < n; i++) {
+    num += (cells[i] - meanCell) * (centres[i] - meanCentre)
+    den += (cells[i] - meanCell) ** 2
+  }
+  if (den <= 0) return null
+  const pitch = num / den
+  if (!(pitch > 0.5)) return null
+
+  const intercept = meanCentre - pitch * meanCell
+  let ss = 0
+  for (let i = 0; i < n; i++) ss += (centres[i] - (intercept + pitch * cells[i])) ** 2
+  return Math.sqrt(ss / n) / pitch < MONO_GRID_RESIDUAL
 }

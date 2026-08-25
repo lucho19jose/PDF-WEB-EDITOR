@@ -74,18 +74,23 @@ function approxWidth(text: string, fontSize: number, family: string): number {
  * them, and a patch flush with the box leaves a grey outline of the old word.
  */
 function patchRect(item: OcrTextItem): RectT {
+  // The INK box, not the current one. They differ as soon as the run is dragged,
+  // and painting over where the text has GONE leaves the photographed words
+  // exactly where they were — so the page came back with them twice, once in
+  // the scan and once as the replacement.
+  const ink = item.inkRect ?? item.rect
   // The padding is around the RUN, not around the axes: a vertical run is tall
   // and narrow, so the generous pad has to go on x and the tight one on y or
   // the patch is a wide band across the page with the old ink still showing at
   // the ends of it.
-  const across = item.vertical ? item.rect.width : item.rect.height
+  const across = item.vertical ? ink.width : ink.height
   const padY = item.vertical ? Math.max(1, across * 0.15) : Math.max(1, across * 0.12)
   const padX = item.vertical ? Math.max(1, across * 0.12) : Math.max(1, across * 0.15)
   return [
-    item.rect.x - padX,
-    item.rect.y - padY,
-    item.rect.x + item.rect.width + padX,
-    item.rect.y + item.rect.height + padY
+    ink.x - padX,
+    ink.y - padY,
+    ink.x + ink.width + padX,
+    ink.y + ink.height + padY
   ]
 }
 
