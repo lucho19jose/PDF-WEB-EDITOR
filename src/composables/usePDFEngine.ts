@@ -96,8 +96,8 @@ export function usePDFEngine() {
   }
 
   /** Triage aid: BT blocks per content source, as the worker's matchers see them. */
-  async function debugBtBlocks(pageIndex: number): Promise<any[]> {
-    return bridge.debugBtBlocks(pageIndex)
+  async function debugBtBlocks(pageIndex: number, maxLen?: number): Promise<any[]> {
+    return bridge.debugBtBlocks(pageIndex, maxLen)
   }
 
   /**

@@ -153,7 +153,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
             blocks: blocks.map(b => ({
               start: b.start, end: b.end, xPos: b.xPos, yPos: b.yPos,
               hasPos: b.hasPos, hasTm: b.hasTm, fontRef: b.fontRef,
-              text: b.decodedText.slice(0, 60)
+              text: b.decodedText.slice(0, req.data.maxLen ?? 60)
             }))
           })
         }
@@ -2100,6 +2100,13 @@ function transformInSource(
         ? findTargetRun(block, targetBlock.text, pageIndex)
         : null
 
+      // When the block draws far more than the target and neither a
+      // line-leading run nor a governing Tm can be pinned down, every remaining
+      // strategy moves OTHER text: rewriting the first Tm dragged a table's
+      // header row when a cell 50pt below it was asked to move. Refuse the
+      // block — a loud "could not find matching text" beats a silent wrong drag.
+      if (holdsMoreThanTarget && !(run && run.startsLine) && !governing) continue
+
       let newContent: string
       if (run && run.startsLine) {
         // Td operands are multiplied by the TEXT matrix, so the delta has to be
@@ -2631,7 +2638,8 @@ function findTargetRun(
 ): { start: number; end: number; startsLine: boolean } | null {
   const targetNorm = targetText.replace(/\s+/g, ' ').trim()
   if (!targetNorm) return null
-  const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef))
+  const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
   if (ops.length === 0) return null
 
   let best: { i: number; j: number; score: number } | null = null
@@ -2682,7 +2690,8 @@ function findGoverningTm(
   const targetNorm = targetText.replace(/\s+/g, ' ').trim()
   if (!targetNorm) return null
 
-  const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef))
+  const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
   if (ops.length === 0) return null
 
   // Best contiguous run of show-ops whose text matches the target
@@ -3200,6 +3209,12 @@ function findBtBlocksByPosition(
     // unrelated runs (a label and its value); transforming the whole group
     // would drag the label along.
     const near = lineBlocks.filter(b => distOf(b) <= onTarget)
+    // A containment match ("the joined text has the target somewhere in it")
+    // with NO member on the clicked position is a wrong line: a Ghostscript
+    // mega-block whose join contains every cell of the table put "710.00" into
+    // a header-row group, and taking the whole group moved the header. Only an
+    // exact whole-line match may survive without a near member.
+    if (near.length === 0 && !exact) continue
     const picked = near.length > 0 ? near : lineBlocks
     candidates.push({
       blocks: picked,
@@ -3236,11 +3251,36 @@ function findBtBlocksByPosition(
   // It only runs when everything else has already come up empty, so no match
   // that worked before can change.
   if (candidates.length === 0) {
-    for (const block of allBlocks) {
-      if (targetFontRef && block.fontRef !== targetFontRef) continue
-      if (!(distOf(block) <= onTarget * 2)) continue
-      if (!findGoverningTm(block, targetBlock.text, pageIndex)) continue
-      candidates.push({ blocks: [block], score: 1, dist: distOf(block), order: candidates.length })
+    // The position asked of the BLOCK is its first Tm's — for a Ghostscript
+    // table drawn as one huge BT that is the top-left cell, hundreds of points
+    // from the row being dragged. When the governing Tm of the matching run can
+    // be read, measure THAT distance instead. The font filter also runs in two
+    // passes: such a block switches fonts mid-stream, so its first Tf routinely
+    // differs from the target run's font.
+    const govDist = (block: BtInfo): number => {
+      const gov = findGoverningTm(block, targetBlock.text, pageIndex)
+      if (!gov) return Infinity
+      const m = gov.text.match(/(-?[\d.]+)\s+(-?[\d.]+)\s+Tm$/)
+      if (!m || pageHeight === undefined) return distOf(block)
+      const ctm = getFullCtmAtOffset(stream, block.start)
+      const ux = parseFloat(m[1]) * ctm[0] + parseFloat(m[2]) * ctm[2] + ctm[4]
+      const uy = parseFloat(m[1]) * ctm[1] + parseFloat(m[2]) * ctm[3] + ctm[5]
+      const x = ux, y = pageHeight - uy
+      const [x0, y0, x1, y1] = targetBlock.bbox
+      const nx = Math.min(Math.max(x, Math.min(x0, x1)), Math.max(x0, x1))
+      const ny = Math.min(Math.max(y, Math.min(y0, y1)), Math.max(y0, y1))
+      return Math.hypot(x - nx, y - ny)
+    }
+    for (const fontFiltered of [true, false]) {
+      for (const block of allBlocks) {
+        if (fontFiltered && targetFontRef && block.fontRef !== targetFontRef) continue
+        if (!fontFiltered && targetFontRef && block.fontRef === targetFontRef) continue
+        const d = Math.min(distOf(block), govDist(block))
+        if (!(d <= onTarget * 2)) continue
+        if (!findGoverningTm(block, targetBlock.text, pageIndex)) continue
+        candidates.push({ blocks: [block], score: 1, dist: d, order: candidates.length })
+      }
+      if (candidates.length > 0 || !targetFontRef) break
     }
   }
 
@@ -4293,6 +4333,8 @@ interface ShowOpInfo {
   /** Text-space position where this op draws (tracked via Tm/Td/TD/T*) */
   x: number
   y: number
+  /** Font in force at this op, when it differs from the block's first (Tf tracked). */
+  fontRef: string | null
 }
 
 /**
@@ -4303,7 +4345,14 @@ interface ShowOpInfo {
 function scanShowOps(
   content: string,
   encoding: ReturnType<typeof getFontEncoding>,
-  simpleInfo?: SimpleFontInfo | null
+  simpleInfo?: SimpleFontInfo | null,
+  /**
+   * Follow mid-block Tf switches, decoding each op with the font in force AT
+   * that op. Ghostscript draws a whole table with one BT that switches fonts
+   * per cell run; decoding every op with the block's first font turned the
+   * other fonts' cells into garbage that matched nothing.
+   */
+  resolveFont?: (name: string) => { encoding: ReturnType<typeof getFontEncoding>; simpleInfo: SimpleFontInfo | null }
 ): ShowOpInfo[] {
   const re = new RegExp(
     // positioning operators (tracked, not collected)
@@ -4314,12 +4363,15 @@ function scanShowOps(
     // show-text operators (collected)
     `(\\[(?:${STR_LIT_SRC}|${HEX_LIT_SRC}|[^\\]])*\\]\\s*TJ)` + '|' +
     `((?:-?[\\d.]+\\s+-?[\\d.]+\\s+)?(?:${STR_LIT_SRC}|${HEX_LIT_SRC})\\s*")` + '|' +
-    `((?:${STR_LIT_SRC}|${HEX_LIT_SRC})\\s*(?:Tj|'))`,
+    `((?:${STR_LIT_SRC}|${HEX_LIT_SRC})\\s*(?:Tj|'))` + '|' +
+    // font switches (tracked, not collected)
+    `\\/([^\\s<>\\[\\]()/%]+)\\s+[\\d.-]+\\s+Tf`,
     'g'
   )
 
   const ops: ShowOpInfo[] = []
   let x = 0, y = 0, leading = 0
+  let curFont: string | null = null
   let m: RegExpExecArray | null
   while ((m = re.exec(content)) !== null) {
     if (m[1] !== undefined) { // Tm — take translation part
@@ -4333,6 +4385,15 @@ function scanShowOps(
     }
     if (m[10] !== undefined) { leading = parseFloat(m[10]); continue } // TL
     if (m[0] === 'T*') { y -= leading; continue }
+    if (m[14] !== undefined) { // Tf
+      curFont = m[14]
+      if (resolveFont) {
+        const next = resolveFont(m[14])
+        encoding = next.encoding
+        simpleInfo = next.simpleInfo
+      }
+      continue
+    }
 
     const raw = m[0]
     const kind: ShowOpInfo['kind'] =
@@ -4347,7 +4408,8 @@ function scanShowOps(
       decoded: decodeBtBlockText(raw, encoding, simpleInfo),
       kind,
       isHex: /<[0-9A-Fa-f\s]*[0-9A-Fa-f]/.test(raw),
-      x, y
+      x, y,
+      fontRef: curFont
     })
   }
   return ops
@@ -4548,11 +4610,25 @@ function applyPartialBlockReplacement(
   pageHeight?: number
 ): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   const simpleInfo = getSimpleFontInfo(pageIndex, block.fontRef)
-  const ops = scanShowOps(block.content, block.encoding, simpleInfo)
+  const ops = scanShowOps(block.content, block.encoding, simpleInfo,
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
   if (ops.length < 1) return null
 
   const targetNorm = targetBlock.text.replace(/\s+/g, ' ').trim()
   if (!targetNorm) return null
+
+  // The run being replaced may sit under a mid-block Tf — encode the new text
+  // for the font in force AT the run, not the block's first font.
+  const encodingFor = (op: ShowOpInfo) => {
+    if (!op.fontRef || op.fontRef === block.fontRef) {
+      return { fontRef: block.fontRef, encoding: block.encoding, simpleInfo }
+    }
+    return {
+      fontRef: op.fontRef,
+      encoding: getFontEncoding(pageIndex, op.fontRef),
+      simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef)
+    }
+  }
 
   // Map the clicked block's page position into this BT block's local text
   // space so repeated identical strings ("16:00" in every table row) resolve
@@ -4602,14 +4678,6 @@ function applyPartialBlockReplacement(
   // array (Ghostscript merges a whole table row into one array, jumping
   // between cells with kern numbers). Replace just those glyphs.
   if (!best) {
-    const plan = planTextEncoding(pageIndex, block, [newText], targetBlock)
-    if (plan.kind === 'error') return { error: plan.error }
-    if (plan.kind === 'subst') return null // can't switch fonts inside an array
-
-    const newLit = plan.kind === 'keep-hex'
-      ? { literal: `<${plan.hexLines[0]}>`, codes: hexToCodes(plan.hexLines[0], block.encoding ? (block.encoding.codeBytes === 1 ? 1 : 2) : 1) }
-      : { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [...plan.byteLines[0]].map(c => c.charCodeAt(0)) }
-
     const tfMatch = block.content.match(/\/(?:[^\s<>[\]()/%]+)\s+([\d.]+)\s+Tf/)
     const tfSize = tfMatch ? parseFloat(tfMatch[1]) : 12
 
@@ -4624,7 +4692,19 @@ function applyPartialBlockReplacement(
       })
 
     for (const op of candidates) {
-      const newRaw = replaceInsideTjArray(op, targetNorm, newLit, block.encoding, simpleInfo, targetLocal?.x ?? null, tfSize)
+      // Encode for the font in force AT this array, not the block's first.
+      const fr = encodingFor(op)
+      const plan = planTextEncoding(pageIndex,
+        { mode: op.isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding },
+        [newText], targetBlock)
+      if (plan.kind === 'error') return { error: plan.error }
+      if (plan.kind === 'subst') continue // can't switch fonts inside an array
+
+      const newLit = plan.kind === 'keep-hex'
+        ? { literal: `<${plan.hexLines[0]}>`, codes: hexToCodes(plan.hexLines[0], fr.encoding ? (fr.encoding.codeBytes === 1 ? 1 : 2) : 1) }
+        : { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [...plan.byteLines[0]].map(c => c.charCodeAt(0)) }
+
+      const newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, tfSize)
       if (newRaw) {
         const content = block.content.slice(0, op.start) + newRaw + block.content.slice(op.end)
         return {
@@ -4635,7 +4715,10 @@ function applyPartialBlockReplacement(
     return null
   }
 
-  const plan = planTextEncoding(pageIndex, block, [newText], targetBlock)
+  const bestFr = encodingFor(ops[best.i])
+  const plan = planTextEncoding(pageIndex,
+    { mode: ops[best.i].isHex ? 'hex' : 'plain', fontRef: bestFr.fontRef, encoding: bestFr.encoding },
+    [newText], targetBlock)
   if (plan.kind === 'error') return { error: plan.error }
 
   let content = block.content

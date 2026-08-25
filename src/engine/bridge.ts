@@ -107,8 +107,8 @@ export class MuPDFBridge {
   }
 
   /** Triage aid: BT blocks per content source, as the matchers see them. */
-  async debugBtBlocks(pageIndex: number): Promise<any[]> {
-    return this.send('debugBtBlocks', { pageIndex })
+  async debugBtBlocks(pageIndex: number, maxLen?: number): Promise<any[]> {
+    return this.send('debugBtBlocks', { pageIndex, maxLen })
   }
 
   /**
