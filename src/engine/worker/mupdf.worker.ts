@@ -3047,6 +3047,23 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
       const nameMatch = content.slice(fontMatch.index).match(/^\/([^\s<>[\]()/%]+)/)
       fontRef = nameMatch ? nameMatch[1] : null
     }
+
+    // EVERY font the block uses, not just the first. One BT can switch fonts
+    // per run (Ghostscript tables, or this engine's own substitutions), and a
+    // font filter that only knows the first Tf rejects the very block that
+    // draws the target — which is how a block became uneditable a second time
+    // after an edit substituted Helvetica into it.
+    const fonts: string[] = []
+    {
+      const tfAll = /\/[ ]*\s+[\d.-]+\s+Tf/g
+      let fm: RegExpExecArray | null
+      while ((fm = tfAll.exec(maskedContent)) !== null) {
+        const nm = content.slice(fm.index).match(/^\/([^\s<>[\]()/%]+)/)
+        if (nm && !fonts.includes(nm[1])) fonts.push(nm[1])
+      }
+      const inherited = fontAt(start)
+      if (inherited && !fonts.includes(inherited)) fonts.push(inherited)
+    }
     // No Tf inside: inherit whatever was in force when the block opened.
     if (!fontRef) fontRef = fontAt(start)
     if (!fontRef) continue
@@ -3068,6 +3085,7 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
       start,
       end,
       fontRef,
+      fonts,
       yPos: origin.y,
       xPos: origin.x,
       hasPos: origin.hasPos,
@@ -3117,7 +3135,7 @@ function findMatchingBtBlocks(
 
   // Fallback: single-block matching
   for (const block of allBlocks) {
-    if (targetFontRef && block.fontRef !== targetFontRef) continue
+    if (targetFontRef && !blockUsesFont(block, targetFontRef)) continue
     const normalizedDecoded = block.decodedText.replace(/\s+/g, ' ').trim()
     if (!normalizedDecoded || normalizedDecoded.length < 2) continue
 
@@ -3235,7 +3253,7 @@ function findBtBlocksByPosition(
 
   // Single blocks
   for (const block of allBlocks) {
-    if (targetFontRef && block.fontRef !== targetFontRef) continue
+    if (targetFontRef && !blockUsesFont(block, targetFontRef)) continue
     const nd = block.decodedText.replace(/\s+/g, ' ').trim()
     if (!nd || nd.length < 2) continue
     const exact = nd === normalizedTarget
@@ -3282,8 +3300,8 @@ function findBtBlocksByPosition(
     }
     for (const fontFiltered of [true, false]) {
       for (const block of allBlocks) {
-        if (fontFiltered && targetFontRef && block.fontRef !== targetFontRef) continue
-        if (!fontFiltered && targetFontRef && block.fontRef === targetFontRef) continue
+        if (fontFiltered && targetFontRef && !blockUsesFont(block, targetFontRef)) continue
+        if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) continue
         const d = Math.min(distOf(block), govDist(block))
         if (!(d <= onTarget * 2)) continue
         if (!findGoverningTm(block, targetBlock.text, pageIndex)) continue
@@ -3310,6 +3328,8 @@ interface BtInfo {
   start: number
   end: number
   fontRef: string
+  /** Every font the block switches to (first Tf, later Tfs, inherited). */
+  fonts: string[]
   yPos: number
   xPos: number
   /** The block carries at least one text-positioning operator (Tm/Td/TD/T*). */
@@ -3320,6 +3340,11 @@ interface BtInfo {
   mode: 'hex' | 'plain'
   encoding: ReturnType<typeof getFontEncoding>
   hasSubstantialText: boolean
+}
+
+/** Does the block draw anything in this font? (a BT can switch fonts per run) */
+function blockUsesFont(b: BtInfo, ref: string): boolean {
+  return b.fontRef === ref || b.fonts.includes(ref)
 }
 
 /**
@@ -3427,7 +3452,7 @@ function replaceTextInContentStreamFontAware(
 
   // Step 3: single-block matching (for PDFs where each text block is one BT)
   for (const block of allBlocks) {
-    if (targetFontRef && block.fontRef !== targetFontRef) continue
+    if (targetFontRef && !blockUsesFont(block, targetFontRef)) continue
     const normalizedDecoded = block.decodedText.replace(/\s+/g, ' ').trim()
     if (!normalizedDecoded || normalizedDecoded.length < 2) continue
 
@@ -3480,8 +3505,8 @@ function replaceTextInContentStreamFontAware(
   if (targetCompact.length >= 2) {
     for (const fontFiltered of [true, false]) {
       const containing = allBlocks.filter(block => {
-        if (fontFiltered && targetFontRef && block.fontRef !== targetFontRef) return false
-        if (!fontFiltered && targetFontRef && block.fontRef === targetFontRef) return false
+        if (fontFiltered && targetFontRef && !blockUsesFont(block, targetFontRef)) return false
+        if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) return false
         const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '')
         return decodedCompact.length > targetCompact.length && decodedCompact.includes(targetCompact)
       })
@@ -4716,8 +4741,13 @@ function applyPartialBlockReplacement(
       const newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, tfSize)
       if (newRaw) {
         const content = block.content.slice(0, op.start) + newRaw + block.content.slice(op.end)
+        // On a tagged page the span still claims the OLD words — override it
+        // with the block's text as it now reads (only this array changed).
+        const spanText = ops.map(o => o === op ? o.decoded.replace(targetNorm, newText) : o.decoded).join('')
+        const tag = retagSpanActualText(stream, block.start, spanText.trim())
         return {
-          stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end)
+          stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end),
+          retags: tag ? [tag] : []
         }
       }
     }
@@ -4757,9 +4787,19 @@ function applyPartialBlockReplacement(
     content = content.slice(0, op.start) + repl + content.slice(op.end)
   }
 
+  // A partial rewrite on a TAGGED page leaves the span claiming the old words
+  // for the WHOLE block — extraction (including this engine's own next read)
+  // then reports the old text and a second edit has nothing to match. Override
+  // with the block's text as it now reads: the replaced run's new text plus
+  // every untouched op's own.
+  const spanText = ops.map((o, k) =>
+    k === best!.i ? newText : (k > best!.i && k <= best!.j ? '' : o.decoded)).join('')
+  const tag = retagSpanActualText(stream, block.start, spanText.trim())
+
   return {
     stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end),
-    substitutedFont
+    substitutedFont,
+    retags: tag ? [tag] : []
   }
 }
 
