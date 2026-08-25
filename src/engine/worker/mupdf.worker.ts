@@ -3237,8 +3237,12 @@ function findBtBlocksByPosition(
     const foldedLine = foldForMatch(line)
     return fuzzyTextMatch(line, normalizedTarget) ||
       (foldedLine.length > 5 && foldedTarget.length > 5 &&
-       (foldedLine.includes(foldedTarget) || foldedTarget.includes(foldedLine)))
+       (wildcardIncludes(foldedLine, foldedTarget) || foldedTarget.includes(foldedLine)))
   }
+  // NOT space-stripped on the containment leg, deliberately: compacting let a
+  // line of a WRAPPED pdfTeX paragraph match, and the td-bracket then landed
+  // mid-line and sheared the paragraph — the previous line's glyphs interleaved
+  // with the moved run. A loud "could not find" is the correct outcome there.
 
   for (const [, lineBlocks] of lineGroups) {
     const alongStream = joinOf(lineBlocks)
@@ -3264,7 +3268,7 @@ function findBtBlocksByPosition(
     else if (exact) picked = lineBlocks
     else {
       const compact = (s: string) => foldForMatch(s).replace(/\s+/g, '')
-      const carrying = lineBlocks.filter(b => compact(b.decodedText).includes(compact(normalizedTarget)))
+      const carrying = lineBlocks.filter(b => wildcardIncludes(compact(b.decodedText), compact(normalizedTarget)))
       if (carrying.length === 0) continue
       picked = carrying
     }
@@ -3370,6 +3374,34 @@ interface BtInfo {
 /** Does the block draw anything in this font? (a BT can switch fonts per run) */
 function blockUsesFont(b: BtInfo, ref: string): boolean {
   return b.fontRef === ref || b.fonts.includes(ref)
+}
+
+/**
+ * Containment where a '?' in `hay` (an unmapped glyph — typically a ligature)
+ * stands for ONE OR TWO characters of `needle`. A pdfTeX block decodes
+ * "comprehension ?rst" while extraction reports "comprehension first"; a plain
+ * .includes() then never matches and the paragraph cannot be edited at all.
+ */
+function wildcardIncludes(hay: string, needle: string): boolean {
+  if (!needle) return true
+  if (hay.includes(needle)) return true
+  if (!hay.includes('?')) return false
+  const n = needle.length
+  for (let s = 0; s < hay.length; s++) {
+    if (hay[s] !== '?' && hay[s] !== needle[0]) continue
+    let frontier: number[] = [0]
+    for (let i = s; i < hay.length && frontier.length; i++) {
+      const next: number[] = []
+      const c = hay[i]
+      for (const j of frontier) {
+        if (c === '?') { next.push(j + 1, j + 2) }
+        else if (c === needle[j]) next.push(j + 1)
+      }
+      if (next.some(j => j >= n)) return true
+      frontier = [...new Set(next.filter(j => j < n))]
+    }
+  }
+  return false
 }
 
 /**
@@ -3511,7 +3543,7 @@ function replaceTextInContentStreamFontAware(
         if (fontFiltered && targetFontRef && !blockUsesFont(block, targetFontRef)) continue
         if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) continue
         const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '')
-        if (!(decodedCompact.length > targetCompact.length && decodedCompact.includes(targetCompact))) continue
+        if (!(decodedCompact.length > targetCompact.length && wildcardIncludes(decodedCompact, targetCompact))) continue
         // Below every direct fuzzy score (>= 0.7): at equal distance a whole
         // match still beats a fragment of a bigger block.
         candidates.push({
