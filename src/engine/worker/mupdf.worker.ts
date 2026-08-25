@@ -3438,7 +3438,7 @@ function findBtBlocksByPosition(
     else if (near.length > 0) picked = near
     else if (exact) picked = lineBlocks
     else {
-      const compact = (s: string) => foldForMatch(s).replace(/\s+/g, '')
+      const compact = (s: string) => foldForMatch(s).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
       const carrying = lineBlocks.filter(b => wildcardIncludes(compact(b.decodedText), compact(normalizedTarget)))
       if (carrying.length === 0) continue
       picked = carrying
@@ -3587,6 +3587,17 @@ function undouble(s: string): string | null {
   }
   return pairs >= 2 ? out : null
 }
+
+/**
+ * Standalone accent marks, stripped from BOTH sides of a containment compare.
+ *
+ * TeX composes "ó" by drawing the accent glyph and the letter as separate
+ * show-ops, and this decoder and MuPDF's extraction disagree on which side of
+ * the letter the mark lands ("segmentaci´on" vs "segmentacio´n") — one
+ * transposed character defeated containment on a paragraph that plainly held
+ * the target. The letters themselves carry the identification.
+ */
+const ACCENT_MARKS = /[´`¨ˆ˜¯˘˚¸ˇ^~̀-ͯ]/g
 
 /**
  * Containment where a '?' in `hay` (an unmapped glyph — typically a ligature)
@@ -3767,13 +3778,13 @@ function replaceTextInContentStreamFontAware(
   // last resort: a containment match sitting ON the click must outrank an
   // exact-text single block 300pt away (nine occurrences of "10.00" on one
   // timesheet — the far one used to win just by being tried first).
-  const targetCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '')
+  const targetCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
   if (targetCompact.length >= 2) {
     for (const fontFiltered of [true, false]) {
       for (const block of allBlocks) {
         if (fontFiltered && targetFontRef && !blockUsesFont(block, targetFontRef)) continue
         if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) continue
-        const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '')
+        const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
         if (!(decodedCompact.length > targetCompact.length && wildcardIncludes(decodedCompact, targetCompact))) continue
         // Below every direct fuzzy score (>= 0.7): at equal distance a whole
         // match still beats a fragment of a bigger block.
