@@ -658,6 +658,15 @@ interface ContentSource {
   write(bytes: Uint8Array): void
   /** The Form XObject dict, when this source is one — its /BBox bounds the text. */
   formDict?: any
+  /**
+   * CTM that maps this source's coordinates into PAGE space: the form's own
+   * /Matrix composed with the graphics state at its `Do` (and recursively with
+   * the parent form's, when nested). Without it, a page-space drag applied to
+   * text inside `0.24 0 0 -0.24 0 850 cm /X6 Do` moved 0.24x the ask and
+   * upside down. Identity (absent) for the page's own stream. When a form is
+   * invoked more than once the FIRST invocation's CTM is used.
+   */
+  invokeCtm?: Mat6
 }
 
 const MAX_XOBJECT_DEPTH = 4
@@ -699,15 +708,18 @@ function getContentSources(pageIndex: number): ContentSource[] {
     const pageRes = page.getObject().get('Resources')
     const seen = new Set<string>()
 
-    const walk = (stream: string, resources: any, path: string, depth: number) => {
+    const walk = (stream: string, resources: any, path: string, depth: number, parentCtm: Mat6) => {
       if (depth > MAX_XOBJECT_DEPTH) return
       const xobjects = resources?.get?.('XObject')
       if (!xobjects || String(xobjects) === 'null') return
 
-      // Only the forms this stream actually invokes.
-      const invoked = [...new Set(
-        [...stream.matchAll(/\/([A-Za-z0-9_.+-]+)\s+Do(?![A-Za-z0-9])/g)].map(m => m[1])
-      )]
+      // Only the forms this stream actually invokes. The first invocation's
+      // offset is kept so the CTM in force at that `Do` can be replayed.
+      const invokedAt = new Map<string, number>()
+      for (const m of stream.matchAll(/\/([A-Za-z0-9_.+-]+)\s+Do(?![A-Za-z0-9])/g)) {
+        if (!invokedAt.has(m[1])) invokedAt.set(m[1], m.index!)
+      }
+      const invoked = [...invokedAt.keys()]
 
       for (const name of invoked) {
         let ref: any
@@ -742,6 +754,18 @@ function getContentSources(pageIndex: number): ContentSource[] {
 
         if (sources.length > MAX_XOBJECT_SOURCES) return
 
+        // Page space = form's /Matrix, then the CTM at its `Do`, then whatever
+        // maps the PARENT stream to the page.
+        let invokeCtm: Mat6 = matConcat(getCtmAtOffset(stream, invokedAt.get(name)!), parentCtm)
+        try {
+          const mtx = resolved.get('Matrix')
+          if (mtx && String(mtx) !== 'null') {
+            const arr = mtx.resolve ? mtx.resolve() : mtx
+            const v = [0, 1, 2, 3, 4, 5].map(i => Number(String(arr.get(i))))
+            if (v.every(n => Number.isFinite(n))) invokeCtm = matConcat(v as Mat6, invokeCtm)
+          }
+        } catch (_) { /* no /Matrix — identity */ }
+
         const key = path + '/' + name
         if (/(?<![A-Za-z0-9])BT(?![A-Za-z0-9])/.test(text)) {
           const target = ref
@@ -750,14 +774,15 @@ function getContentSources(pageIndex: number): ContentSource[] {
             stream: text,
             resources: childRes ?? pageRes,
             write: (bytes) => { target.writeStream(bytes) },
-            formDict: resolved
+            formDict: resolved,
+            invokeCtm
           })
         }
-        walk(text, childRes ?? pageRes, key, depth + 1)
+        walk(text, childRes ?? pageRes, key, depth + 1, invokeCtm)
       }
     }
 
-    walk(pageStream, pageRes, '', 1)
+    walk(pageStream, pageRes, '', 1, [1, 0, 0, 1, 0, 0])
   } catch (_) { /* fall back to the page stream alone */ }
   finally { try { page?.destroy() } catch (_) { /* already gone */ } }
 
@@ -770,10 +795,11 @@ function getContentSources(pageIndex: number): ContentSource[] {
   return sources
 }
 
-/** Run `fn` with font lookups scoped to a content source. */
+/** Run `fn` with font lookups and CTM composition scoped to a content source. */
 function withSource<T>(src: ContentSource, fn: () => T): T {
   activeResources = src.resources ? { key: src.key, dict: src.resources } : null
-  try { return fn() } finally { activeResources = null }
+  activeInvokeCtm = src.invokeCtm ?? null
+  try { return fn() } finally { activeResources = null; activeInvokeCtm = null }
 }
 
 function writeContentStream(pageIndex: number, bytes: Uint8Array): void {
@@ -918,6 +944,20 @@ function parseToUnicodeCMap(cmapText: string): {
  * always cleared in a finally block.
  */
 let activeResources: { key: string; dict: any } | null = null
+
+/**
+ * The active source's invocation CTM (see ContentSource.invokeCtm), consulted
+ * by getFullCtmAtOffset so every page-space<->local conversion inside a Form
+ * XObject includes the matrix the form is DRAWN under, not just the cm
+ * operators inside its own stream.
+ */
+let activeInvokeCtm: Mat6 | null = null
+
+/** CTM at `offset` composed with the active source's invocation CTM. */
+function getFullCtmAtOffset(stream: string, offset: number): Mat6 {
+  const local = getCtmAtOffset(stream, offset)
+  return activeInvokeCtm ? matConcat(local, activeInvokeCtm) : local
+}
 
 /** Resources for the source currently being edited. */
 function resolveResources(pageObj: any): any {
@@ -1982,7 +2022,7 @@ function transformInSource(
       // "0.24 0 0 0.24 cm"). Convert through the inverse CTM so a 100pt page
       // drag moves the block exactly 100pt on screen.
       let dxL = dx, dyL = dy, anchorXL = anchorX, anchorYL = anchorY
-      const ctm = getCtmAtOffset(stream, block.start)
+      const ctm = getFullCtmAtOffset(stream, block.start)
       const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
       if (Math.abs(det) > 1e-9) {
         const ia = ctm[3] / det, ib = -ctm[1] / det
@@ -2230,7 +2270,7 @@ function dropBaselineInBlock(inner: string, stream: string, blockStart: number, 
   const dy = -dropPagePts
   let dxL = 0
   let dyL = dy
-  const ctm = getCtmAtOffset(stream, blockStart)
+  const ctm = getFullCtmAtOffset(stream, blockStart)
   const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
   if (Math.abs(det) > 1e-9) {
     const ib = -ctm[1] / det
@@ -2657,7 +2697,7 @@ function btBlockDistanceToTarget(
 ): number {
   if (pageHeight === undefined || !block.hasPos) return Infinity
 
-  const ctm = getCtmAtOffset(stream, block.start)
+  const ctm = getFullCtmAtOffset(stream, block.start)
   const ux = block.xPos * ctm[0] + block.yPos * ctm[2] + ctm[4]
   const uy = block.xPos * ctm[1] + block.yPos * ctm[3] + ctm[5]
   const x = ux
@@ -2769,7 +2809,7 @@ function widenClipForText(
   extraHeightPage: number,
   pageHeight: number
 ): string | null {
-  const ctm = getCtmAtOffset(stream, clip.index)
+  const ctm = getFullCtmAtOffset(stream, clip.index)
   const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
   if (Math.abs(det) < 1e-9) return null
   const ia = ctm[3] / det, ib = -ctm[1] / det
@@ -2819,7 +2859,7 @@ function expandClipForTransform(
 ): string | null {
   // The rect lives in the CTM at the `re` operator, which is NOT the one the
   // text sits in (the text has an extra `cm` inside the clip's q).
-  const ctm = getCtmAtOffset(stream, clip.index)
+  const ctm = getFullCtmAtOffset(stream, clip.index)
   const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
   if (Math.abs(det) < 1e-9) return null
 
@@ -4446,7 +4486,7 @@ function applyPartialBlockReplacement(
   // to the occurrence the user actually clicked.
   let targetLocal: { x: number; y: number } | null = null
   if (pageHeight !== undefined) {
-    const ctm = getCtmAtOffset(stream, block.start)
+    const ctm = getFullCtmAtOffset(stream, block.start)
     const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
     if (Math.abs(det) > 1e-9) {
       const pageX = targetBlock.bbox[0]
