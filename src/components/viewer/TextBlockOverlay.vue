@@ -471,8 +471,8 @@ async function loadBlocks(announce = false) {
     // still go wrong is EXTRACTION — MuPDF occasionally shreds a rotated glyph
     // run into per-character blocks (thousands of useless hitboxes) — so the
     // gate is now empirical: only a page whose extraction actually came back
-    // shredded keeps text editing off. Add-text stays disabled on any rotated
-    // page (its coordinate path writes raw Tm values).
+    // shredded keeps text editing off. (Add-text also converts through the
+    // rotation now, so nothing else needs the blanket gate.)
     const size = await pdfEngine.getPageSize(pageIndex).catch(() => null)
     pageRotated.value = !!size && size.rotation % 360 !== 0
 
@@ -2132,10 +2132,8 @@ function getAnchorPoint(handle: HandlePosition, pdfBbox: Rect): { x: number; y: 
 // ── Add text ──
 
 function onAddTextClick(event: MouseEvent) {
-  if (pageRotated.value) {
-    editorStore.setStatus('Text editing is disabled on rotated pages — rotate back to 0° first')
-    return
-  }
+  // Rotated pages are fine: addTextToPage converts the visible-space click
+  // through the page rotation's inverse and rotates the glyphs to match.
   const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
   const screenX = event.clientX - rect.left
   const screenY = event.clientY - rect.top

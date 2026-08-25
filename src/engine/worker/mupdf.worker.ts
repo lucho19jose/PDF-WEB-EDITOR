@@ -737,15 +737,8 @@ function getContentSources(pageIndex: number): ContentSource[] {
   // Composing the rotation into every source's invocation CTM makes deltas,
   // distance ranking and clip growth all operate in visible space — on a
   // 90-rotated page a "move right" used to land as "move up" while reporting
-  // success. (getBounds()/getPageSize are already rotated, so width here is
-  // the VISIBLE width.)
-  let baseCtm: Mat6 | undefined
-  try {
-    const size = getPageSize(pageIndex)
-    if (size.rotation === 90) baseCtm = [0, -1, 1, 0, 0, size.height]
-    else if (size.rotation === 270) baseCtm = [0, 1, -1, 0, size.width, 0]
-    else if (size.rotation === 180) baseCtm = [-1, 0, 0, -1, size.width, size.height]
-  } catch (_) { /* unrotated */ }
+  // success.
+  const baseCtm = pageRotationCtm(pageIndex) ?? undefined
 
   sources.push({
     key: 'page',
@@ -1017,6 +1010,29 @@ let activeInvokeCtm: Mat6 | null = null
 function getFullCtmAtOffset(stream: string, offset: number): Mat6 {
   const local = getCtmAtOffset(stream, offset)
   return activeInvokeCtm ? matConcat(local, activeInvokeCtm) : local
+}
+
+/**
+ * The matrix that maps RAW page user space onto the rotated (visible) space,
+ * or null for an unrotated page. getBounds()/getPageSize are already rotated,
+ * so width/height here are the VISIBLE ones.
+ */
+function pageRotationCtm(pageIndex: number): Mat6 | null {
+  try {
+    const size = getPageSize(pageIndex)
+    if (size.rotation === 90) return [0, -1, 1, 0, 0, size.height]
+    if (size.rotation === 270) return [0, 1, -1, 0, size.width, 0]
+    if (size.rotation === 180) return [-1, 0, 0, -1, size.width, size.height]
+  } catch (_) { /* unrotated */ }
+  return null
+}
+
+/** Inverse of an affine Mat6, or null when singular. */
+function matInvert(m: Mat6): Mat6 | null {
+  const det = m[0] * m[3] - m[1] * m[2]
+  if (Math.abs(det) < 1e-12) return null
+  const ia = m[3] / det, ib = -m[1] / det, ic = -m[2] / det, id = m[0] / det
+  return [ia, ib, ic, id, -(m[4] * ia + m[5] * ic), -(m[4] * ib + m[5] * id)]
 }
 
 /** Resources for the source currently being edited. */
@@ -1694,8 +1710,27 @@ function addTextToPage(
     const upright = Math.abs(rotation) < 0.01
     const ca = upright ? 1 : Math.cos(rad)
     const sa = upright ? 0 : Math.sin(rad)
+    // x/y arrive in the VISIBLE (rotated) space the user clicked in; on a
+    // /Rotate page the stream draws in the raw one, so the whole text matrix
+    // goes through the rotation's inverse — glyphs come out upright on screen
+    // and the origin lands where the click was.
+    let tm: Mat6 = [ca, sa, -sa, ca, x, y]
+    const pageRot = pageRotationCtm(pageIndex)
+    if (pageRot) {
+      const inv = matInvert(pageRot)
+      if (inv) tm = matConcat(tm, inv)
+    }
+    // The block is APPENDED, so it draws under whatever CTM the stream leaves
+    // in force at its end. Some generators bake an unbracketed rotation right
+    // at the top (`0 1 -1 0 842 0 cm` compensating /Rotate 90) — inherited by
+    // the new block, it rotated the added text a second time. Undo it.
+    const endCtm = getCtmAtOffset(existingStream, existingStream.length)
+    if (endCtm.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
+      const endInv = matInvert(endCtm)
+      if (endInv) tm = matConcat(tm, endInv)
+    }
     const fmt = (n: number) => (Math.abs(n) < 1e-6 ? '0' : n.toFixed(4))
-    const newBlock = `\nBT\n${r} ${g} ${b} rg\n/${fontRefName} ${fontSize} Tf\n${fmt(ca)} ${fmt(sa)} ${fmt(-sa)} ${fmt(ca)} ${x.toFixed(2)} ${y.toFixed(2)} Tm\n(${escaped}) Tj\nET\n`
+    const newBlock = `\nBT\n${r} ${g} ${b} rg\n/${fontRefName} ${fontSize} Tf\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n(${escaped}) Tj\nET\n`
 
     // 4. Append to content stream
     const combined = existingStream + newBlock
