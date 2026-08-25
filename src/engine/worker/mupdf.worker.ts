@@ -2783,15 +2783,31 @@ function getActiveClipsAtOffset(
   const depths: number[] = []
   const current: Clip[] = []
 
-  const re = /((-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re)\s+W\*?\s+n\b|(?:^|[\s\]>])([qQ])(?=[\s(<\[/%]|$)/g
+  const re = /((-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re)\s+W\*?\s+n\b|((-?[\d.]+)\s+(-?[\d.]+)\s+m\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l\s+h?)\s*W\*?\s+n\b|(?:^|[\s\]>])([qQ])(?=[\s(<\[/%]|$)/g
   let m: RegExpExecArray | null
   while ((m = re.exec(masked)) !== null) {
-    if (m[6] === 'q') { depths.push(current.length); continue }
-    if (m[6] === 'Q') { current.length = depths.length > 0 ? depths.pop()! : 0; continue }
+    if (m[15] === 'q') { depths.push(current.length); continue }
+    if (m[15] === 'Q') { current.length = depths.length > 0 ? depths.pop()! : 0; continue }
     // Clips INTERSECT, they do not replace one another. Word nests the SAME
     // rectangle twice around a table cell, so widening only the innermost left
     // the outer one still cutting the text off.
-    current.push({ index: m.index, length: m[1].length, rect: [+m[2], +m[3], +m[4], +m[5]] })
+    if (m[1] !== undefined) {
+      current.push({ index: m.index, length: m[1].length, rect: [+m[2], +m[3], +m[4], +m[5]] })
+      continue
+    }
+    // A rectangle drawn as a PATH — `x0 y0 m x1 y1 l x2 y2 l x3 y3 l h W* n`
+    // (ilovepdf clips every table cell this way). Accepted only when the four
+    // points really form an axis-aligned rectangle; the rewrite emits the same
+    // area as a `re`, which the expansion code already knows how to grow.
+    const px = [+m[7], +m[9], +m[11], +m[13]]
+    const py = [+m[8], +m[10], +m[12], +m[14]]
+    const eq = (a: number, b: number) => Math.abs(a - b) < 0.01
+    const hvhv = eq(py[0], py[1]) && eq(px[1], px[2]) && eq(py[2], py[3]) && eq(px[3], px[0])
+    const vhvh = eq(px[0], px[1]) && eq(py[1], py[2]) && eq(px[2], px[3]) && eq(py[3], py[0])
+    if (!hvhv && !vhvh) continue
+    const x0 = Math.min(...px), x1 = Math.max(...px)
+    const y0 = Math.min(...py), y1 = Math.max(...py)
+    current.push({ index: m.index, length: m[6].length, rect: [x0, y0, x1 - x0, y1 - y0] })
   }
   return current
 }
