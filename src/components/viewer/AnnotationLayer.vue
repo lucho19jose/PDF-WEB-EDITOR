@@ -9,7 +9,7 @@
         v-for="img in scaledContentImgs"
         :key="'ci' + img.id"
         class="cimg-hit"
-        :class="{ selected: selectedImgId === img.id }"
+        :class="{ selected: selectedImgId === img.id || multiImgs.has(img.id) }"
         :style="img.style"
         title="Image in the page — drag to move, handles to resize"
         @mousedown.stop="onImgMouseDown($event, img.id)"
@@ -18,7 +18,7 @@
         v-for="a in scaledAnnots"
         :key="a.index"
         class="annot-hit"
-        :class="{ selected: selectedIndex === a.index }"
+        :class="{ selected: selectedIndex === a.index || multiAnnots.has(a.index) }"
         :style="a.style"
         :title="a.title"
         @mousedown.stop="onAnnotMouseDown($event, a.index)"
@@ -174,6 +174,64 @@ const contentImages = ref<ContentImageInfo[]>([])
 const selectedImgId = ref<number | null>(null)
 const selectedImg = computed(() => contentImages.value.find(i => i.id === selectedImgId.value) || null)
 
+/**
+ * MULTI-selection across content images and annotations: Shift/Ctrl+click
+ * toggles a member, the rubber band (forwarded from the text overlay, which
+ * owns the empty-paper surface) sweeps them in, and dragging any member moves
+ * the whole group as one undo point. The single "primary" selection keeps the
+ * resize handles and the per-image buttons; a group is move-only.
+ */
+const multiImgs = ref<Set<number>>(new Set())
+const multiAnnots = ref<Set<number>>(new Set())
+const multiCount = computed(() => multiImgs.value.size + multiAnnots.value.size)
+
+function clearMultiSelection() {
+  if (multiImgs.value.size) multiImgs.value = new Set()
+  if (multiAnnots.value.size) multiAnnots.value = new Set()
+}
+
+/** A Shift+click on a second element turns the primary into a group member. */
+function foldPrimaryIntoMulti() {
+  if (selectedImgId.value !== null) {
+    const s = new Set(multiImgs.value); s.add(selectedImgId.value)
+    multiImgs.value = s; selectedImgId.value = null
+  }
+  if (selectedIndex.value !== null) {
+    const s = new Set(multiAnnots.value); s.add(selectedIndex.value)
+    multiAnnots.value = s; selectedIndex.value = null
+  }
+}
+
+/**
+ * Sweep everything the band TOUCHES into the selection (same rule as the text
+ * overlay: full containment silently drops the element whose edge the band
+ * stopped a point short of). `rect` arrives in page space, y-down.
+ */
+function selectInBand(rect: number[], additive: boolean) {
+  if (editorStore.currentTool !== 'select') return
+  if (additive) foldPrimaryIntoMulti()
+  else { selectedIndex.value = null; selectedImgId.value = null }
+  const touches = (r: RectT) =>
+    r[0] < rect[2] && rect[0] < r[2] && r[1] < rect[3] && rect[1] < r[3]
+  const imgs = new Set<number>(additive ? multiImgs.value : [])
+  const anns = new Set<number>(additive ? multiAnnots.value : [])
+  for (const img of contentImages.value) if (touches(img.rect)) imgs.add(img.id)
+  for (const a of annotations.value) if (touches(a.rect)) anns.add(a.index)
+
+  // One element alone is a PRIMARY selection — it keeps its handles.
+  if (imgs.size + anns.size === 1) {
+    clearMultiSelection()
+    if (imgs.size) selectedImgId.value = [...imgs][0]
+    else selectedIndex.value = [...anns][0]
+    return
+  }
+  multiImgs.value = imgs
+  multiAnnots.value = anns
+  if (imgs.size + anns.size > 0) {
+    editorStore.setStatus(`${imgs.size + anns.size} element(s) selected — drag any of them to move the group`)
+  }
+}
+
 interface DragState {
   tool: Tool
   startSx: number; startSy: number   // screen (relative to layer)
@@ -183,8 +241,8 @@ interface DragState {
 }
 const drag = ref<DragState | null>(null)
 
-// Move-existing-annotation (or content-image) drag
-interface MoveState { kind: 'annot' | 'cimg'; index: number; startX: number; startY: number; dx: number; dy: number; moved: boolean; rect: RectT }
+// Move-existing-annotation (or content-image, or the multi-selection) drag
+interface MoveState { kind: 'annot' | 'cimg' | 'multi'; index: number; startX: number; startY: number; dx: number; dy: number; moved: boolean; rect: RectT }
 const moveState = ref<MoveState | null>(null)
 
 // FreeText editing
@@ -262,14 +320,20 @@ const annotHandles = computed(() => {
   }))
 })
 
+/** Shift `r` by the drag in progress, in page units. */
+function draggedRect(r: RectT, m: MoveState): RectT {
+  return [r[0] + m.dx / scaleX.value, r[1] + m.dy / scaleY.value,
+          r[2] + m.dx / scaleX.value, r[3] + m.dy / scaleY.value]
+}
+
 /** The annotation's rect including any drag or resize in progress. */
 function liveAnnotRect(a: AnnotationInfo): RectT {
   const rz = annotResize.value
   if (rz?.kind === 'annot' && rz.index === a.index && rz.moved) return resizedRect(rz)
   const m = moveState.value
-  if (m?.kind === 'annot' && m.index === a.index && m.moved) {
-    return [m.rect[0] + m.dx / scaleX.value, m.rect[1] + m.dy / scaleY.value,
-            m.rect[2] + m.dx / scaleX.value, m.rect[3] + m.dy / scaleY.value]
+  if (m?.moved && ((m.kind === 'annot' && m.index === a.index) ||
+      (m.kind === 'multi' && multiAnnots.value.has(a.index)))) {
+    return draggedRect(m.kind === 'annot' ? m.rect : a.rect, m)
   }
   return a.rect
 }
@@ -279,9 +343,9 @@ function liveImgRect(img: ContentImageInfo): RectT {
   const rz = annotResize.value
   if (rz?.kind === 'cimg' && rz.index === img.id && rz.moved) return resizedRect(rz)
   const m = moveState.value
-  if (m?.kind === 'cimg' && m.index === img.id && m.moved) {
-    return [m.rect[0] + m.dx / scaleX.value, m.rect[1] + m.dy / scaleY.value,
-            m.rect[2] + m.dx / scaleX.value, m.rect[3] + m.dy / scaleY.value]
+  if (m?.moved && ((m.kind === 'cimg' && m.index === img.id) ||
+      (m.kind === 'multi' && multiImgs.value.has(img.id)))) {
+    return draggedRect(m.kind === 'cimg' ? m.rect : img.rect, m)
   }
   return img.rect
 }
@@ -346,6 +410,37 @@ async function onAnnotResizeUp() {
     return
   }
   await commitRectChange(rz.index, rz.rect as RectT, rect, 'Annotation resized')
+}
+
+/**
+ * Move every member of the multi-selection by the same delta, as one engine
+ * pass and one undo point. Content images of the SAME source are transformed
+ * from the highest Do offset down — each injection lengthens the stream, so
+ * only offsets BELOW an already-spliced one stay valid.
+ */
+async function commitMultiMove(dxP: number, dyP: number) {
+  const imgs = contentImages.value
+    .filter(i => multiImgs.value.has(i.id))
+    .sort((a, b) => a.sourceKey === b.sourceKey
+      ? b.doOffset - a.doOffset
+      : (a.sourceKey < b.sourceKey ? -1 : 1))
+  const anns = annotations.value.filter(a => multiAnnots.value.has(a.index))
+  const total = imgs.length + anns.length
+  if (!total) return
+  const pageIndex = docStore.currentPage - 1
+  const shift = (r: RectT): RectT => [r[0] + dxP, r[1] + dyP, r[2] + dxP, r[3] + dyP]
+
+  let ok = 0
+  await annotOp(`${total} element(s) moved`, async () => {
+    for (const img of imgs) {
+      if (await pdfEngine.transformContentImage(pageIndex, img.sourceKey, img.doOffset, img.name, shift(img.rect))) ok++
+    }
+    for (const a of anns) {
+      if (await pdfEngine.updateAnnotation(pageIndex, a.index, { rect: shift(a.rect) })) ok++
+    }
+    return ok > 0
+  })
+  if (ok < total) editorStore.setStatus(`Moved ${ok} of ${total} — Ctrl+Z takes the whole move back`)
 }
 
 /** Apply a new rectangle to a content-drawn image, clamped onto the page. */
@@ -591,6 +686,15 @@ async function loadAnnotations() {
   } catch { contentImages.value = [] }
   if (selectedImgId.value !== null && !contentImages.value.some(i => i.id === selectedImgId.value)) {
     selectedImgId.value = null
+  }
+  // Prune group members that no longer exist after a reload.
+  if (multiImgs.value.size) {
+    const ids = new Set(contentImages.value.map(i => i.id))
+    multiImgs.value = new Set([...multiImgs.value].filter(id => ids.has(id)))
+  }
+  if (multiAnnots.value.size) {
+    const idxs = new Set(annotations.value.map(a => a.index))
+    multiAnnots.value = new Set([...multiAnnots.value].filter(i => idxs.has(i)))
   }
 }
 
@@ -934,7 +1038,22 @@ async function annotOp(msg: string, mutate: () => Promise<boolean>, pushSnapshot
 }
 
 // --- select / move / delete existing annotations ---
+function startMultiMove(e: MouseEvent) {
+  moveState.value = { kind: 'multi', index: -1, startX: e.clientX, startY: e.clientY, dx: 0, dy: 0, moved: false, rect: [0, 0, 0, 0] }
+  window.addEventListener('mousemove', onMoveMove)
+  window.addEventListener('mouseup', onMoveUp)
+}
+
 function onAnnotMouseDown(e: MouseEvent, index: number) {
+  if (e.shiftKey || e.ctrlKey || e.metaKey) {
+    foldPrimaryIntoMulti()
+    const s = new Set(multiAnnots.value)
+    if (s.has(index)) s.delete(index); else s.add(index)
+    multiAnnots.value = s
+    return
+  }
+  if (multiAnnots.value.has(index) && multiCount.value > 1) { startMultiMove(e); return }
+  clearMultiSelection()
   selectedIndex.value = index
   selectedImgId.value = null
   const a = annotations.value.find(x => x.index === index)
@@ -945,6 +1064,15 @@ function onAnnotMouseDown(e: MouseEvent, index: number) {
 }
 
 function onImgMouseDown(e: MouseEvent, id: number) {
+  if (e.shiftKey || e.ctrlKey || e.metaKey) {
+    foldPrimaryIntoMulti()
+    const s = new Set(multiImgs.value)
+    if (s.has(id)) s.delete(id); else s.add(id)
+    multiImgs.value = s
+    return
+  }
+  if (multiImgs.value.has(id) && multiCount.value > 1) { startMultiMove(e); return }
+  clearMultiSelection()
   selectedImgId.value = id
   selectedIndex.value = null
   const img = contentImages.value.find(i => i.id === id)
@@ -974,6 +1102,12 @@ async function onMoveUp() {
   // moving. Clamped instead.
   if (m.kind === 'cimg') {
     await commitImgRect(m.index, newRect, 'Image moved')
+    return
+  }
+
+  // The multi-selection travels as one operation and ONE undo point.
+  if (m.kind === 'multi') {
+    await commitMultiMove(dxP, dyP)
     return
   }
 
@@ -1044,6 +1178,7 @@ function onKeyDown(e: KeyboardEvent) {
 watch(() => editorStore.currentTool, () => {
   selectedIndex.value = null
   selectedImgId.value = null
+  clearMultiSelection()
   cancelFreeText()
   if (showLayer.value) loadAnnotations()
 })
@@ -1076,7 +1211,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', onAnnotResizeUp)
 })
 
-defineExpose({ loadAnnotations, deleteSelected })
+defineExpose({ loadAnnotations, deleteSelected, selectInBand, clearMultiSelection })
 </script>
 
 <style scoped>

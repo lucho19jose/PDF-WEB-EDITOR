@@ -150,6 +150,11 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   textChanged: []
+  /** The rubber band closed over this page-space rect (y-down). The annotation
+   *  layer listens so images and annotations join the sweep too. */
+  bandSelected: [rect: [number, number, number, number], additive: boolean]
+  /** A plain click on empty paper — selections elsewhere should clear too. */
+  bandCleared: []
 }>()
 
 const docStore = useDocumentStore()
@@ -1772,7 +1777,7 @@ function onMarqueeEnd() {
 
   // A click on empty page with no drag just clears the selection.
   if (!dragged) {
-    if (!m.additive) clearSelection()
+    if (!m.additive) { clearSelection(); emit('bandCleared') }
     return
   }
 
@@ -1804,9 +1809,16 @@ function onMarqueeEnd() {
     setSelection(hit)
   }
 
-  editorStore.setStatus(selectedIds.value.length === 0
-    ? 'Nothing selected'
-    : `${selectedIds.value.length} text block(s) selected — drag to move them together`)
+  // The same band sweeps the ANNOTATION layer's images too — it owns those
+  // elements but this overlay owns the empty-paper surface the band starts on.
+  emit('bandSelected', [
+    box.left / scaleX.value, box.top / scaleY.value,
+    box.right / scaleX.value, box.bottom / scaleY.value
+  ], m.additive)
+
+  if (selectedIds.value.length > 0) {
+    editorStore.setStatus(`${selectedIds.value.length} text block(s) selected — drag to move them together`)
+  }
 }
 
 // ── Move / Resize drag ──

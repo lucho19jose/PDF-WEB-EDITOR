@@ -33,6 +33,8 @@
           :pdf-width="pdfPageWidth"
           :pdf-height="pdfPageHeight"
           @text-changed="onTextChanged"
+          @band-selected="onBandSelected"
+          @band-cleared="onBandCleared"
         />
         <AnnotationLayer
           :ref="setAnnotLayer"
@@ -132,6 +134,19 @@ function setTextOverlay(el: any) {
 }
 function setAnnotLayer(el: any) {
   annotationLayerRef.value = el || null
+}
+
+/**
+ * The rubber band lives in the TEXT overlay (it owns the empty-paper surface),
+ * but images and annotations live in the ANNOTATION layer. The two are
+ * siblings, so the band is forwarded here — same wiring reason as
+ * makeRoomInText, in the other direction.
+ */
+function onBandSelected(rect: [number, number, number, number], additive: boolean) {
+  annotationLayerRef.value?.selectInBand?.(rect, additive)
+}
+function onBandCleared() {
+  annotationLayerRef.value?.clearMultiSelection?.()
 }
 
 /**
