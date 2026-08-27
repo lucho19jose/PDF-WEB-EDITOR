@@ -1499,9 +1499,49 @@ function pickSubstituteFont(info: SimpleFontInfo | null, targetBlock?: TextBlock
 }
 
 /**
+ * The operators a BT block runs to place the pen BEFORE it draws anything —
+ * Tm, Td, TD, TL and T*, in the order the generator wrote them.
+ *
+ * A rebuild has to re-emit all of them. Keeping only `Tm`, as this used to,
+ * draws at the text-space origin, and on a clipped page that is not merely
+ * misplaced — it is INVISIBLE: the block vanishes from the render and from
+ * every extractor, which reads as the edit having deleted the text. Word (via
+ * iLovePDF) is exactly that shape: every block sets an identity
+ * `1 0 0 1 0 0 Tm` and positions with `TD`, so editing one line of a form blanked
+ * it.
+ *
+ * Two things this has to get right, and both were the bug:
+ * - **`TD` counts, not just `Td`.** They differ only in that TD also sets the
+ *   leading, which has no bearing on where the pen is.
+ * - **The cut-off is the first SHOW op, located on the MASKED content** — not
+ *   the first `(`, `<` or `[`. Word writes `0 J [] 0 d 0 j 1 w 10 M` ahead of
+ *   its positioning, so splitting at the first bracket stops at the empty dash
+ *   array and never reaches the operator that matters. That alone breaks
+ *   lowercase `Td` generators too.
+ *
+ * The operators are preserved verbatim rather than folded into a single `Tm`
+ * because Td operands are multiplied by the text matrix: a block whose Tm
+ * carries a scale cannot have its offsets added into the matrix.
+ */
+function leadingPositionOps(content: string): string {
+  const masked = maskStreamLiterals(content)
+  const showAt = masked.search(/(?<![A-Za-z0-9])(?:Tj|TJ)(?![A-Za-z0-9])|'|"/)
+  const head = showAt >= 0 ? masked.slice(0, showAt) : masked
+  const ops = head.match(
+    /(?:-?[\d.]+\s+){5}-?[\d.]+\s+Tm\b|-?[\d.]+\s+-?[\d.]+\s+(?:Td|TD)\b|-?[\d.]+\s+TL\b|(?<![A-Za-z0-9])T\*(?![A-Za-z0-9])/g
+  )
+  if (ops && ops.length) return ops.join('\n')
+  // Nothing positions the block before it draws. Fall back to the first Tm
+  // anywhere inside it — a block that sets its matrix only between runs
+  // (SUNAT/JasperReports) still starts at that matrix once rebuilt as one run.
+  const tm = masked.match(/(?:-?[\d.]+\s+){5}-?[\d.]+\s+Tm\b/)
+  return tm ? tm[0] : ''
+}
+
+/**
  * Rebuild a BT block's inner content to draw the given pre-encoded lines,
  * optionally switching to a different font resource. Preserves the original
- * text matrix, color operators and Tf size.
+ * positioning operators, color operators and Tf size.
  */
 function rebuildBtContent(
   content: string,
@@ -1519,15 +1559,7 @@ function rebuildBtContent(
         ? (overrideSize !== undefined ? `/${tfMatch[1]} ${tfSize} Tf` : tfMatch[0])
         : '')
 
-  const tmMatch = content.match(/(-?[\d.]+\s+){5}-?[\d.]+\s+Tm/)
-  const tmPart = tmMatch ? tmMatch[0] : ''
-
-  // Preserve Td offsets that precede the first show-text op — some generators
-  // position every line via "Tm 0 -N Td"; dropping them would move the text
-  // back to the Tm origin.
-  const preShow = content.split(/[(<[]/)[0]
-  const tdMatches = preShow.match(/-?[\d.]+\s+-?[\d.]+\s+Td/g)
-  const tdPart = tdMatches ? tdMatches.join('\n') : ''
+  const posPart = leadingPositionOps(content)
 
   const colorMatch = content.match(/[\d.]+(?:\s+[\d.]+){0,3}\s+(?:rg|g|k|sc|scn)\b/)
   const colorPart = overrideColorOp != null ? overrideColorOp : (colorMatch ? colorMatch[0] : '')
@@ -1555,7 +1587,7 @@ function rebuildBtContent(
   // that were never touched. Put the original font back on the way out.
   const restoreTf = (newFontRef && tfMatch) ? `\n${tfMatch[0]}` : ''
 
-  return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${tmPart}\n${tdPart ? tdPart + '\n' : ''}${tjParts.join('\n')}${restoreTf}\n`
+  return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${posPart}\n${tjParts.join('\n')}${restoreTf}\n`
 }
 
 type EncodingPlan =
@@ -3674,6 +3706,68 @@ function wildcardIncludes(hay: string, needle: string): boolean {
 }
 
 /**
+ * Same characters in any order — one string is a SHUFFLE of the other.
+ *
+ * MuPDF orders extracted glyphs by position, so when two runs overlap on the
+ * page the block it reports is an INTERLEAVING of them, not a concatenation:
+ * two copies of "Correo Electrónico: …" drawn 39pt apart come back as
+ * `"Correo E Cleocrtrreóon iEcole: cbt arróbnoizcaog:o …"`. Neither the exact
+ * test nor `fuzzyTextMatch` can see through that, so such a line matched
+ * NOTHING and could not be edited or even deleted — it just reported "Could
+ * not find matching text in content stream". This is what any page with
+ * overlapping text does: double-struck fake bold, a watermark crossing a line,
+ * a stamped value over a form field.
+ *
+ * A shuffle preserves the character multiset exactly, and the run loop already
+ * has the run's concatenation in hand — so comparing sorted characters costs
+ * one sort and needs no order-aware DP. It is a NECESSARY condition, not a
+ * sufficient one (anagrams exist), which is why it is tried only after the
+ * exact and fuzzy tests have both failed, is refused on short strings where
+ * an accidental anagram is plausible, and still has to win the distance
+ * ranking against every other candidate like anything else.
+ */
+const SHUFFLE_MIN_CHARS = 8
+
+function sameCharacters(a: string, b: string): boolean {
+  const key = (s: string) => foldForMatch(s).replace(/[\s?]/g, '').split('').sort().join('')
+  const ka = key(a)
+  if (ka.length < SHUFFLE_MIN_CHARS) return false
+  return ka === key(b)
+}
+
+/**
+ * Drop blocks carrying no visible glyph from both ends of a matched run.
+ *
+ * A run is ANCHORED on its first block: `dist` is measured from there, and
+ * bucketed distance is the primary sort key over every candidate. A blank block
+ * on the end contributes nothing to the text that matched — but it drags the
+ * anchor with it, and one cell's trailing space belongs to the run that starts
+ * in the NEXT cell.
+ *
+ * Word draws every word as its own BT, so the row
+ * `Telf. Fijo/Móvil: | Correo Electrónico:` is eight blocks sharing one Tm y.
+ * The run matching "Correo Electrónico:" exactly was found starting at the
+ * space that ends "Fijo/Móvil:" — 82pt to the left — so it ranked BELOW a
+ * single-block match on "Electrónico:" alone, which sits on the click and
+ * carries two thirds of the target. That partial match won, the new text was
+ * written into the "Electrónico:" block, and the "Correo" block went on drawing
+ * beside it: the cell rendered the label twice, overlapping, in two different
+ * faces.
+ *
+ * The blocks removed here would have been skipped by `applyLineReplacement`
+ * anyway — it neither writes into nor blanks a block with no visible glyph — so
+ * nothing about the edit changes except where the run is measured from. Never
+ * trimmed to empty: a run of nothing but spaces is still a legitimate target
+ * (an empty form field being filled in).
+ */
+function trimBlankEnds(blocks: BtInfo[]): BtInfo[] {
+  let lo = 0, hi = blocks.length - 1
+  while (lo < hi && !blocks[lo].decodedText.trim()) lo++
+  while (hi > lo && !blocks[hi].decodedText.trim()) hi--
+  return lo === 0 && hi === blocks.length - 1 ? blocks : blocks.slice(lo, hi + 1)
+}
+
+/**
  * Font-aware content stream text replacement.
  *
  * Strategy:
@@ -3761,8 +3855,12 @@ function replaceTextInContentStreamFontAware(
           let score = 0
           if (norm === normalizedTarget) score = 2
           else if (fuzzyTextMatch(norm, normalizedTarget)) score = ratio
+          // The extractor shuffled two overlapping runs together (see
+          // sameCharacters). The run still COVERS the target, so it scores
+          // above any fragment of it but below a match that reads in order.
+          else if (sameCharacters(norm, normalizedTarget)) score = 1.5
           if (score > 0 && (!best || score > best.score)) {
-            best = { blocks: sorted.slice(i, j + 1), score }
+            best = { blocks: trimBlankEnds(sorted.slice(i, j + 1)), score }
           }
         }
       }
@@ -3840,6 +3938,31 @@ function replaceTextInContentStreamFontAware(
         })
       }
       if (!targetFontRef) break // second pass is identical when no font filter exists
+    }
+  }
+
+  // Step 5: a target with NO text can only be identified by POSITION.
+  //
+  // A form's blank fields extract as whitespace-only blocks — the gap between
+  // "Andahuaylas," and "de" where the day goes — and every step above needs
+  // characters to work with: the line runs skip an empty normalized target,
+  // single-block matching demands two characters, containment demands two. A
+  // blank therefore produced ZERO candidates, and typing into one reported
+  // "Could not find matching text in content stream" while the page sat
+  // unchanged. Filling in a blank is the edit a form most obviously needs.
+  //
+  // Position is not a weaker signal here, it is the ONLY one: there is no text
+  // to tell two blanks apart, and the user has already pointed at the one they
+  // mean. The block must SIT on the clicked bbox — the same test
+  // `findBtBlocksByPosition` applies — and only blocks that are THEMSELVES
+  // blank are eligible, so a near miss can never overwrite the label beside it.
+  if (!matchLength(normalizedTarget)) {
+    const onTarget = Math.max(6, targetBlock.height || 0)
+    for (const block of allBlocks) {
+      if (!block.hasPos || block.decodedText.trim()) continue
+      const dist = distOf(block)
+      if (dist > onTarget) continue
+      candidates.push({ blocks: [block], score: 1, dist, line: false, order: candidates.length })
     }
   }
 

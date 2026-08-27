@@ -174,6 +174,41 @@ when the block has none — inject `sx 0 0 sy e f Tm` right after `BT`. BT reset
 the line matrix to the identity, so every following Td/TD/T* is relative to the
 injected matrix and the whole block (all its lines) transforms with it.
 
+### A rebuilt block keeps EVERY operator that placed the pen
+`rebuildBtContent` re-emits the block from scratch, so whatever positioned the
+original has to be carried over — `leadingPositionOps()` collects the Tm, Td,
+TD, TL and T\* that run before the block's first show op and re-emits them in
+order. Keeping only `Tm`, as it used to, draws at the text-space origin; and
+because these blocks are almost always inside a clip, the text does not land in
+the wrong place, it lands **nowhere**. It disappears from the render and from
+every extractor, so the edit reads as having deleted the line — reported as
+"after I write José Luis B it disappears".
+
+Two separate defects produced that, and either alone is enough:
+
+- **`TD` was not matched, only `Td`.** They differ solely in that TD also sets
+  the leading, which has nothing to do with where the pen is. Word re-saved
+  through iLovePDF positions every block with `1 0 0 1 0 0 Tm` + `TD`, so the
+  whole document rebuilt at the page origin.
+- **The pre-show slice was cut at the first `(`, `<` or `[`.** Word writes
+  `0 J [] 0 d 0 j 1 w 10 M` ahead of its positioning, so the slice stopped at
+  the empty dash array and never reached the operator that mattered — which
+  breaks lowercase-`Td` generators just as thoroughly. The cut-off is now the
+  first show op, located on the LITERAL-MASKED content, the same rule
+  `scanBtBlocks` and `getBlockOrigin` already follow.
+
+The operators are re-emitted verbatim rather than folded into one `Tm`: Td
+operands are multiplied by the text matrix, so a block whose Tm carries a scale
+cannot have its offsets added into the matrix. Re-emitting a duplicate (iText
+writes the same `Tm` twice) or a `TL` that nothing then consumes is harmless —
+dropping one is not.
+
+Only the rebuild path was affected, which is why this survived so long: the
+surgical `replaceTjInBlock` path leaves the positioning alone, and a rebuild
+only happens on a font substitution or a wrapped multi-line replacement. On the
+corpus it changes 403 of 2912 blocks across 5 producers and flips no sweep
+result except the one it fixes.
+
 ### Text is not only in the page's content stream
 `getContentSources()` returns the page stream AND every Form XObject the page
 invokes, walked recursively (TCPDF's page invokes `/TPL0`, whose stream invokes
@@ -674,6 +709,79 @@ Three things this got wrong first, all silent:
 The whole insertion is ONE undo point: the caller snapshots before making room
 and passes `pushSnapshot: false` to `annotOp`, or one action would take two
 Ctrl+Z — the first leaving the page rearranged around an image no longer there.
+
+### A blank field has no text — position is not a fallback, it is the signal
+Every matching step needs characters to work with: the line runs skip an empty
+normalized target, single-block matching demands two characters, containment
+demands two. A form's blank fields extract as whitespace-only blocks — the gap
+between "Andahuaylas," and "de" where the day goes — so they produced ZERO
+candidates, and typing into one reported "Could not find matching text in
+content stream" while the page sat unchanged. Filling in a blank is the edit a
+form most obviously needs, and it was the one edit that could never work.
+
+Step 5 of `replaceTextInContentStreamFontAware` collects candidates by position
+alone when `matchLength(normalizedTarget)` is zero. Two guards keep it honest:
+the block must SIT on the clicked bbox (`dist <= max(6, targetBlock.height)`,
+the same test `findBtBlocksByPosition` uses), and only blocks that are
+THEMSELVES blank are eligible — so a near miss can never overwrite the label
+beside it. It is inert wherever the text steps already produce something: on the
+52-file corpus it changes not one result.
+
+### Overlapping text extracts as a SHUFFLE, not as two blocks
+MuPDF orders extracted glyphs by position, so two runs drawn over each other
+come back as one block whose text INTERLEAVES them. Two copies of
+"Correo Electrónico: barbozagonzalesjose@gmail.com" 39pt apart read as
+
+    "Correo E Cleocrtrreóon iEcole: cbt arróbnoizcaog:o bnazarbleoszjoasgeo@…"
+
+Neither the exact test nor `fuzzyTextMatch` can see through that, so the line
+matched nothing at all: it could not be edited, and it could not even be
+DELETED — "Could not find matching text in content stream", with the wrong text
+still on the page and no way to remove it. Any page with overlapping text lands
+here: double-struck fake bold, a watermark crossing a line, a stamped value over
+a form field — or a document this editor damaged itself before the two fixes
+above.
+
+A shuffle preserves the character multiset exactly, and the run loop already
+holds the run's concatenation, so `sameCharacters()` compares sorted characters
+— one sort, no order-aware DP. It is a NECESSARY condition and not a sufficient
+one (anagrams exist), so it is tried only after exact and fuzzy have both
+failed, is refused below `SHUFFLE_MIN_CHARS`, scores 1.5 (above any fragment,
+below anything that reads in order), and still has to win the distance ranking
+like every other candidate.
+
+The repair follows from the match: the run covers BOTH copies, so
+`applyLineReplacement` writes the new text into the leftmost and blanks the
+other — one edit turns the doubled line back into a single clean one, and an
+empty replacement removes it outright.
+
+### A run is anchored on its first block — so a blank block must not lead it
+`dist` is measured from `blocks[0]`, and bucketed distance is the PRIMARY sort
+key over every candidate. A block with no visible glyph adds nothing to the text
+that matched, but it drags that anchor with it — and one cell's trailing space
+sits, in stream order, immediately before the run that starts in the NEXT cell.
+
+Word draws every word as its own BT, so `Telf. Fijo/Móvil: | Correo
+Electrónico:` is eight blocks sharing one Tm y. The run matching "Correo
+Electrónico:" **exactly** was found starting at the space that ends
+"Fijo/Móvil:", 82pt to the left, so it ranked below a single-block match on
+"Electrónico:" alone — which sits on the click and carries two thirds of the
+target:
+
+    single score=0.63 dist=0.0  ["Electrónico:"]          <- won
+    line   score=2.00 dist=81.6 [" " + "Correo" + " " + "Electrónico:"]
+
+The partial match won, the whole new text went into the "Electrónico:" block,
+and the "Correo" block went on drawing beside it: the cell rendered the label
+twice, overlapping, in two different faces. `trimBlankEnds()` drops
+non-contributing blocks from both ends of a matched run before it is scored.
+Nothing else about the edit changes — `applyLineReplacement` neither writes into
+nor blanks a block with no visible glyph — only where the run is measured from.
+It never trims to empty: a run of nothing but spaces is a legitimate target (an
+empty form field being filled in).
+
+This is the same failure family as the note below, one level up: there a
+fragment outranked the covering run on SCORE, here it outranked it on DISTANCE.
 
 ### A partial run must not outrank the line group that covers it
 A form draws "Código de Postulante" and its value "70492487" as two runs that
