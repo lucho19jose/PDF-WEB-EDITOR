@@ -225,6 +225,102 @@ operations re-read every XObject on every keystroke-level operation and the
 editor hung for minutes. The number of XObject sources is capped
 (`MAX_XOBJECT_SOURCES`) and the cap is logged rather than silently applied.
 
+### A fontless block inherits its Tf — and a substitution must give it back
+Font is graphics state, so a BT block need not set one: PDF24 draws each form
+field's VALUE as `BT x y Td [(…)]TJ ET` with no `Tf` at all, inheriting the
+`/TT1 11.04 Tf` set by the block that drew the LABELS. `scanBtBlocks` already
+resolved that (`fontAt`), but `rebuildBtContent` read the font to restore out of
+the block's OWN content:
+
+    const restoreTf = (newFontRef && tfMatch) ? `\n${tfMatch[0]}` : ''
+
+`tfMatch` is null for such a block, so nothing was put back and the SUBSTITUTED
+face stayed in force past `ET`. Every later fontless block then inherited it,
+`fontAt` reported it as their font, and the font filter (`blockUsesFont`)
+rejected the very block holding the target. The symptom is that editing one
+field breaks the NEXT one: on a six-page report, changing "Área" made "Técnico"
+fail with *"Could not find matching text in content stream … font TT1"*, while
+each field edited fine in isolation. The comment above that line already
+described the hazard — the guard just never covered the case that needed it
+most, because it asked the block for state the block had inherited.
+
+`BtInfo.inheritedTf` carries the operator VERBATIM (`fontOpAt`, recorded only
+when the block sets no `Tf` of its own) and is threaded to every substitution
+call site. The same null `tfMatch` also made `tfSize` fall back to a flat `12`,
+so this document's 11.04pt fields were redrawn half a point too large; the
+inherited size fixes that in the same expression. `applyPartialBlockReplacement`
+had the identical guard on its op-window restore, and `replaceInsideTjArray` the
+identical `12` default — both take the inherited value now.
+
+Every branch short-circuits to the old expression whenever the block HAS its own
+`Tf`, so the only behaviour that changes is a substitution on a fontless block.
+
+A q/Q wrapper around the rebuild was considered and rejected: `Q` would RESET
+the colour, `Tc`/`Tw`/`Tz`/`Tr` that the original block deliberately left in
+force for the blocks after it, which is the same class of silent damage in the
+other direction. Restoring beats resetting — the stream after the edit should
+behave like the stream before it.
+
+**Known limitation:** `fontAt`/`fontOpAt` are textual and do not replay q/Q, so
+a `Tf` set inside a `q…Q` before the block yields a stale operator — but that is
+the font the engine already believed the block used, so the restore is never
+more wrong than the match. A fontless block inside a Form XObject that inherits
+from the invoking stream still gets no `inheritedTf`, and no restore is emitted.
+
+### Don't re-encode the characters the edit didn't touch
+A replacement is encoded in ONE font, and a line is under no obligation to be
+drawable in one. These technical reports start every bullet with a `✓` that its
+own font draws — a CJK subset (`/C0_0` KozMinPr6N, `<3F8E>`) or Wingdings — and
+set the sentence after it in Calibri. Re-encoding the whole line therefore had
+to find a single face holding both the tick and the Latin text, found none, fell
+through to the WinAnsi substitute, and WinAnsi has no U+2713:
+
+    Cannot encode characters: ✓ (not supported by fallback font)
+
+Every bullet on every page was uneditable — the entire body of the document,
+since the findings and conclusions are all bulleted. The tell in the report was
+that **erasing the line and retyping it worked while editing it did not**: an
+erase-and-retype drops the `✓`, an edit keeps it.
+
+`narrowToChangedOps` drops LEADING show ops whose glyphs the new text still
+begins with, and only the remainder is re-encoded. Leaving the tick's operator
+alone is not a workaround for the encoder, it is the more faithful edit — the
+character did not change, so the operator that drew it should not either, and it
+keeps its own font instead of being approximated by a substitute.
+
+It runs ONLY as a rescue, after the whole-run encode has already failed. Trimming
+unconditionally would be worse: where a run does encode today, the untouched head
+would stay in the original face while the changed tail became Helvetica, putting
+two faces inside one line. Measured on the 52-file corpus the rescue changes
+nothing — 262 experiments, 227 successes, identical before and after.
+
+**Trimming the TAIL is the obvious symmetry and it is wrong.** A run's later ops
+are placed by their own `Td`, an offset computed for the width of the text that
+USED to precede them; `Td` translates the LINE matrix, so it does not follow the
+glyphs actually drawn. Leaving those ops untouched while the text before them
+changes length strands them at the old offset — a gap when the replacement is
+shorter, and the two printed through each other when it is longer. That shipped
+briefly and turned "✓Fecha de garantía: … (Según fabricante)." into a line drawn
+over the one beneath it, extracted as the interleaved
+`✓✓/FFeecchhaa …` shuffle. A LEADING op has no such dependency: it is drawn
+before the replacement, so its position cannot depend on the replacement's width.
+
+Whole ops only: an op is the smallest unit whose font is known, so a symbol in
+the MIDDLE of an edited run still has to be re-encoded with everything around
+it, and typing a genuinely new `✓` into a block whose fonts cannot draw it still
+fails — correctly, with the message above, and without touching the page.
+
+`applyBlockReplacement` falls back to the partial path when its own whole-block
+encode fails, because a bullet that is a block of ITSELF never reached the
+narrowing otherwise (the delegation is otherwise gated on the block holding much
+more than the target). Document-wide that took the bullets from 0 to 23 of 24.
+
+**Known limitation:** the last one is a bullet whose `✓` is a BT block of its own,
+so it is matched as a LINE GROUP; `applyLineReplacement` picks the leftmost block
+as primary — the tick — and encodes the whole line for the tick's font. The same
+narrowing one level up (drop a leading BLOCK the edit did not change) would fix
+it and is not implemented.
+
 ### A glyph is unusable when its advance is zero
 `encodeForSimpleFont` decides substitution from the **Widths array**, never from
 the BaseFont name or the embedding flag. Word subsets fonts without the
@@ -270,11 +366,20 @@ Font state also survives ET, so `rebuildBtContent` restores the original `Tf`
 after a substitution — otherwise every later block that inherited that font gets
 silently re-fonted.
 
-**Known unfixed:** on a Corel datasheet (`/Corel_OTF … DP` marked content, CID
-font with a 29-entry ToUnicode), replacing `3/4''` still rewrites a whole row —
-702 characters across 36 blocks. The block is matched as a line group and the
-guards above do not catch it; the changed region begins mid-block at a `TD`, so
-the run selection is what is wrong, not the size test.
+**Partly fixed.** On a Corel datasheet (`/Corel_OTF … DP` marked content, CID
+font with a 29-entry ToUnicode), replacing `3/4''` used to rewrite a whole row —
+702 characters across 36 blocks. Corel is the generator that sets `Tf` BEFORE
+the `BT` and leaves the block itself fontless, so it was hit by the leaked-Tf
+bug above: a substitution re-fonted its neighbours and the line-group run
+selection then spanned them. With the inherited `Tf` restored the collateral
+damage is gone — measured on the sweep, `char_delta` 690 → 0 and
+`blocks_touched` 36 → 2.
+
+What remains is the run selection itself: the replacement still does not land in
+the clicked cell (the sweep reads `1/2''` where it asked for its marker), so the
+experiment is still not scored a success. The changed region begins mid-block at
+a `TD`, and that is the part that is wrong — not the size test, and no longer
+the font.
 
 ### Matching invariant: text alone never identifies a block
 The same string appears more than once on a page all the time — an email

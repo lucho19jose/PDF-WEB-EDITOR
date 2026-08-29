@@ -1549,10 +1549,18 @@ function rebuildBtContent(
   newFontRef: string | null,
   hex = false,
   overrideSize?: number,
-  overrideColorOp?: string | null
+  overrideColorOp?: string | null,
+  inheritedTf?: string | null
 ): string {
   const tfMatch = content.match(/\/([A-Za-z0-9_.+-]+)\s+([\d.]+)\s+Tf/)
-  const tfSize = overrideSize !== undefined ? fmtNum(overrideSize) : (tfMatch ? tfMatch[2] : '12')
+  // A block with no Tf of its own inherits font AND size from the graphics
+  // state, so the size has to come from the operator that was in force
+  // (BtInfo.inheritedTf) — falling back to 12 drew this document's 11.04pt
+  // fields half a point too large.
+  const inheritedSize = inheritedTf ? inheritedTf.match(/([\d.]+)\s+Tf\s*$/)?.[1] : undefined
+  const tfSize = overrideSize !== undefined
+    ? fmtNum(overrideSize)
+    : (tfMatch ? tfMatch[2] : (inheritedSize ?? '12'))
   const tfPart = newFontRef
     ? `/${newFontRef} ${tfSize} Tf`
     : (tfMatch
@@ -1585,7 +1593,18 @@ function rebuildBtContent(
   // therefore re-fonts every LATER block that relied on inheriting it — one
   // edit on a Corel datasheet silently changed 702 characters across 36 blocks
   // that were never touched. Put the original font back on the way out.
-  const restoreTf = (newFontRef && tfMatch) ? `\n${tfMatch[0]}` : ''
+  //
+  // The block that needs this MOST is one with no Tf of its own, and that was
+  // exactly the case the guard used to miss: PDF24 draws each form-field VALUE
+  // as a fontless BT that inherits the /TT1 set by the labels block, so
+  // `tfMatch` is null and nothing was restored. The substituted face then stood
+  // as the font in force for every later fontless block, `scanBtBlocks`
+  // attributed it to them, and the font filter rejected the very block holding
+  // the target: editing one field made the NEXT one report "Could not find
+  // matching text in content stream". Restore what the block inherited.
+  const restoreTf = newFontRef
+    ? (tfMatch ? `\n${tfMatch[0]}` : (inheritedTf ? `\n${inheritedTf}` : ''))
+    : ''
 
   return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${posPart}\n${tjParts.join('\n')}${restoreTf}\n`
 }
@@ -2678,7 +2697,7 @@ function restyleInSource(
           ? rebuildBtContent(block.content, plan.hexLines, null, true, sizeOverride, colorOp)
           : plan.kind === 'keep-plain'
             ? rebuildBtContent(block.content, plan.byteLines, null, false, sizeOverride, colorOp)
-            : rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, sizeOverride, colorOp)
+            : rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, sizeOverride, colorOp, block.inheritedTf)
 
         inner = stripActualText(inner)
         inner = dropBaselineInBlock(inner, stream, block.start, baselineDrop)
@@ -2711,7 +2730,7 @@ function restyleInSource(
           const cur = tf ? parseFloat(tf[1]) : NaN
           if (Number.isFinite(cur)) sizeOverride = cur * sizeRatio
         }
-        inner = rebuildBtContent(block.content, [enc.bytes], newFontRef, false, sizeOverride, colorOp)
+        inner = rebuildBtContent(block.content, [enc.bytes], newFontRef, false, sizeOverride, colorOp, block.inheritedTf)
         usedStrategy ??= 'rebuild_font'
       } else {
         inner = block.content
@@ -3225,14 +3244,24 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
   // not of the text object. Corel sets Tf BEFORE the BT and leaves the block
   // itself fontless: requiring a Tf inside dropped 71 of that page's 95 blocks
   // outright, so most of the page could not be edited at all.
-  const tfBefore: { at: number; name: string }[] = []
+  const tfBefore: { at: number; name: string; raw: string }[] = []
   const tfRe = /\/([^\s<>[\]()/%]+)\s+[\d.-]+\s+Tf/g
   {
     let t: RegExpExecArray | null
     const maskedTf = /\/[ ]*\s+[\d.-]+\s+Tf/g
     while ((t = maskedTf.exec(masked)) !== null) {
       const nameMatch = stream.slice(t.index).match(/^\/([^\s<>[\]()/%]+)/)
-      if (nameMatch) tfBefore.push({ at: t.index, name: nameMatch[1] })
+      // `raw` is the operator VERBATIM — name AND size — because a rebuild that
+      // substitutes a font has to put back exactly what the block inherited,
+      // and the size is half of that. Slicing the ORIGINAL stream at a masked
+      // offset is sound: maskStreamLiterals preserves length 1:1.
+      if (nameMatch) {
+        tfBefore.push({
+          at: t.index,
+          name: nameMatch[1],
+          raw: stream.slice(t.index, t.index + t[0].length)
+        })
+      }
     }
   }
   void tfRe
@@ -3242,6 +3271,15 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
     for (const t of tfBefore) {
       if (t.at > offset) break
       found = t.name
+    }
+    return found
+  }
+  /** The whole Tf operator in force at a stream offset (`/TT1 11.04 Tf`). */
+  const fontOpAt = (offset: number): string | null => {
+    let found: string | null = null
+    for (const t of tfBefore) {
+      if (t.at > offset) break
+      found = t.raw
     }
     return found
   }
@@ -3287,8 +3325,15 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
         if (inherited && !fonts.includes(inherited)) fonts.push(inherited)
       }
     }
-    // No Tf inside: inherit whatever was in force when the block opened.
-    if (!fontRef) fontRef = fontAt(start)
+    // No Tf inside: inherit whatever was in force when the block opened, and
+    // keep the operator itself — a rebuild that substitutes a font must restore
+    // THIS on the way out, or the substitute becomes the inherited font of
+    // every block after it (see rebuildBtContent's restoreTf).
+    let inheritedTf: string | null = null
+    if (!fontRef) {
+      fontRef = fontAt(start)
+      inheritedTf = fontOpAt(start)
+    }
     if (!fontRef) continue
 
     const origin = getBlockOrigin(maskedContent)
@@ -3309,6 +3354,7 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
       end,
       fontRef,
       fonts,
+      inheritedTf,
       yPos: origin.y,
       xPos: origin.x,
       hasPos: origin.hasPos,
@@ -3600,6 +3646,13 @@ interface BtInfo {
   fontRef: string
   /** Every font the block switches to (first Tf, later Tfs, inherited). */
   fonts: string[]
+  /**
+   * The Tf operator in force when the block opened (`/TT1 11.04 Tf`), set ONLY
+   * when the block carries no Tf of its own. A rewrite that substitutes a font
+   * restores this so the substitute cannot become the inherited font of every
+   * block that follows.
+   */
+  inheritedTf?: string | null
   yPos: number
   xPos: number
   /** The block carries at least one text-positioning operator (Tm/Td/TD/T*). */
@@ -4072,7 +4125,20 @@ function applyBlockReplacement(
 
   // Standard single-line replacement
   const plan = planTextEncoding(pageIndex, block, [laidOut[0] ?? newText], targetBlock)
-  if (plan.kind === 'error') return { error: plan.error }
+  if (plan.kind === 'error') {
+    // Not encodable in any ONE face. When a bullet is a block of its own its
+    // "✓" is drawn by its own font and the sentence by another, so no single
+    // face holds the line and the base-14 fallback has no U+2713. The partial
+    // path can leave the ops the edit never touched alone (narrowToChangedOps)
+    // — which is both the only way to encode this and the more faithful edit.
+    // Reached only after the whole-block encode has already failed, so a block
+    // that rewrites today still rewrites the same way.
+    if (targetBlock) {
+      const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
+      if (partial && !('error' in partial)) return partial
+    }
+    return { error: plan.error }
+  }
 
   let newContent: string
   let substitutedFont: string | undefined
@@ -4081,7 +4147,7 @@ function applyBlockReplacement(
   } else if (plan.kind === 'keep-plain') {
     newContent = replaceTjInBlock(block.content, plan.byteLines[0], 'plain')
   } else {
-    newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef)
+    newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, undefined, undefined, block.inheritedTf)
     substitutedFont = plan.fontName
   }
 
@@ -4241,7 +4307,7 @@ function applyWrappedReplacement(
   } else if (plan.kind === 'keep-plain') {
     newContent = rebuildBtContent(block.content, plan.byteLines, null)
   } else {
-    newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef)
+    newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, undefined, undefined, block.inheritedTf)
     substitutedFont = plan.fontName
   }
 
@@ -4323,7 +4389,7 @@ function applyLineReplacement(
       const plan = planTextEncoding(pageIndex, block, lines, targetBlock)
       if (plan.kind === 'error') return { error: plan.error }
       if (plan.kind === 'subst') {
-        newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef)
+        newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, undefined, undefined, block.inheritedTf)
         substitutedFont = plan.fontName
       } else if (lines.length > 1) {
         newContent = plan.kind === 'keep-hex'
@@ -5134,6 +5200,55 @@ function buildShowOp(kind: ShowOpInfo['kind'], literal: string, rawOld: string):
 }
 
 /**
+ * Shrink a matched op run to the part the edit actually changed, by dropping
+ * leading show ops whose glyphs the new text still begins with. Returns null
+ * when nothing can be dropped.
+ *
+ * This exists because a replacement is encoded in ONE font, and a line is not
+ * obliged to be drawable in one: these reports start every bullet with a "✓"
+ * that its own font draws (a CJK or dingbat subset) and set the sentence in
+ * another. Re-encoding the whole line therefore had to find a single face
+ * holding both, failed, fell through to WinAnsi — which has no U+2713 — and
+ * reported "Cannot encode characters: ✓". Every bullet on every page was
+ * uneditable, while erasing the line and retyping it worked, because that
+ * dropped the ✓.
+ *
+ * Dropping the op that draws the ✓ is not a workaround for the encoder, it is
+ * the more faithful edit: the character is UNCHANGED, so the right thing is to
+ * leave the operator that drew it exactly as it was, in its own font, rather
+ * than re-encode it into a substitute that would not look the same.
+ *
+ * Whole ops only — an op is the smallest unit whose font is known, so a symbol
+ * left in the MIDDLE of a run still has to be re-encoded with everything
+ * around it.
+ *
+ * **From the FRONT only.** Trimming the tail as well is the obvious symmetry
+ * and it is wrong: a run's later ops are placed by their own `Td`, an offset
+ * computed for the width of the text that USED to precede them. Leaving them
+ * untouched while the text before them changes length strands them at the old
+ * offset — a gap when the replacement is shorter, and the two drawn through
+ * each other when it is longer, which is how "✓Fecha de garantía: … (Según
+ * fabricante)." came back as one line printed over another. A leading op has
+ * no such dependency: it is drawn BEFORE the replacement, so its position
+ * cannot depend on the replacement's width.
+ */
+function narrowToChangedOps(
+  ops: ShowOpInfo[],
+  i: number,
+  j: number,
+  newText: string
+): { i: number; j: number; text: string } | null {
+  let lo = i, text = newText
+  while (lo < j) {
+    const d = ops[lo].decoded
+    if (!d || !text.startsWith(d)) break
+    text = text.slice(d.length)
+    lo++
+  }
+  return lo !== i ? { i: lo, j, text } : null
+}
+
+/**
  * Replace only the show-ops matching the target text INSIDE a BT block that
  * contains more text than the target (a single BT holding several Td/'-
  * positioned lines — e.g. a 4-line header box). Whole-block replacement in
@@ -5217,7 +5332,13 @@ function applyPartialBlockReplacement(
   // between cells with kern numbers). Replace just those glyphs.
   if (!best) {
     const tfMatch = block.content.match(/\/(?:[^\s<>[\]()/%]+)\s+([\d.]+)\s+Tf/)
-    const tfSize = tfMatch ? parseFloat(tfMatch[1]) : 12
+    // A fontless block takes its size from the Tf it inherited, not from a flat
+    // 12: this size is written back out with the restore, so guessing it
+    // re-sizes the inherited font for everything drawn after the array.
+    const inheritedSize2 = parseFloat(block.inheritedTf?.match(/([\d.]+)\s+Tf\s*$/)?.[1] ?? '')
+    const tfSize = tfMatch
+      ? parseFloat(tfMatch[1])
+      : (Number.isFinite(inheritedSize2) ? inheritedSize2 : 12)
 
     // Candidate arrays containing the target, nearest clicked position first
     const candidates = ops
@@ -5273,18 +5394,36 @@ function applyPartialBlockReplacement(
     return null
   }
 
-  const bestFr = encodingFor(ops[best.i])
-  const plan = planTextEncoding(pageIndex,
-    { mode: ops[best.i].isHex ? 'hex' : 'plain', fontRef: bestFr.fontRef, encoding: bestFr.encoding },
-    [newText], targetBlock)
-  if (plan.kind === 'error') return { error: plan.error }
+  const planFor = (at: number, text: string) => {
+    const fr = encodingFor(ops[at])
+    return planTextEncoding(pageIndex,
+      { mode: ops[at].isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding },
+      [text], targetBlock)
+  }
+
+  let winI = best.i, winJ = best.j, winText = newText
+  let plan = planFor(winI, winText)
+  if (plan.kind === 'error') {
+    // The run as a whole is not encodable in any one face. Before giving up,
+    // stop trying to re-encode the ops the edit never touched — see
+    // narrowToChangedOps. Only ever tried as a rescue: where the run already
+    // encodes, the rewrite stays exactly as wide as it was.
+    const narrowed = narrowToChangedOps(ops, winI, winJ, winText)
+    if (narrowed) {
+      const retry = planFor(narrowed.i, narrowed.text)
+      if (retry.kind !== 'error') {
+        winI = narrowed.i; winJ = narrowed.j; winText = narrowed.text; plan = retry
+      }
+    }
+    if (plan.kind === 'error') return { error: plan.error }
+  }
 
   let content = block.content
   let substitutedFont: string | undefined
-  for (let k = best.j; k >= best.i; k--) {
+  for (let k = winJ; k >= winI; k--) {
     const op = ops[k]
     let repl: string
-    if (k === best.i) {
+    if (k === winI) {
       if (plan.kind === 'keep-hex') {
         repl = buildShowOp(op.kind, `<${plan.hexLines[0]}>`, op.raw)
       } else if (plan.kind === 'keep-plain') {
@@ -5292,9 +5431,17 @@ function applyPartialBlockReplacement(
       } else {
         // Substituted font applies to THIS op only — restore the block's
         // original font afterwards so the untouched lines keep theirs.
+        //
+        // A block with no Tf of its own restores the one it INHERITED, for the
+        // same reason rebuildBtContent does: without it the substitute stays in
+        // force past ET and becomes the font of every later fontless block,
+        // which then cannot be matched for editing at all.
         const tfMatch = block.content.match(/\/([^\s<>[\]()/%]+)\s+([\d.]+)\s+Tf/)
-        const size = tfMatch ? tfMatch[2] : '12'
-        const restore = tfMatch ? ` /${tfMatch[1]} ${size} Tf` : ''
+        const inheritedSize = block.inheritedTf?.match(/([\d.]+)\s+Tf\s*$/)?.[1]
+        const size = tfMatch ? tfMatch[2] : (inheritedSize ?? '12')
+        const restore = tfMatch
+          ? ` /${tfMatch[1]} ${size} Tf`
+          : (block.inheritedTf ? ` ${block.inheritedTf}` : '')
         repl = `/${plan.fontRef} ${size} Tf ${buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw)}${restore}`
         substitutedFont = plan.fontName
       }
@@ -5312,7 +5459,7 @@ function applyPartialBlockReplacement(
   // with the block's text as it now reads: the replaced run's new text plus
   // every untouched op's own.
   const spanText = ops.map((o, k) =>
-    k === best!.i ? newText : (k > best!.i && k <= best!.j ? '' : o.decoded)).join('')
+    k === winI ? winText : (k > winI && k <= winJ ? '' : o.decoded)).join('')
   const tag = retagSpanActualText(stream, block.start, spanText.trim())
 
   return {
