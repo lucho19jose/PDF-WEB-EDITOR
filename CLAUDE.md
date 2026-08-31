@@ -368,6 +368,87 @@ successes, no regressions. The same gate is why `N°` accepts `Nro`, `No`, `N`
 and `De` but not `zzz` — that font has no `z` — which reads as "some edits work
 and some don't" unless you know what to look at.
 
+### A /Rotate page's LINES run along the other axis — the frames were already right
+A landscape fund-request form (/Rotate 90, one glyph per BT, 485 blocks a
+page) read as almost entirely uneditable. Not because of coordinates:
+`getContentSources` already composes `pageRotationCtm` into every source's
+invocation CTM, so `getFullCtmAtOffset` maps a block straight into the
+rotated (visible) frame — the SAME frame extraction reports the target bbox
+in, with getBounds()'s post-rotation height as the flip. Converting the bbox
+again "to be safe" rotates the target twice: measured, the one exact-match
+candidate scored 372.8pt of distance while sitting dead on the click. Do NOT
+add frame conversions at the entry points; the geometry is handled below.
+
+What was actually wrong: the LINE GROUPING. A visual line on a /Rotate 90|270
+page is constant text-space X with Y advancing, and grouping by Y put every
+glyph of "税号 RUC: 20606091380" in its own group — no multi-block line could
+ever assemble. Grouping, reading order, and the line-start choice all follow
+the rotation now (ascending Y for 90, descending for 270, reversed X for 180).
+
+### A glyph the NEIGHBOUR draws is still part of the line
+The same form fuses boundary glyphs across cells: "暂扣款（质保金" is seven
+one-glyph blocks and the closing "）" is the first character of the
+"）Importe Pagado …" block beside it. Three consequences, each shipped as its
+own guard:
+
+- **A prefix run with a provable fused tail is a first-class candidate.** No
+  contiguous run equals the target, and the only textual match left was a
+  sloppy fuzzy 90pt away that edited the WRONG copy of the label and clipped
+  a glyph off its neighbour. When a run reads as a strict prefix of the
+  target AND the next block provably starts with the missing remainder, it is
+  ranked just under an exact match (1.9 — above every fuzzy, which also
+  claims prefix windows and then draws the fused tail a SECOND time). The
+  remainder stays on the page, so it is trimmed off the replacement at apply
+  time (`consumeSuffixFree`); an edit that CHANGED the fused tail skips the
+  candidate rather than half-applying.
+- **A line group provably far from the click is never applied.** Distance was
+  only a ranking term, so a garbage fuzzy run with no competition simply won.
+  Line candidates with a KNOWN distance over 48pt are skipped; Infinity means
+  "position unknown", and the no-position fallback some generators need keeps
+  working.
+- **A lone block holding more than the target is the containment shape at
+  EVERY level.** The line scorer skips such windows (the partial path edits
+  inside the block); `applyBlockReplacement` delegates to the partial path on
+  provable containment even when the excess is ONE glyph — "）Importe Pagado"
+  is only a bracket bigger than its target, far under the 1.4× glyph-count
+  slack, and the whole-block rewrite deleted a bracket that belongs to the
+  cell before. And `applyLineReplacement` refuses to BLANK a block whose
+  folded, space-free text does not appear in the target ('?' placeholders
+  exempt — unreadable is not foreign).
+
+### A substituted window restores the font at its END, not the block's first Tf
+A three-line cell — two Latin lines under a font inherited from BEFORE the
+BT, then a CJK line set by the block's only in-content Tf — corrupted its
+untouched lines the moment line one was edited with a substitution: the
+restore grabbed "the block's first Tf", which is the CJK one, and the Latin
+lines after the window rendered as garbage and extracted as U+FFFD. The ops
+after a window inherit the font in force at the window's END: `op.fontRef`
+(the last in-block Tf before the op), or — when null, meaning no Tf preceded
+it inside the block — the block's ENTERING font, `inheritedTf` verbatim or
+the resolved name in `block.fontRef`. Sizes come from `textStateAtOp` at the
+window, not from whatever Tf happens to appear first in the content.
+
+### A line no single font can draw narrows at BLOCK level — both ends
+Bilingual lines ("申请部门 Area solicitante: Sistemas") mix a CJK font and a
+Latin one; re-encoding the whole run needs a face holding both, there is
+none, and WinAnsi has no 申. `narrowLineAndRetry` in `applyLineReplacement`
+is `narrowToChangedOps` one level up: drop the blocks the edit did not
+change and re-run on the middle. One difference makes BOTH ends safe here
+where the op-level trim may only touch the head: each BT block carries its
+own absolute position (BT resets the line matrix), so an untouched TRAILING
+block keeps its place however the text before it changed — the Td-offset
+hazard is between ops, not between blocks. Strictly a rescue: it runs only
+after the whole-run encode has failed.
+
+**Known limitations on this producer:** a cell whose extraction block spans
+TWO visual lines (Latin row + CJK row, "COSTO CONTRATO + ADENDAS 合同+…")
+matches nothing — the halves live in different line groups and the Latin half
+is fused behind a stray bracket; the edit refuses cleanly. Cells whose font
+decodes to garbage (the E001-* invoice numbers) refuse for the
+incomplete-decode reasons already documented. Sweep: 262 experiments, 226
+successes, totals identical to baseline; one experiment that used to corrupt
+4 characters now passes clean.
+
 ### The SECOND edit of a row must survive the first one's artifacts
 Editing the memo's addressee twice — "Ing." → "Ingeniero.", then "Ingeniero."
 → "Gerente." — destroyed the row on the second pass: the "A" label vanished

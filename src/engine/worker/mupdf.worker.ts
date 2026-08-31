@@ -1946,7 +1946,7 @@ function replaceTextInStream(
 
   try {
     const pageData = extractPageText(pageIndex)
-    const targetBlock = pageData.blocks.find(b => b.id === blockId)
+    let targetBlock = pageData.blocks.find(b => b.id === blockId)
     if (!targetBlock) {
       return { success: false, error: `Block ${blockId} not found` }
     }
@@ -1954,9 +1954,27 @@ function replaceTextInStream(
     // Get page size for line wrapping + position-aware matching
     const pageBounds = pdfDoc.loadPage(pageIndex)
     const boundsRect = pageBounds.getBounds()
-    const pageWidth = boundsRect[2] - boundsRect[0]
-    const pageHeight = boundsRect[3] - boundsRect[1]
+    let pageWidth = boundsRect[2] - boundsRect[0]
+    let pageHeight = boundsRect[3] - boundsRect[1]
+    let rotation = 0
+    try {
+      const r = pageBounds.getObject().get('Rotate')
+      if (r && r.toString() !== 'null') {
+        rotation = ((parseInt(r.toString(), 10) % 360) + 360) % 360
+      }
+    } catch (_) { /* unrotated */ }
     pageBounds.destroy()
+
+    // NO coordinate conversion happens here, deliberately. /Rotate is already
+    // handled a level down: getContentSources composes pageRotationCtm into
+    // every source's invocation CTM, so getFullCtmAtOffset maps a block
+    // straight into the rotated (visible) frame — the same frame extraction
+    // reports the target's bbox in, with getBounds()'s post-rotation height as
+    // the flip. Converting the bbox here as well rotates the target TWICE:
+    // measured on this landscape form, the one exact-match candidate scored a
+    // distance of 372.8pt while sitting dead on the click. The rotation value
+    // is still needed below, but only to pick the LINE axis, which lives in
+    // raw text space that the invocation CTM never touches.
 
     // The text may live in the page stream OR in a Form XObject it invokes.
     // Try each in turn, with font lookups scoped to that source's resources.
@@ -1985,7 +2003,7 @@ function replaceTextInStream(
         }
         const targetFontRef = findMatchingFontRef(targetBlock.fontName, fontRefToBaseName)
         return replaceTextInContentStreamFontAware(
-          stream, pageIndex, targetBlock, newText, targetFontRef, pageWidth, pageHeight
+          stream, pageIndex, targetBlock!, newText, targetFontRef, pageWidth, pageHeight, rotation
         )
       })
 
@@ -3926,6 +3944,20 @@ function trimBlankEnds(blocks: BtInfo[]): BtInfo[] {
 /** Why the last match attempt failed — read by callers to build a useful error. */
 let lastMatchDiagnostic = ''
 
+/**
+ * Raw index in `text` where the space-free suffix `suffixFree` begins, spaces
+ * in `text` skipped — or null when the text does not end with it.
+ */
+function consumeSuffixFree(text: string, suffixFree: string): number | null {
+  let p = text.length
+  for (let k = suffixFree.length - 1; k >= 0; k--) {
+    while (p > 0 && /\s/.test(text[p - 1])) p--
+    if (p <= 0 || text[p - 1] !== suffixFree[k]) return null
+    p--
+  }
+  return p
+}
+
 function replaceTextInContentStreamFontAware(
   stream: string,
   pageIndex: number,
@@ -3933,7 +3965,8 @@ function replaceTextInContentStreamFontAware(
   newText: string,
   targetFontRef: string | null,
   pageWidth?: number,
-  pageHeight?: number
+  pageHeight?: number,
+  rotation = 0
 ): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   // Step 1: Parse all BT blocks with position and text info
   const allBlocks = scanBtBlocks(stream, pageIndex)
@@ -3947,7 +3980,15 @@ function replaceTextInContentStreamFontAware(
   // the nearest one is applied. Returning the first textual match instead used
   // to silently rewrite a different paragraph while the clicked one appeared
   // not to be editable at all.
-  interface Candidate { blocks: BtInfo[]; score: number; dist: number; line: boolean; partial?: boolean; order: number }
+  interface Candidate {
+    blocks: BtInfo[]; score: number; dist: number; line: boolean; partial?: boolean; order: number
+    /**
+     * Space-free tail of the target that is NOT drawn by this run — it lives
+     * fused at the head of the block that follows the run, so it stays on the
+     * page and must be trimmed off the replacement before applying.
+     */
+    tailFused?: string
+  }
   const candidates: Candidate[] = []
   const distCache = new Map<number, number>()
   const distOf = (b: BtInfo) => {
@@ -3959,15 +4000,24 @@ function replaceTextInContentStreamFontAware(
     return d
   }
 
-  // Step 2: Group blocks by Y position and try line-grouped matching FIRST
-  // (MuPDF often groups multiple BT blocks into one TextBlock)
+  // Step 2: Group blocks into VISUAL lines and try line-grouped matching FIRST
+  // (MuPDF often groups multiple BT blocks into one TextBlock).
+  //
+  // On an unrotated page a visual line is constant content-space Y. On a
+  // /Rotate 90|270 page it is constant content-space X — the paper is turned,
+  // so the reading direction runs along the content Y axis. Grouping by Y
+  // there puts every glyph of a line in its own group (this fund-request form
+  // draws ONE GLYPH PER BT, so "税号 RUC: 20606091380" was ~20 groups of one)
+  // and no multi-block line could ever be assembled: the page read as almost
+  // entirely uneditable while single-block cells edited fine.
+  const sideways = rotation === 90 || rotation === 270
   const lineGroups = new Map<number, BtInfo[]>()
   for (const block of allBlocks) {
     if (!block.hasPos) continue
-    // Round Y to nearest 0.5 to group same-line blocks
-    const yKey = Math.round(block.yPos * 2) / 2
-    if (!lineGroups.has(yKey)) lineGroups.set(yKey, [])
-    lineGroups.get(yKey)!.push(block)
+    // Round to nearest 0.5 to group same-line blocks
+    const key = Math.round((sideways ? block.xPos : block.yPos) * 2) / 2
+    if (!lineGroups.has(key)) lineGroups.set(key, [])
+    lineGroups.get(key)!.push(block)
   }
 
   for (const [, lineBlocks] of lineGroups) {
@@ -3985,10 +4035,20 @@ function replaceTextInContentStreamFontAware(
     // stranded next to the replacement. (Same rule the move matcher already
     // applies; trying both can only ever ADD a candidate.)
     const byStart = [...lineBlocks].sort((a, b) => a.start - b.start)
-    const byX = [...lineBlocks].sort((a, b) => a.xPos - b.xPos)
-    const orderings = byX.every((b, i) => b === byStart[i]) ? [byStart] : [byStart, byX]
+    // Reading order along the line: X on an upright page; along the content Y
+    // axis when the page is turned (ascending for /Rotate 90, descending for
+    // 270 — the display X grows with content Y one way round and against it
+    // the other); reversed X for 180.
+    const byRead = [...lineBlocks].sort((a, b) =>
+      rotation === 90 ? a.yPos - b.yPos :
+      rotation === 270 ? b.yPos - a.yPos :
+      rotation === 180 ? b.xPos - a.xPos :
+      a.xPos - b.xPos)
+    const orderings = byRead.every((b, i) => b === byStart[i]) ? [byStart] : [byStart, byRead]
 
     let best: { blocks: BtInfo[]; score: number } | null = null
+    let bestFused: { blocks: BtInfo[]; coverage: number; rest: string } | null = null
+    const tFree = normalizedTarget.replace(/\s+/g, '')
     for (const sorted of orderings) {
       for (let i = 0; i < sorted.length; i++) {
         let acc = ''
@@ -3999,6 +4059,17 @@ function replaceTextInContentStreamFontAware(
           if (!norm) continue
           const ratio = matchRatio(norm, normalizedTarget)
           if (ratio < 0.7) continue
+          // A LONE block holding more than the target is the containment
+          // shape, not a line run: rewriting it whole eats the extra glyphs.
+          // This form fuses the previous label's "）" onto "Importe Pagado "
+          // in one block, and the line path deleted the bracket every time
+          // the label was edited. The partial path edits inside such a block;
+          // scoring it here just let the destructive route outrank it.
+          const winFree = norm.replace(/\s+/g, '')
+          if (i === j && winFree !== tFree && !winFree.includes('?') &&
+              winFree.includes(tFree) && winFree.replace(tFree, '').length > 0) {
+            continue
+          }
           let score = 0
           if (norm === normalizedTarget) score = 2
           else if (fuzzyTextMatch(norm, normalizedTarget)) score = ratio
@@ -4009,6 +4080,37 @@ function replaceTextInContentStreamFontAware(
           if (score > 0 && (!best || score > best.score)) {
             best = { blocks: trimBlankEnds(sorted.slice(i, j + 1)), score }
           }
+          // The line's TAIL glyph is fused into the block that follows. This
+          // bilingual form draws "暂扣款（质保金）" as seven one-glyph blocks
+          // and then "）Importe Pagado …" as ONE block — the closing bracket
+          // belongs to the label but is drawn by the neighbour, so no
+          // contiguous run ever equals the target. A prefix run is accepted
+          // when the next block PROVABLY starts with the missing remainder;
+          // the remainder stays on the page, so it is trimmed off the
+          // replacement at apply time — and when the edit CHANGED that tail,
+          // the candidate is skipped there rather than half-applied.
+          //
+          // Checked whatever `score` says: the fuzzy matcher happily claims a
+          // prefix window too, and applying THAT writes the fused tail a
+          // second time. The structural reading — this run is the target
+          // minus exactly what the neighbour starts with — explains the page
+          // better than a fuzzy whole-match, so it is also RANKED above one:
+          // just under an exact match, well above every fuzzy and shuffle.
+          if (j + 1 < sorted.length) {
+            const runFree = norm.replace(/\s+/g, '')
+            if (runFree.length >= 3 && runFree.length >= tFree.length * 0.6 &&
+                runFree.length < tFree.length && tFree.startsWith(runFree)) {
+              const rest = tFree.slice(runFree.length)
+              if (rest && sorted[j + 1].decodedText.replace(/\s+/g, '').startsWith(rest)) {
+                if (!bestFused || runFree.length / tFree.length > bestFused.coverage) {
+                  bestFused = {
+                    blocks: trimBlankEnds(sorted.slice(i, j + 1)),
+                    coverage: runFree.length / tFree.length, rest
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -4017,6 +4119,12 @@ function replaceTextInContentStreamFontAware(
       candidates.push({
         blocks: best.blocks, score: best.score,
         dist: distOf(best.blocks[0]), line: true, order: candidates.length
+      })
+    }
+    if (bestFused) {
+      candidates.push({
+        blocks: bestFused.blocks, score: 1.9, tailFused: bestFused.rest,
+        dist: distOf(bestFused.blocks[0]), line: true, order: candidates.length
       })
     }
   }
@@ -4152,11 +4260,30 @@ function replaceTextInContentStreamFontAware(
   )
 
   for (const c of candidates) {
+    // A line group provably FAR from the click is never the line the user
+    // meant: a sloppy fuzzy run 90pt away once beat nothing at all, edited the
+    // other copy of a repeated label, and clipped a glyph off its neighbour.
+    // Only a KNOWN distance disqualifies — Infinity means the position could
+    // not be measured, and the no-position fallback some generators need must
+    // keep working.
+    if (c.line && Number.isFinite(c.dist) && c.dist > 48) continue
+    // A fused-tail run draws only part of the target; the rest stays on the
+    // page in the neighbouring block, so it must be trimmed off the
+    // replacement. An edit that CHANGED that tail cannot land through this
+    // run — skip it rather than write a replacement that half-disagrees with
+    // what remains drawn.
+    let effNewText = newText
+    if (c.tailFused) {
+      const end = consumeSuffixFree(newText, c.tailFused)
+      if (end === null) continue
+      effNewText = newText.slice(0, end)
+      if (!effNewText.trim() && newText.trim()) continue
+    }
     const result = c.partial
-      ? applyPartialBlockReplacement(stream, c.blocks[0], newText, pageIndex, targetBlock, pageHeight)
+      ? applyPartialBlockReplacement(stream, c.blocks[0], effNewText, pageIndex, targetBlock, pageHeight)
       : c.line
-        ? applyLineReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth)
-        : applyBlockReplacement(stream, c.blocks, newText, pageIndex, targetBlock, pageWidth, pageHeight)
+        ? applyLineReplacement(stream, c.blocks, effNewText, pageIndex, targetBlock, pageWidth, rotation)
+        : applyBlockReplacement(stream, c.blocks, effNewText, pageIndex, targetBlock, pageWidth, pageHeight)
     if (result) {
       if (!('error' in result)) {
         result.strategy = c.partial ? 'partial_block' : c.line ? 'line_group' : 'single_block'
@@ -4220,7 +4347,17 @@ function applyBlockReplacement(
     // is incomplete the decoded text is empty or '????' while the block still
     // holds an entire table row, and a decoded-length test waves it through.
     const blockGlyphs = estimateGlyphCount(block.content)
-    if (targetNorm && blockGlyphs > targetNorm.length * 1.4) {
+    // Provable containment delegates too, however small the excess: a header
+    // block reading "）Importe Pagado " is only ONE glyph bigger than its
+    // target, far under any glyph-count slack, and the whole-block rewrite
+    // deleted the bracket — which belongs to the label in the cell BEFORE.
+    // Same test as the op-level gate: not the target, contains it, leftover
+    // visible, and no '?' placeholders pretending to be foreign glyphs.
+    const dFree = block.decodedText.replace(/\s+/g, '')
+    const tFreeHere = targetNorm.replace(/\s+/g, '')
+    const provablyHoldsMore = !!tFreeHere && dFree !== tFreeHere && !dFree.includes('?') &&
+      dFree.includes(tFreeHere) && dFree.replace(tFreeHere, '').length > 0
+    if (targetNorm && (blockGlyphs > targetNorm.length * 1.4 || provablyHoldsMore)) {
       const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
       if (partial) return partial
       // Falling through would rewrite the WHOLE block, and this block holds far
@@ -4450,7 +4587,8 @@ function applyLineReplacement(
   newText: string,
   pageIndex: number,
   targetBlock?: TextBlock,
-  pageWidth?: number
+  pageWidth?: number,
+  rotation = 0
 ): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   // Sort by position in stream (ascending)
   const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
@@ -4469,10 +4607,79 @@ function applyLineReplacement(
   // the fallback when any position is unknown.
   const contributing = sorted.filter(contributes)
   if (contributing.length === 0) return null
+  // "Starts the line" follows the page's reading direction: min x upright,
+  // along the content Y axis when the paper is turned (min y for /Rotate 90,
+  // max for 270), reversed x for 180.
+  const readCmp = (a: BtInfo, b: BtInfo) =>
+    rotation === 90 ? a.yPos - b.yPos :
+    rotation === 270 ? b.yPos - a.yPos :
+    rotation === 180 ? b.xPos - a.xPos :
+    a.xPos - b.xPos
   const primary = contributing.every(b => b.hasPos)
-    ? contributing.reduce((min, b) => b.xPos < min.xPos ? b : min)
+    ? contributing.reduce((min, b) => readCmp(b, min) < 0 ? b : min)
     : contributing[0]
   const primaryIdx = sorted.indexOf(primary)
+
+  /**
+   * RESCUE for a run whose blocks no single font can draw: drop the blocks
+   * the edit did not change, from BOTH ends, and re-run on the middle.
+   *
+   * A bilingual form draws "税号 RUC: 20606091380" as ~20 one-glyph BT blocks
+   * — the CJK in a CID font, the Latin in another — and re-encoding the whole
+   * line has to find one face holding both scripts. There is none, WinAnsi has
+   * no 税, and every such line failed with "Cannot encode characters" however
+   * small the actual change was. This is `narrowToChangedOps` one level up,
+   * with one difference that makes BOTH ends safe here: each BT block carries
+   * its own absolute position (BT resets the line matrix), so an untouched
+   * TRAILING block keeps its place no matter how the text before it changed —
+   * the Td-offset hazard that forbids tail-trimming inside a single block
+   * does not exist between blocks.
+   *
+   * Strictly a rescue: it runs only after the whole-run encode has FAILED, so
+   * no line that encodes today changes, and the recursion terminates because
+   * each pass strictly shrinks the run or stops.
+   */
+  const narrowLineAndRetry = (): ReturnType<typeof applyLineReplacement> => {
+    if (!contributing.every(b => b.hasPos)) return null
+    const reading = [...contributing].sort(readCmp)
+    // Consume a block's space-free text from newText at `pos` forward (or
+    // `end` backward); null = the block's text is not there, i.e. the edit
+    // changed it.
+    const forward = (pos: number, bf: string): number | null => {
+      let p = pos
+      for (let k = 0; k < bf.length; k++) {
+        while (p < newText.length && /\s/.test(newText[p])) p++
+        if (p >= newText.length || newText[p] !== bf[k]) return null
+        p++
+      }
+      return p
+    }
+    const backward = (end: number, bf: string): number | null => {
+      let p = end
+      for (let k = bf.length - 1; k >= 0; k--) {
+        while (p > 0 && /\s/.test(newText[p - 1])) p--
+        if (p <= 0 || newText[p - 1] !== bf[k]) return null
+        p--
+      }
+      return p
+    }
+    let head = 0, tail = reading.length, pos = 0, end = newText.length
+    while (head < tail - 1) {
+      const p = forward(pos, reading[head].decodedText.replace(/\s+/g, ''))
+      if (p === null) break
+      pos = p; head++
+    }
+    while (tail - 1 > head) {
+      const p = backward(end, reading[tail - 1].decodedText.replace(/\s+/g, ''))
+      if (p === null) break
+      end = p; tail--
+    }
+    if (head === 0 && tail === reading.length) return null // nothing to drop
+    const middleText = newText.slice(pos, end).trim()
+    if (!middleText) return null
+    return applyLineReplacement(stream, reading.slice(head, tail), middleText,
+      pageIndex, targetBlock, pageWidth, rotation)
+  }
 
   // Every block here except the primary gets blanked, so refuse when the run
   // carries far more text than the target: a bad line-group match on a Corel
@@ -4487,6 +4694,23 @@ function applyLineReplacement(
     const runGlyphs = sorted.reduce((n, b) => n + estimateGlyphCount(b.content), 0)
     const targetLen = targetBlock.text.replace(/\s+/g, ' ').trim().length
     if (targetLen > 0 && runGlyphs > targetLen * 2.5 + 16) return null
+
+    // Every non-primary block here gets BLANKED — so every one of them must
+    // be part of the target. A fuzzy run happily picks up a stray glyph from
+    // the neighbouring cell (the tail of "S.A.C." in front of a RUC, the
+    // label bracket fused before a header), and blanking that deletes ink
+    // the edit never named. Judged case-folded and space-free; a block whose
+    // decode carries '?' placeholders is exempt — unreadable is not the same
+    // as foreign, and refusing on it broke fonts with incomplete CMaps.
+    const tFold = foldForMatch(targetBlock.text).replace(/\s+/g, '')
+    if (tFold) {
+      for (const b of contributing) {
+        if (b === primary) continue
+        const bf = foldForMatch(b.decodedText).replace(/\s+/g, '')
+        if (!bf || bf.includes('?')) continue
+        if (!tFold.includes(bf)) return null
+      }
+    }
   }
 
   // Build replacements (process from end to start to preserve offsets)
@@ -4507,7 +4731,12 @@ function applyLineReplacement(
       drawnLines = lines.length
 
       const plan = planTextEncoding(pageIndex, block, lines, targetBlock)
-      if (plan.kind === 'error') return { error: plan.error }
+      if (plan.kind === 'error') {
+        // Before giving up, stop re-encoding the blocks the edit never
+        // touched — the CJK label beside an edited Latin value, or the other
+        // way round. See narrowLineAndRetry above.
+        return narrowLineAndRetry() ?? { error: plan.error }
+      }
       if (plan.kind === 'subst') {
         newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, undefined, undefined, block.inheritedTf)
         substitutedFont = plan.fontName
@@ -6157,20 +6386,37 @@ function applyPartialBlockReplacement(
       } else if (plan.kind === 'keep-plain') {
         repl = buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw)
       } else {
-        // Substituted font applies to THIS op only — restore the block's
-        // original font afterwards so the untouched lines keep theirs.
+        // Substituted font applies to THIS op only — afterwards, restore the
+        // font the ops AFTER the window actually inherit: the one in force at
+        // the window's END, not the block's first Tf. A bilingual form draws
+        // one cell as three lines in a single BT — two Latin lines under a
+        // font inherited from BEFORE the block, then a CJK line set by the
+        // block's only in-content Tf. Restoring "the block's first Tf" put
+        // the CJK font over the untouched Latin lines the moment line one was
+        // edited: they rendered as garbage and extracted as U+FFFD, reported
+        // as the edit corrupting the rest of the cell.
         //
-        // A block with no Tf of its own restores the one it INHERITED, for the
-        // same reason rebuildBtContent does: without it the substitute stays in
-        // force past ET and becomes the font of every later fontless block,
-        // which then cannot be matched for editing at all.
+        // op.fontRef carries the last in-block Tf before the op; null means
+        // the window ran under the block's ENTERING font — the inherited
+        // operator verbatim when recorded, else the resolved name in
+        // block.fontRef. Sizes come from the text state at the window, not
+        // from whatever Tf happens to appear first in the content.
         const tfMatch = block.content.match(/\/([^\s<>[\]()/%]+)\s+([\d.]+)\s+Tf/)
         const inheritedSize = block.inheritedTf?.match(/([\d.]+)\s+Tf\s*$/)?.[1]
-        const size = tfMatch ? tfMatch[2] : (inheritedSize ?? '12')
-        const restore = tfMatch
-          ? ` /${tfMatch[1]} ${size} Tf`
-          : (block.inheritedTf ? ` ${block.inheritedTf}` : '')
-        repl = `/${plan.fontRef} ${size} Tf ${buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw)}${restore}`
+        const fallbackSize = tfMatch ? tfMatch[2] : (inheritedSize ?? '12')
+        const stateIn = textStateAtOp(block, ops, winI, pageIndex)
+        const stateOut = winJ === winI ? stateIn : textStateAtOp(block, ops, winJ, pageIndex)
+        const drawSize = stateIn?.tfSize ? fmtNum(stateIn.tfSize) : fallbackSize
+        const endSize = stateOut?.tfSize ? fmtNum(stateOut.tfSize) : fallbackSize
+        const endFont = ops[winJ].fontRef
+        const restore = endFont
+          ? ` /${endFont} ${endSize} Tf`
+          : block.inheritedTf
+            ? ` ${block.inheritedTf}`
+            : block.fontRef
+              ? ` /${block.fontRef} ${endSize} Tf`
+              : (tfMatch ? ` /${tfMatch[1]} ${fallbackSize} Tf` : '')
+        repl = `/${plan.fontRef} ${drawSize} Tf ${buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw)}${restore}`
         substitutedFont = plan.fontName
       }
     } else {
