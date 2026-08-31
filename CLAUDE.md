@@ -364,7 +364,24 @@ Ghostscript subset has neither. Editing such a row to text it can already draw
 works; typing a name with new letters reports that it could not be matched.
 Measured: same-glyph, shorter and longer replacements all keep the "A" label and
 land in the right column; the corpus is unchanged, 262 experiments, 227
-successes, no regressions.
+successes, no regressions. The same gate is why `N°` accepts `Nro`, `No`, `N`
+and `De` but not `zzz` — that font has no `z` — which reads as "some edits work
+and some don't" unless you know what to look at.
+
+**A ONE-character label cannot be reached, and trying broke things.** The same
+memo labels its addressee row `A`, against `De`, `Asunto` and `N°` below it.
+Containment is the only pass that could find it inside the single BT that draws
+the whole header, and containment demands two characters
+(`targetCompact.length >= 2`). Lowering that to one — even restricted to a
+STANDALONE token, so `A` could not match the `A` inside "Adjunto" — put the
+replacement in the wrong place: asked to change the label, the engine rewrote
+the signature line some 500pt away, interleaving "PARA" into "Alberto" as
+`PAlbReArto`. The block that contains a lone letter is ranked by distance from
+that BLOCK'S ORIGIN, and the origin of a BT drawing an entire header is nowhere
+near the clicked row, so the ranking has nothing to go on and the position
+safeguards further down never get a chance to matter. Reverted. Refusing the
+edit is the honest outcome; a fix needs per-RUN positions at selection time, not
+per-block.
 
 ### Object operations never edit the matrix that placed the image
 Acrobat's "Objetos" panel — flip, rotate, crop, align, arrange, replace — for

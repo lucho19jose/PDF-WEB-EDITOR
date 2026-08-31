@@ -4034,6 +4034,15 @@ function replaceTextInContentStreamFontAware(
   // exact-text single block 300pt away (nine occurrences of "10.00" on one
   // timesheet — the far one used to win just by being tried first).
   const targetCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
+  // Two characters, NOT one. A single-character label — this memo's addressee
+  // row is labelled `A`, against `De`, `Asunto` and `N°` below it — cannot be
+  // identified by its text, and admitting it here (even restricted to a
+  // standalone token) put the replacement in the wrong place: asked to change
+  // the `A`, the engine rewrote the signature line 500pt away, interleaving
+  // "PARA" into "Alberto" as "PAlbReArto". The block that CONTAINS a lone
+  // letter is picked by distance from the block's ORIGIN, and the origin of the
+  // one BT that draws this whole header is nowhere near the clicked row, so the
+  // ranking has nothing to go on. Refusing the edit is the honest outcome.
   if (targetCompact.length >= 2) {
     for (const fontFiltered of [true, false]) {
       for (const block of allBlocks) {
