@@ -179,6 +179,16 @@ function onObjectPicked() {
 const sizes = ref(new Map<number, { w: number; h: number }>())
 const fallbackSize = ref({ w: 612, h: 792 })
 
+/**
+ * Each page's size in PDF POINTS — scale divided out, and rotation already
+ * applied by PDF.js's viewport.
+ *
+ * Kept separately from `sizes` (which is CSS pixels at whatever scale the page
+ * was painted at) so that arriving on a page can hand the overlays a paper size
+ * that does not depend on the zoom being unchanged since that page was drawn.
+ */
+const pdfSizes = ref(new Map<number, { w: number; h: number }>())
+
 function sizeOf(page: number): { w: number; h: number } {
   return sizes.value.get(page) ?? fallbackSize.value
 }
@@ -243,6 +253,10 @@ async function pump() {
         sizes.value = next
       }
       if (page === 1) fallbackSize.value = { w: result.width, h: result.height }
+      pdfSizes.value.set(page, {
+        w: result.viewport.width / docStore.scale,
+        h: result.viewport.height / docStore.scale
+      })
       if (page === docStore.currentPage) adoptCurrentGeometry(result)
     }
   } finally {
@@ -448,8 +462,19 @@ watch(() => docStore.currentPage, async (page) => {
   // A page reached by scrolling is already where it should be; one chosen from
   // the thumbnails or the keyboard has to be brought into view.
   if (continuous.value && !syncingFromScroll) scrollToPage(page)
+  // BOTH geometries, or the overlays scale the new page's blocks by the old
+  // page's paper. adoptCurrentGeometry only runs when a page is RENDERED, and
+  // a page already painted is not re-rendered on arrival — so every overlay
+  // kept the previous page's pdf dimensions. Nobody notices while a document
+  // is one paper size; on a file whose page 1 is portrait 595x842 and page 2
+  // landscape 842x595 the two are exactly swapped, and every clickable text
+  // box on page 2 landed somewhere else (x scaled by 1263/595, y by 892/842).
+  // Clicking a line opened the editor on a DIFFERENT line, which reads as
+  // "I still can't edit this page" however well the engine matches.
   const size = sizes.value.get(page)
   if (size) { pageWidth.value = size.w; pageHeight.value = size.h }
+  const pdfSize = pdfSizes.value.get(page)
+  if (pdfSize) { pdfPageWidth.value = pdfSize.w; pdfPageHeight.value = pdfSize.h }
   requestVisible()
 })
 
@@ -466,6 +491,7 @@ watch(() => docStore.loaded, async (loaded) => {
     attempts.clear()
     renderQueue = []
     sizes.value = new Map()
+    pdfSizes.value = new Map()
     await nextTick()
     requestVisible()
   }

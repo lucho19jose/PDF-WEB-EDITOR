@@ -368,6 +368,30 @@ successes, no regressions. The same gate is why `N°` accepts `Nro`, `No`, `N`
 and `De` but not `zzz` — that font has no `z` — which reads as "some edits work
 and some don't" unless you know what to look at.
 
+### Arriving on a page adopts BOTH its geometries, or the overlays lie
+`adoptCurrentGeometry` runs only when a page is RENDERED, and a page already
+painted is not re-rendered on arrival — so `pdfPageWidth/Height` kept the
+PREVIOUS page's paper while `pageWidth/Height` took the new page's canvas.
+Every overlay scales `bbox × pageWidth/pdfWidth`, so on a document whose page
+1 is portrait 595x842 and page 2 landscape 842x595 the two are exactly
+swapped: measured, x scaled by 1263/595 = 2.12 and y by 892/842 = 1.06 where
+both should be 1.5. Every clickable text box on page 2 sat somewhere else,
+so clicking a line opened the editor on a DIFFERENT line — which reads as
+"I still can't edit this page" no matter how well the engine matches, and is
+invisible on any document of one paper size.
+
+The `currentPage` watcher now adopts both. The pdf-space sizes are kept in
+their OWN map (`pdfSizes`, points, rotation already applied by PDF.js's
+viewport) rather than derived from the CSS-pixel `sizes` map: that one is
+measured at whatever scale the page was painted at, so dividing it by the
+CURRENT scale is wrong for exactly as long as a zoom change takes to repaint.
+
+**Test at the DOM level, not just the engine.** Every engine-level probe of
+this page passed while the app was unusable, because the failure was in the
+mapping between the two. `elementFromPoint` at a block's centre returning
+that block's own overlay is the check that proves it — the same rule already
+recorded for the file-input overlay.
+
 ### A /Rotate page's LINES run along the other axis — the frames were already right
 A landscape fund-request form (/Rotate 90, one glyph per BT, 485 blocks a
 page) read as almost entirely uneditable. Not because of coordinates:
