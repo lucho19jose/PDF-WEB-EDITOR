@@ -1845,6 +1845,58 @@ text at 4 (annotations stay above both — one stamped over a scan must still wi
 its own click), and `scaledContentImgs` sorts BIGGEST FIRST so that among the
 images themselves the frame never covers the photograph inside it.
 
+### A digitally signed signature is a WIDGET, and widgets are not annotations
+MuPDF's `getAnnotations()` deliberately excludes `/Widget` annotations — form
+fields — and a signing service (Intellisign) stamps each signature image
+through exactly that: a `/FT /Sig` widget whose appearance form draws the
+scribble. On a signed memo the three signatures therefore existed in no list
+this editor kept: not content images (no `Do` in any content source), not
+annotations (`getAnnotations()` answers 0 on a page whose `/Annots` holds
+three), so they had no hit target and could not be selected, moved, resized or
+deleted — while the page's logo, an ordinary content-stream image, dragged
+fine. Reported as "I can move the logo but not the signatures".
+
+`getAnnotsAndWidgets()` is the one list everybody uses — the listing AND every
+index resolver (update, delete, rotate, flatten, move-to-page), since the UI
+addresses annotations by list position and the two sides must agree. Widgets
+append AFTER the plain annotations so no index that worked before changes, and
+hidden/no-view widgets are filtered on both sides for the same reason. Three
+things widgets need done differently:
+
+- **Never call `annot.update()` on one.** MuPDF regenerating a form field's
+  appearance replaces the signing service's image with MuPDF's own idea of the
+  field. The viewer maps the appearance BBox onto `/Rect` (PDF 32000 12.5.5),
+  so `setRect` alone IS a complete move or resize.
+- **`/Annots` position must be SEARCHED, not indexed.** The combined list puts
+  widgets last; `/Annots` interleaves them in producer order. `moveAnnotationToPage`
+  finds its entry by `/Rect` + `/Subtype` and picks the arrival from the right
+  sub-list (`getWidgets()` vs `getAnnotations()`, each in `/Annots` order).
+- The widgets' `/F` is 132 — Print + **Locked**. Locked is advisory
+  (viewer-level), and honouring it would defeat the point of an editor whose
+  whole purpose is editing signed documents; edits break the cryptographic
+  signature anyway, exactly as text edits already do.
+
+Verified engine-level (rect moved, AP stream byte-identical, ink pixels moved
+by exactly the delta) and in the browser (drag commits, undo restores).
+
+### The overlays learn of a reload from ONE bump — so it must come LAST
+Undo was `pdfViewer.reloadDocument(snapshot)` then `pdfEngine.loadDocument(snapshot)`.
+The viewer reload bumps `renderVersion` (via `reloadBytes`), and that bump is
+the only signal the overlay watchers get — undo has no explicit re-fetch the
+way `annotOp` has. Every overlay therefore fetched from a worker still holding
+the PRE-undo document and kept the stale answer forever: after undoing a
+signature move the canvas showed it back in place while its hit target stayed
+where the undone move had put it, one whole operation behind, permanently.
+Engine first, viewer second — the bump then describes a document both engines
+agree on. Same fix in redo.
+
+Opening a file has the same shape with a different guard: the bump inside
+`pdfViewer.loadDocument` fires while `pdfEngine.docLoaded` is still false, the
+overlays' fetch guard answers "no document", and nothing ever asks again — a
+freshly opened file had no clickable objects until the tool was toggled. There
+the order cannot swap (the viewer load is what validates the file), so
+`loadBytes` bumps AGAIN once the engine is ready.
+
 ### An image drags out of its own clip
 `transformContentImage` splices a widened `re` for every clip in force at the
 `Do`, exactly as `transformTextBlock` does for text. A picture in a table cell

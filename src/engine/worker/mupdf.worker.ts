@@ -6331,12 +6331,45 @@ function safe<T>(fn: () => T, fallback: T): T {
   try { return fn() } catch { return fallback }
 }
 
+/**
+ * Annotations AND widgets, as ONE list.
+ *
+ * MuPDF's getAnnotations() deliberately excludes /Widget annotations — form
+ * fields, which is what an e-signing service (Intellisign) stamps its
+ * signature images through: a /Sig widget whose appearance form draws the
+ * handwritten scribble. A signed memo's three signatures therefore had no
+ * entry anywhere in this layer — no hit target, not selectable, not movable —
+ * while the page's own logo dragged fine, reported as "I can move the logo
+ * but not the signatures".
+ *
+ * Widgets are appended AFTER the plain annotations, so every index that
+ * worked before is unchanged, and a freshly created annotation's index
+ * (`getAnnotations().length - 1`) still names the same entry in this list.
+ * Hidden and no-view widgets are left out on BOTH the listing and the
+ * resolving side — the two must agree on indices, and a hit target over
+ * something that draws nothing invites deleting the invisible.
+ */
+function getAnnotsAndWidgets(page: any): any[] {
+  const annots = page.getAnnotations()
+  let widgets: any[] = []
+  try {
+    widgets = (page.getWidgets() || []).filter((w: any) => {
+      const f = safe(() => Number(String(w.getObject().get('F') ?? 0)) || 0, 0)
+      return !(f & 2) && !(f & 32) // Hidden, NoView
+    })
+  } catch (_) { /* no widget support — annotations alone */ }
+  return widgets.length ? [...annots, ...widgets] : annots
+}
+
 function listAnnotations(pageIndex: number): any[] {
   const page = pdfDoc.loadPage(pageIndex)
-  const annots = page.getAnnotations()
+  const annots = getAnnotsAndWidgets(page)
   const out: any[] = []
   annots.forEach((annot: any, index: number) => {
-    const type = safe(() => annot.getType(), 'Unknown')
+    let type = safe(() => annot.getType(), 'Unknown')
+    if (type === 'Widget') {
+      type = safe(() => String(annot.getObject().get('FT')) === '/Sig' ? 'Signature' : 'Widget', 'Widget')
+    }
     // Some annotation types (Ink, Line) may throw on getRect — fall back to getBounds.
     let rect = safe<number[] | null>(() => annot.getRect(), null)
     if (!rect) rect = safe<number[] | null>(() => annot.getBounds(), null)
@@ -6581,7 +6614,7 @@ function rotateStampImage(
   let page: any = null
   try {
     page = pdfDoc.loadPage(pageIndex)
-    const annot = page.getAnnotations()[annotIndex]
+    const annot = getAnnotsAndWidgets(page)[annotIndex]
     if (!annot) return { success: false, error: `Annotation ${annotIndex} not found` }
 
     const aobj = annot.getObject()
@@ -6871,8 +6904,9 @@ function moveAnnotationToPage(
   let dst: any = null
   try {
     src = pdfDoc.loadPage(pageIndex)
-    const annot = src.getAnnotations()[annotIndex]
+    const annot = getAnnotsAndWidgets(src)[annotIndex]
     if (!annot) return { success: false, error: `Annotation ${annotIndex} not found` }
+    const wasWidget = safe(() => String(annot.getObject().get('Subtype')) === '/Widget', false)
 
     // The appearance matrix carries the image's rotation; keep it across the trip.
     const savedMatrix = readApMatrix(annot)
@@ -6882,14 +6916,29 @@ function moveAnnotationToPage(
     if (!srcAnnots || String(srcAnnots) === 'null') return { success: false, error: 'Page has no annotations' }
     srcAnnots = srcAnnots.resolve ? srcAnnots.resolve() : srcAnnots
 
-    // /Annots order and getAnnotations() order agree in MuPDF, but verify the
-    // entry really is this annotation before surgery — /Rect is as good an
-    // identity as is reachable from both sides.
-    const ref = srcAnnots.get(annotIndex)
-    const sameRect = String(ref?.resolve?.()?.get?.('Rect') ?? '') === String(annot.getObject().get('Rect') ?? '')
-    if (!ref || String(ref) === 'null' || !sameRect) {
+    // The entry has to be FOUND in /Annots, not indexed into it: the combined
+    // list here appends widgets after the plain annotations, while /Annots
+    // interleaves them in whatever order the producer wrote — so a widget's
+    // list index is not its /Annots index on any page holding both kinds.
+    // /Rect plus /Subtype is as good an identity as is reachable from both
+    // sides; a page with two annotations of the same kind on the same rect
+    // moves whichever comes first, which draw identically anyway.
+    const annotRect = String(annot.getObject().get('Rect') ?? '')
+    const annotSubtype = String(annot.getObject().get('Subtype') ?? '')
+    let refIdx = -1
+    const srcLen = srcAnnots.length ?? 0
+    for (let i = 0; i < srcLen; i++) {
+      const cand = srcAnnots.get(i)
+      const r = cand?.resolve?.()
+      if (String(r?.get?.('Rect') ?? '') === annotRect && String(r?.get?.('Subtype') ?? '') === annotSubtype) {
+        refIdx = i
+        break
+      }
+    }
+    if (refIdx < 0) {
       return { success: false, error: 'Annotation list and /Annots disagree — refusing to move' }
     }
+    const ref = srcAnnots.get(refIdx)
 
     dst = pdfDoc.loadPage(targetPage)
     const dstObj = dst.getObject()
@@ -6901,7 +6950,7 @@ function moveAnnotationToPage(
       dstAnnots = dstAnnots.resolve ? dstAnnots.resolve() : dstAnnots
     }
     dstAnnots.push(ref)
-    srcAnnots.delete(annotIndex)
+    srcAnnots.delete(refIdx)
     try {
       const r = ref.resolve()
       if (r.get('P') && String(r.get('P')) !== 'null') r.delete('P')
@@ -6909,11 +6958,18 @@ function moveAnnotationToPage(
 
     // A fresh page handle sees the annotation it now owns; the old handles are
     // stale. setRect converts through the target page's own rotation.
+    //
+    // The arrival is the NEWEST entry of its own kind — getAnnotations() and
+    // getWidgets() each follow /Annots order, and the ref was pushed at the
+    // end, so a moved widget is the last widget and a moved annotation the
+    // last annotation. The combined index reported back counts annotations
+    // first, the same order listAnnotations hands the UI.
     try { dst.destroy() } catch (_) {}
     dst = pdfDoc.loadPage(targetPage)
-    const movedList = dst.getAnnotations()
-    const newIdx = movedList.length - 1
-    const moved = movedList[newIdx]
+    const dstPlain = dst.getAnnotations()
+    const dstAll = getAnnotsAndWidgets(dst)
+    const moved = wasWidget ? dstAll[dstAll.length - 1] : dstPlain[dstPlain.length - 1]
+    const newIdx = wasWidget ? dstAll.length - 1 : dstPlain.length - 1
     if (moved) {
       try { moved.setRect(rect as any) } catch (_) { /* keep the old rect */ }
       if (savedMatrix && savedMatrix.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
@@ -6937,12 +6993,16 @@ function flattenAnnotationBehind(
   let page: any = null
   try {
     page = pdfDoc.loadPage(pageIndex)
-    const annots = page.getAnnotations()
+    const annots = getAnnotsAndWidgets(page)
     const annot = annots[annotIndex]
     if (!annot) { page.destroy(); return { success: false, error: `Annotation ${annotIndex} not found` } }
 
-    // Make sure the appearance is up to date before it is borrowed.
-    try { annot.update() } catch (_) {}
+    // Make sure the appearance is up to date before it is borrowed. Not for a
+    // widget: regenerating a form field's appearance would replace the signing
+    // service's scribble with MuPDF's own idea of the field, and the stream as
+    // stored IS what is on screen.
+    const flattenIsWidget = safe(() => String(annot.getObject().get('Subtype')) === '/Widget', false)
+    if (!flattenIsWidget) { try { annot.update() } catch (_) {} }
 
     const aobj = annot.getObject()
     const apDict = aobj.get('AP')
@@ -7527,7 +7587,7 @@ function addImageStamp(
 function deleteAnnotationAt(pageIndex: number, annotIndex: number): { success: boolean; error?: string } {
   try {
     const page = pdfDoc.loadPage(pageIndex)
-    const annots = page.getAnnotations()
+    const annots = getAnnotsAndWidgets(page)
     if (annotIndex < 0 || annotIndex >= annots.length) {
       page.destroy()
       return { success: false, error: `Annotation ${annotIndex} not found` }
@@ -7547,7 +7607,7 @@ function updateAnnotationAt(d: {
 }): { success: boolean; error?: string } {
   try {
     const page = pdfDoc.loadPage(d.pageIndex)
-    const annots = page.getAnnotations()
+    const annots = getAnnotsAndWidgets(page)
     const annot = annots[d.annotIndex]
     if (!annot) { page.destroy(); return { success: false, error: 'Annotation not found' } }
     if (d.rect) { try { annot.setRect(d.rect as any) } catch (_) {} }
@@ -7561,10 +7621,19 @@ function updateAnnotationAt(d: {
     // snapped it back upright. Capture it, let update() do its work, put it
     // back. Restoring an identity is a no-op, so unrotated annotations lose
     // nothing.
-    const savedMatrix = readApMatrix(annot)
-    annot.update()
-    if (savedMatrix && savedMatrix.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
-      writeApMatrix(annot, savedMatrix)
+    //
+    // A WIDGET is never updated: its appearance is not MuPDF's to regenerate —
+    // for a signed /Sig field it is the signing service's own scribble, and a
+    // resynthesised one would replace it with whatever MuPDF draws for a form
+    // field. The viewer maps the appearance BBox onto /Rect (PDF 32000
+    // 12.5.5), so setRect alone is a complete move or resize.
+    const isWidget = safe(() => String(annot.getObject().get('Subtype')) === '/Widget', false)
+    if (!isWidget) {
+      const savedMatrix = readApMatrix(annot)
+      annot.update()
+      if (savedMatrix && savedMatrix.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
+        writeApMatrix(annot, savedMatrix)
+      }
     }
     page.destroy()
     return { success: true }

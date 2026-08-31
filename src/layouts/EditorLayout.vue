@@ -268,6 +268,12 @@ async function loadBytes(bytes: Uint8Array, name: string) {
     // A copy: the bridge transfers this buffer to the worker, and `bytes` is
     // what docStore now holds for saving and undo.
     const pageCount = await pdfEngine.loadDocument(bytes.buffer.slice(0) as ArrayBuffer)
+    // The overlays (text blocks, annotations, page images) fetch on the
+    // renderVersion bump, and the bump inside pdfViewer.loadDocument fired
+    // while the ENGINE was still empty — their guard answered "no document"
+    // and nothing ever asked again, so a freshly opened file had no clickable
+    // objects until the tool was toggled. Bump again now the engine is ready.
+    docStore.reloadBytes(bytes)
     editorStore.setStatus(`${name} — ${pageCount} pages (ready)`)
   } catch (err: any) {
     // It renders but cannot be edited — say exactly that instead of a bare
@@ -637,8 +643,15 @@ async function undo() {
     editorStore.setStatus('Undoing...')
     if (docStore.pdfBytes) historyStore.pushRedo(new Uint8Array(docStore.pdfBytes))
     const snapshot = historyStore.popUndo()!
-    await pdfViewer.reloadDocument(snapshot)
+    // ENGINE first, viewer second. reloadDocument bumps renderVersion (via
+    // reloadBytes), and that bump is the ONLY signal the overlays get — undo
+    // has no explicit re-fetch the way annotOp does. With the viewer first,
+    // every overlay watcher fetched from a worker still holding the pre-undo
+    // document and kept the stale answer forever: the canvas showed the
+    // signature back in place while its hit target stayed where the undone
+    // move had put it.
     await pdfEngine.loadDocument(snapshot.buffer.slice(0) as ArrayBuffer)
+    await pdfViewer.reloadDocument(snapshot)
     docStore.markModified()
     editorStore.setStatus('Undo applied')
   })
@@ -651,8 +664,9 @@ async function redo() {
     editorStore.setStatus('Redoing...')
     if (docStore.pdfBytes) historyStore.pushUndoNoClear(new Uint8Array(docStore.pdfBytes))
     const snapshot = historyStore.popRedo()!
-    await pdfViewer.reloadDocument(snapshot)
+    // Engine before viewer — same reason as undo above.
     await pdfEngine.loadDocument(snapshot.buffer.slice(0) as ArrayBuffer)
+    await pdfViewer.reloadDocument(snapshot)
     docStore.markModified()
     editorStore.setStatus('Redo applied')
   })
