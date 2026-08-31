@@ -4,7 +4,8 @@ import type { WorkerRequest, WorkerResponse } from './worker-protocol'
 import { glyphNameToUnicode } from './glyphNames'
 import type {
   TextBlock, TextChar, TextLine, PageTextData,
-  BlockTransformOp, BlockStyleOp, BlockTransformResult, ContentImageInfo
+  BlockTransformOp, BlockStyleOp, BlockTransformResult, ContentImageInfo,
+  ImageOrient, ImageAlign
 } from '../types'
 
 // MuPDF module — loaded dynamically to catch errors
@@ -244,6 +245,36 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       case 'transformContentImage': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({ id: req.id, type: 'success', data: transformContentImage(req.data.pageIndex, req.data.sourceKey, req.data.doOffset, req.data.name, req.data.rect) })
+        break
+      }
+      case 'deleteContentImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: deleteContentImage(req.data.pageIndex, req.data.sourceKey, req.data.doOffset, req.data.name) })
+        break
+      }
+      case 'orientContentImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: orientContentImage(req.data.pageIndex, req.data.sourceKey, req.data.doOffset, req.data.name, req.data.op) })
+        break
+      }
+      case 'cropContentImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: cropContentImage(req.data.pageIndex, req.data.sourceKey, req.data.doOffset, req.data.name, req.data.rect) })
+        break
+      }
+      case 'alignContentImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: alignContentImage(req.data.pageIndex, req.data.sourceKey, req.data.doOffset, req.data.name, req.data.mode, req.data.margin) })
+        break
+      }
+      case 'reorderContentImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: reorderContentImage(req.data.pageIndex, req.data.sourceKey, req.data.doOffset, req.data.name, req.data.where) })
+        break
+      }
+      case 'replaceContentImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: replaceContentImage(req.data.pageIndex, req.data.sourceKey, req.data.doOffset, req.data.name, req.data.imageBytes) })
         break
       }
       case 'flattenAnnotationBehind': {
@@ -6112,7 +6143,76 @@ function transformContentImage(
     const M = matConcat(matConcat(F, T), Finv)
 
     const inject = `q ${M.map(fmtNum).join(' ')} cm /${name} Do Q`
-    const newStream = src.stream.slice(0, doOffset) + inject + src.stream.slice(doEnd)
+    const splices: { start: number; end: number; text: string }[] = [
+      { start: doOffset, end: doEnd, text: inject }
+    ]
+
+    // Carry the clip window along, exactly as moving TEXT does.
+    //
+    // A picture in a Word table cell is bounded by that cell's `re W* n`, and
+    // the band is barely bigger than the picture. Dragging it a couple of
+    // centimetres therefore pushes it outside its own window and the part that
+    // left is not merely misplaced, it is invisible — measured on the reported
+    // document, a photo moved 120pt right came back with two thirds of it cut
+    // off and nothing on screen to say why.
+    //
+    // Anchored at the user-space origin, since T maps p -> p·[sx,sy] + (e,f)
+    // about that origin. The union can only ever REVEAL more of the group the
+    // clip bounds, which is the safe direction: hiding content is the failure
+    // being fixed.
+    for (const clip of withSource(src, () => getActiveClipsAtOffset(src.stream, doOffset))) {
+      const grown = withSource(src, () =>
+        expandClipForTransform(src.stream, clip, T[4], T[5], T[0], T[3], 0, 0))
+      if (grown) splices.push({ start: clip.index, end: clip.index + clip.length, text: grown })
+    }
+
+    // Highest offset first: a clip sits BELOW the Do it bounds, so splicing
+    // forwards would apply every later edit at an offset the earlier one moved.
+    let newStream = src.stream
+    for (const sp of splices.sort((a, b) => b.start - a.start)) {
+      newStream = newStream.slice(0, sp.start) + sp.text + newStream.slice(sp.end)
+    }
+    const bytes = new Uint8Array(newStream.length)
+    for (let i = 0; i < newStream.length; i++) bytes[i] = newStream.charCodeAt(i) & 0xFF
+    src.write(bytes)
+    invalidateContentSources(pageIndex)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Remove an image the page content draws.
+ *
+ * Only the `/Name Do` invocation goes; the XObject itself is left in
+ * /Resources. Unpicking the resource dictionary would be wrong whenever the
+ * same image is drawn more than once — this document draws one table border
+ * three times on a page — and an unreferenced XObject costs bytes, not
+ * correctness. The graphics state around the Do is untouched for the same
+ * reason: the q/Q and cm that placed it may well be positioning what comes
+ * after it too.
+ *
+ * The invocation is BLANKED, not cut out: every other image on the page was
+ * listed against offsets into this same stream, and shortening it would move
+ * all of them. Deleting a multi-image selection would then address the wrong
+ * `Do` from the second one on.
+ */
+function deleteContentImage(
+  pageIndex: number,
+  sourceKey: string,
+  doOffset: number,
+  name: string
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  try {
+    const src = getContentSources(pageIndex).find(s => s.key === sourceKey)
+    if (!src) return { success: false, error: `Source ${sourceKey} not found` }
+    const nm = src.stream.slice(doOffset).match(/^\/([^\s<>[\]()/%]+)(\s+)Do(?![A-Za-z0-9])/)
+    if (!nm || nm[1] !== name) {
+      return { success: false, error: 'The image is no longer where it was listed — reload and try again' }
+    }
+    const newStream = src.stream.slice(0, doOffset) + ' '.repeat(nm[0].length) + src.stream.slice(doOffset + nm[0].length)
     const bytes = new Uint8Array(newStream.length)
     for (let i = 0; i < newStream.length; i++) bytes[i] = newStream.charCodeAt(i) & 0xFF
     src.write(bytes)
@@ -6420,6 +6520,351 @@ function drawImageInContent(
 
     invalidateContentSources(pageIndex)
     return { success: true, name }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  } finally {
+    try { image?.destroy() } catch (_) {}
+    try { page?.destroy() } catch (_) {}
+  }
+}
+
+/* ───────────────────────── Object operations on page images ─────────────────
+ *
+ * Acrobat's "OBJETOS" panel — flip, rotate, crop, align, arrange, replace —
+ * for the pictures the CONTENT STREAM draws (not annotations).
+ *
+ * Every one of them works the way `transformContentImage` established: the CTM
+ * chain that places an image can be arbitrarily deep and is shared with
+ * whatever else that `q` bracket covers, so it is never edited. A correction is
+ * INJECTED around the `Do` instead — `q M cm /Name Do Q` with M = F·T·F⁻¹,
+ * where F is the full CTM in force at the Do and T is the change expressed in
+ * plain user space. Wrapping in q/Q keeps the correction from leaking onto
+ * anything drawn afterwards, and because each call re-reads F, the operations
+ * compose: rotating twice really is 180°.
+ */
+
+interface ImageSite {
+  src: ContentSource
+  /** Full CTM in force at the Do, and its inverse. */
+  F: Mat6
+  Finv: Mat6
+  /** End offset of the `/Name Do` token. */
+  doEnd: number
+  /** Axis-aligned footprint in bottom-up USER space. */
+  x0: number; x1: number; y0: number; y1: number
+}
+
+/**
+ * Resolve an image listed by `listContentImages` back to its place in the
+ * stream, re-checking that the `Do` is still there.
+ *
+ * The offset is re-validated on every call because the stream may have been
+ * rewritten since the caller listed it — by another op, or by the same one.
+ * Applying a matrix at a stale offset does not fail loudly, it transforms
+ * whatever moved into that position.
+ */
+function locateContentImage(
+  pageIndex: number,
+  sourceKey: string,
+  doOffset: number,
+  name: string
+): ImageSite | { error: string } {
+  const src = getContentSources(pageIndex).find(s => s.key === sourceKey)
+  if (!src) return { error: `Source ${sourceKey} not found` }
+  const nm = src.stream.slice(doOffset).match(/^\/([^\s<>[\]()/%]+)(\s+)Do(?![A-Za-z0-9])/)
+  if (!nm || nm[1] !== name) {
+    return { error: 'The image is no longer where it was listed — reload and try again' }
+  }
+  const F = withSource(src, () => getFullCtmAtOffset(src.stream, doOffset))
+  const Finv = matInvert(F)
+  if (!Finv) return { error: 'The image is drawn under a degenerate matrix' }
+
+  const xs: number[] = [], ys: number[] = []
+  for (const [ux, uy] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) {
+    xs.push(ux * F[0] + uy * F[2] + F[4])
+    ys.push(ux * F[1] + uy * F[3] + F[5])
+  }
+  const x0 = Math.min(...xs), x1 = Math.max(...xs)
+  const y0 = Math.min(...ys), y1 = Math.max(...ys)
+  if (!(x1 - x0 > 0.01 && y1 - y0 > 0.01)) return { error: 'The image is drawn degenerate' }
+  return { src, F, Finv, doEnd: doOffset + nm[0].length, x0, x1, y0, y1 }
+}
+
+/** Apply splices to a content source, highest offset first, and invalidate. */
+function writeContentSource(
+  src: ContentSource,
+  splices: { start: number; end: number; text: string }[],
+  pageIndex: number
+): void {
+  let out = src.stream
+  for (const sp of [...splices].sort((a, b) => b.start - a.start)) {
+    out = out.slice(0, sp.start) + sp.text + out.slice(sp.end)
+  }
+  const bytes = new Uint8Array(out.length)
+  for (let i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 0xFF
+  src.write(bytes)
+  invalidateContentSources(pageIndex)
+}
+
+/**
+ * Flip or rotate an image in place, about the centre of its own footprint.
+ *
+ * A flip keeps the axis-aligned footprint exactly, so no clip can start cutting
+ * the picture and none is touched. A quarter turn SWAPS width and height, and a
+ * picture in a Word table cell is bounded by that cell's `re W* n` — turning a
+ * wide photo upright inside a wide band would push the ends of it outside the
+ * clip, where it is not merely misplaced but invisible. The clips in force are
+ * therefore grown, and only ever grown (`Math.max(1, …)`, and the helper takes
+ * the union with the original): revealing more of the group a clip bounds is
+ * safe, hiding part of it is the failure being avoided.
+ */
+function orientContentImage(
+  pageIndex: number,
+  sourceKey: string,
+  doOffset: number,
+  name: string,
+  op: ImageOrient
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  try {
+    const site = locateContentImage(pageIndex, sourceKey, doOffset, name)
+    if ('error' in site) return { success: false, error: site.error }
+    const { src, F, Finv, doEnd, x0, x1, y0, y1 } = site
+
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2
+    // User space is y-UP and is rendered y-up, so a turn that reads clockwise
+    // on screen is clockwise here — no handedness flip to undo.
+    const R: Mat6 =
+      op === 'flip-h' ? [-1, 0, 0, 1, 0, 0]
+      : op === 'flip-v' ? [1, 0, 0, -1, 0, 0]
+      : op === 'rotate-cw' ? [0, -1, 1, 0, 0, 0]
+      : [0, 1, -1, 0, 0, 0]
+    const T = matConcat(matConcat([1, 0, 0, 1, -cx, -cy], R), [1, 0, 0, 1, cx, cy])
+    const M = matConcat(matConcat(F, T), Finv)
+
+    const splices = [{
+      start: doOffset, end: doEnd,
+      text: `q ${M.map(fmtNum).join(' ')} cm /${name} Do Q`
+    }]
+
+    if (op === 'rotate-cw' || op === 'rotate-ccw') {
+      const w = x1 - x0, h = y1 - y0
+      const sx = Math.max(1, h / w), sy = Math.max(1, w / h)
+      for (const clip of withSource(src, () => getActiveClipsAtOffset(src.stream, doOffset))) {
+        const grown = withSource(src, () =>
+          expandClipForTransform(src.stream, clip, 0, 0, sx, sy, cx, cy))
+        if (grown) splices.push({ start: clip.index, end: clip.index + clip.length, text: grown })
+      }
+    }
+
+    writeContentSource(src, splices, pageIndex)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Crop an image to `rect` (page space, y-down) — the part to KEEP.
+ *
+ * The picture is CLIPPED, not resampled: the image data is left exactly as it
+ * was, so nothing is lost, the crop can be undone with Ctrl+Z, and a second
+ * crop simply intersects with the first (which is what clips do, and what
+ * cropping twice should mean).
+ *
+ * The clip rectangle has to be written in the space the `re` will be read in,
+ * and at the Do that is F — an arbitrary chain, possibly rotated. Rather than
+ * push the rectangle through F⁻¹ and hope it stays axis-aligned, the injection
+ * switches to user space (`Finv cm` makes the CTM the identity), states the
+ * rectangle there, and switches back (`F cm`) for the Do itself.
+ */
+function cropContentImage(
+  pageIndex: number,
+  sourceKey: string,
+  doOffset: number,
+  name: string,
+  rect: number[]
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  try {
+    const site = locateContentImage(pageIndex, sourceKey, doOffset, name)
+    if ('error' in site) return { success: false, error: site.error }
+    const { src, F, Finv, doEnd } = site
+
+    const pageH = getPageSize(pageIndex).height
+    const ux0 = Math.min(rect[0], rect[2]), ux1 = Math.max(rect[0], rect[2])
+    const uy0 = pageH - Math.max(rect[1], rect[3])
+    const uy1 = pageH - Math.min(rect[1], rect[3])
+    if (!(ux1 - ux0 > 0.5 && uy1 - uy0 > 0.5)) {
+      return { success: false, error: 'The crop area is empty' }
+    }
+
+    const inject =
+      `q ${Finv.map(fmtNum).join(' ')} cm ` +
+      `${fmtNum(ux0)} ${fmtNum(uy0)} ${fmtNum(ux1 - ux0)} ${fmtNum(uy1 - uy0)} re W n ` +
+      `${F.map(fmtNum).join(' ')} cm /${name} Do Q`
+
+    writeContentSource(src, [{ start: doOffset, end: doEnd, text: inject }], pageIndex)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Align an image to the page, keeping its size.
+ *
+ * A pure translation, so it goes through the same F·T·F⁻¹ injection and grows
+ * whatever clips it is under exactly as a drag does — an image aligned to the
+ * left margin out of a table cell would otherwise vanish into the cell's clip.
+ */
+function alignContentImage(
+  pageIndex: number,
+  sourceKey: string,
+  doOffset: number,
+  name: string,
+  mode: ImageAlign,
+  margin = 0
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  try {
+    const site = locateContentImage(pageIndex, sourceKey, doOffset, name)
+    if ('error' in site) return { success: false, error: site.error }
+    const { src, F, Finv, doEnd, x0, x1, y0, y1 } = site
+
+    const size = getPageSize(pageIndex)
+    const w = x1 - x0, h = y1 - y0
+    let nx0 = x0, ny0 = y0
+    switch (mode) {
+      case 'left':   nx0 = margin; break
+      case 'right':  nx0 = size.width - margin - w; break
+      case 'center': nx0 = (size.width - w) / 2; break
+      // User space counts UP, so the top of the page is the HIGH y.
+      case 'top':    ny0 = size.height - margin - h; break
+      case 'bottom': ny0 = margin; break
+      case 'middle': ny0 = (size.height - h) / 2; break
+    }
+    const dx = nx0 - x0, dy = ny0 - y0
+    if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) return { success: true }
+
+    const T: Mat6 = [1, 0, 0, 1, dx, dy]
+    const M = matConcat(matConcat(F, T), Finv)
+    const splices = [{
+      start: doOffset, end: doEnd,
+      text: `q ${M.map(fmtNum).join(' ')} cm /${name} Do Q`
+    }]
+    for (const clip of withSource(src, () => getActiveClipsAtOffset(src.stream, doOffset))) {
+      const grown = withSource(src, () =>
+        expandClipForTransform(src.stream, clip, dx, dy, 1, 1, 0, 0))
+      if (grown) splices.push({ start: clip.index, end: clip.index + clip.length, text: grown })
+    }
+    writeContentSource(src, splices, pageIndex)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Bring an image to the front of the page, or send it behind everything.
+ *
+ * Paint order in a content stream IS document order, so this is a move: the
+ * original invocation is blanked where it stands and a fresh one, carrying the
+ * image's absolute placement, is written at the top or the bottom of the page
+ * stream. The old one is BLANKED rather than cut so that the offsets of every
+ * other image the caller listed stay where they were.
+ *
+ * Only for images the PAGE draws. An XObject's `/Name` resolves against that
+ * form's own resources, so hoisting one into the page stream would name a
+ * picture the page has never heard of and draw nothing at all.
+ *
+ * The absolute placement assumes the CTM is the identity at the ends of the
+ * page stream, which holds for balanced q/Q — the same assumption
+ * `drawImageInContent` already makes when it appends or prepends a picture.
+ */
+function reorderContentImage(
+  pageIndex: number,
+  sourceKey: string,
+  doOffset: number,
+  name: string,
+  where: 'front' | 'back'
+): { success: boolean; error?: string } {
+  if (!pdfDoc) return { success: false, error: 'No document' }
+  try {
+    if (sourceKey !== 'page') {
+      return { success: false, error: 'Only an image the page itself draws can be reordered' }
+    }
+    const site = locateContentImage(pageIndex, sourceKey, doOffset, name)
+    if ('error' in site) return { success: false, error: site.error }
+    const { src, F, doEnd } = site
+
+    const draw = `\nq ${F.map(fmtNum).join(' ')} cm /${name} Do Q\n`
+    const blanked = src.stream.slice(0, doOffset) +
+                    ' '.repeat(doEnd - doOffset) +
+                    src.stream.slice(doEnd)
+    const out = where === 'back' ? draw + blanked : blanked + draw
+
+    const bytes = new Uint8Array(out.length)
+    for (let i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 0xFF
+    src.write(bytes)
+    invalidateContentSources(pageIndex)
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Swap the picture an invocation draws for a different image file, leaving the
+ * placement — position, size, any flip or rotation already applied — alone.
+ *
+ * A NEW XObject under a name nothing is using, never an overwrite of the old
+ * one: the same image is very often drawn more than once (a logo in a header,
+ * a rule repeated down a table), and replacing the resource in place would
+ * change every one of those at once. Only this invocation is repointed.
+ */
+function replaceContentImage(
+  pageIndex: number,
+  sourceKey: string,
+  doOffset: number,
+  name: string,
+  imageBytes: Uint8Array
+): { success: boolean; name?: string; error?: string } {
+  if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
+  let page: any = null
+  let image: any = null
+  try {
+    const site = locateContentImage(pageIndex, sourceKey, doOffset, name)
+    if ('error' in site) return { success: false, error: site.error }
+    const { src, doEnd } = site
+
+    page = pdfDoc.loadPage(pageIndex)
+    let resources: any = src.resources
+    if (!resources) resources = page.getObject().get('Resources')
+    resources = resources?.resolve ? resources.resolve() : resources
+    if (!resources || String(resources) === 'null') {
+      return { success: false, error: 'That image lives in a source with no resources' }
+    }
+    let xobjects = resources.get('XObject')
+    if (!xobjects || String(xobjects) === 'null') {
+      return { success: false, error: 'That source draws no images' }
+    }
+    xobjects = xobjects.resolve()
+
+    image = new mupdf.Image(imageBytes)
+    const imgRef = pdfDoc.addImage(image)
+
+    let fresh = ''
+    for (let i = 0; i < 500; i++) {
+      const candidate = `ImRp${i}`
+      const existing = xobjects.get(candidate)
+      if (!existing || String(existing) === 'null') { fresh = candidate; break }
+    }
+    if (!fresh) return { success: false, error: 'No free image slot on this page' }
+    xobjects.put(fresh, imgRef)
+
+    writeContentSource(src, [{ start: doOffset, end: doEnd, text: `/${fresh} Do` }], pageIndex)
+    return { success: true, name: fresh }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
   } finally {

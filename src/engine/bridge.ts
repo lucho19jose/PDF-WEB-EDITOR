@@ -1,4 +1,4 @@
-import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult } from './types'
+import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult, ImageOrient, ImageAlign } from './types'
 import type { WorkerResponse } from './worker/worker-protocol'
 
 /**
@@ -218,6 +218,36 @@ export class MuPDFBridge {
   /** Move/resize a content-drawn image to `rect` (page space, y-down). */
   async transformContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, rect: RectT): Promise<{ success: boolean; error?: string }> {
     return this.send('transformContentImage', { pageIndex, sourceKey, doOffset, name, rect })
+  }
+
+  /** Remove a content-drawn image's `Do` invocation from the stream. */
+  async deleteContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string): Promise<{ success: boolean; error?: string }> {
+    return this.send('deleteContentImage', { pageIndex, sourceKey, doOffset, name })
+  }
+
+  /** Mirror or quarter-turn a content-drawn image about its own centre. */
+  async orientContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, op: ImageOrient): Promise<{ success: boolean; error?: string }> {
+    return this.send('orientContentImage', { pageIndex, sourceKey, doOffset, name, op })
+  }
+
+  /** Crop a content-drawn image to `rect` (page space, y-down) — the part to KEEP. */
+  async cropContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, rect: RectT): Promise<{ success: boolean; error?: string }> {
+    return this.send('cropContentImage', { pageIndex, sourceKey, doOffset, name, rect })
+  }
+
+  /** Align a content-drawn image to the page, keeping its size. */
+  async alignContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, mode: ImageAlign, margin?: number): Promise<{ success: boolean; error?: string }> {
+    return this.send('alignContentImage', { pageIndex, sourceKey, doOffset, name, mode, margin })
+  }
+
+  /** Bring a page image to the front of the paint order, or send it behind. */
+  async reorderContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, where: 'front' | 'back'): Promise<{ success: boolean; error?: string }> {
+    return this.send('reorderContentImage', { pageIndex, sourceKey, doOffset, name, where })
+  }
+
+  /** Swap the picture an invocation draws, keeping its placement. */
+  async replaceContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, imageBytes: Uint8Array): Promise<{ success: boolean; name?: string; error?: string }> {
+    return this.send('replaceContentImage', { pageIndex, sourceKey, doOffset, name, imageBytes })
   }
 
   /** Draw an image into the page content — behind everything, or over everything. */

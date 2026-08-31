@@ -1,7 +1,11 @@
 <template>
   <div class="annot-layer-container" v-if="showLayer">
-    <!-- Existing annotations: selectable / movable hit-targets (select mode) -->
-    <template v-if="editorStore.currentTool === 'select'">
+    <!-- Existing annotations and page images: selectable / movable hit-targets.
+         Live in the EDIT tool as well as in select — Acrobat's "Editar PDF" is
+         one mode in which a click on text edits the text and a click on a
+         picture picks the picture up, and splitting that across two tools meant
+         the images on the page you were editing could not be touched at all. -->
+    <template v-if="objectsSelectable">
       <!-- Images drawn by the page content (logos, photos, scans). UNDER the
            annotation hits: an annotation stamped over a scan must still win
            the click. -->
@@ -11,7 +15,7 @@
         class="cimg-hit"
         :class="{ selected: selectedImgId === img.id || multiImgs.has(img.id) }"
         :style="img.style"
-        title="Image in the page — drag to move, handles to resize"
+        title="Image in the page — drag to move, handles to resize, Del to remove"
         @mousedown.stop="onImgMouseDown($event, img.id)"
       />
       <div
@@ -79,10 +83,12 @@
         </q-btn>
       </div>
 
-      <!-- Delete button for selected annotation -->
-      <div v-if="selectedAnnot" class="annot-delete" :style="deleteBtnStyle" @mousedown.prevent>
+      <!-- Delete button for whatever is selected — an annotation or one of the
+           page's own images. An object you can pick up and move but not remove
+           is a half-finished object. -->
+      <div v-if="selectedRect" class="annot-delete" :style="deleteBtnStyle" @mousedown.prevent>
         <q-btn dense round size="xs" color="negative" icon="delete" @click.stop="deleteSelected">
-          <q-tooltip>Delete annotation (Del)</q-tooltip>
+          <q-tooltip>{{ selectedImg ? 'Delete this image (Del)' : 'Delete annotation (Del)' }}</q-tooltip>
         </q-btn>
       </div>
     </template>
@@ -152,7 +158,7 @@ import { hexToRgb01, rgb01ToCss } from '@/utils/color'
 import { enqueueOp, beginTransaction } from '@/utils/opQueue'
 
 const props = defineProps<{ pageWidth: number; pageHeight: number; pdfWidth: number; pdfHeight: number }>()
-const emit = defineEmits<{ changed: [] }>()
+const emit = defineEmits<{ changed: []; objectPicked: [] }>()
 
 const $q = useQuasar()
 const docStore = useDocumentStore()
@@ -190,6 +196,20 @@ function clearMultiSelection() {
   if (multiAnnots.value.size) multiAnnots.value = new Set()
 }
 
+/**
+ * Drop every object selection — called when the TEXT overlay takes a click.
+ *
+ * The two layers keep their own selections, and in the edit tool they are now
+ * both live at once. Without this, clicking a line of text left the image you
+ * had picked up still selected and still wearing its handles, and Delete had
+ * two answers to the question of what it was going to remove.
+ */
+function clearObjectSelection() {
+  selectedIndex.value = null
+  selectedImgId.value = null
+  clearMultiSelection()
+}
+
 /** A Shift+click on a second element turns the primary into a group member. */
 function foldPrimaryIntoMulti() {
   if (selectedImgId.value !== null) {
@@ -208,7 +228,7 @@ function foldPrimaryIntoMulti() {
  * stopped a point short of). `rect` arrives in page space, y-down.
  */
 function selectInBand(rect: number[], additive: boolean) {
-  if (editorStore.currentTool !== 'select') return
+  if (!objectsSelectable.value) return
   if (additive) foldPrimaryIntoMulti()
   else { selectedIndex.value = null; selectedImgId.value = null }
   const touches = (r: RectT) =>
@@ -261,7 +281,18 @@ const makeRoomInText = inject<(y: number, amount: number, below: boolean) => Pro
 
 const scaleX = computed(() => props.pageWidth / props.pdfWidth)
 const scaleY = computed(() => props.pageHeight / props.pdfHeight)
-const showLayer = computed(() => editorStore.isAnnotationTool || editorStore.currentTool === 'select')
+/**
+ * The tools in which the page's OBJECTS — annotations and the images the
+ * content draws — are selectable, movable and resizable.
+ *
+ * `edit` is in the list because that is the tool people are in when they are
+ * working on a document: Acrobat's "Editar PDF" hands you text and pictures at
+ * once, and here the picture layer simply was not rendered, so every image on
+ * the page being edited was inert. Switching to `select` first is not a
+ * discoverable step, and it is not one Acrobat asks for.
+ */
+const objectsSelectable = computed(() => ['select', 'edit'].includes(editorStore.currentTool))
+const showLayer = computed(() => editorStore.isAnnotationTool || objectsSelectable.value)
 const isMarkupPreview = computed(() => !!drag.value && MARKUP_TOOLS.includes(drag.value.tool))
 const ftFontPx = computed(() => editorStore.fontSize * scaleY.value)
 
@@ -301,7 +332,7 @@ const annotResize = ref<AnnotResize | null>(null)
  * way to change one was to delete it and insert again at a different width.
  */
 const annotHandles = computed(() => {
-  if (editorStore.currentTool !== 'select') return []
+  if (!objectsSelectable.value) return []
   const a = selectedAnnot.value
   const img = selectedImg.value
   if (!a && !img) return []
@@ -350,19 +381,32 @@ function liveImgRect(img: ContentImageInfo): RectT {
   return img.rect
 }
 
-/** Content-image hit targets, scaled to the canvas. */
-const scaledContentImgs = computed(() => contentImages.value.map(img => {
-  const r = liveImgRect(img)
-  return {
-    id: img.id,
-    style: {
-      left: `${r[0] * scaleX.value}px`,
-      top: `${r[1] * scaleY.value}px`,
-      width: `${Math.max(2, (r[2] - r[0]) * scaleX.value)}px`,
-      height: `${Math.max(2, (r[3] - r[1]) * scaleY.value)}px`
+/**
+ * Content-image hit targets, scaled to the canvas — BIGGEST FIRST.
+ *
+ * They all share one z-index, so the last one in the DOM takes the click, and
+ * the order they are listed in is the order the stream draws them: a Word
+ * export draws the frame around a table cell before the photograph inside it,
+ * which put the frame on top and made the photograph — the only one of the two
+ * anybody wants to grab — unclickable. Sorting by area means the smallest
+ * target under the cursor always wins, which is the rule that keeps a large
+ * object from swallowing everything it contains.
+ */
+const scaledContentImgs = computed(() => contentImages.value
+  .map(img => {
+    const r = liveImgRect(img)
+    return {
+      id: img.id,
+      area: Math.max(0, r[2] - r[0]) * Math.max(0, r[3] - r[1]),
+      style: {
+        left: `${r[0] * scaleX.value}px`,
+        top: `${r[1] * scaleY.value}px`,
+        width: `${Math.max(2, (r[2] - r[0]) * scaleX.value)}px`,
+        height: `${Math.max(2, (r[3] - r[1]) * scaleY.value)}px`
+      }
     }
-  }
-}))
+  })
+  .sort((a, b) => b.area - a.area))
 
 /** Apply a resize drag to its starting rect, keeping it at least a few points wide. */
 function resizedRect(rz: AnnotResize): RectT {
@@ -533,12 +577,23 @@ async function commitRectChange(index: number, oldRect: RectT, newRect: RectT, v
   await annotOp(note, apply, false)
 }
 
-const deleteBtnStyle = computed(() => {
+/** The rect of the single selected object, whichever kind it is. */
+const selectedRect = computed<RectT | null>(() => {
   const a = selectedAnnot.value
-  if (!a) return {}
+  if (a) return liveAnnotRect(a)
+  const img = selectedImg.value
+  return img ? liveImgRect(img) : null
+})
+
+const deleteBtnStyle = computed(() => {
+  const r = selectedRect.value
+  if (!r) return {}
+  // Clamped onto the page: anchored past the right edge it lands off the canvas
+  // for anything in the right margin, and a button you cannot see is a button
+  // you do not have.
   return {
-    left: `${a.rect[2] * scaleX.value + 4}px`,
-    top: `${a.rect[1] * scaleY.value - 4}px`,
+    left: `${Math.min(r[2] * scaleX.value + 4, props.pageWidth - 26)}px`,
+    top: `${Math.max(2, r[1] * scaleY.value - 4)}px`,
     position: 'absolute' as const, zIndex: 30, pointerEvents: 'auto' as const
   }
 })
@@ -1045,6 +1100,7 @@ function startMultiMove(e: MouseEvent) {
 }
 
 function onAnnotMouseDown(e: MouseEvent, index: number) {
+  emit('objectPicked')
   if (e.shiftKey || e.ctrlKey || e.metaKey) {
     foldPrimaryIntoMulti()
     const s = new Set(multiAnnots.value)
@@ -1064,6 +1120,7 @@ function onAnnotMouseDown(e: MouseEvent, index: number) {
 }
 
 function onImgMouseDown(e: MouseEvent, id: number) {
+  emit('objectPicked')
   if (e.shiftKey || e.ctrlKey || e.metaKey) {
     foldPrimaryIntoMulti()
     const s = new Set(multiImgs.value)
@@ -1077,6 +1134,7 @@ function onImgMouseDown(e: MouseEvent, id: number) {
   selectedIndex.value = null
   const img = contentImages.value.find(i => i.id === id)
   if (!img) return
+  editorStore.setStatus('Image selected — drag to move it, the handles to resize, Del to remove it')
   moveState.value = { kind: 'cimg', index: id, startX: e.clientX, startY: e.clientY, dx: 0, dy: 0, moved: false, rect: img.rect }
   window.addEventListener('mousemove', onMoveMove)
   window.addEventListener('mouseup', onMoveUp)
@@ -1157,18 +1215,60 @@ async function transferToPage(index: number, rect: RectT, from: number, to: numb
   docStore.setPage(to + 1)
 }
 
+/**
+ * Remove whatever is selected — an annotation, one of the page's own images, or
+ * the whole group.
+ *
+ * A multi-selection is deleted as ONE operation and one undo point, images
+ * first: annotation indices shift when an annotation is removed, so the
+ * annotations go from the highest index down, exactly as the multi-move sorts
+ * its images by offset.
+ */
 async function deleteSelected() {
+  const pageIndex = docStore.currentPage - 1
+
+  if (multiCount.value > 0) {
+    const imgs = contentImages.value.filter(i => multiImgs.value.has(i.id))
+    const anns = annotations.value
+      .filter(a => multiAnnots.value.has(a.index))
+      .sort((a, b) => b.index - a.index)
+    const total = imgs.length + anns.length
+    if (!total) return
+    clearMultiSelection()
+    let ok = 0
+    await annotOp(`${total} element(s) deleted`, async () => {
+      for (const img of imgs) {
+        if (await pdfEngine.deleteContentImage(pageIndex, img.sourceKey, img.doOffset, img.name)) ok++
+      }
+      for (const a of anns) {
+        if (await pdfEngine.deleteAnnotation(pageIndex, a.index)) ok++
+      }
+      return ok > 0
+    })
+    if (ok < total) editorStore.setStatus(`Deleted ${ok} of ${total} — Ctrl+Z takes the whole deletion back`)
+    return
+  }
+
+  if (selectedImgId.value !== null) {
+    const img = contentImages.value.find(i => i.id === selectedImgId.value)
+    if (!img) return
+    selectedImgId.value = null
+    await annotOp('Image deleted', () => pdfEngine.deleteContentImage(pageIndex, img.sourceKey, img.doOffset, img.name))
+    return
+  }
+
   if (selectedIndex.value === null) return
   const idx = selectedIndex.value
   selectedIndex.value = null
-  await annotOp('Annotation deleted', () => pdfEngine.deleteAnnotation(docStore.currentPage - 1, idx))
+  await annotOp('Annotation deleted', () => pdfEngine.deleteAnnotation(pageIndex, idx))
 }
 
 function onKeyDown(e: KeyboardEvent) {
   if (e.defaultPrevented) return // TextBlockOverlay already consumed this Delete
   const tag = (e.target as HTMLElement)?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
-  if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIndex.value !== null && editorStore.currentTool === 'select') {
+  const hasSelection = selectedIndex.value !== null || selectedImgId.value !== null || multiCount.value > 0
+  if ((e.key === 'Delete' || e.key === 'Backspace') && hasSelection && objectsSelectable.value) {
     e.preventDefault()
     deleteSelected()
   }
@@ -1193,7 +1293,9 @@ watch(() => editorStore.currentTool, () => {
 onMounted(() => { loadAnnotations() })
 
 watch(() => docStore.currentPage, () => {
-  selectedIndex.value = null
+  // The image ids are per page, so a selection carried across pages points at
+  // whatever happens to hold that id on the new one.
+  clearObjectSelection()
   cancelFreeText() // an open freetext editor must not commit onto the NEW page
   loadAnnotations()
 })
@@ -1211,7 +1313,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', onAnnotResizeUp)
 })
 
-defineExpose({ loadAnnotations, deleteSelected, selectInBand, clearMultiSelection })
+defineExpose({ loadAnnotations, deleteSelected, selectInBand, clearMultiSelection, clearObjectSelection })
 </script>
 
 <style scoped>
@@ -1228,9 +1330,18 @@ defineExpose({ loadAnnotations, deleteSelected, selectInBand, clearMultiSelectio
 }
 .annot-hit:hover { border-color: rgba(66,133,244,0.6); background: rgba(66,133,244,0.05); }
 .annot-hit.selected { border: 1.5px solid #4285f4; background: rgba(66,133,244,0.08); }
-/* Content-drawn images: below annotations, dashed so the two read differently. */
+/*
+  Content-drawn images: below annotations — an annotation stamped over a scan
+  must still win the click — and below the TEXT blocks (z-index 4 in the text
+  overlay, which is a sibling layer sharing this stacking context).
+
+  Under the text, because a page's own images are routinely the size of the
+  region they decorate: table borders, cell backgrounds, a frame around a
+  photograph. At z-index 15 they covered the text drawn inside them, and on a
+  Word export that is most of the page.
+*/
 .cimg-hit {
-  position: absolute; pointer-events: auto; z-index: 15;
+  position: absolute; pointer-events: auto; z-index: 3;
   border: 1px dashed transparent; box-sizing: border-box; cursor: move;
 }
 .cimg-hit:hover { border-color: rgba(52,168,83,0.7); background: rgba(52,168,83,0.05); }

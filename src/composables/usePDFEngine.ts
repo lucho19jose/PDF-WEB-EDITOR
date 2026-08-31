@@ -1,6 +1,6 @@
 import { ref, readonly } from 'vue'
 import { getMuPDFBridge } from '@/engine/bridge'
-import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, ContentImageInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult } from '@/engine/types'
+import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, ContentImageInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult, ImageOrient, ImageAlign } from '@/engine/types'
 
 /**
  * Composable for interacting with the MuPDF editing engine.
@@ -331,6 +331,36 @@ export function usePDFEngine() {
     return wrap(await bridge.transformContentImage(pageIndex, sourceKey, doOffset, name, rect), 'transformContentImage', pageIndex)
   }
 
+  /** Remove a content-drawn image from the page. */
+  async function deleteContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string): Promise<boolean> {
+    return wrap(await bridge.deleteContentImage(pageIndex, sourceKey, doOffset, name), 'deleteContentImage', pageIndex)
+  }
+
+  /** Mirror or quarter-turn a content-drawn image about its own centre. */
+  async function orientContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, op: ImageOrient): Promise<boolean> {
+    return wrap(await bridge.orientContentImage(pageIndex, sourceKey, doOffset, name, op), 'orientContentImage', pageIndex)
+  }
+
+  /** Crop a content-drawn image to `rect` (page space, y-down) — the part to KEEP. */
+  async function cropContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, rect: RectT): Promise<boolean> {
+    return wrap(await bridge.cropContentImage(pageIndex, sourceKey, doOffset, name, rect), 'cropContentImage', pageIndex)
+  }
+
+  /** Align a content-drawn image to the page, keeping its size. */
+  async function alignContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, mode: ImageAlign, margin?: number): Promise<boolean> {
+    return wrap(await bridge.alignContentImage(pageIndex, sourceKey, doOffset, name, mode, margin), 'alignContentImage', pageIndex)
+  }
+
+  /** Bring a page image to the front of the paint order, or send it behind. */
+  async function reorderContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, where: 'front' | 'back'): Promise<boolean> {
+    return wrap(await bridge.reorderContentImage(pageIndex, sourceKey, doOffset, name, where), 'reorderContentImage', pageIndex)
+  }
+
+  /** Swap the picture an invocation draws, keeping its placement. */
+  async function replaceContentImage(pageIndex: number, sourceKey: string, doOffset: number, name: string, imageBytes: Uint8Array): Promise<boolean> {
+    return wrap(await bridge.replaceContentImage(pageIndex, sourceKey, doOffset, name, imageBytes), 'replaceContentImage', pageIndex)
+  }
+
   /** Draw an image into the page content — behind everything, or over everything. */
   async function drawImageInContent(pageIndex: number, rect: RectT, bytes: ArrayBuffer, behind: boolean): Promise<boolean> {
     return wrap(await bridge.drawImageInContent(pageIndex, rect, bytes, behind), 'drawImageInContent', pageIndex)
@@ -465,6 +495,12 @@ export function usePDFEngine() {
     moveAnnotationToPage,
     listContentImages,
     transformContentImage,
+    deleteContentImage,
+    orientContentImage,
+    cropContentImage,
+    alignContentImage,
+    reorderContentImage,
+    replaceContentImage,
     drawImageInContent,
     fillRect,
     shiftGraphicsBelow,

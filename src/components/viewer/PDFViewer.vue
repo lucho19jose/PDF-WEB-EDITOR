@@ -35,6 +35,7 @@
           @text-changed="onTextChanged"
           @band-selected="onBandSelected"
           @band-cleared="onBandCleared"
+          @blocks-picked="onBlocksPicked"
         />
         <AnnotationLayer
           :ref="setAnnotLayer"
@@ -43,6 +44,7 @@
           :pdf-width="pdfPageWidth"
           :pdf-height="pdfPageHeight"
           @changed="onTextChanged"
+          @object-picked="onObjectPicked"
         />
         <!--
           Over the scan, under nothing: the OCR layer only appears for pages
@@ -147,6 +149,21 @@ function onBandSelected(rect: [number, number, number, number], additive: boolea
 }
 function onBandCleared() {
   annotationLayerRef.value?.clearMultiSelection?.()
+}
+
+/**
+ * One selection at a time across the two layers.
+ *
+ * In the edit tool both are live — a click on text edits the text, a click on a
+ * picture picks the picture up — and each keeps its own selection. Whichever
+ * takes the click clears the other's, or the page shows two selections wearing
+ * handles and Delete has two answers to what it is about to remove.
+ */
+function onBlocksPicked() {
+  annotationLayerRef.value?.clearObjectSelection?.()
+}
+function onObjectPicked() {
+  textBlockOverlayRef.value?.clearSelection?.()
 }
 
 /**

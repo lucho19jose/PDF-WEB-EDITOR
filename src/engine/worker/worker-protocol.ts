@@ -1,4 +1,4 @@
-import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp } from '../types'
+import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, ImageOrient, ImageAlign } from '../types'
 
 // Messages from main thread -> worker
 export type WorkerRequest =
@@ -20,6 +20,12 @@ export type WorkerRequest =
   | { id: number; type: 'moveAnnotationToPage'; data: { pageIndex: number; annotIndex: number; targetPage: number; rect: RectT } }
   | { id: number; type: 'listContentImages'; data: { pageIndex: number } }
   | { id: number; type: 'transformContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string; rect: RectT } }
+  | { id: number; type: 'deleteContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string } }
+  | { id: number; type: 'orientContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string; op: ImageOrient } }
+  | { id: number; type: 'cropContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string; rect: RectT } }
+  | { id: number; type: 'alignContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string; mode: ImageAlign; margin?: number } }
+  | { id: number; type: 'reorderContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string; where: 'front' | 'back' } }
+  | { id: number; type: 'replaceContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string; imageBytes: Uint8Array } }
   | { id: number; type: 'drawImageInContent'; data: { pageIndex: number; rect: RectT; bytes: ArrayBuffer; behind: boolean } }
   | { id: number; type: 'fillRect'; data: { pageIndex: number; rect: RectT; color: [number, number, number] } }
   | { id: number; type: 'shiftGraphicsBelow'; data: { pageIndex: number; thresholdY: number; dy: number } }

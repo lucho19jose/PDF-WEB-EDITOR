@@ -321,6 +321,44 @@ as primary — the tick — and encodes the whole line for the tick's font. The 
 narrowing one level up (drop a leading BLOCK the edit did not change) would fix
 it and is not implemented.
 
+### Object operations never edit the matrix that placed the image
+Acrobat's "Objetos" panel — flip, rotate, crop, align, arrange, replace — for
+the pictures the CONTENT STREAM draws. `orientContentImage`, `cropContentImage`,
+`alignContentImage`, `reorderContentImage` and `replaceContentImage` all follow
+the rule `transformContentImage` established: the CTM chain placing an image can
+be arbitrarily deep and is shared with everything else inside that `q`, so it is
+never rewritten. A correction is INJECTED around the `Do` — `q M cm /Name Do Q`
+with **M = F·T·F⁻¹**, F being the full CTM at the Do and T the change stated in
+plain user space. The q/Q keeps it off everything drawn after, and because each
+call re-reads F the operations COMPOSE: two quarter turns measure back to the
+original footprint, to the point.
+
+- **Flip vs rotate and the clip.** A mirror keeps the axis-aligned footprint, so
+  no clip can start cutting the picture and none is touched. A quarter turn
+  SWAPS width and height — and a photo in a Word table cell is bounded by that
+  cell's `re W* n`, so turning a wide picture upright inside a wide band would
+  push its ends outside the clip, where they are not misplaced but invisible.
+  Clips in force are therefore grown, and only ever grown.
+- **Crop CLIPS, it does not resample.** The image data is untouched, so nothing
+  is lost, Ctrl+Z restores it, and a second crop intersects the first — which is
+  what clips do and what cropping twice should mean. The rectangle cannot simply
+  be written at the Do: `re` would be read in F, an arbitrary and possibly
+  rotated space. The injection switches to user space (`Finv cm` makes the CTM
+  the identity), states the rectangle there, and switches back (`F cm`) for the
+  Do. Note `listContentImages` still reports the full PLACEMENT rect, not the
+  cropped one.
+- **Arrange is a move, because paint order IS document order.** The old
+  invocation is BLANKED where it stands — not cut — so the offsets of every
+  other image the caller listed stay valid, and a fresh one carrying the
+  absolute placement is written at the top or bottom of the page stream. Page
+  images only: an XObject's `/Name` resolves against that form's resources, so
+  hoisting one into the page stream would name a picture the page has never
+  heard of and draw nothing.
+- **Replace adds a NEW XObject, never overwrites the old one.** The same image
+  is routinely drawn more than once — a logo in a header, a rule repeated down a
+  table — and replacing the resource in place would change every one of them at
+  once. Only the one invocation is repointed.
+
 ### A glyph is unusable when its advance is zero
 `encodeForSimpleFont` decides substitution from the **Widths array**, never from
 the BaseFont name or the embedding flag. Word subsets fonts without the
@@ -1624,6 +1662,45 @@ own `/Rect` instead — it is already in the space `Do` is invoked in, so no pag
 height and no `/Rotate` guesswork is needed. `drawImageInContent` converts
 explicitly (`y = pageHeight - top - h`) and is the model for anything else that
 has to cross between the two.
+
+### Editing a page means text AND pictures, in one tool
+Acrobat's "Editar PDF" is a single mode: a click on a line edits the line, a
+click on a picture picks the picture up. Here the annotation layer — which owns
+both the annotations and the images the CONTENT draws — rendered only for the
+`select` tool, so in the tool people actually work in every image on the page
+was inert. `objectsSelectable` covers `select` and `edit` alike, and the resize
+handles, the delete button, the band sweep and the Del key follow it.
+
+Two selections are now live at once, so whichever layer takes the click clears
+the other's (`objectPicked` / `blocksPicked`, forwarded through `PDFViewer` the
+same way the rubber band already was). Otherwise the page wears two sets of
+handles and Delete has two answers to what it is about to remove.
+
+**The smaller target takes the click.** A Word export draws its table borders
+and cell backgrounds as IMAGES: on the reported document 25 of a page's 34 text
+blocks sit inside one, and the image hit-targets sat at z-index 15 over text
+blocks at 1 — so most of the page's text could not be clicked at all in `select`
+mode, and turning the layer on in `edit` would have taken the rest with it.
+Measured, on `main`: `elementFromPoint` over the paragraph "Se observa ambas
+partes del equipo…" returned `cimg-hit`. Content images are now z-index 3 under
+text at 4 (annotations stay above both — one stamped over a scan must still win
+its own click), and `scaledContentImgs` sorts BIGGEST FIRST so that among the
+images themselves the frame never covers the photograph inside it.
+
+### An image drags out of its own clip
+`transformContentImage` splices a widened `re` for every clip in force at the
+`Do`, exactly as `transformTextBlock` does for text. A picture in a table cell
+is bounded by that cell, barely bigger than the picture: dragging it 120pt right
+came back with two thirds of it cut off — in the file, drawn, and invisible.
+Splices go on back-to-front, since a clip sits at a LOWER offset than the `Do`
+it bounds.
+
+`deleteContentImage` BLANKS the `/Name Do` with spaces rather than cutting it
+out. Every other image on the page was listed against offsets into the same
+stream, so shortening it would move all of them and a multi-image delete would
+address the wrong `Do` from the second one on. The XObject stays in
+/Resources — the same image is often drawn several times, and an unreferenced
+one costs bytes, not correctness.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates

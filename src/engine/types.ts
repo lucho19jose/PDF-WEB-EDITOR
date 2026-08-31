@@ -76,6 +76,11 @@ export type RectT = [number, number, number, number]
 export type MarkupType = 'Highlight' | 'Underline' | 'StrikeOut' | 'Squiggly'
 export type ShapeType = 'Square' | 'Circle' | 'Line'
 
+/** Quarter turns and mirrors, as Acrobat's "Objetos" panel offers them. */
+export type ImageOrient = 'flip-h' | 'flip-v' | 'rotate-cw' | 'rotate-ccw'
+/** Where to put an image relative to the page. */
+export type ImageAlign = 'left' | 'center' | 'right' | 'top' | 'middle' | 'bottom'
+
 /** Summary of an existing annotation on a page (index is positional within the page). */
 /**
  * An image drawn by the page CONTENT (an /Image XObject invoked with Do) —

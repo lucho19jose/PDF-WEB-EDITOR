@@ -155,6 +155,10 @@ const emit = defineEmits<{
   bandSelected: [rect: [number, number, number, number], additive: boolean]
   /** A plain click on empty paper — selections elsewhere should clear too. */
   bandCleared: []
+  /** A click landed on TEXT. The annotation layer drops its object selection:
+   *  in the edit tool both layers are live at once, and two selections wearing
+   *  handles at the same time leaves Delete with two answers. */
+  blocksPicked: []
 }>()
 
 const docStore = useDocumentStore()
@@ -1730,6 +1734,9 @@ function findByAnchorIn(list: TextBlock[], anchor: Anchor): TextBlock | null {
 
 function selectAllBlocks() {
   setSelection([...blocks.value])
+  // Ctrl+A means "all the TEXT" — an image left selected alongside it would
+  // take the next Delete with it.
+  emit('blocksPicked')
   editorStore.setStatus(`${selectedIds.value.length} text block(s) selected`)
 }
 
@@ -1827,6 +1834,7 @@ function onBlockMouseDown(event: MouseEvent, blockId: string) {
   if (!['select', 'edit'].includes(editorStore.currentTool)) return
   const block = blocks.value.find(b => b.id === blockId)
   if (!block) return
+  emit('blocksPicked')
 
   if (event.shiftKey || event.ctrlKey || event.metaKey) {
     toggleSelection(block)
@@ -2302,7 +2310,7 @@ watch(() => docStore.renderVersion, () => {
   loadBlocks()
 })
 
-defineExpose({ loadBlocks, deleteSelectedBlocks, selectAllBlocks, makeRoomAt })
+defineExpose({ loadBlocks, deleteSelectedBlocks, selectAllBlocks, makeRoomAt, clearSelection })
 </script>
 
 <style scoped>
@@ -2328,13 +2336,23 @@ defineExpose({ loadBlocks, deleteSelectedBlocks, selectAllBlocks, makeRoomAt })
   z-index: 0;
 }
 
+/*
+  Above the page's own images (.cimg-hit, z-index 3) and below everything else.
+
+  A Word export draws its table borders and cell backgrounds as IMAGES — on the
+  documents this was reported against, 25 of a page's 34 text blocks sit inside
+  one — so an image hit-target that wins the click makes most of the page's text
+  unselectable. The rule that avoids it is the same one that orders the images
+  among themselves: the smaller, more specific target takes the click. A line of
+  text is always the smaller of the two.
+*/
 .text-block {
   position: absolute;
   border: 1px dashed transparent;
   cursor: text;
   pointer-events: auto;
   transition: border-color 0.15s;
-  z-index: 1;
+  z-index: 4;
 }
 
 .text-block:hover {
