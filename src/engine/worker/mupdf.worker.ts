@@ -2344,8 +2344,9 @@ function transformInSource(
       const targetLen = matchLength(targetBlock.text)
       const holdsMoreThanTarget = blockLen > targetLen * 1.4 + 4
       const pureTranslate = sx === 1 && sy === 1
+      const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
       const run = (holdsMoreThanTarget && pureTranslate)
-        ? findTargetRun(block, targetBlock.text, pageIndex)
+        ? findTargetRun(block, targetBlock.text, pageIndex, local)
         : null
 
       /**
@@ -2909,7 +2910,17 @@ function getCtmAtOffset(stream: string, offset: number): Mat6 {
 function findTargetRun(
   block: BtInfo,
   targetText: string,
-  pageIndex: number
+  pageIndex: number,
+  /**
+   * Where the clicked text sits in this block's own space, when it can be
+   * worked out. A run that does not OVERLAP it is not the run: text alone
+   * never identifies anything here, which is the same rule
+   * `findBtBlocksByPosition` follows one level up. Three signature rules drawn
+   * as one array score alike on text — a row of underscores fuzzy-matches any
+   * other row of underscores — so once the first had been split out of the
+   * array the other two both matched IT and were moved on top of it.
+   */
+  local?: { x: number; xEnd: number } | null
 ): { start: number; end: number; startsLine: boolean } | null {
   const targetNorm = targetText.replace(/\s+/g, ' ').trim()
   if (!targetNorm) return null
@@ -2934,6 +2945,31 @@ function findTargetRun(
     }
   }
   if (!best) return null
+
+  // Does the winning run actually sit on the clicked text? Measured on real
+  // advances, so it is only asked when every width is known; where it cannot be
+  // answered the run stands, exactly as it did before.
+  if (local) {
+    const state = textStateAtOp(block, ops, best.i, pageIndex)
+    if (state) {
+      let width = 0
+      let known = true
+      for (let k = best.i; k <= best.j && known; k++) {
+        const op = ops[k]
+        const fr = op.fontRef && op.fontRef !== block.fontRef
+          ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
+          : { encoding: block.encoding, simpleInfo: getSimpleFontInfo(pageIndex, block.fontRef) }
+        const w = showOpAdvance(op, fr.encoding, fr.simpleInfo, state.tfSize, 0, 0)
+        if (w === null) known = false
+        else width += w
+      }
+      if (known) {
+        const lo = Math.min(local.x, local.xEnd) - 2
+        const hi = Math.max(local.x, local.xEnd) + 2
+        if (!(state.penX < hi && lo < state.penX + width)) return null
+      }
+    }
+  }
 
   // A line-leading run has a positioning operator, and no other show op,
   // immediately before it. Inserting a Td in front of a MID-line run would
@@ -5283,18 +5319,20 @@ function blockLocalPoint(
   block: BtInfo,
   targetBlock: TextBlock,
   pageHeight?: number
-): { x: number; y: number } | null {
+): { x: number; y: number; xEnd: number } | null {
   if (pageHeight === undefined) return null
   const ctm = getFullCtmAtOffset(stream, block.start)
   const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
   if (Math.abs(det) < 1e-9) return null
-  const pageX = targetBlock.bbox[0]
   const pageY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2 // bottom-up
-  const ax = pageX - ctm[4], ay = pageY - ctm[5]
-  return {
-    x: (ax * ctm[3] - ay * ctm[2]) / det,
-    y: (ay * ctm[0] - ax * ctm[1]) / det
+  const map = (pageX: number) => {
+    const ax = pageX - ctm[4], ay = pageY - ctm[5]
+    return { x: (ax * ctm[3] - ay * ctm[2]) / det, y: (ay * ctm[0] - ax * ctm[1]) / det }
   }
+  const a = map(targetBlock.bbox[0])
+  // Both edges, because a run is rejected by whether it OVERLAPS the clicked
+  // text, and a width in page points is not a width in the block's own space.
+  return { x: a.x, y: a.y, xEnd: map(targetBlock.bbox[2]).x }
 }
 
 /** Horizontal advance of one Tj/TJ op, in text-space units, or null if unknown. */
@@ -5312,7 +5350,10 @@ function showOpAdvance(
   // A bare Tj is measured as a one-item array — parseTjItems only looks for
   // literals and numbers between the brackets, and `Tj` is neither.
   const items = parseTjItems(op.kind === 'TJ' ? op.raw : `[${op.raw}]`, encoding, simpleInfo)
-  if (!items.length) return null
+  // An EMPTY array advances by nothing — it is not an unknown. Splitting a run
+  // out of the front of an array leaves exactly that, `[] TJ`, and calling it
+  // unknown made the whole line's pen position unknowable with it.
+  if (!items.length) return op.kind === 'TJ' ? 0 : null
   let sum = 0
   for (const it of items) {
     if (!it.isLiteral) { sum -= (it.value ?? 0) / 1000 * tfSize; continue }
@@ -5370,7 +5411,11 @@ function textStateAtOp(
   // wrong advance for every glyph.
   const inherited = parseFloat(block.inheritedTf?.match(/([\d.]+)\s+Tf\s*$/)?.[1] ?? '')
   const tfAt = (off: number): number => {
-    const re = /\/[^\s<>[\]()/%]+\s+(-?[\d.]+)\s+Tf(?![A-Za-z0-9])/g
+    // The NAME is blanked by the mask, so the operand is all that is left to
+    // match on — `/TT1 11.04 Tf` masks to `/    11.04 Tf`. Asking for the name
+    // here matches nothing at all, which read as "no font size" and refused
+    // every block that has one.
+    const re = /\/\s+(-?[\d.]+)\s+Tf(?![A-Za-z0-9])/g
     let v = inherited
     let m: RegExpExecArray | null
     while ((m = re.exec(masked)) !== null) {

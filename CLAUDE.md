@@ -383,6 +383,69 @@ safeguards further down never get a chance to matter. Reverted. Refusing the
 edit is the honest outcome; a fix needs per-RUN positions at selection time, not
 per-block.
 
+### A run inside a TJ array can be MOVED as well as edited
+The same shape one level over: Word draws the three rules above a signature
+block as ONE array whose columns are kern jumps —
+`[(__)-3 … (__)-4  ( )-1796  ( )(_)9 …]TJ` — inside a BT that also holds the
+names and the job titles. Every matcher in the move path works at show-OPERATOR
+granularity, so the smallest thing it could address was that whole array: 68
+characters against a 20-character target, which `findTargetRun` rejects on
+length before it ever looks at the text. `findGoverningTm` returns nothing
+because the block has no `Tm` at all (it positions with `Td`), so
+`transformInSource` refused. Selecting the three rules and dragging them
+reported *"Could not be moved — no matching text found in the content stream"*
+while the names on the lines either side moved perfectly well.
+
+`findTargetSegment` + `shiftInsideTjArray` address the run itself. **`Td` cannot
+be used here** — it moves the LINE matrix, so a `Td` in front of a mid-line run
+resets the pen to the start of the line and scrambles everything after it. The
+two displacements that are safe mid-line are:
+
+- **x — a kern**, `k = −tdx·1000/Tfs`, with its exact negation after the run so
+  the pen lands where it always did for everything that follows;
+- **y — `Ts`** (text rise), restored afterwards to whatever was in force. `Ts`
+  is in unscaled text-space units, the same space `Td` operands live in.
+
+The array is split into up to three ops around the run, the shape
+`replaceInsideTjArray`'s substitution branch already emits. Splitting does not
+change the block's decoded text: `BtInfo.decodedText` is decoded over the whole
+block in one pass, so the separating kern still yields its synthesised space.
+
+It is consulted ONLY where every other strategy has already given up, so no move
+that worked before can change. Three things had to be right, and each was wrong
+first:
+
+- **The `Tf` scan cannot ask for the font's NAME.** `textStateAtOp` reads the
+  size in force from the LITERAL-MASKED content, where `/TT1 11.04 Tf` reads
+  `/    11.04 Tf` — the name is blanked. A pattern requiring the name matches
+  nothing at all, which read back as "no font size" and refused every block that
+  has one. The operand is all there is to match on.
+- **An empty array advances by nothing; that is not the same as unknown.**
+  Splitting a run off the FRONT of an array leaves `[] TJ`, and calling its
+  advance unknown made the whole line's pen position unknowable with it — which
+  silently disabled the position guard below.
+- **A run that does not sit on the clicked text is not the run.** A row of
+  underscores fuzzy-matches any other row of underscores, so once the first rule
+  had been split out, `findTargetRun` matched THAT for the second and third and
+  stacked all three on top of each other. `findTargetRun` now takes the target's
+  span in block-local space and refuses a winning run whose real pen span does
+  not overlap it — measured on actual advances, and skipped entirely when any
+  width is unknown, so where it cannot be answered the run stands exactly as
+  before. This is the same rule `findBtBlocksByPosition` follows one level up:
+  text alone never identifies anything here.
+
+Measured on the reported document, in the browser, at pixel level: the three
+rules' ink runs move from `[128,292] [337,534] [575,756]` to
+`[152,316] [361,558] [599,780]` — **+24 x, +40 y on every one, widths
+unchanged** — for a drag asking exactly that. The extraction BOX moves by a
+different amount because a split re-attributes the leading spaces between the
+runs; the box is not the ink and must not be what such a change is judged on.
+
+**Not in scope:** resize (scaling a run inside a shared array needs every glyph
+advance rebuilt, so `pureTranslate` stays a precondition), and taking precedence
+over a shared `Tm` — moving one cell of a Ghostscript table row still drags the
+row, and changing that needs the sweep re-run.
+
 ### Object operations never edit the matrix that placed the image
 Acrobat's "Objetos" panel — flip, rotate, crop, align, arrange, replace — for
 the pictures the CONTENT STREAM draws. `orientContentImage`, `cropContentImage`,
