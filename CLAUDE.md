@@ -368,20 +368,53 @@ successes, no regressions. The same gate is why `N°` accepts `Nro`, `No`, `N`
 and `De` but not `zzz` — that font has no `z` — which reads as "some edits work
 and some don't" unless you know what to look at.
 
-**A ONE-character label cannot be reached, and trying broke things.** The same
-memo labels its addressee row `A`, against `De`, `Asunto` and `N°` below it.
-Containment is the only pass that could find it inside the single BT that draws
-the whole header, and containment demands two characters
-(`targetCompact.length >= 2`). Lowering that to one — even restricted to a
-STANDALONE token, so `A` could not match the `A` inside "Adjunto" — put the
-replacement in the wrong place: asked to change the label, the engine rewrote
-the signature line some 500pt away, interleaving "PARA" into "Alberto" as
-`PAlbReArto`. The block that contains a lone letter is ranked by distance from
-that BLOCK'S ORIGIN, and the origin of a BT drawing an entire header is nowhere
-near the clicked row, so the ranking has nothing to go on and the position
-safeguards further down never get a chance to matter. Reverted. Refusing the
-edit is the honest outcome; a fix needs per-RUN positions at selection time, not
-per-block.
+### A ONE-character label needs a per-RUN position, and now has one
+The same memo labels its addressee row `A`, against `De`, `Asunto` and `N°`
+below it. It was unreachable, and the note that stood here said so: containment
+is the only pass that can find it inside the single BT that draws the whole
+header, containment demanded two characters, and lowering that to one put the
+replacement in the wrong place — asked to change the label, the engine rewrote
+the signature line 500pt away and interleaved "PARA" into "Alberto" as
+`PAlbReArto`. The reason was that a block containing a lone letter is ranked by
+distance from that BLOCK'S ORIGIN, and the origin of a BT drawing an entire
+header is nowhere near the clicked row. The note ended: *a fix needs per-RUN
+positions at selection time, not per-block.* That is now what exists, built for
+moving a run inside a TJ array (below), and three things use it:
+
+- **`runDistanceToTarget`** — where inside a block the target is actually drawn,
+  measured on real glyph advances. A one-character target is admitted to the
+  containment pass only when a run carrying it SITS on the click, and the
+  candidate is then ranked by that distance instead of the block's. Nothing
+  changes for targets of two characters or more.
+- **`runGapToTarget`** — the same measurement for a chosen op window. The op
+  scan's own distance is only a TIE-BREAK, so a stray match can win on score
+  outright: against the one-character target it found a lone-glyph `a` at the
+  end of "Tecnología" — a perfect ratio — 350pt away and a line down, while the
+  label itself lives inside a big TJ array and is never scored at op level at
+  all, because the array breaks the length guard immediately. The replacement
+  went there: "Tecnología" came back "Tecnologírrrr" and the label was
+  untouched. A window that does not sit on the click is now dropped, which lets
+  the in-array path run and find the label. Restricted to targets of three
+  characters or fewer — below that length the text carries almost no
+  identification, and above it the op scan has a corpus behind it.
+- **`replaceInsideTjArray` filters occurrences to literal boundaries BEFORE
+  choosing**, not after. Every `A` inside "Alberto" and "Activos" sits
+  mid-literal and would be rejected by the guard at the end anyway; dropping
+  them first leaves the standalone `(A)` the click actually meant, where
+  choosing first and rejecting afterwards gave up on the whole array.
+
+The vertical term is measured to the BOX, not to its centre. A baseline sits a
+few points below the middle of the box it draws, and counting that as
+displacement rejected the very run that drew the text — measured, 3.2pt of
+ordinary descender slack became 13 against a 10pt budget, so `blockLocalPoint`
+returns the box's full local span and the gap is zero anywhere inside it.
+
+Verified in the browser on the reported memo: `A` → `rrrr` rewrites the label,
+the colon stays in its column, "Tecnología" is untouched, and the ink in the
+label cell goes from 63 dark pixels spanning 90.7–98pt to 107 spanning
+91.3–107.3. `De` → `XY` (two characters, the neighbouring case) picks
+`De :   Ing. Juan Alb` at the clicked x. A long value on the same row still
+takes the untouched op-level path.
 
 ### A run inside a TJ array can be MOVED as well as edited
 The same shape one level over: Word draws the three rules above a signature

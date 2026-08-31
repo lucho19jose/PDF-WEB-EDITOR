@@ -4070,26 +4070,43 @@ function replaceTextInContentStreamFontAware(
   // exact-text single block 300pt away (nine occurrences of "10.00" on one
   // timesheet — the far one used to win just by being tried first).
   const targetCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
-  // Two characters, NOT one. A single-character label — this memo's addressee
-  // row is labelled `A`, against `De`, `Asunto` and `N°` below it — cannot be
-  // identified by its text, and admitting it here (even restricted to a
-  // standalone token) put the replacement in the wrong place: asked to change
-  // the `A`, the engine rewrote the signature line 500pt away, interleaving
-  // "PARA" into "Alberto" as "PAlbReArto". The block that CONTAINS a lone
-  // letter is picked by distance from the block's ORIGIN, and the origin of the
-  // one BT that draws this whole header is nowhere near the clicked row, so the
-  // ranking has nothing to go on. Refusing the edit is the honest outcome.
-  if (targetCompact.length >= 2) {
+  /**
+   * A ONE-character label is admitted, but only on a measured RUN position.
+   *
+   * This memo's addressee row is labelled `A`, against `De`, `Asunto` and `N°`
+   * below it. Text cannot identify it — every `A` in "Alberto", "Adjunto" and
+   * "Activos" reads the same — and when it was admitted on the block-level
+   * ranking alone the engine rewrote the signature line 500pt away,
+   * interleaving "PARA" into "Alberto" as "PAlbReArto". The reason was that a
+   * block containing a lone letter is ranked by distance from the BLOCK's
+   * origin, and the origin of the one BT drawing this whole header is nowhere
+   * near the clicked row, so the ranking had nothing to go on.
+   *
+   * `runDistanceToTarget` is that missing signal: where inside the block the
+   * character is actually drawn, measured on real advances. The block is only
+   * admitted when a run carrying the target sits ON the click, and it is then
+   * ranked by THAT distance rather than the block's. Nothing changes for
+   * targets of two characters or more.
+   */
+  const loneChar = targetCompact.length === 1
+  if (targetCompact.length >= 2 || loneChar) {
+    const onTarget = Math.max(6, targetBlock.height || 0)
     for (const fontFiltered of [true, false]) {
       for (const block of allBlocks) {
         if (fontFiltered && targetFontRef && !blockUsesFont(block, targetFontRef)) continue
         if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) continue
         const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
         if (!(decodedCompact.length > targetCompact.length && wildcardIncludes(decodedCompact, targetCompact))) continue
+        let dist = distOf(block)
+        if (loneChar) {
+          const runDist = runDistanceToTarget(block, normalizedTarget, pageIndex, stream, targetBlock, pageHeight)
+          if (runDist === null || runDist > onTarget) continue
+          dist = runDist
+        }
         // Below every direct fuzzy score (>= 0.7): at equal distance a whole
         // match still beats a fragment of a bigger block.
         candidates.push({
-          blocks: [block], score: 0.4, dist: distOf(block),
+          blocks: [block], score: 0.4, dist,
           line: false, partial: true, order: candidates.length
         })
       }
@@ -5211,6 +5228,22 @@ function replaceInsideTjArray(
   }
   if (!occ.length) return null
 
+  /**
+   * Only occurrences that start at a literal's first character and end at a
+   * literal's last are usable — anything else splits a literal in half, and the
+   * guard further down rejects it. Filtering them out HERE rather than there is
+   * what makes a one-character target work: every `A` inside "Alberto" and
+   * "Activos" sits mid-literal, so dropping them first leaves the standalone
+   * `(A)` the click actually meant. Choosing first and rejecting afterwards
+   * gave up on the whole array instead.
+   */
+  const aligned = occ.filter(o => {
+    const f = charItem[o.start]
+    const l = charItem[o.end - 1]
+    return f && l && f.charInItem === 0 && l.charInItem === items[l.item].decoded.length - 1
+  })
+  if (aligned.length) occ.length = 0, occ.push(...aligned)
+
   // Pick the occurrence nearest the clicked x when we can estimate positions
   // (identical values repeat across table columns)
   let chosen = occ[0]
@@ -5319,20 +5352,29 @@ function blockLocalPoint(
   block: BtInfo,
   targetBlock: TextBlock,
   pageHeight?: number
-): { x: number; y: number; xEnd: number } | null {
+): { x: number; y: number; xEnd: number; yLo: number; yHi: number } | null {
   if (pageHeight === undefined) return null
   const ctm = getFullCtmAtOffset(stream, block.start)
   const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
   if (Math.abs(det) < 1e-9) return null
-  const pageY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2 // bottom-up
-  const map = (pageX: number) => {
+  const map = (pageX: number, pageY: number) => {
     const ax = pageX - ctm[4], ay = pageY - ctm[5]
     return { x: (ax * ctm[3] - ay * ctm[2]) / det, y: (ay * ctm[0] - ax * ctm[1]) / det }
   }
-  const a = map(targetBlock.bbox[0])
-  // Both edges, because a run is rejected by whether it OVERLAPS the clicked
-  // text, and a width in page points is not a width in the block's own space.
-  return { x: a.x, y: a.y, xEnd: map(targetBlock.bbox[2]).x }
+  const midY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2 // bottom-up
+  const a = map(targetBlock.bbox[0], midY)
+  // The whole BOX, not one point. A run is judged by whether it overlaps the
+  // clicked text, and neither a width nor a line height in page points is a
+  // width or a height in the block's own space. The vertical span matters as
+  // much as the horizontal: a baseline sits a few points below the middle of
+  // the box it draws, and treating that as displacement rejects the very run
+  // that drew it.
+  const top = map(targetBlock.bbox[0], pageHeight - targetBlock.bbox[1]).y
+  const bot = map(targetBlock.bbox[0], pageHeight - targetBlock.bbox[3]).y
+  return {
+    x: a.x, y: a.y, xEnd: map(targetBlock.bbox[2], midY).x,
+    yLo: Math.min(top, bot), yHi: Math.max(top, bot)
+  }
 }
 
 /** Horizontal advance of one Tj/TJ op, in text-space units, or null if unknown. */
@@ -5453,6 +5495,140 @@ function textStateAtOp(
   }
 
   return { penX: ops[index].x + adv, tfSize, ts }
+}
+
+/**
+ * How far the run `ops[from..to]` sits from the clicked text, in points —
+ * zero when it is on it — or null when it cannot be measured.
+ *
+ * y is weighted because two rows of a form are twelve points apart vertically
+ * and hundreds horizontally, and it is measured to the BOX, not to its centre:
+ * a baseline sits a few points below the middle of the box it draws.
+ */
+function runGapToTarget(
+  block: BtInfo,
+  ops: ShowOpInfo[],
+  from: number,
+  to: number,
+  pageIndex: number,
+  local: { x: number; xEnd: number; yLo: number; yHi: number }
+): number | null {
+  const state = textStateAtOp(block, ops, from, pageIndex)
+  if (!state) return null
+  let width = 0
+  for (let k = from; k <= to; k++) {
+    const op = ops[k]
+    const fr = op.fontRef && op.fontRef !== block.fontRef
+      ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
+      : { encoding: block.encoding, simpleInfo: getSimpleFontInfo(pageIndex, block.fontRef) }
+    const w = showOpAdvance(op, fr.encoding, fr.simpleInfo ?? null, state.tfSize, 0, 0)
+    if (w === null) return null
+    width += w
+  }
+  const lo = Math.min(local.x, local.xEnd), hi = Math.max(local.x, local.xEnd)
+  const x0 = state.penX, x1 = state.penX + width
+  const xGap = x1 < lo ? lo - x1 : (x0 > hi ? x0 - hi : 0)
+  const y = ops[from].y
+  const yGap = y < local.yLo ? local.yLo - y : (y > local.yHi ? y - local.yHi : 0)
+  return xGap + yGap * 3
+}
+
+/**
+ * How far the clicked text is from the nearest RUN inside `block` that actually
+ * draws it — measured on real glyph advances — or null when the block draws it
+ * nowhere near.
+ *
+ * A block's own ORIGIN is useless for this. The one BT that draws a memo's
+ * whole header starts at its top-left corner, so every row inside it scores the
+ * same distance, and a ONE-character label was therefore unreachable: `A`
+ * cannot be told from the `A` in "Alberto" by its text, the block-level ranking
+ * had nothing else to offer, and admitting it rewrote a signature line 500pt
+ * away — "PARA" interleaved into "Alberto" as "PAlbReArto". This is the
+ * per-RUN position that case always needed.
+ *
+ * y is weighted, as it is everywhere else here: two rows of a form are a few
+ * points apart vertically and hundreds horizontally, so a small y error means
+ * far more than a small x one.
+ */
+function runDistanceToTarget(
+  block: BtInfo,
+  targetText: string,
+  pageIndex: number,
+  stream: string,
+  targetBlock: TextBlock,
+  pageHeight?: number
+): number | null {
+  const targetNorm = targetText.replace(/\s+/g, ' ').trim()
+  if (!targetNorm) return null
+  const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
+  if (!local) return null
+  const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+
+  const lo = Math.min(local.x, local.xEnd)
+  const hi = Math.max(local.x, local.xEnd)
+  /** Gap between a run's x span and the clicked one — zero when they overlap. */
+  const gap = (x0: number, x1: number) => x1 < lo ? lo - x1 : (x0 > hi ? x0 - hi : 0)
+  /**
+   * How far the baseline falls OUTSIDE the clicked box, weighted.
+   *
+   * Not the distance to its centre: a baseline sits a few points below the
+   * middle of the box it draws, and counting that as displacement rejected the
+   * very run that drew the text — measured, 3.2pt of ordinary descender slack
+   * became 13 against a 10pt budget. Outside the box it is weighted, because
+   * two rows of a form are twelve points apart vertically and hundreds
+   * horizontally.
+   */
+  const yGap = (y: number) => (y < local.yLo ? local.yLo - y : (y > local.yHi ? y - local.yHi : 0)) * 3
+
+  let best: number | null = null
+  const keep = (d: number) => { if (best === null || d < best) best = d }
+
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i]
+    if (!op.decoded.includes(targetNorm)) continue
+    const dy = yGap(op.y)
+    const state = textStateAtOp(block, ops, i, pageIndex)
+    if (!state) { keep(dy); continue }   // position known only to the line
+
+    const fr = op.fontRef && op.fontRef !== block.fontRef
+      ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
+      : { encoding: block.encoding, simpleInfo: getSimpleFontInfo(pageIndex, block.fontRef) }
+    const widths = fr.simpleInfo?.widths
+
+    // Inside a TJ array the target can be one cell of a row, so the run is
+    // located glyph by glyph rather than taken as the whole op.
+    if (op.kind === 'TJ' && widths) {
+      const fc = fr.simpleInfo!.firstChar
+      const items = parseTjItems(op.raw, fr.encoding, fr.simpleInfo)
+      let full = '', acc = 0, usable = true
+      const xAt: number[] = []
+      for (const it of items) {
+        if (!it.isLiteral) { acc -= (it.value ?? 0); continue }
+        if (it.decoded.length !== it.codes.length) { usable = false; break }
+        for (let c = 0; c < it.decoded.length; c++) {
+          const cw = widths[it.codes[c] - fc]
+          if (cw === undefined) { usable = false; break }
+          xAt.push(acc); acc += cw; full += it.decoded[c]
+        }
+        if (!usable) break
+      }
+      if (usable) {
+        let p = full.indexOf(targetNorm)
+        while (p !== -1) {
+          const x0 = state.penX + xAt[p] * state.tfSize / 1000
+          const x1 = state.penX + (xAt[p + targetNorm.length - 1] ?? xAt[p]) * state.tfSize / 1000
+          keep(gap(x0, x1) + dy)
+          p = full.indexOf(targetNorm, p + 1)
+        }
+        continue
+      }
+    }
+
+    const w = showOpAdvance(op, fr.encoding, fr.simpleInfo ?? null, state.tfSize, 0, 0)
+    keep(gap(state.penX, state.penX + (w ?? 0)) + dy)
+  }
+  return best
 }
 
 interface TjSegmentHit {
@@ -5725,20 +5901,7 @@ function applyPartialBlockReplacement(
   // Map the clicked block's page position into this BT block's local text
   // space so repeated identical strings ("16:00" in every table row) resolve
   // to the occurrence the user actually clicked.
-  let targetLocal: { x: number; y: number } | null = null
-  if (pageHeight !== undefined) {
-    const ctm = getFullCtmAtOffset(stream, block.start)
-    const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
-    if (Math.abs(det) > 1e-9) {
-      const pageX = targetBlock.bbox[0]
-      const pageY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2 // bottom-up
-      const ax = pageX - ctm[4], ay = pageY - ctm[5]
-      targetLocal = {
-        x: (ax * ctm[3] - ay * ctm[2]) / det,
-        y: (ay * ctm[0] - ax * ctm[1]) / det
-      }
-    }
-  }
+  const targetLocal = blockLocalPoint(stream, block, targetBlock, pageHeight)
 
   // Best contiguous run of ops whose concatenated text matches the target;
   // ties broken by distance to the clicked position
@@ -5764,6 +5927,27 @@ function applyPartialBlockReplacement(
         best = { i, j, score, dist }
       }
     }
+  }
+
+  /**
+   * A SHORT target's winning window has to sit on the clicked text.
+   *
+   * Distance is only a tie-break above, and a stray match can win on score
+   * outright. Asked to change this memo's `A` label, the op scan found a
+   * lone-glyph `a` at the end of "Tecnología" — a perfect ratio against a
+   * one-character target — 350pt away and a line down, while the label itself
+   * lives inside a big TJ array and is never scored at op level at all
+   * (the array breaks the length guard immediately). The replacement went
+   * there: "Tecnología" came back "Tecnologírrrr" and the label was untouched.
+   *
+   * Measured on real advances, so it is only asked where every width is known;
+   * where it cannot be answered the window stands. Restricted to targets of
+   * three characters or fewer — below that length the text carries almost no
+   * identification, and above it the op scan has a corpus behind it.
+   */
+  if (best && targetLocal && targetNorm.length <= 3) {
+    const gap = runGapToTarget(block, ops, best.i, best.j, pageIndex, targetLocal)
+    if (gap !== null && gap > Math.max(6, targetBlock.height || 0)) best = null
   }
 
   /**
