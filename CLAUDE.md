@@ -321,6 +321,51 @@ as primary — the tick — and encodes the whole line for the tick's font. The 
 narrowing one level up (drop a leading BLOCK the edit did not change) would fix
 it and is not implemented.
 
+### A matched op that CONTAINS the target is a table row, not the target
+Ghostscript draws a whole table row as ONE TJ array, the columns separated by
+kern jumps rather than by separate ops. A memo's addressee line is therefore a
+single op reading `A :  Ing. Matías Miguel Mamani Cabrera` — the label, the
+colon and the name together — and the op-level matcher in
+`applyPartialBlockReplacement` fuzzy-matched it against the target
+`:  Ing. Matías Miguel Mamani Cabrera` at 0.95 and picked it. The op-level
+replacement then writes the new text into the op and blanks the rest of the
+window, so the replacement was drawn at the START of the row and every other
+cell was deleted: **the "A" label vanished and the name moved into its column.**
+
+`replaceInsideTjArray` exists for exactly this and was never reached — it was
+gated on `if (!best)`, i.e. only when NOTHING matched at op level. Here
+something does match, *because* the row contains the target.
+
+Two things had to change:
+
+- **The gate is a containment test, not a length ratio.** The row is only two
+  characters longer than the target and those two characters are the label, so
+  any "materially bigger" threshold waves it through (`× 1.25 + 2` did). The
+  test is: the op's text is not the target, CONTAINS it, and what is left over
+  after removing it still has a visible glyph. Then the array must be edited
+  from the inside.
+- **The search inside the array is whitespace-COLLAPSED.** `full` is the array's
+  literal items concatenated, and the gap between two cells is a kern, not a
+  space glyph — so the run's own spacing need not match the spacing MuPDF
+  reported for the block. An exact `indexOf` missed the very rows the function
+  exists for. The projection is matched and mapped back to raw item positions,
+  so the boundary-alignment guard still applies.
+
+If the surgical path cannot be taken the edit is REFUSED rather than applied at
+op level: this array holds cells the edit never named, and losing an edit is
+recoverable where silently deleting the rest of the row is not. Likewise an
+unencodable cell is only fatal when the array was the only candidate — with an
+op window still in hand it just means this route is not the one.
+
+**Known limitation:** a replacement needing glyphs the embedded subset lacks is
+refused here, because in-array substitution is deliberately gated on a known
+byte encoding and plausible widths (see the in-array gate commit) and a
+Ghostscript subset has neither. Editing such a row to text it can already draw
+works; typing a name with new letters reports that it could not be matched.
+Measured: same-glyph, shorter and longer replacements all keep the "A" label and
+land in the right column; the corpus is unchanged, 262 experiments, 227
+successes, no regressions.
+
 ### Object operations never edit the matrix that placed the image
 Acrobat's "Objetos" panel — flip, rotate, crop, align, arrange, replace — for
 the pictures the CONTENT STREAM draws. `orientContentImage`, `cropContentImage`,

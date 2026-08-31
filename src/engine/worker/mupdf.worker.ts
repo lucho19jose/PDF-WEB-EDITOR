@@ -2348,28 +2348,55 @@ function transformInSource(
         ? findTargetRun(block, targetBlock.text, pageIndex)
         : null
 
+      /**
+       * Last chance before refusing: the target may not be a show OP at all,
+       * but a run of glyphs inside one TJ array.
+       *
+       * Word draws the three rules above a signature block as a single array
+       * whose columns are kern jumps, and that array has no Tm and no
+       * line-leading run to grab — so a drag on any of them found nothing and
+       * said so, while the names on the lines either side moved perfectly well.
+       *
+       * Consulted ONLY where every other strategy has already given up, so no
+       * move that works today can change.
+       */
+      const seg = (holdsMoreThanTarget && pureTranslate && !(run && run.startsLine) && !governing)
+        ? findTargetSegment(block, targetBlock, pageIndex, stream, pageHeight)
+        : null
+
       // When the block draws far more than the target and neither a
       // line-leading run nor a governing Tm can be pinned down, every remaining
       // strategy moves OTHER text: rewriting the first Tm dragged a table's
       // header row when a cell 50pt below it was asked to move. Refuse the
       // block — a loud "could not find matching text" beats a silent wrong drag.
-      if (holdsMoreThanTarget && !(run && run.startsLine) && !governing) continue
+      if (holdsMoreThanTarget && !(run && run.startsLine) && !seg && !governing) continue
+
+      /** The page-space delta expressed in the text matrix's own space. */
+      const inTmSpace = (): { tdx: number; tdy: number } => {
+        if (!tmMatch) return { tdx: dxL, tdy: dyL }
+        const a = parseFloat(tmMatch[1]), b2 = parseFloat(tmMatch[2])
+        const c2 = parseFloat(tmMatch[3]), d2 = parseFloat(tmMatch[4])
+        const det2 = a * d2 - b2 * c2
+        if (!(Math.abs(det2) > 1e-9)) return { tdx: dxL, tdy: dyL }
+        return {
+          tdx: (dxL * d2 - dyL * c2) / det2,
+          tdy: (dyL * a - dxL * b2) / det2
+        }
+      }
 
       let newContent: string
-      if (run && run.startsLine) {
+      if (seg) {
+        const { tdx, tdy } = inTmSpace()
+        const newRaw = shiftInsideTjArray(seg, tdx, tdy)
+        if (!newRaw) continue
+        newContent =
+          block.content.slice(0, seg.op.start) + newRaw + block.content.slice(seg.op.end)
+        usedStrategy ??= 'tj_segment_shift'
+      } else if (run && run.startsLine) {
         // Td operands are multiplied by the TEXT matrix, so the delta has to be
         // expressed in Tm space — feeding it the CTM-space value moved this
         // block 5.9x too far on a page whose Tm scales by 0.17.
-        let tdx = dxL, tdy = dyL
-        if (tmMatch) {
-          const a = parseFloat(tmMatch[1]), b2 = parseFloat(tmMatch[2])
-          const c2 = parseFloat(tmMatch[3]), d2 = parseFloat(tmMatch[4])
-          const det = a * d2 - b2 * c2
-          if (Math.abs(det) > 1e-9) {
-            tdx = (dxL * d2 - dyL * c2) / det
-            tdy = (dyL * a - dxL * b2) / det
-          }
-        }
+        const { tdx, tdy } = inTmSpace()
         newContent =
           block.content.slice(0, run.start) +
           `${fmtNum(tdx)} ${fmtNum(tdy)} Td ` +
@@ -5113,12 +5140,30 @@ function replaceInsideTjArray(
     full += it.decoded
   })
 
-  const target = targetText.trim()
+  // Matched on a whitespace-COLLAPSED projection of the array, mapped back to
+  // raw positions. `full` is the array's literal items concatenated, and the
+  // gaps between a Ghostscript row's cells are KERNS, not space glyphs — so the
+  // run's own spacing does not have to match the spacing the extractor
+  // reported. An exact `indexOf` therefore missed the very rows this function
+  // exists for, and the caller then fell back to replacing the whole array.
+  const target = targetText.replace(/\s+/g, ' ').trim()
   if (!target) return null
-  // all occurrences
-  const occ: number[] = []
-  let p = full.indexOf(target)
-  while (p !== -1) { occ.push(p); p = full.indexOf(target, p + 1) }
+  const projIdx: number[] = []
+  let proj = ''
+  for (let i = 0; i < full.length; i++) {
+    if (/\s/.test(full[i])) {
+      if (proj.length && proj[proj.length - 1] !== ' ') { proj += ' '; projIdx.push(i) }
+    } else {
+      proj += full[i]; projIdx.push(i)
+    }
+  }
+  // Raw [start, end) of every occurrence.
+  const occ: { start: number; end: number }[] = []
+  let p = proj.indexOf(target)
+  while (p !== -1) {
+    occ.push({ start: projIdx[p], end: projIdx[p + target.length - 1] + 1 })
+    p = proj.indexOf(target, p + 1)
+  }
   if (!occ.length) return null
 
   // Pick the occurrence nearest the clicked x when we can estimate positions
@@ -5143,13 +5188,13 @@ function replaceInsideTjArray(
     const clickedRel = (targetLocalX - op.x) * 1000 / tfSize
     let bestD = Infinity
     for (const o of occ) {
-      const d = Math.abs(clickedRel - (xAt[o] ?? 0))
+      const d = Math.abs(clickedRel - (xAt[o.start] ?? 0))
       if (d < bestD) { bestD = d; chosen = o }
     }
   }
 
-  const startC = chosen
-  const endC = chosen + target.length
+  const startC = chosen.start
+  const endC = chosen.end
   const first = charItem[startC]
   const last = charItem[endC - 1]
   if (!first || !last) return null
@@ -5214,6 +5259,315 @@ function replaceInsideTjArray(
     if (known) comp = ` ${fmtNum(newW - oldW)} `
   }
   return op.raw.slice(0, spliceStart) + newLiteral.literal + comp + ' ' + op.raw.slice(spliceEnd)
+}
+
+/**
+ * The clicked block's position expressed in ONE BT block's own text space.
+ *
+ * Repeated strings — "16:00" in eight table rows, a rule under each of three
+ * signatures — are told apart by where they are, and "where" only means
+ * anything once the page-space bbox has been pushed back through the CTM the
+ * block draws under.
+ */
+function blockLocalPoint(
+  stream: string,
+  block: BtInfo,
+  targetBlock: TextBlock,
+  pageHeight?: number
+): { x: number; y: number } | null {
+  if (pageHeight === undefined) return null
+  const ctm = getFullCtmAtOffset(stream, block.start)
+  const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
+  if (Math.abs(det) < 1e-9) return null
+  const pageX = targetBlock.bbox[0]
+  const pageY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2 // bottom-up
+  const ax = pageX - ctm[4], ay = pageY - ctm[5]
+  return {
+    x: (ax * ctm[3] - ay * ctm[2]) / det,
+    y: (ay * ctm[0] - ax * ctm[1]) / det
+  }
+}
+
+/** Horizontal advance of one Tj/TJ op, in text-space units, or null if unknown. */
+function showOpAdvance(
+  op: ShowOpInfo,
+  encoding: ReturnType<typeof getFontEncoding>,
+  simpleInfo: SimpleFontInfo | null,
+  tfSize: number,
+  tc: number,
+  tw: number
+): number | null {
+  const widths = simpleInfo?.widths
+  if (!widths || !(tfSize > 0)) return null
+  const fc = simpleInfo!.firstChar
+  // A bare Tj is measured as a one-item array — parseTjItems only looks for
+  // literals and numbers between the brackets, and `Tj` is neither.
+  const items = parseTjItems(op.kind === 'TJ' ? op.raw : `[${op.raw}]`, encoding, simpleInfo)
+  if (!items.length) return null
+  let sum = 0
+  for (const it of items) {
+    if (!it.isLiteral) { sum -= (it.value ?? 0) / 1000 * tfSize; continue }
+    for (const code of it.codes) {
+      const cw = widths[code - fc]
+      if (cw === undefined) return null
+      sum += cw / 1000 * tfSize + tc + (code === 32 ? tw : 0)
+    }
+  }
+  return sum
+}
+
+/**
+ * Where the pen REALLY is when op `index` starts drawing, plus the text state
+ * in force there.
+ *
+ * `scanShowOps` tracks x only through Tm/Td/TD/T*, so every op after the first
+ * of a line reports the LINE's origin rather than the pen. That is enough to
+ * rank whole ops against a click and not enough to locate a glyph inside one —
+ * and it goes badly wrong once an array has been split, because the part
+ * holding the rest of the line still claims to begin where the line began, a
+ * hundred points to its left.
+ *
+ * Null when the answer cannot be trusted: a width missing from the font, a
+ * horizontal scale other than 100, or a ' / " in the way. A wrong number here
+ * does not fail — it picks the wrong copy of a repeated string and moves that.
+ */
+function textStateAtOp(
+  block: BtInfo,
+  ops: ShowOpInfo[],
+  index: number,
+  pageIndex: number
+): { penX: number; tfSize: number; ts: number } | null {
+  const masked = maskStreamLiterals(block.content)
+  const at = ops[index].start
+
+  /** Last operand of a single-operand text-state operator at or before `off`. */
+  const lastOperand = (op: string, dflt: number, off: number): number => {
+    const re = new RegExp(`(-?[\\d.]+)\\s+${op}(?![A-Za-z0-9])`, 'g')
+    let v = dflt
+    let m: RegExpExecArray | null
+    while ((m = re.exec(masked)) !== null) {
+      if (m.index > off) break
+      v = parseFloat(m[1])
+    }
+    return v
+  }
+  if (Math.abs(lastOperand('Tz', 100, at) - 100) > 1e-6) return null
+  const tc = lastOperand('Tc', 0, at)
+  const tw = lastOperand('Tw', 0, at)
+  const ts = lastOperand('Ts', 0, at)
+
+  // A fontless block takes its size from the Tf it inherited — the same rule
+  // `rebuildBtContent` follows, and for the same reason: guessing 12 here is a
+  // wrong advance for every glyph.
+  const inherited = parseFloat(block.inheritedTf?.match(/([\d.]+)\s+Tf\s*$/)?.[1] ?? '')
+  const tfAt = (off: number): number => {
+    const re = /\/[^\s<>[\]()/%]+\s+(-?[\d.]+)\s+Tf(?![A-Za-z0-9])/g
+    let v = inherited
+    let m: RegExpExecArray | null
+    while ((m = re.exec(masked)) !== null) {
+      if (m.index > off) break
+      v = parseFloat(m[1])
+    }
+    return v
+  }
+  const tfSize = tfAt(at)
+  if (!Number.isFinite(tfSize) || tfSize <= 0) return null
+
+  // Everything drawn since the pen was last put at a line origin.
+  let reset = 0
+  const posRe = /(?:-?[\d.]+\s+){6}Tm(?![A-Za-z0-9])|(?:-?[\d.]+\s+){2}T[dD](?![A-Za-z0-9])|T\*(?![A-Za-z0-9])/g
+  let pm: RegExpExecArray | null
+  while ((pm = posRe.exec(masked)) !== null) {
+    if (pm.index > at) break
+    reset = pm.index + pm[0].length
+  }
+
+  let adv = 0
+  for (let i = 0; i < index; i++) {
+    const op = ops[i]
+    if (op.start < reset) continue
+    // ' and " carry an implicit T* and " rewrites Tw/Tc. Refusing is cheaper
+    // than modelling them, and they do not appear in the generators this path
+    // exists for.
+    if (op.kind === 'quote' || op.kind === 'dquote') return null
+    const fr = op.fontRef && op.fontRef !== block.fontRef
+      ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
+      : { encoding: block.encoding, simpleInfo: getSimpleFontInfo(pageIndex, block.fontRef) }
+    const w = showOpAdvance(op, fr.encoding, fr.simpleInfo, tfAt(op.start), tc, tw)
+    if (w === null) return null
+    adv += w
+  }
+
+  return { penX: ops[index].x + adv, tfSize, ts }
+}
+
+interface TjSegmentHit {
+  op: ShowOpInfo
+  /** Byte range of the run INSIDE op.raw. */
+  spliceStart: number
+  spliceEnd: number
+  tfSize: number
+  /** Text rise in force before the op, restored after the shifted run. */
+  ts: number
+  /** How far the chosen occurrence sits from the click, in points. */
+  err: number
+}
+
+/**
+ * The target text as a run of glyphs INSIDE one TJ array.
+ *
+ * Word draws the three rules above a signature block as ONE array whose columns
+ * are kern jumps — `[(__)…(__) -1796 ( ) (_)…]TJ` — and Ghostscript does the
+ * same with a whole table row. Every matcher in the move path works at
+ * show-OPERATOR granularity, so the smallest thing it can address is that whole
+ * array: 68 characters against a 20-character target, which the run scan
+ * rejects on length before it ever looks at the text. The result was a drag
+ * that reported "Could not find matching text in content stream" while the
+ * names on the lines above and below moved perfectly well.
+ *
+ * The occurrence is chosen by POSITION, exactly as `replaceInsideTjArray` does
+ * it: 20 consecutive underscores also occur inside the 24- and 22-underscore
+ * runs beside them, so text alone identifies nothing.
+ */
+function findTargetSegment(
+  block: BtInfo,
+  targetBlock: TextBlock,
+  pageIndex: number,
+  stream: string,
+  pageHeight?: number
+): TjSegmentHit | null {
+  const targetNorm = targetBlock.text.replace(/\s+/g, ' ').trim()
+  if (targetNorm.length < 2) return null
+
+  const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
+  const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+
+  let best: TjSegmentHit | null = null
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i]
+    if (op.kind !== 'TJ') continue
+    if (!op.decoded.includes(targetNorm)) continue
+
+    const fr = op.fontRef && op.fontRef !== block.fontRef
+      ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
+      : { encoding: block.encoding, simpleInfo: getSimpleFontInfo(pageIndex, block.fontRef) }
+    const widths = fr.simpleInfo?.widths
+    if (!widths) continue
+    const fc = fr.simpleInfo!.firstChar
+
+    const items = parseTjItems(op.raw, fr.encoding, fr.simpleInfo)
+    if (!items.length) continue
+
+    // Per-character x inside the array, in thousandths of the drawn size —
+    // the same table `replaceInsideTjArray` builds to pick its occurrence.
+    const charItem: { item: number; charInItem: number }[] = []
+    const xAt: number[] = []
+    let full = ''
+    let acc = 0
+    let usable = true
+    for (let idx = 0; idx < items.length && usable; idx++) {
+      const it = items[idx]
+      if (!it.isLiteral) { acc -= (it.value ?? 0); continue }
+      // One code per character, or the x table does not line up with the text.
+      if (it.decoded.length !== it.codes.length) { usable = false; break }
+      for (let c = 0; c < it.decoded.length; c++) {
+        const cw = widths[it.codes[c] - fc]
+        if (cw === undefined) { usable = false; break }
+        charItem.push({ item: idx, charInItem: c })
+        xAt.push(acc)
+        acc += cw
+        full += it.decoded[c]
+      }
+    }
+    if (!usable) continue
+
+    const occ: number[] = []
+    let p = full.indexOf(targetNorm)
+    while (p !== -1) { occ.push(p); p = full.indexOf(targetNorm, p + 1) }
+    // Boundary-aligned only: the run must start at a literal's first character
+    // and end at a literal's last. Anything else splits a literal in half, and
+    // the array would be corrupt rather than merely wrong.
+    const aligned = occ.filter(o => {
+      const a = charItem[o]
+      const b = charItem[o + targetNorm.length - 1]
+      return a && b && a.charInItem === 0 && b.charInItem === items[b.item].decoded.length - 1
+    })
+    if (!aligned.length) continue
+
+    const state = textStateAtOp(block, ops, i, pageIndex)
+    if (!state) continue
+
+    let chosen = aligned[0]
+    let err = 0
+    if (local) {
+      const clickedRel = (local.x - state.penX) * 1000 / state.tfSize
+      let bestD = Infinity
+      for (const o of aligned) {
+        const d = Math.abs(clickedRel - xAt[o])
+        if (d < bestD) { bestD = d; chosen = o }
+      }
+      err = bestD * state.tfSize / 1000
+      // Never move a copy the user did not point at. Half the run's own width
+      // is the widest a click can miss by and still plainly mean this one.
+      const runW = (xAt[chosen + targetNorm.length - 1] - xAt[chosen]) * state.tfSize / 1000
+      if (err > Math.max(12, runW * 0.5)) continue
+    } else if (aligned.length > 1) {
+      // Repeated text and no position to tell the copies apart.
+      continue
+    }
+
+    const first = charItem[chosen]
+    const last = charItem[chosen + targetNorm.length - 1]
+    const hit: TjSegmentHit = {
+      op,
+      spliceStart: items[first.item].start,
+      spliceEnd: items[last.item].end,
+      tfSize: state.tfSize,
+      ts: state.ts,
+      err
+    }
+    if (!best || hit.err < best.err) best = hit
+  }
+  return best
+}
+
+/**
+ * Displace a run of glyphs inside a TJ array by (tdx, tdy), in text space.
+ *
+ * `Td` cannot be used here: it moves the LINE matrix, so a Td in front of a
+ * mid-line run resets the pen to the start of the line and scrambles
+ * everything after it. The two displacements that are safe mid-line are a kern
+ * for x — with its exact negation afterwards, so the pen lands where it always
+ * did — and `Ts` (text rise) for y, restored to whatever was in force.
+ *
+ * The array is split into up to three ops around the run, the same shape
+ * `replaceInsideTjArray`'s substitution branch already emits. An empty array is
+ * legal and draws nothing, so a run at either end needs no special case.
+ */
+function shiftInsideTjArray(hit: TjSegmentHit, tdx: number, tdy: number): string | null {
+  if (!Number.isFinite(hit.tfSize) || hit.tfSize <= 0) return null
+  if (!Number.isFinite(tdx) || !Number.isFinite(tdy)) return null
+
+  const raw = hit.op.raw
+  const pre = raw.slice(0, hit.spliceStart).trimEnd()      // "[ …items-before"
+  const mid = raw.slice(hit.spliceStart, hit.spliceEnd)    // the run itself
+  const post = raw.slice(hit.spliceEnd).replace(/^\s*/, '') // "items-after… ] TJ"
+
+  // A kern k displaces the pen by −k/1000 × size, so advancing it by tdx needs
+  // −tdx, and putting it back needs the same number with the other sign.
+  const kern = -tdx * 1000 / hit.tfSize
+  const lead = Math.abs(kern) > 1e-4 ? `${fmtNum(kern)} ` : ''
+  const trail = Math.abs(kern) > 1e-4 ? `${fmtNum(-kern)} ` : ''
+  const rise = Math.abs(tdy) > 1e-4
+  if (!lead && !rise) return null
+
+  const parts = [`${pre}] TJ`]
+  if (rise) parts.push(`${fmtNum(hit.ts + tdy)} Ts`)
+  parts.push(`[${lead}${mid}] TJ`)
+  if (rise) parts.push(`${fmtNum(hit.ts)} Ts`)
+  parts.push(`[${trail}${post}`)
+  return parts.join(' ')
 }
 
 /** Rebuild a show op with a new literal, PRESERVING its operator (so the
@@ -5358,10 +5712,36 @@ function applyPartialBlockReplacement(
     }
   }
 
+  /**
+   * The matched op carries materially MORE text than the target.
+   *
+   * That is the Ghostscript table row: ONE TJ array holding every cell of the
+   * line, the columns separated by kern jumps rather than by separate ops. The
+   * op-level replacement writes the new text into the op and blanks the rest of
+   * the window, so applying it here draws the replacement at the START of the
+   * row and deletes every other cell — editing a memo's addressee took its "A"
+   * label with it and moved the name to the label's column.
+   *
+   * The array has to be edited from the inside instead, which is exactly what
+   * `replaceInsideTjArray` exists for; it was only ever reached when NO op
+   * matched, and here one does, because the row CONTAINS the target and so
+   * fuzzy-matches it.
+   */
+  const bestHoldsMoreThanTarget = best !== null && best.i === best.j &&
+    ops[best.i].kind === 'TJ' && (() => {
+      // Not a length ratio — the leftover is what matters. A memo's addressee
+      // row is one array reading "A :  Ing. Matías …" against a target of
+      // ":  Ing. Matías …": only two characters longer, and those two are the
+      // label the replacement would delete.
+      const d = ops[best!.i].decoded.replace(/\s+/g, ' ').trim()
+      if (d === targetNorm || !d.includes(targetNorm)) return false
+      return d.replace(targetNorm, ' ').trim().length > 0
+    })()
+
   // No op-level window matched — the target may live INSIDE a single TJ
   // array (Ghostscript merges a whole table row into one array, jumping
   // between cells with kern numbers). Replace just those glyphs.
-  if (!best) {
+  if (!best || bestHoldsMoreThanTarget) {
     const tfMatch = block.content.match(/\/(?:[^\s<>[\]()/%]+)\s+([\d.]+)\s+Tf/)
     // A fontless block takes its size from the Tf it inherited, not from a flat
     // 12: this size is written back out with the restore, so guessing it
@@ -5373,7 +5753,9 @@ function applyPartialBlockReplacement(
 
     // Candidate arrays containing the target, nearest clicked position first
     const candidates = ops
-      .filter(o => o.kind === 'TJ' && o.decoded.includes(targetNorm))
+      // Normalised on both sides: the gap between two cells is a KERN, so the
+      // array's own spacing need not match the spacing the extractor reported.
+      .filter(o => o.kind === 'TJ' && o.decoded.replace(/\s+/g, ' ').trim().includes(targetNorm))
       .sort((a, b) => {
         if (!targetLocal) return 0
         const da = Math.abs(a.x - targetLocal.x) + Math.abs(a.y - targetLocal.y) * 4
@@ -5387,7 +5769,9 @@ function applyPartialBlockReplacement(
       const plan = planTextEncoding(pageIndex,
         { mode: op.isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding },
         [newText], targetBlock)
-      if (plan.kind === 'error') return { error: plan.error }
+      // Only fatal when the array is the ONLY hope; with an op window still in
+      // hand, an unencodable cell just means this route is not the one.
+      if (plan.kind === 'error') { if (!best) return { error: plan.error }; break }
 
       let newRaw: string | null = null
       let substFont: string | undefined
@@ -5422,6 +5806,9 @@ function applyPartialBlockReplacement(
         }
       }
     }
+    // Refuse rather than fall through to the op-level replacement: this array
+    // holds cells the edit never named, and losing the edit is recoverable
+    // where silently deleting the rest of the row is not.
     return null
   }
 
