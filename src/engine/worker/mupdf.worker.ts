@@ -5172,6 +5172,25 @@ function parseTjItems(
  * every other item verbatim and appends a compensating kern so the following
  * cells don't shift when the new text is wider/narrower.
  */
+/**
+ * Replace `needle` inside `hay` ignoring every space on both sides — the
+ * spacing extraction reports and the spacing a stream draws routinely
+ * disagree (kern-drawn gaps, spaces invented inside re-encoded runs), so a
+ * space-sensitive replace can silently do nothing.
+ */
+function looseReplace(hay: string, needle: string, repl: string): string {
+  const nFree = needle.replace(/\s+/g, '')
+  if (!nFree) return hay
+  const idx: number[] = []
+  let proj = ''
+  for (let i = 0; i < hay.length; i++) {
+    if (!/\s/.test(hay[i])) { proj += hay[i]; idx.push(i) }
+  }
+  const p = proj.indexOf(nFree)
+  if (p === -1) return hay
+  return hay.slice(0, idx[p]) + repl + hay.slice(idx[p + nFree.length - 1] + 1)
+}
+
 function replaceInsideTjArray(
   op: ShowOpInfo,
   targetText: string,
@@ -5202,28 +5221,34 @@ function replaceInsideTjArray(
     full += it.decoded
   })
 
-  // Matched on a whitespace-COLLAPSED projection of the array, mapped back to
-  // raw positions. `full` is the array's literal items concatenated, and the
-  // gaps between a Ghostscript row's cells are KERNS, not space glyphs — so the
+  // Matched on a SPACE-FREE projection of the array, mapped back to raw
+  // positions. `full` is the array's literal items concatenated, and the gaps
+  // between a Ghostscript row's cells are KERNS, not space glyphs — so the
   // run's own spacing does not have to match the spacing the extractor
-  // reported. An exact `indexOf` therefore missed the very rows this function
-  // exists for, and the caller then fell back to replacing the whole array.
-  const target = targetText.replace(/\s+/g, ' ').trim()
+  // reported. A collapsed projection is not enough either: extraction can
+  // invent a space INSIDE a run this engine re-encoded ("Cab rera" out of a
+  // contiguous hex literal), and the second edit of such a row then found no
+  // occurrence at all. Spaces identify nothing here — the glyphs do.
+  const target = targetText.replace(/\s+/g, '')
   if (!target) return null
   const projIdx: number[] = []
   let proj = ''
   for (let i = 0; i < full.length; i++) {
-    if (/\s/.test(full[i])) {
-      if (proj.length && proj[proj.length - 1] !== ' ') { proj += ' '; projIdx.push(i) }
-    } else {
-      proj += full[i]; projIdx.push(i)
-    }
+    if (!/\s/.test(full[i])) { proj += full[i]; projIdx.push(i) }
   }
-  // Raw [start, end) of every occurrence.
+  // Raw [start, end) of every occurrence. The bounds land on non-space chars,
+  // so boundary spaces that live INSIDE the boundary literals are re-absorbed —
+  // an occurrence beginning at the second char of "( Ingeniero…)" only because
+  // char one is a space still starts at that literal's first character, and the
+  // alignment guards below must see it that way.
   const occ: { start: number; end: number }[] = []
   let p = proj.indexOf(target)
   while (p !== -1) {
-    occ.push({ start: projIdx[p], end: projIdx[p + target.length - 1] + 1 })
+    let s = projIdx[p]
+    let e = projIdx[p + target.length - 1] + 1
+    while (s > 0 && charItem[s - 1].item === charItem[s].item && /\s/.test(full[s - 1])) s--
+    while (e < full.length && charItem[e].item === charItem[e - 1].item && /\s/.test(full[e])) e++
+    occ.push({ start: s, end: e })
     p = proj.indexOf(target, p + 1)
   }
   if (!occ.length) return null
@@ -5283,12 +5308,42 @@ function replaceInsideTjArray(
   if (first.charInItem !== 0) return null
   if (last.charInItem !== items[last.item].decoded.length - 1) return null
 
+  // Absorb the SPACE-only literals that immediately follow the range (kerns
+  // between them included). The compensation below deliberately keeps every
+  // later item at its ORIGINAL pen position — that is what holds the row's
+  // other cells in their columns — but a trailing space glyph's original
+  // position is INSIDE a replacement that grew: an invisible glyph stranded
+  // mid-run, which extraction then interleaves into the text as a phantom
+  // space ("Cabrera" read back as "Cab rera", measured at x=358.9 between the
+  // b at 353.6 and the r at 360.3). The next edit's target carries the
+  // phantom, and committing it draws a REAL gap — each round trip adding one
+  // more. A space is the one glyph that is safe to move: nothing visible
+  // marks where it was, and the replacement text carries its own. Widths must
+  // be known for what is absorbed, or the compensation would misplace every
+  // cell after it — an unknown width just means the space stays, exactly as
+  // before.
+  let lastItem = last.item
+  if (simpleInfo?.widths) {
+    const w = simpleInfo.widths
+    const fc = simpleInfo.firstChar
+    let k = last.item + 1
+    let cand = last.item
+    while (k < items.length) {
+      const it = items[k]
+      if (!it.isLiteral) { k++; continue }
+      if (it.decoded.length && /^\s+$/.test(it.decoded) &&
+          it.codes.every(c => w[c - fc] !== undefined)) { cand = k; k++; continue }
+      break
+    }
+    lastItem = cand
+  }
+
   // width compensation
   let oldW = 0, oldKnown = true, oldGlyphs = 0
   if (simpleInfo?.widths) {
     const w = simpleInfo.widths
     const fc = simpleInfo.firstChar
-    for (let k = first.item; k <= last.item; k++) {
+    for (let k = first.item; k <= lastItem; k++) {
       const it = items[k]
       if (it.isLiteral) for (const code of it.codes) {
         oldGlyphs++
@@ -5301,7 +5356,7 @@ function replaceInsideTjArray(
   } else oldKnown = false
 
   const spliceStart = items[first.item].start
-  const spliceEnd = items[last.item].end
+  const spliceEnd = items[lastItem].end
 
   if (subst) {
     // A substitute face has different advances, so the pen lands somewhere
@@ -5971,9 +6026,20 @@ function applyPartialBlockReplacement(
       // row is one array reading "A :  Ing. Matías …" against a target of
       // ":  Ing. Matías …": only two characters longer, and those two are the
       // label the replacement would delete.
-      const d = ops[best!.i].decoded.replace(/\s+/g, ' ').trim()
-      if (d === targetNorm || !d.includes(targetNorm)) return false
-      return d.replace(targetNorm, ' ').trim().length > 0
+      //
+      // Compared with every space REMOVED, not collapsed. The extracted target
+      // and the decoded stream disagree on spaces routinely — extraction
+      // synthesises one from a kern, or invents one inside a run this engine
+      // re-encoded (the "Cab rera" artifact) — and a collapsed `includes` then
+      // fails on the very row it exists to protect. That is how the SECOND
+      // edit of this memo's addressee fell through to the op-level rewrite the
+      // first edit was saved from: the whole array was replaced, the "A" label
+      // and its column kern with it, and the row redrew starting in the label's
+      // column.
+      const dFree = ops[best!.i].decoded.replace(/\s+/g, '')
+      const tFree = targetNorm.replace(/\s+/g, '')
+      if (!tFree || dFree === tFree || !dFree.includes(tFree)) return false
+      return dFree.replace(tFree, '').length > 0
     })()
 
   // No op-level window matched — the target may live INSIDE a single TJ
@@ -5991,9 +6057,12 @@ function applyPartialBlockReplacement(
 
     // Candidate arrays containing the target, nearest clicked position first
     const candidates = ops
-      // Normalised on both sides: the gap between two cells is a KERN, so the
-      // array's own spacing need not match the spacing the extractor reported.
-      .filter(o => o.kind === 'TJ' && o.decoded.replace(/\s+/g, ' ').trim().includes(targetNorm))
+      // Space-FREE on both sides: the gap between two cells is a KERN, so the
+      // array's own spacing need not match the spacing the extractor reported —
+      // and extraction can also invent a space inside a run this engine
+      // re-encoded, which a merely collapsed comparison still trips over.
+      .filter(o => o.kind === 'TJ' &&
+        o.decoded.replace(/\s+/g, '').includes(targetNorm.replace(/\s+/g, '')))
       .sort((a, b) => {
         if (!targetLocal) return 0
         const da = Math.abs(a.x - targetLocal.x) + Math.abs(a.y - targetLocal.y) * 4
@@ -6035,7 +6104,10 @@ function applyPartialBlockReplacement(
         const content = block.content.slice(0, op.start) + newRaw + block.content.slice(op.end)
         // On a tagged page the span still claims the OLD words — override it
         // with the block's text as it now reads (only this array changed).
-        const spanText = ops.map(o => o === op ? o.decoded.replace(targetNorm, newText) : o.decoded).join('')
+        // The splice is space-insensitive for the same reason the match is:
+        // a plain .replace silently no-ops when the extractor's spacing
+        // disagrees with the stream's, and the span then keeps the old words.
+        const spanText = ops.map(o => o === op ? looseReplace(o.decoded, targetNorm, newText) : o.decoded).join('')
         const tag = retagSpanActualText(stream, block.start, spanText.trim())
         return {
           stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end),

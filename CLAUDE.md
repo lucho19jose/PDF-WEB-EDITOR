@@ -368,6 +368,49 @@ successes, no regressions. The same gate is why `N°` accepts `Nro`, `No`, `N`
 and `De` but not `zzz` — that font has no `z` — which reads as "some edits work
 and some don't" unless you know what to look at.
 
+### The SECOND edit of a row must survive the first one's artifacts
+Editing the memo's addressee twice — "Ing." → "Ingeniero.", then "Ingeniero."
+→ "Gerente." — destroyed the row on the second pass: the "A" label vanished
+and the name redrew starting in the label's column, the exact failure the
+containment gate exists to stop, on the exact row it was built for. Two
+artifacts of the FIRST edit disabled it:
+
+- **Extraction and the stream disagree on spaces after a re-encode.** The
+  first edit's wider replacement leaves the row's original trailing SPACE
+  glyph at its old pen position — the compensation kern deliberately keeps
+  every later item where it was, and that position is now inside the new run.
+  MuPDF orders extracted glyphs by position, so the invisible space
+  interleaves as a phantom: "Cabrera" reads back "Cab rera" (measured: space
+  at x=358.9 between the b at 353.6 and the r at 360.3). The second edit's
+  target then carries a space the stream does not draw.
+- **Every comparison on the containment path was space-SENSITIVE.** The gate
+  (`does the op hold more than the target`), the candidate filter, and
+  `replaceInsideTjArray`'s projection search all used collapsed-whitespace
+  `includes`/`indexOf` — and "…Cabrera…" does not contain "…Cab rera". The
+  gate answered no, the edit fell through to the op-level rewrite of the
+  whole array, and the op-level rewrite is ALWAYS wrong for a row that holds
+  more than the target.
+
+Both ends are fixed. Matching is space-FREE (spaces removed, not collapsed)
+in all three places — spaces identify nothing in a TJ array, where cell gaps
+are kerns and extraction invents its own — with occurrence bounds re-absorbed
+over boundary-literal spaces so the alignment guards still see literal edges.
+And `replaceInsideTjArray` now ABSORBS the space-only literals immediately
+following the replaced range into the splice: a space is the one glyph safe
+to move (nothing visible marks where it was, and the replacement carries its
+own), and with no glyph stranded mid-run the phantom never forms — three
+consecutive edits of the row read back clean. Absorption requires known
+widths for what it absorbs, or the row's other cells would shift; unknown
+widths just leave the space where it was.
+
+The `spanText` for a tagged span's /ActualText goes through `looseReplace`
+for the same reason — a plain `.replace` silently no-ops on the spacing
+mismatch and the span keeps claiming the old words.
+
+Measured: baseline and fixed sweeps are experiment-identical (262 runs, 226
+successes, 0 diffs) — the change only alters behaviour where extraction
+spacing disagrees with the stream, which a first edit never hits.
+
 ### A ONE-character label needs a per-RUN position, and now has one
 The same memo labels its addressee row `A`, against `De`, `Asunto` and `N°`
 below it. It was unreachable, and the note that stood here said so: containment
