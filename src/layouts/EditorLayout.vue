@@ -78,7 +78,10 @@ import { useEditorStore } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
 import { useSearchStore } from '@/stores/search'
 import { useOcrStore } from '@/stores/ocr'
-import { useOCR } from '@/composables/useOCR'
+import { useOCR, OCR_DEFAULT_LANG } from '@/composables/useOCR'
+
+/** OCR reads the page at 220 DPI; PDF user space is 72 to the inch. */
+const OCR_RENDER_SCALE = 220 / 72
 import { planOcrExport } from '@/utils/ocr/ocrExport'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
@@ -142,7 +145,7 @@ onUnmounted(() => {
  * not rewrite anyone's file just by being made — only the runs the user then
  * edits are ever drawn, and only at export.
  */
-async function runOcrOnPage(lang = 'spa') {
+async function runOcrOnPage(lang = OCR_DEFAULT_LANG) {
   if (!docStore.loaded || ocr.busy.value) return
   const pageIndex = docStore.currentPage - 1
 
@@ -165,14 +168,73 @@ async function runOcrOnPage(lang = 'spa') {
   await runOcrNow(pageIndex, lang)
 }
 
-async function runOcrNow(pageIndex: number, lang: string) {
-  const canvas = document.querySelector('canvas.pdf-canvas') as HTMLCanvasElement | null
-  if (!canvas) { editorStore.setStatus('The page is not rendered yet'); return }
+/**
+ * Is this page a picture of a document?
+ *
+ * Two things have to hold: the page's own text layer is (as good as) absent,
+ * and something is actually drawn — an image covering at least half the paper.
+ * A blank page has no text either and recognising it is a wasted five seconds.
+ * The verdict is cached per page; it cannot change until the document does,
+ * and the store's `clear()` on a new file drops the cache with the results.
+ */
+async function isScanLikePage(pageIndex: number): Promise<boolean> {
+  const cached = ocrStore.scanVerdicts.get(pageIndex)
+  if (cached !== undefined) return cached
+  let verdict = false
+  try {
+    const blocks = await pdfEngine.getTextBlocks(pageIndex)
+    const chars = blocks.reduce((n, b) => n + b.text.trim().length, 0)
+    if (ocr.judgeScanned(chars).scanned) {
+      const size = await pdfEngine.getPageSize(pageIndex)
+      const paper = Math.max(1, size.width * size.height)
+      const images = await pdfEngine.listContentImages(pageIndex)
+      verdict = images.some(img => {
+        const [x0, y0, x1, y1] = img.rect
+        return Math.abs((x1 - x0) * (y1 - y0)) >= paper * 0.5
+      })
+    }
+  } catch (_) { verdict = false }
+  ocrStore.scanVerdicts.set(pageIndex, verdict)
+  return verdict
+}
 
+/**
+ * What the editing layers need in order to recognise a scan on a click:
+ * the verdict, the runner (no "already has text" dialog — the caller has
+ * proved the page is a scan) and whether one is already running.
+ */
+provide('ocrController', {
+  isScanLike: isScanLikePage,
+  recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG),
+  busy: ocr.busy
+})
+
+async function runOcrNow(pageIndex: number, lang: string) {
   const size = await pdfEngine.getPageSize(pageIndex).catch(() => ({ width: 612, height: 792 }))
   editorStore.setStatus('Recognising text on this page...')
 
-  const result = await ocr.recognizePage(canvas, pageIndex, size.width, size.height, lang)
+  // OCR reads its own render of THIS page at its own resolution. The visible
+  // canvas will not do: in continuous scroll the first `canvas.pdf-canvas` in
+  // the document is page 1's whatever page is current, and page 2's OCR came
+  // back reading page 1.
+  const canvas = await pdfViewer.renderPageToCanvas(pageIndex + 1, OCR_RENDER_SCALE).catch(() => null)
+  if (!canvas) { editorStore.setStatus('The page could not be rendered for recognition'); return }
+
+  // Progress in the status bar: a page of Chinese and Spanish takes long
+  // enough that silence reads as a hang.
+  const stopProgress = watch([ocr.stage, ocr.progress], ([stage, pct]) => {
+    if (!ocr.busy.value) return
+    const label = stage === 'recognizing text' || stage === 'Recognising text...'
+      ? `Recognising text on this page... ${pct}%`
+      : stage ? `${stage[0].toUpperCase()}${stage.slice(1)}` : 'Recognising text on this page...'
+    editorStore.setStatus(label)
+  })
+  let result: Awaited<ReturnType<typeof ocr.recognizePage>> = null
+  try {
+    result = await ocr.recognizePage(canvas, pageIndex, size.width, size.height, lang)
+  } finally {
+    stopProgress()
+  }
   if (!result) {
     editorStore.setStatus(`OCR failed: ${ocr.error.value || 'unknown error'}`)
     return

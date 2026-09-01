@@ -20,6 +20,8 @@ export const useOcrStore = defineStore('ocr', () => {
   const selectedId = ref<string | null>(null)
   /** The layer is shown only when the user asked for it. */
   const layerVisible = ref(false)
+  /** pageIndex -> "this page is a picture of a document". Cached: it cannot change until the file does. */
+  const scanVerdicts = ref<Map<number, boolean>>(new Map())
 
   function resultFor(pageIndex: number): OcrPageResult | null {
     return pages.value.get(pageIndex) ?? null
@@ -126,10 +128,11 @@ export const useOcrStore = defineStore('ocr', () => {
     pages.value = new Map()
     selectedId.value = null
     layerVisible.value = false
+    scanVerdicts.value = new Map()
   }
 
   return {
-    pages, selectedId, layerVisible, selected, hasEdits,
+    pages, selectedId, layerVisible, scanVerdicts, selected, hasEdits,
     resultFor, itemsFor, editedItems, setResult, updateItem, removeItem, revertItem, clear
   }
 })

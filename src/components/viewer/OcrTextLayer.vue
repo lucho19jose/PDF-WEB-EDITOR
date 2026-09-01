@@ -196,7 +196,13 @@ const editorStyle = computed(() => {
   if (!item) return {}
   const base = styleFor(item)
   const fs = item.fontSize * scaleY.value
-  const minAlong = Math.max(160, fs * 10, draft.value.length * fs * 0.62)
+  // Never past the paper's edge: an editor wider than the page makes the
+  // viewer scroll sideways the moment it opens, and the page moves under the
+  // user — the one thing opening an editor must not do.
+  const room = item.vertical
+    ? Math.max(40, item.rect.y * scaleY.value + item.rect.height * scaleY.value)
+    : Math.max(40, props.pageWidth - item.rect.x * scaleX.value)
+  const minAlong = Math.min(room, Math.max(160, fs * 10, draft.value.length * fs * 0.62))
   const minAcross = fs * 1.6 + 8
   return {
     ...base,
@@ -273,7 +279,12 @@ function onDragEnd() {
 }
 
 // ── Editing the words ──
-function beginEdit(id: string) {
+/**
+ * Open the editor on a run. With a caret offset the caret goes THERE, collapsed,
+ * the way the text layer opens on a click; without one the run is selected
+ * backwards so the view lands on its start (see the same fix in TextBlockOverlay).
+ */
+function beginEdit(id: string, caretAt?: number) {
   const item = ocrStore.itemsFor(pageIndex.value).find(i => i.id === id)
   if (!item || item.removed) return
   ocrStore.selectedId = id
@@ -282,13 +293,36 @@ function beginEdit(id: string) {
   nextTick(() => {
     const el = editorRef.value
     if (!el) return
-    // Selected backwards, so the view lands on the START of the run rather than
-    // on its last word — see the same fix in TextBlockOverlay.
     el.focus({ preventScroll: true })
-    el.setSelectionRange(0, el.value.length, 'backward')
+    if (caretAt !== undefined) {
+      const o = Math.max(0, Math.min(el.value.length, caretAt))
+      el.setSelectionRange(o, o)
+    } else {
+      el.setSelectionRange(0, el.value.length, 'backward')
+    }
     el.scrollLeft = 0
     el.scrollTop = 0
   })
+}
+
+/**
+ * Open the run under a page-space point, caret where the point falls.
+ *
+ * The caret offset is the point's share of the run's width — OCR gives word
+ * boxes, not glyph boxes, so a proportion is as exact as it gets. Returns
+ * whether a run was there at all.
+ */
+function editAt(x: number, y: number): boolean {
+  const items = ocrStore.itemsFor(pageIndex.value)
+  const hit = items.find(i => !i.removed &&
+    x >= i.rect.x && x <= i.rect.x + i.rect.width &&
+    y >= i.rect.y && y <= i.rect.y + i.rect.height)
+  if (!hit) return false
+  const along = hit.vertical
+    ? (hit.rect.y + hit.rect.height - y) / Math.max(hit.rect.height, 1)
+    : (x - hit.rect.x) / Math.max(hit.rect.width, 1)
+  beginEdit(hit.id, Math.round(along * hit.text.length))
+  return true
 }
 
 function commitEdit() {
@@ -305,7 +339,7 @@ function cancelEdit() {
 /** An open editor must not follow the user to another page. */
 watch(pageIndex, () => { editing.value = null })
 
-defineExpose({ beginEdit })
+defineExpose({ beginEdit, editAt })
 </script>
 
 <style scoped>

@@ -16,6 +16,7 @@ let pdfDoc: any = null // mupdf.PDFDocument
 const fontEncodingCache = new Map<string, {
   unicodeToGlyph: Map<number, number>
   glyphToUnicode: Map<number, number>
+  glyphToText?: Map<number, string>
   codeBytes?: number
 } | null>()
 
@@ -93,6 +94,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 
       case 'addText': {
         if (!pdfDoc) throw new Error('No document loaded')
+        await ensureCjkFontFor(req.data.text)
         const addResult = addTextToPage(
           req.data.pageIndex, req.data.x, req.data.y,
           req.data.text, req.data.fontSize, req.data.fontName, req.data.color,
@@ -489,12 +491,147 @@ function extractPageText(pageIndex: number): PageTextData {
     page.destroy()
   }
 
+  // The same char objects sit in both `lines` and `blocks`, so marking them
+  // through the lines marks the blocks — and survives the split below, which
+  // copies the objects rather than rebuilding them.
+  markUnreadableGlyphs(pageIndex, lines)
+
   // Split blocks at significant horizontal gaps so each text segment
   // becomes its own clickable/movable element (e.g., "Label:" and "Value"
   // on the same line become separate blocks instead of one big block)
   const splitBlocks = splitBlocksAtGaps(blocks, pageIndex)
 
   return { pageIndex, blocks: splitBlocks, lines }
+}
+
+/** What a well-behaved ToUnicode legitimately expands ONE glyph to. */
+const LIGATURE_TEXT = /^(ff|fi|fl|ffi|ffl|ft|st|Th|ij|IJ|[a-z]{2,3})$/
+/**
+ * A CID subset with this few printable codes and at least one proven lie is a
+ * CJK subset in disguise: every glyph it draws is a lie, including the ones
+ * that happen to claim a single plausible letter.
+ */
+const TINY_SUBSET_CODES = 32
+
+/**
+ * Mark the glyphs whose ToUnicode entry is provably wrong.
+ *
+ * A signed order re-subsetted by a Chinese generator maps CJK glyphs to Latin
+ * junk: `<0005>` → "i:l", `<003E>` → "El", `<0004>` → "f". CFF subsets carry no
+ * Unicode of their own, so the real characters are unrecoverable, and matching
+ * must go on comparing the junk against the stream's decode of the same junk.
+ * What CAN be told is which glyphs are lying, so an editor can show the drawn
+ * glyph instead of the junk and refuse to retype it.
+ *
+ * The tell is in the quads. MuPDF gives the FIRST character of a multi-char
+ * destination the glyph's advance and every further one a zero-width quad at
+ * its right edge (measured: `"i"(adv) ":"(0) "l"(0)`). A real ligature does the
+ * same, so the joined string is checked against the ligature shapes first;
+ * "i:l", "El" and U+FFFD are lies.
+ *
+ * Single-letter lies ("f", "H", "M") are indistinguishable from real text on
+ * their own. They are caught at FONT level: a font already caught lying whose
+ * ToUnicode holds no more than `TINY_SUBSET_CODES` printable codes is a CJK
+ * subset, and everything it draws is marked. A big font with one lying glyph
+ * (`*Verdana-14399`: 170 codes, one "El") keeps per-glyph marking, so the date
+ * it also draws stays editable.
+ */
+function markUnreadableGlyphs(pageIndex: number, lines: TextLine[]) {
+  const lyingFonts = new Set<string>()
+
+  for (const line of lines) {
+    const chars = line.chars
+    let i = 0
+    while (i < chars.length) {
+      const head = chars[i]
+      if (head.c === '�') {
+        head.unreadable = true
+        lyingFonts.add(head.fontName)
+        i++
+        continue
+      }
+      const rightEdge = head.quad[2]
+      let j = i + 1
+      while (j < chars.length && isDestinationContinuation(chars[j], rightEdge, head.fontName)) j++
+      if (j > i + 1) {
+        const text = chars.slice(i, j).map(ch => ch.c).join('')
+        if (!LIGATURE_TEXT.test(text)) {
+          for (let k = i; k < j; k++) chars[k].unreadable = true
+          lyingFonts.add(head.fontName)
+        }
+      }
+      i = j
+    }
+  }
+  if (lyingFonts.size === 0) return
+
+  const tiny = new Set<string>()
+  for (const name of lyingFonts) {
+    if (isTinyLyingSubset(pageIndex, name)) tiny.add(name)
+  }
+  if (tiny.size === 0) return
+  for (const line of lines) {
+    for (const ch of line.chars) if (tiny.has(ch.fontName)) ch.unreadable = true
+  }
+}
+
+/** A zero-width, non-space char of the same font sitting on the head's right edge. */
+function isDestinationContinuation(ch: TextChar, rightEdge: number, fontName: string): boolean {
+  if (ch.fontName !== fontName) return false
+  if (/\s/.test(ch.c)) return false
+  const width = Math.abs(ch.quad[2] - ch.quad[0])
+  return width < 0.05 && Math.abs(ch.quad[0] - rightEdge) < 0.05
+}
+
+/** Structured-text font name and /BaseFont, made comparable. */
+function normalizeFontName(name: string): string {
+  return name
+    .replace(/^\//, '')
+    .replace(/#20/g, ' ')
+    .replace(/^[A-Z]{6}\+/, '')
+    .replace(/-Identity-[HV]$/, '')
+    .trim()
+}
+
+/**
+ * Does the page font with this structured-text name have a tiny ToUnicode?
+ *
+ * Only the PAGE's own /Font dictionary is searched. A font that lives inside a
+ * Form XObject is not found and the answer is no, which leaves that font with
+ * per-glyph marking only — a miss, never a false positive.
+ */
+function isTinyLyingSubset(pageIndex: number, stextFontName: string): boolean {
+  if (!pdfDoc) return false
+  const wanted = normalizeFontName(stextFontName)
+  let page: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    const resources = resolveResources(page.getObject())
+    const fontDict = resources?.get('Font')
+    if (!fontDict || String(fontDict) === 'null') return false
+    const resolvedDict = fontDict.resolve?.() ?? fontDict
+    let refName: string | null = null
+    resolvedDict.forEach((val: any, key: any) => {
+      if (refName) return
+      try {
+        const base = val.resolve().get('BaseFont')
+        const baseName = normalizeFontName(String(base?.asName?.() || base || ''))
+        if (baseName === wanted) refName = String(key).replace(/^\//, '')
+      } catch (_) { /* not a font we can read */ }
+    })
+    if (!refName) return false
+    const enc = getFontEncoding(pageIndex, refName)
+    if (!enc) return false
+    let printable = enc.glyphToText?.size ?? 0
+    for (const uni of enc.glyphToUnicode.values()) {
+      if (uni > 0x20 && uni !== 0xA0 && uni !== 0xAD && uni !== 0xFFFD) printable++
+    }
+    return printable <= TINY_SUBSET_CODES
+  } catch (_) {
+    return false
+  } finally {
+    try { page?.destroy() } catch (_) { /* already destroyed */ }
+  }
 }
 
 /**
@@ -1005,13 +1142,48 @@ function writeContentStream(pageIndex: number, bytes: Uint8Array): void {
 function parseToUnicodeCMap(cmapText: string): {
   unicodeToGlyph: Map<number, number>
   glyphToUnicode: Map<number, number>
+  glyphToText: Map<number, string>
   codeBytes: number
 } {
   const unicodeToGlyph = new Map<number, number>()
   const glyphToUnicode = new Map<number, number>()
+  const glyphToText = new Map<number, string>()
   // Track the code width: fonts with 1-byte codes write <41> keys; decoding
   // them with a fixed 2-byte stride turns "Hello" into CJK garbage.
   let maxKeyHexLen = 0
+
+  // A destination is UTF-16BE and under no obligation to be ONE character.
+  // Ligature subsets map a glyph to "ffi"; this signed order's re-subsetted
+  // fonts map CJK glyphs to whatever Latin run their tool decided ("El" from
+  // <0045006C>). parseInt on the whole hex made those glyphs decode as '?',
+  // while MuPDF's extraction expands them — so the target text and the stream
+  // decode could never agree, and the line containing such a glyph matched
+  // nothing. Whether the mapping is semantically right is not this parser's
+  // business: agreement with extraction is what matching runs on.
+  const record = (glyphId: number, dstHex: string, keepExistingReverse = false) => {
+    const setReverse = (u: number) => {
+      if (!keepExistingReverse || !unicodeToGlyph.has(u)) unicodeToGlyph.set(u, glyphId)
+    }
+    if (dstHex.length <= 4) {
+      const unicode = parseInt(dstHex, 16)
+      glyphToUnicode.set(glyphId, unicode)
+      setReverse(unicode)
+      return
+    }
+    const units: number[] = []
+    for (let i = 0; i + 4 <= dstHex.length; i += 4) units.push(parseInt(dstHex.slice(i, i + 4), 16))
+    if (dstHex.length % 4 === 2) units.push(parseInt(dstHex.slice(-2), 16))
+    const text = String.fromCharCode(...units)
+    const cps = [...text]
+    if (cps.length === 1) {
+      // A surrogate pair is still ONE character (an astral code point).
+      const u = text.codePointAt(0)!
+      glyphToUnicode.set(glyphId, u)
+      setReverse(u)
+    } else {
+      glyphToText.set(glyphId, text)
+    }
+  }
 
   // Parse bfchar entries: <glyphHex> <unicodeHex>
   const bfcharRegex = /beginbfchar\s([\s\S]*?)endbfchar/g
@@ -1022,10 +1194,8 @@ function parseToUnicodeCMap(cmapText: string): {
     let pair: RegExpExecArray | null
     while ((pair = pairRegex.exec(entries)) !== null) {
       const glyphId = parseInt(pair[1], 16)
-      const unicode = parseInt(pair[2], 16)
       maxKeyHexLen = Math.max(maxKeyHexLen, pair[1].length)
-      glyphToUnicode.set(glyphId, unicode)
-      unicodeToGlyph.set(unicode, glyphId)
+      record(glyphId, pair[2])
     }
   }
 
@@ -1063,11 +1233,7 @@ function parseToUnicodeCMap(cmapText: string): {
     const applyArray = (loHex: string, dst: string[]) => {
       const start = parseInt(loHex, 16)
       maxKeyHexLen = Math.max(maxKeyHexLen, loHex.length)
-      dst.forEach((d, i) => {
-        const u = firstCodePoint(d)
-        glyphToUnicode.set(start + i, u)
-        if (!unicodeToGlyph.has(u)) unicodeToGlyph.set(u, start + i)
-      })
+      dst.forEach((d, i) => record(start + i, d, true))
     }
 
     while ((tok = tokenRegex.exec(entries)) !== null) {
@@ -1091,7 +1257,7 @@ function parseToUnicodeCMap(cmapText: string): {
     }
   }
 
-  return { unicodeToGlyph, glyphToUnicode, codeBytes: maxKeyHexLen > 0 && maxKeyHexLen <= 2 ? 1 : 2 }
+  return { unicodeToGlyph, glyphToUnicode, glyphToText, codeBytes: maxKeyHexLen > 0 && maxKeyHexLen <= 2 ? 1 : 2 }
 }
 
 /**
@@ -1160,6 +1326,7 @@ function sourceKey(): string {
 function getFontEncoding(pageIndex: number, fontRefName: string): {
   unicodeToGlyph: Map<number, number>
   glyphToUnicode: Map<number, number>
+  glyphToText?: Map<number, string>
   codeBytes?: number
 } | null {
   const cacheKey = `${pageIndex}:${sourceKey()}:${fontRefName}`
@@ -1225,6 +1392,7 @@ function getFontEncoding(pageIndex: number, fontRefName: string): {
 function tryReadToUnicode(fontObj: any): {
   unicodeToGlyph: Map<number, number>
   glyphToUnicode: Map<number, number>
+  glyphToText?: Map<number, string>
   codeBytes?: number
 } | null {
   try {
@@ -1263,14 +1431,23 @@ function tryReadToUnicode(fontObj: any): {
  */
 function encodeTextForFont(
   text: string,
-  encoding: { unicodeToGlyph: Map<number, number>; codeBytes?: number }
+  encoding: { unicodeToGlyph: Map<number, number>; codeBytes?: number },
+  /**
+   * Glyph code to use for a character, ahead of the reverse CMap. A subset's
+   * ToUnicode routinely claims the SAME character for several glyphs, and the
+   * reverse map then guesses which to write — on one signed order it picked a
+   * glyph that claims 'l' but draws '1', and "al" came back "a1". A code the
+   * run being edited already uses for a character is not a guess: it provably
+   * drew that character on this very page.
+   */
+  preferCodes?: Map<number, number>
 ): { hex: string } | { error: string; missingChars: string[] } {
   let hex = ''
   const missingChars: string[] = []
   const pad = (encoding.codeBytes === 1 ? 1 : 2) * 2
   for (let i = 0; i < text.length; i++) {
     const codePoint = text.codePointAt(i)!
-    const glyphId = encoding.unicodeToGlyph.get(codePoint)
+    const glyphId = preferCodes?.get(codePoint) ?? encoding.unicodeToGlyph.get(codePoint)
     if (glyphId === undefined) {
       missingChars.push(String.fromCodePoint(codePoint))
     } else {
@@ -1714,7 +1891,11 @@ type EncodingPlan =
  */
 function planTextEncoding(
   pageIndex: number,
-  block: { mode: 'hex' | 'plain'; fontRef: string; encoding: ReturnType<typeof getFontEncoding> },
+  block: {
+    mode: 'hex' | 'plain'; fontRef: string; encoding: ReturnType<typeof getFontEncoding>
+    /** Glyph codes the run being edited already uses — see encodeTextForFont. */
+    preferCodes?: Map<number, number>
+  },
   lines: string[],
   targetBlock?: TextBlock
 ): EncodingPlan {
@@ -1725,7 +1906,7 @@ function planTextEncoding(
     const hexLines: string[] = []
     let ok = true
     for (const line of lines) {
-      const res = encodeTextForFont(line, block.encoding)
+      const res = encodeTextForFont(line, block.encoding, block.preferCodes)
       if ('error' in res) { ok = false; break }
       hexLines.push(res.hex)
     }
@@ -1760,7 +1941,7 @@ function planTextEncoding(
       const hexLines: string[] = []
       let ok = true
       for (const line of lines) {
-        const res = encodeTextForFont(line, block.encoding)
+        const res = encodeTextForFont(line, block.encoding, block.preferCodes)
         if ('error' in res) { ok = false; break }
         hexLines.push(res.hex)
       }
@@ -1848,23 +2029,36 @@ function addTextToPage(
     const page = pdfDoc.loadPage(pageIndex)
     const pageObj = page.getObject()
 
-    // 1. Ensure the standard font is in page Resources
-    const fontRefName = ensureStandardFont(pageObj, fontName)
+    // 1–3. Font and show operator. WinAnsi in a base-14 face where it can be
+    // — serializing raw Unicode with "& 0xFF" would silently mangle €, smart
+    // quotes, dashes… — and, for text WinAnsi cannot hold (an OCR'd Chinese
+    // label), a subset of the shipped CJK face. The whole run goes into the
+    // CJK face then: it has Latin glyphs, and one op is simpler than two.
+    const winAnsi = encodeWinAnsiText(text)
+    let fontRefName: string
+    let showOp: string
+    if ('missing' in winAnsi) {
+      const cjk = hasCjk(text) ? registerCjkRun(pageObj, text) : null
+      if (!cjk) {
+        page.destroy()
+        const why = hasCjk(text) && !cjkFont
+          ? ' (the CJK font could not be loaded)'
+          : ''
+        return { success: false, error: `Characters not supported by ${fontName}: ${winAnsi.missing.join(', ')}${why}` }
+      }
+      fontRefName = cjk.refName
+      showOp = `<${cjk.hex}> Tj`
+    } else {
+      fontRefName = ensureStandardFont(pageObj, fontName)
+      showOp = `(${escapePdfString(winAnsi.bytes)}) Tj`
+    }
 
     // 2. Read existing content stream
     const existingStream = readContentStream(pageIndex)
 
-    // 3. Build new BT block. Encode to WinAnsi bytes first — serializing raw
-    // Unicode with "& 0xFF" would silently mangle €, smart quotes, dashes…
-    const winAnsi = encodeWinAnsiText(text)
-    if ('missing' in winAnsi) {
-      page.destroy()
-      return { success: false, error: `Characters not supported by ${fontName}: ${winAnsi.missing.join(', ')}` }
-    }
     const r = color?.[0] ?? 0
     const g = color?.[1] ?? 0
     const b = color?.[2] ?? 0
-    const escaped = escapePdfString(winAnsi.bytes)
 
     // Rotation lives in the TEXT MATRIX, not in the font size: `a b c d` is
     // the rotation and `e f` the origin, so vertical text is the same code
@@ -1893,7 +2087,7 @@ function addTextToPage(
       if (endInv) tm = matConcat(tm, endInv)
     }
     const fmt = (n: number) => (Math.abs(n) < 1e-6 ? '0' : n.toFixed(4))
-    const newBlock = `\nBT\n${r} ${g} ${b} rg\n/${fontRefName} ${fontSize} Tf\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n(${escaped}) Tj\nET\n`
+    const newBlock = `\nBT\n${r} ${g} ${b} rg\n/${fontRefName} ${fontSize} Tf\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOp}\nET\n`
 
     // 4. Append to content stream
     const combined = existingStream + newBlock
@@ -1929,6 +2123,103 @@ function addTextToPage(
  * Ensure a standard PDF font (Helvetica, Times-Roman, Courier) is registered
  * in the page's Resources/Font dictionary. Returns the font reference name (e.g. "F10").
  */
+// ── A CJK face for text WinAnsi cannot hold ──
+
+/** Where the shipped CJK face lives; fetched once, on the first run that needs it. */
+const CJK_FONT_URL = '/fonts/NotoSansSC-Regular.otf'
+let cjkFont: any = null
+let cjkFontLoading: Promise<void> | null = null
+
+/** Han, kana, hangul, CJK punctuation and full-width forms. */
+function hasCjk(text: string): boolean {
+  return /[⺀-鿿豈-﫿＀-￯　-〿가-힯]/.test(text)
+}
+
+/**
+ * Load the CJK face if this text will need it. Awaited by the message handler
+ * — the writers themselves are synchronous — and a failure is remembered as
+ * "no font" rather than thrown, so the writer can say so in its own words.
+ */
+async function ensureCjkFontFor(text: string): Promise<void> {
+  if (cjkFont || !mupdf || !hasCjk(text)) return
+  if (!cjkFontLoading) {
+    cjkFontLoading = (async () => {
+      try {
+        const res = await fetch(CJK_FONT_URL)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const bytes = new Uint8Array(await res.arrayBuffer())
+        cjkFont = new mupdf!.Font('NotoSansSC', bytes)
+      } catch (err) {
+        console.warn('[MuPDF Worker] CJK font unavailable:', err)
+        cjkFont = null
+      }
+    })()
+  }
+  await cjkFontLoading
+}
+
+/**
+ * Register a SUBSET of the CJK face holding exactly this run's glyphs, and
+ * encode the run for it.
+ *
+ * `addFont` embeds the whole 8 MB face, and `subsetFonts()` on the real
+ * document would subset the ORIGINAL fonts too — glyphs the page does not
+ * currently draw would be gone, and a later edit needing one of them would be
+ * pushed into a substitute. So the run is drawn in a scratch document, THAT is
+ * subsetted (≈40 KB), and the resulting font dictionary is grafted across.
+ * Grafting carries the subset's own W array and ToUnicode, so the run
+ * extracts back as the characters that were written.
+ */
+function registerCjkRun(pageObj: any, text: string): { refName: string; hex: string } | null {
+  if (!mupdf || !pdfDoc || !cjkFont) return null
+  let hex = ''
+  for (const ch of text) {
+    const gid = cjkFont.encodeCharacter(ch.codePointAt(0)!)
+    if (!gid) return null
+    hex += gid.toString(16).padStart(4, '0')
+  }
+  let scratch: any = null
+  try {
+    scratch = new mupdf.PDFDocument()
+    const fontRef = scratch.addFont(cjkFont)
+    const res = scratch.newDictionary()
+    const fd = scratch.newDictionary()
+    fd.put('F1', fontRef)
+    res.put('Font', fd)
+    scratch.insertPage(-1, scratch.addPage([0, 0, 100, 100], 0, res, `BT /F1 10 Tf 0 0 Td <${hex}> Tj ET`))
+    scratch.subsetFonts()
+    const subsetFont = scratch.loadPage(0).getObject().get('Resources').get('Font').get('F1')
+    const grafted = pdfDoc.graftObject(subsetFont)
+
+    let resources = pageObj.get('Resources')
+    if (!resources || resources.toString() === 'null') {
+      resources = pdfDoc.newDictionary()
+      pageObj.put('Resources', resources)
+    }
+    resources = resources.resolve()
+    let fontDict = resources.get('Font')
+    if (!fontDict || fontDict.toString() === 'null') {
+      fontDict = pdfDoc.newDictionary()
+      resources.put('Font', fontDict)
+    }
+    fontDict = fontDict.resolve()
+    let n = 1
+    while (true) {
+      const existing = fontDict.get(`FCJK${n}`)
+      if (!existing || String(existing) === 'null') break
+      n++
+    }
+    const refName = `FCJK${n}`
+    fontDict.put(refName, grafted)
+    return { refName, hex }
+  } catch (err) {
+    console.warn('[MuPDF Worker] CJK subset failed:', err)
+    return null
+  } finally {
+    try { scratch?.destroy() } catch (_) { /* nothing to free */ }
+  }
+}
+
 function ensureStandardFont(pageObj: any, fontName: string): string {
   let resources = pageObj.get('Resources')
   if (!resources || resources.toString() === 'null') {
@@ -3479,6 +3770,7 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
     // draws the target — which is how a block became uneditable a second time
     // after an edit substituted Helvetica into it.
     const fonts: string[] = []
+    let headDrawsInherited = false
     {
       const tfAll = /\/[ ]*\s+[\d.-]+\s+Tf/g
       let fm: RegExpExecArray | null
@@ -3494,6 +3786,7 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
       // stream above it and slip through the font filter for a "10.00" edit.
       const firstLit = maskedContent.search(/\(|<[^<]/)
       if (firstTfAt < 0 || (firstLit >= 0 && firstLit < firstTfAt)) {
+        headDrawsInherited = true
         const inherited = fontAt(start)
         if (inherited && !fonts.includes(inherited)) fonts.push(inherited)
       }
@@ -3502,10 +3795,25 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
     // keep the operator itself — a rebuild that substitutes a font must restore
     // THIS on the way out, or the substitute becomes the inherited font of
     // every block after it (see rebuildBtContent's restoreTf).
+    //
+    // The SAME applies when the block has a Tf but its first show op runs
+    // BEFORE it: the head is drawn in the entering font, so decoding it with
+    // the block's own first Tf reads the wrong CMap. This signed order draws
+    // "Plazo de ejecución" under the /C0_1 in force from the previous block,
+    // then switches to /C0_7 mid-block — labelled C0_7, the head decoded as
+    // "7ECIFNDDNDEDCICEMFN" and no edit on the block's 20 lines could match.
+    // The decoder follows every in-block Tf, so starting from the entering
+    // font changes only the head runs, which are exactly the ones it got wrong.
     let inheritedTf: string | null = null
     if (!fontRef) {
       fontRef = fontAt(start)
       inheritedTf = fontOpAt(start)
+    } else if (headDrawsInherited) {
+      const entering = fontAt(start)
+      if (entering) {
+        fontRef = entering
+        inheritedTf = fontOpAt(start)
+      }
     }
     if (!fontRef) continue
 
@@ -3820,10 +4128,11 @@ interface BtInfo {
   /** Every font the block switches to (first Tf, later Tfs, inherited). */
   fonts: string[]
   /**
-   * The Tf operator in force when the block opened (`/TT1 11.04 Tf`), set ONLY
-   * when the block carries no Tf of its own. A rewrite that substitutes a font
-   * restores this so the substitute cannot become the inherited font of every
-   * block that follows.
+   * The Tf operator in force when the block opened (`/TT1 11.04 Tf`), set when
+   * the block carries no Tf of its own OR draws its first show op before its
+   * first Tf (the head runs in the entering font, and fontRef then names that
+   * font). A rewrite that substitutes a font restores this so the substitute
+   * cannot become the inherited font of every block that follows.
    */
   inheritedTf?: string | null
   yPos: number
@@ -4015,6 +4324,20 @@ function consumeSuffixFree(text: string, suffixFree: string): number | null {
     while (p > 0 && /\s/.test(text[p - 1])) p--
     if (p <= 0 || text[p - 1] !== suffixFree[k]) return null
     p--
+  }
+  return p
+}
+
+/**
+ * Raw index in `text` just past the space-free prefix `prefixFree`, spaces in
+ * `text` skipped — or null when the text does not begin with it.
+ */
+function consumePrefixFree(text: string, prefixFree: string): number | null {
+  let p = 0
+  for (let k = 0; k < prefixFree.length; k++) {
+    while (p < text.length && /\s/.test(text[p])) p++
+    if (p >= text.length || text[p] !== prefixFree[k]) return null
+    p++
   }
   return p
 }
@@ -5183,7 +5506,7 @@ const HEX_LIT_SRC = String.raw`<[0-9A-Fa-f\s]*>`
  */
 function decodeBtBlockText(
   block: string,
-  encoding: { glyphToUnicode: Map<number, number>; codeBytes?: number } | null,
+  encoding: { glyphToUnicode: Map<number, number>; glyphToText?: Map<number, string>; codeBytes?: number } | null,
   simpleInfo?: SimpleFontInfo | null,
   /**
    * Resolves a font name mid-block. One BT can switch fonts several times —
@@ -5228,6 +5551,11 @@ function decodeBtBlockText(
       if (unicode !== undefined && unicode >= 0 && unicode <= 0x10FFFF) {
         return String.fromCodePoint(unicode)
       }
+      // A multi-character destination ("ffi", or the Latin runs this signed
+      // order's CMaps map CJK glyphs to). Extraction expands these, so the
+      // decode must too or the two can never be compared.
+      const text = encoding.glyphToText?.get(glyphId)
+      if (text !== undefined) return text
       return '?'
     }
     if (glyphId >= 0 && glyphId <= 0x10FFFF) {
@@ -6296,12 +6624,71 @@ function narrowToChangedOps(
 ): { i: number; j: number; text: string } | null {
   let lo = i, text = newText
   while (lo < j) {
-    const d = ops[lo].decoded
-    if (!d || !text.startsWith(d)) break
-    text = text.slice(d.length)
+    // Space-FREE, like every other stream-vs-extraction compare: the op's
+    // spaces are glyphs at stream positions, the target's are synthesised by
+    // the extractor, and they routinely disagree inside the very runs this
+    // narrowing exists for (a garbled CJK label decodes "fHi:l El" while
+    // extraction reports "fHi :lEl"). An exact startsWith stopped the walk at
+    // the first such disagreement and the unchanged ops were re-encoded anyway.
+    const dFree = ops[lo].decoded.replace(/\s+/g, '')
+    if (dFree) {
+      const consumed = consumePrefixFree(text, dFree)
+      if (consumed === null) break
+      text = text.slice(consumed)
+    }
     lo++
   }
-  return lo !== i ? { i: lo, j, text } : null
+  return lo !== i ? { i: lo, j, text: text.replace(/^\s+/, '') } : null
+}
+
+/**
+ * Glyph codes this block ACTUALLY draws for each character, in the font in
+ * force at `like`. A subset's ToUnicode routinely claims one character for
+ * several glyph ids, so the reverse map has to guess which id to write — and
+ * on a garbled CMap the guess can name a glyph that DRAWS a different
+ * character than it claims ("al" re-encoded through such a map rendered "a1").
+ * A code the block already uses for a character is not a guess: it provably
+ * drew that character on this page. Only single-character mappings are
+ * collected — a multi-character destination has no one code point to key on.
+ */
+function preferredGlyphCodes(
+  ops: ShowOpInfo[],
+  like: ShowOpInfo,
+  block: BtInfo,
+  encoding: ReturnType<typeof getFontEncoding>
+): Map<number, number> | undefined {
+  if (!encoding) return undefined
+  const want = like.fontRef ?? block.fontRef
+  const prefer = new Map<number, number>()
+  const stride = encoding.codeBytes === 1 ? 1 : 2
+  const litRe = new RegExp(`(${STR_LIT_SRC})|(${HEX_LIT_SRC})`, 'g')
+  for (const op of ops) {
+    if ((op.fontRef ?? block.fontRef) !== want) continue
+    litRe.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = litRe.exec(op.raw)) !== null) {
+      const codes: number[] = []
+      if (m[2] !== undefined) {
+        codes.push(...hexToCodes(m[2].slice(1, -1).replace(/\s+/g, ''), stride))
+      } else {
+        // A plain literal only carries CMap codes when the font is glyph-coded
+        // (it has a ToUnicode and draws its codes as raw bytes) — which is the
+        // only case this map is consulted in, since encodeTextForFont is the
+        // encoder for exactly those fonts.
+        const s = unescapePdfString(m[1].slice(1, -1))
+        for (let i = 0; i + stride - 1 < s.length; i += stride) {
+          let c = 0
+          for (let k = 0; k < stride; k++) c = (c << 8) | s.charCodeAt(i + k)
+          codes.push(c)
+        }
+      }
+      for (const c of codes) {
+        const u = encoding.glyphToUnicode.get(c)
+        if (u !== undefined && u >= 0 && u <= 0x10FFFF && !prefer.has(u)) prefer.set(u, c)
+      }
+    }
+  }
+  return prefer.size ? prefer : undefined
 }
 
 /**
@@ -6460,7 +6847,8 @@ function applyPartialBlockReplacement(
       // Encode for the font in force AT this array, not the block's first.
       const fr = encodingFor(op)
       const plan = planTextEncoding(pageIndex,
-        { mode: op.isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding },
+        { mode: op.isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding,
+          preferCodes: preferredGlyphCodes(ops, op, block, fr.encoding) },
         [newText], targetBlock)
       // Only fatal when the array is the ONLY hope; with an op window still in
       // hand, an unencodable cell just means this route is not the one.
@@ -6511,17 +6899,23 @@ function applyPartialBlockReplacement(
   const planFor = (at: number, text: string) => {
     const fr = encodingFor(ops[at])
     return planTextEncoding(pageIndex,
-      { mode: ops[at].isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding },
+      { mode: ops[at].isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding,
+        preferCodes: preferredGlyphCodes(ops, ops[at], block, fr.encoding) },
       [text], targetBlock)
   }
 
   let winI = best.i, winJ = best.j, winText = newText
   let plan = planFor(winI, winText)
-  if (plan.kind === 'error') {
-    // The run as a whole is not encodable in any one face. Before giving up,
-    // stop trying to re-encode the ops the edit never touched — see
-    // narrowToChangedOps. Only ever tried as a rescue: where the run already
-    // encodes, the rewrite stays exactly as wide as it was.
+  if (plan.kind === 'error' || plan.kind === 'subst') {
+    // The run as a whole is not encodable in any one face — or only in a
+    // SUBSTITUTE one. Before accepting either, stop trying to re-encode the
+    // ops the edit never touched — see narrowToChangedOps. A substitution is
+    // as much a reason to narrow as an error: re-encoding an unchanged head
+    // into the substitute redraws glyphs the user never touched, and where
+    // that head is a CJK label whose ToUnicode maps to Latin garbage
+    // ("fHi :lEl M:" for 开始日期), the substitution DRAWS that garbage in
+    // place of the ideographs. Where the run already encodes in its own font,
+    // nothing is trimmed and the rewrite stays exactly as wide as it was.
     const narrowed = narrowToChangedOps(ops, winI, winJ, winText)
     if (narrowed) {
       const retry = planFor(narrowed.i, narrowed.text)

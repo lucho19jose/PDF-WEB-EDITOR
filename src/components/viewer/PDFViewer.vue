@@ -36,6 +36,7 @@
           @band-selected="onBandSelected"
           @band-cleared="onBandCleared"
           @blocks-picked="onBlocksPicked"
+          @scan-clicked="onScanClicked"
         />
         <AnnotationLayer
           :ref="setAnnotLayer"
@@ -51,6 +52,7 @@
           that were recognised, and never replaces the rendered page beneath it.
         -->
         <OcrTextLayer
+          :ref="setOcrLayer"
           :page-width="pageWidth"
           :page-height="pageHeight"
           :pdf-width="pdfPageWidth"
@@ -95,9 +97,17 @@ provide('makeRoomInText', (pdfY: number, amount: number, below: boolean) =>
 const pdfViewer = inject<ReturnType<typeof usePDFViewer>>('pdfViewer')!
 const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
 
+/**
+ * The text overlay crops the rendered page to show glyphs whose font cannot
+ * name them. The canvases are owned here, one per page in continuous mode.
+ */
+provide('getPageCanvas', (page: number) => canvases.get(page))
+
 const containerRef = ref<HTMLDivElement | null>(null)
 const textBlockOverlayRef = ref<InstanceType<typeof TextBlockOverlay> | null>(null)
 const annotationLayerRef = ref<InstanceType<typeof AnnotationLayer> | null>(null)
+const ocrLayerRef = ref<InstanceType<typeof OcrTextLayer> | null>(null)
+const ocrController = inject<{ recognise: (pageIndex: number) => Promise<void> } | null>('ocrController', null)
 
 /** The CURRENT page's geometry — what every overlay is laid out against. */
 const pageWidth = ref(0)
@@ -136,6 +146,24 @@ function setTextOverlay(el: any) {
 }
 function setAnnotLayer(el: any) {
   annotationLayerRef.value = el || null
+}
+function setOcrLayer(el: any) {
+  ocrLayerRef.value = el || null
+}
+
+/**
+ * A click on an unrecognised scan, in the edit tool: recognise the page and
+ * open the run under the click, as Acrobat does. The text overlay asks (it
+ * owns the empty-paper surface), the layout recognises, the OCR layer edits —
+ * three siblings, so the hand-off lives here.
+ */
+async function onScanClicked(x: number, y: number) {
+  if (!ocrController) return
+  const pageIndex = docStore.currentPage - 1
+  await ocrController.recognise(pageIndex)
+  if (docStore.currentPage - 1 !== pageIndex) return
+  await nextTick()
+  ocrLayerRef.value?.editAt?.(x, y)
 }
 
 /**

@@ -189,7 +189,7 @@
 <script setup lang="ts">
 import { computed, inject, ref, watch } from 'vue'
 import { useOcrStore } from '@/stores/ocr'
-import { useOCR } from '@/composables/useOCR'
+import { useOCR, OCR_DEFAULT_LANG } from '@/composables/useOCR'
 import { hexToRgb01, rgb01ToHex } from '@/utils/color'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, type Tool } from '@/stores/editor'
@@ -225,8 +225,16 @@ const ocrStore = useOcrStore()
 const ocr = useOCR()
 const runOcrOnPage = inject<(lang: string) => Promise<void>>('runOcrOnPage', async () => {})
 
-/** The OCR row owns the properties bar while a recognised page is on screen. */
-watch(() => ocrStore.layerVisible, v => { editorStore.ocrMode = v }, { immediate: true })
+/**
+ * The OCR row owns the properties bar while a recognised page is on screen —
+ * THIS page. Keyed on `layerVisible` alone it kept the bar on every page of the
+ * document once any one page had been recognised, text pages included.
+ */
+watch(
+  () => [ocrStore.layerVisible, docStore.currentPage, ocrStore.pages] as const,
+  ([visible, page]) => { editorStore.ocrMode = visible && ocrStore.itemsFor(page - 1).length > 0 },
+  { immediate: true }
+)
 
 const ocrHex = computed(() => rgb01ToHex(ocrStore.selected?.color ?? [0, 0, 0]))
 
@@ -236,7 +244,7 @@ function patchOcr(patch: Record<string, unknown>) {
 }
 
 async function runOcr() {
-  await runOcrOnPage('spa')
+  await runOcrOnPage(OCR_DEFAULT_LANG)
 }
 const fonts = ['Helvetica', 'Times-Roman', 'Courier']
 

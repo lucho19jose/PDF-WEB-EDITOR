@@ -80,7 +80,23 @@ const VERTICAL_MIN_CONFIDENCE = 55
 
 interface Box { x0: number; y0: number; x1: number; y1: number }
 
+/** The languages recognised by default: the document's Spanish and its Chinese labels. */
+export const OCR_DEFAULT_LANG = 'spa+chi_sim'
+
+/**
+ * ONE recogniser for the whole app.
+ *
+ * `useOCR()` used to build fresh state per caller, so the toolbar's spinner
+ * watched a `busy` that the layout's runner never set — the button sat idle
+ * through every recognition. Everything shares this instance now.
+ */
+let instance: ReturnType<typeof createOCR> | null = null
 export function useOCR() {
+  if (!instance) instance = createOCR()
+  return instance
+}
+
+function createOCR() {
   const busy = ref(false)
   const progress = ref(0)
   const stage = ref('')
@@ -350,7 +366,10 @@ export function useOCR() {
           const lineEm = emOf(allWords, line.bbox.y1 - line.bbox.y0, lineText)
 
           for (const run of splitRuns(allWords, lineEm)) {
+            // Tesseract's Chinese model puts a "word" space between adjacent
+            // characters; Chinese has none, so those are closed up again.
             const text = run.map(w => w.text).join(' ').replace(/\s+/g, ' ').trim()
+              .replace(/(\p{Script=Han})\s+(?=\p{Script=Han})/gu, '$1')
             if (!text) continue
 
             const bb = unionBox(run)
@@ -440,7 +459,7 @@ export function useOCR() {
     pageIndex: number,
     pageWidth: number,
     pageHeight: number,
-    lang = 'spa',
+    lang = OCR_DEFAULT_LANG,
     readVertical = true
   ): Promise<OcrPageResult | null> {
     if (busy.value) return null

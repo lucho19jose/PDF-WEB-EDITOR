@@ -768,6 +768,50 @@ A regex that only knows the first does not merely miss the second — it
 re-matches triples of entries INSIDE the array and invents mappings, which is
 why Qt output decoded as `????????` and could not be edited at all.
 
+### The decode must agree with EXTRACTION — right or wrong
+A signed order (Intellisign over a Chinese generator, fonts named
+`*Verdana-14399` etc., one CID subset per style run) exposed four defects at
+once; the reported symptom was one uneditable date line, and the real scope was
+every line of every such document. Matching compares the extracted target
+against this engine's own stream decode, so what matters is that the two AGREE
+— even when the CMap is lying. That document's ToUnicode maps CJK glyphs to
+Latin junk ("fHi :lEl M:" for 开始日期), and the junk is fine as long as both
+sides read the same junk:
+
+- **A ToUnicode destination is a UTF-16BE STRING, not one code point.**
+  `<003E> <0045006C>` maps ONE glyph to "El"; `parseInt` on the whole hex made
+  a number past 0x10FFFF and the glyph decoded '?', while MuPDF's extraction
+  expanded it. Two '?' against extraction's five junk chars can never align,
+  so the line matched nothing. `glyphToText` carries multi-char destinations
+  (single code points, surrogate pairs included, stay in `glyphToUnicode`).
+- **A block whose first show op precedes its first Tf decodes its head with
+  the ENTERING font.** This producer opens a BT, draws "Plazo de ejecución"
+  under the `/C0_1` still in force from the previous block, and only then
+  switches to `/C0_7` — labelled C0_7, the head decoded as
+  "7ECIFNDDNDEDCICEMFN" and the whole 20-line block was unmatchable.
+  `fontRef`/`inheritedTf` now come from `fontAt(start)` in that case; the
+  decoder follows every in-block Tf, so only the head runs change.
+- **A SUBSTITUTION is as much a reason to narrow as an error.**
+  `narrowToChangedOps` only rescued a failed encode; a successful substitute
+  encode re-encoded the whole window — and the garbled label's junk is
+  encodable Latin, so the CJK glyphs were REPLACED by literal "fHi :lEl M:"
+  drawn in Times-Bold. Narrowing now also runs before accepting a substitute,
+  and its comparison is space-FREE (`consumePrefixFree`) because extraction
+  and the stream disagree on spaces inside exactly these garbled runs. With
+  the unchanged label ops dropped, the date run re-encodes in its own font.
+- **The reverse CMap needs a WITNESS, not a guess.** Several glyphs claim the
+  same character in these subsets, and one of C0_1's glyphs claims 'l' but
+  draws '1' — re-encoding "al" rendered "a1". `preferredGlyphCodes` collects
+  the codes the block itself uses per character (in the font in force at the
+  window) and `encodeTextForFont` consults them ahead of `unicodeToGlyph`: a
+  code that provably drew the character on this page beats whichever claimant
+  the map happened to keep.
+
+Measured: the reported line edits cleanly (dates change, 开始日期 stays, no
+substitution), a second edit of the same line works, the head line edits too,
+and the sweep is experiment-identical to baseline (262 experiments, 228
+successes, zero gained/lost/changed).
+
 ### Replacement text has to be given room
 Longer text is silently truncated by whatever bounds it, and the characters are
 then in the file but invisible and unfindable. `replaceTextInStream` widens two
@@ -2174,6 +2218,104 @@ stream, so shortening it would move all of them and a multi-image delete would
 address the wrong `Do` from the second one on. The XObject stays in
 /Resources — the same image is often drawn several times, and an unreferenced
 one costs bytes, not correctness.
+
+### A glyph the font cannot NAME is shown, never retyped
+The signed order's CFF subsets map CJK glyphs to Latin junk (`<0005>` →
+"i:l", `<003E>` → "El", `<0004>` → "f"), and CFF carries no Unicode of its own,
+so the real characters are unrecoverable and the editor showed "Fecha de inicio
+fHi :lEl M:" for 开始日期. Matching MUST go on comparing that junk against the
+stream's decode of the same junk (see "The decode must agree with EXTRACTION"),
+so `TextBlock.text` is untouched. What changed is that the glyphs are FLAGGED
+(`TextChar.unreadable`, set by `markUnreadableGlyphs` in `extractPageText`) and
+the inline editor shows each flagged run as a `glyph-chip`: a crop of the
+rendered canvas, `contenteditable=false`, whose `data-text` is the junk the
+engine expects. `readEditor` emits that junk, so an unchanged chip is a no-op
+and a deleted chip deletes its glyphs.
+
+Two tells, and a rule that catches what the tells cannot:
+- **A multi-char destination shows up as zero-width continuation chars.**
+  MuPDF gives the first character the glyph's advance and every further one a
+  zero-width quad at its right edge (`"i"(adv) ":"(0) "l"(0)`). A ligature does
+  the same, so `LIGATURE_TEXT` is checked first. U+FFFD is the other tell.
+- **A single-letter lie is indistinguishable on its own** — `<0004>` → "f" is a
+  perfectly good "f". It is caught at FONT level: a font already caught lying
+  whose ToUnicode has ≤ `TINY_SUBSET_CODES` printable codes is a CJK subset in
+  disguise and everything it draws is flagged. `*Verdana-14399` (170 codes, one
+  "El") keeps per-glyph flagging, which is what leaves the date it also draws
+  editable. Fonts inside Form XObjects are not looked up — a miss, never a
+  false positive.
+
+Chips are DOM-built, so the overlay's scoped stylesheet needs `:deep()` to
+reach them; without it the span stays inline, ignores its size and shows
+nothing. The crop is a band around the baseline (0.95em up, 0.25em down), not
+the quad — this producer's quads are three times the em and a chip that tall
+made a one-line editor two lines high.
+
+### The inline editor opens where you clicked, on the page's baseline, in the page's face
+Acrobat places a caret; the editor used to select the whole line. `openInlineEditor`
+takes the click and `placeCaret` finds the offset on the block's own glyph
+quads (`charOffsetAt`) — exact, where asking the browser where the click fell
+in the editor is only as good as the editor's face. `cssFontStack` puts the
+PDF's own family first (`*Microsoft Sans Serif-Bold-1440` → "Microsoft Sans
+Serif"), so on a machine that has it the editor lines up with the glyphs.
+
+Vertical placement is MEASURED, not derived: a zero-size inline-block sits
+exactly on the baseline, so its bottom is the editor's baseline in client
+pixels, and `alignToBaseline` nudges the box until that meets the block's
+`chars[0].origin[1]`. Guessing the ascent was off by a few pixels for every
+face and by more once a chip raised the line box; anchoring on the bbox TOP put
+the text a whole line above the glyphs on this producer, with the original
+showing through underneath.
+
+**A blur caused by the editor leaving the document is not a commit.** Chrome
+fires blur on a focused element that is removed, and this overlay is removed
+whenever its page stops being current — scrolling on mid-edit, or a hot
+reload. The ref is null or detached by then, the read came back empty, and the
+empty commit DELETED the line (measured: "Text replaced in block 0:26" right
+after a hot update, and the line gone). `onBlur` now cancels when the element
+is not connected.
+
+### A scanned page recognises itself on the first click
+In the edit tool, a page with no text blocks asks `ocrController.isScanLike`
+(no text AND an image covering half the paper — a blank page is not a scan and
+recognising it wastes five seconds; verdicts are cached in `ocrStore.scanVerdicts`).
+The status says so, and a click on the paper emits `scanClicked`; `PDFViewer`
+recognises the page and hands the point to `OcrTextLayer.editAt`, which opens
+the run under it with the caret at the click's share of the run. Three things
+had to give way:
+- **The scan's own image took the click.** The page-filling image is a content
+  image with a hit target at z 3, above the overlay's marquee surface at z 0.
+  On a scan page, in the edit tool, an image covering half the paper is marked
+  `paper` and made transparent to the pointer; in the select tool it is still
+  an object.
+- **OCR read page 1 whatever page was current.** `runOcrNow` grabbed
+  `document.querySelector('canvas.pdf-canvas')` — the FIRST canvas in the
+  document. It now renders the page itself at 220 DPI through
+  `renderPageToCanvas`, with its own task so it neither cancels nor is
+  cancelled by the visible pages.
+- **`useOCR()` built fresh state per caller**, so the toolbar's spinner watched
+  a `busy` the layout never set. It is a singleton now, and the status bar
+  shows the recogniser's own progress.
+`editorStore.ocrMode` is keyed on the CURRENT page having results, not on the
+layer being visible — the OCR row used to hijack the properties bar on every
+page of the document once any page had been recognised.
+
+Default language is `spa+chi_sim` (`OCR_DEFAULT_LANG`); Tesseract's Chinese
+model puts a word space between adjacent characters, which `buildItems` closes
+up. A page of both takes ~45 s including the sideways pass.
+
+### Writing text WinAnsi cannot hold: subset in a SCRATCH document, then graft
+The WASM build has no built-in CJK face, so `addTextToPage` fetches
+`public/fonts/NotoSansSC-Regular.otf` on the first run that needs it
+(`ensureCjkFontFor`, awaited in the message handler — the writers are
+synchronous). `registerCjkRun` draws the run in a scratch `PDFDocument`,
+calls `subsetFonts()` THERE, and `graftObject`s the resulting font dictionary
+into the page under a fresh `FCJKn`; the run is written as Identity-H hex of
+the glyph ids. `addFont` alone embeds all 8 MB, and `subsetFonts()` on the
+real document would subset the ORIGINAL fonts too — glyphs the page does not
+currently draw would be gone and a later edit needing one would be pushed into
+a substitute. Measured: 39 KB per run, 242 ms, extracts back as written. The
+FreeType "invalid argument" warnings during subsetting are MuPDF's and harmless.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates

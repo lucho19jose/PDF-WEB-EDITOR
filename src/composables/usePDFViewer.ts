@@ -124,6 +124,28 @@ export function usePDFViewer() {
     }
   }
 
+  /**
+   * Render one page to a canvas of its own at an explicit scale.
+   *
+   * For OCR, which wants ~220 DPI whatever the zoom is, and which used to read
+   * `document.querySelector('canvas.pdf-canvas')` — the FIRST canvas on the
+   * page, i.e. page 1's in continuous scroll, whatever page was current. This
+   * render has its own task and never touches `renderToken`, so it neither
+   * cancels nor is cancelled by the visible pages' rendering.
+   */
+  async function renderPageToCanvas(pageNum: number, scale: number): Promise<HTMLCanvasElement | null> {
+    if (!pdfDoc.value) return null
+    const page = await pdfDoc.value.getPage(pageNum)
+    const viewport = page.getViewport({ scale })
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.floor(viewport.width))
+    canvas.height = Math.max(1, Math.floor(viewport.height))
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
+    if (!ctx) return null
+    await page.render({ canvasContext: ctx, viewport, canvas } as any).promise
+    return canvas
+  }
+
   async function getTextContent(pageNum: number) {
     if (!pdfDoc.value) return null
     const page = await pdfDoc.value.getPage(pageNum)
@@ -138,6 +160,6 @@ export function usePDFViewer() {
 
   return {
     pdfDoc, isLoading, error,
-    loadDocument, reloadDocument, renderPage, getTextContent, getPageViewport
+    loadDocument, reloadDocument, renderPage, renderPageToCanvas, getTextContent, getPageViewport
   }
 }

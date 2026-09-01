@@ -49,6 +49,14 @@ export interface TextChar {
    * colour and the toolbar would show the wrong swatch for it.
    */
   color?: [number, number, number]
+  /**
+   * The font cannot NAME this glyph: its ToUnicode entry is provably a lie
+   * (one glyph expanded to "i:l"), it is U+FFFD, or it belongs to a tiny CID
+   * subset already caught lying. The string is still whatever extraction
+   * reports — matching depends on that — but an editor must show the drawn
+   * glyph rather than the junk, and must never let it be retyped.
+   */
+  unreadable?: boolean
 }
 
 /** A line of text (group of chars on the same baseline) */

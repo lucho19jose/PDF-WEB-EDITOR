@@ -13,7 +13,7 @@
         v-for="img in scaledContentImgs"
         :key="'ci' + img.id"
         class="cimg-hit"
-        :class="{ selected: selectedImgId === img.id || multiImgs.has(img.id) }"
+        :class="{ selected: selectedImgId === img.id || multiImgs.has(img.id), paper: img.paper }"
         :style="img.style"
         title="Image in the page — drag to move, handles to resize, Del to remove"
         @mousedown.stop="onImgMouseDown($event, img.id)"
@@ -152,6 +152,7 @@ import { useQuasar } from 'quasar'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, MARKUP_TOOLS, type Tool } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
+import { useOcrStore } from '@/stores/ocr'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
 import type { AnnotationInfo, ContentImageInfo, Quad, Pt, RectT, MarkupType, ShapeType, TextChar } from '@/engine/types'
 import { hexToRgb01, rgb01ToCss } from '@/utils/color'
@@ -163,6 +164,7 @@ const emit = defineEmits<{ changed: []; objectPicked: [] }>()
 const $q = useQuasar()
 const docStore = useDocumentStore()
 const editorStore = useEditorStore()
+const ocrStore = useOcrStore()
 const historyStore = useHistoryStore()
 const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
 
@@ -415,12 +417,24 @@ function liveImgRect(img: ContentImageInfo): RectT {
  * target under the cursor always wins, which is the rule that keeps a large
  * object from swallowing everything it contains.
  */
+/**
+ * On a page that is a SCAN, the page-filling image is the paper, not an
+ * object. In the edit tool it must not take the click — the text overlay
+ * underneath is what turns that click into recognition and an editor — so it
+ * is made transparent to the pointer there. In the select tool it stays an
+ * image: it can still be moved, resized or deleted like any other.
+ */
+const scanPage = computed(() => ocrStore.scanVerdicts.get(docStore.currentPage - 1) === true)
+const paperArea = computed(() => Math.max(1, props.pdfWidth * props.pdfHeight) * 0.5)
+
 const scaledContentImgs = computed(() => contentImages.value
   .map(img => {
     const r = liveImgRect(img)
+    const area = Math.max(0, r[2] - r[0]) * Math.max(0, r[3] - r[1])
     return {
       id: img.id,
-      area: Math.max(0, r[2] - r[0]) * Math.max(0, r[3] - r[1]),
+      area,
+      paper: scanPage.value && editorStore.currentTool === 'edit' && area >= paperArea.value,
       style: {
         left: `${r[0] * scaleX.value}px`,
         top: `${r[1] * scaleY.value}px`,
@@ -1382,6 +1396,8 @@ defineExpose({ loadAnnotations, deleteSelected, selectInBand, clearMultiSelectio
   border: 1px dashed transparent; box-sizing: border-box; cursor: move;
 }
 .cimg-hit:hover { border-color: rgba(52,168,83,0.7); background: rgba(52,168,83,0.05); }
+/* The paper of a scan, in the edit tool: the click belongs to the text layer. */
+.cimg-hit.paper { pointer-events: none; border-color: transparent; }
 .cimg-hit.selected { border: 1.5px dashed #34a853; background: rgba(52,168,83,0.08); }
 .annot-preview {
   position: absolute; border: 2px solid; box-sizing: border-box; z-index: 17; pointer-events: none;

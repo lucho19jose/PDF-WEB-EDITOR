@@ -109,11 +109,12 @@ import { ref, computed, watch, nextTick, inject, onMounted, onBeforeUnmount } fr
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
+import { useOcrStore } from '@/stores/ocr'
 import { enqueueOp } from '@/utils/opQueue'
 import { groupIntoRows, resolveCollisions, planReflow, planPushDown, type Rect } from '@/utils/layoutCollision'
 import { hexToRgb01, rgb01ToHex } from '@/utils/color'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
-import type { TextBlock, BlockTransformOp, BlockStyleOp } from '@/engine/types'
+import type { TextBlock, TextChar, BlockTransformOp, BlockStyleOp } from '@/engine/types'
 
 type HandlePosition = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
 
@@ -159,12 +160,25 @@ const emit = defineEmits<{
    *  in the edit tool both layers are live at once, and two selections wearing
    *  handles at the same time leaves Delete with two answers. */
   blocksPicked: []
+  /** A click on a page that is a SCAN, in edit mode, before it has been
+   *  recognised: page-space point (top-left origin, points). The viewer runs
+   *  OCR and opens the run under the click. */
+  scanClicked: [x: number, y: number]
 }>()
 
 const docStore = useDocumentStore()
 const editorStore = useEditorStore()
 const historyStore = useHistoryStore()
 const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
+/** The rendered canvas of a page — the only place an unnameable glyph can be seen. */
+const getPageCanvas = inject<(page: number) => HTMLCanvasElement | undefined>('getPageCanvas', () => undefined)
+/** Scan detection and recognition, owned by the layout. */
+const ocrController = inject<{
+  isScanLike: (pageIndex: number) => Promise<boolean>
+  recognise: (pageIndex: number) => Promise<void>
+  busy: { value: boolean }
+} | null>('ocrController', null)
+const ocrStore = useOcrStore()
 
 const hostRef = ref<HTMLDivElement | null>(null)
 const blocks = ref<TextBlock[]>([])
@@ -456,15 +470,31 @@ const editorStyle = computed(() => {
   const h = (by1 - by0) * scaleY.value
   const fs = block.fontSize * scaleY.value
 
+  // A single line is anchored on its BASELINE, not on its bbox top. The bbox
+  // carries the font's full ascent, and on some producers that is three times
+  // the em — the editor's text then floated a whole line above the glyphs it
+  // was replacing, with the original showing through underneath. With
+  // line-height 1.15 the text's baseline sits about 0.93em below the top of
+  // the box (border and padding included), so the box is placed accordingly.
+  // A group keeps the bbox: its lines have their own leading.
+  const single = group.length === 1
+  const baseline = single ? block.chars[0]?.origin[1] : undefined
+  const top = baseline !== undefined
+    ? baseline * scaleY.value - fs * 0.93 + baselineNudge.value
+    : y - 1
+
   // Extend editor width to page right edge so text stays on one line
   const availableW = props.pageWidth - x
   return {
     left: `${x - 1}px`,
-    top: `${y - 1}px`,
+    top: `${top}px`,
     minWidth: `${Math.max(w + 2, 60)}px`,
     maxWidth: `${Math.max(availableW, w + 2)}px`,
-    minHeight: `${Math.max(h + 2, fs + 4)}px`,
+    minHeight: single ? `${fs * 1.15 + 4}px` : `${Math.max(h + 2, fs + 4)}px`,
     fontSize: `${fs}px`,
+    // The page's own face where the system has it, so the editor lines up
+    // with the glyphs it covers instead of restating them in the UI font.
+    fontFamily: cssFontStack(block),
     fontWeight: block.isBold ? 'bold' : 'normal',
     fontStyle: block.isItalic ? 'italic' : 'normal',
     color: `rgb(${Math.round(block.color[0] * 255)}, ${Math.round(block.color[1] * 255)}, ${Math.round(block.color[2] * 255)})`,
@@ -525,6 +555,16 @@ async function loadBlocks(announce = false) {
     resolveSelection()
     if (announce && editorStore.currentTool === 'edit') {
       editorStore.setStatus(`Edit mode: ${data.length} text blocks found`)
+    }
+    // A page with nothing to edit may be a picture of a document. Say so, and
+    // say what to do — "0 text blocks found" reads as a dead end.
+    if (data.length === 0 && editorStore.currentTool === 'edit' && ocrController) {
+      const isScan = await ocrController.isScanLike(pageIndex)
+      if (isScan && pageIndex === docStore.currentPage - 1) {
+        editorStore.setStatus(ocrStore.itemsFor(pageIndex).length > 0
+          ? 'Scanned page: click a recognised line to edit it'
+          : 'This page is a scan — click on the text to recognise it')
+      }
     }
   } catch (err: any) {
     console.error('Failed to load text blocks:', err)
@@ -646,47 +686,221 @@ function scrollAncestor(from: HTMLElement | null): HTMLElement | null {
   return document.scrollingElement as HTMLElement | null
 }
 
-function openInlineEditor(block: TextBlock, group: TextBlock[] = []) {
+/** Where the mouse was when the editor was asked for, in client pixels. */
+interface ClientPoint { clientX: number; clientY: number }
+
+/**
+ * One piece of the editor's content and the slice of its block's text it holds.
+ *
+ * A chip holds glyphs that must not be retyped; a text node holds everything
+ * else. `start`/`end` are offsets into that block's `text`, which is what the
+ * caret placement and `readEditor` both need to agree on.
+ */
+interface EditorSegment { blockIdx: number; node: Node; start: number; end: number; chip: boolean }
+let editorSegments: EditorSegment[] = []
+
+/** Contiguous glyphs the font cannot name, as slices of the block's text. */
+function protectedRuns(block: TextBlock): { start: number; end: number; text: string; chars: TextChar[] }[] {
+  const runs: { start: number; end: number; text: string; chars: TextChar[] }[] = []
+  let pos = 0
+  let open: { start: number; end: number; text: string; chars: TextChar[] } | null = null
+  for (const ch of block.chars) {
+    const len = ch.c.length
+    if (ch.unreadable) {
+      if (open && open.end === pos) { open.end = pos + len; open.text += ch.c; open.chars.push(ch) }
+      else { open = { start: pos, end: pos + len, text: ch.c, chars: [ch] }; runs.push(open) }
+    }
+    pos += len
+  }
+  return runs
+}
+
+/**
+ * A chip standing in for glyphs the editor must show but never retype.
+ *
+ * The font's ToUnicode calls 开始日期 "fHi:l El M:", and that junk is what the
+ * engine matches on — so it stays in the editor's VALUE (`data-text`) while
+ * the chip's face is a crop of the rendered page, the one place the real glyph
+ * exists. `contenteditable=false` makes the browser treat it as one atom: the
+ * caret steps over it, Backspace removes it whole, and nothing can be typed
+ * into the middle of a string that means nothing.
+ */
+function makeGlyphChip(block: TextBlock, run: { text: string; chars: TextChar[] }): HTMLSpanElement {
+  const span = document.createElement('span')
+  span.className = 'glyph-chip'
+  span.contentEditable = 'false'
+  span.dataset.text = run.text
+  span.title = 'Glyphs this font cannot name — kept exactly as drawn'
+
+  // The crop is a band around the BASELINE, not the glyph quads: quads carry
+  // the font's full ascent and descent, which on this producer is over three
+  // times the em, and a chip that tall turns a one-line editor into two. The
+  // band holds the ink of any script (0.95em up, 0.25em down).
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
+  for (const ch of run.chars) {
+    const q = ch.quad
+    x0 = Math.min(x0, q[0], q[4]); x1 = Math.max(x1, q[2], q[6])
+    y0 = Math.min(y0, ch.origin[1] - ch.size * 0.95)
+    y1 = Math.max(y1, ch.origin[1] + ch.size * 0.25)
+  }
+  const w = (x1 - x0) * scaleX.value
+  const h = (y1 - y0) * scaleY.value
+  // Shown no taller than the editor's own line can bear, aspect kept, and
+  // sitting on the baseline with its descender share below it.
+  const lineFs = block.fontSize * scaleY.value
+  const shrink = Math.min(1, (lineFs * 1.6) / Math.max(h, 1))
+  const shownH = Math.max(2, Math.round(h * shrink))
+  const shownW = Math.max(2, Math.round(w * shrink))
+  span.style.width = `${shownW}px`
+  span.style.height = `${shownH}px`
+  span.style.verticalAlign = `${-Math.round(shownH * (0.25 / 1.2))}px`
+
+  const canvas = getPageCanvas(docStore.currentPage)
+  if (canvas && w > 0 && h > 0 && props.pageWidth > 0) {
+    // Device pixels per CSS pixel of THIS canvas — it is painted at DPR.
+    const k = canvas.width / props.pageWidth
+    const crop = document.createElement('canvas')
+    crop.width = Math.max(1, Math.ceil(w * k))
+    crop.height = Math.max(1, Math.ceil(h * k))
+    const ctx = crop.getContext('2d')
+    if (ctx) {
+      ctx.drawImage(canvas, x0 * scaleX.value * k, y0 * scaleY.value * k, w * k, h * k, 0, 0, crop.width, crop.height)
+      span.style.backgroundImage = `url(${crop.toDataURL()})`
+      return span
+    }
+  }
+  // No canvas to crop from: show the junk, but greyed and still protected.
+  span.textContent = run.text
+  span.classList.add('no-image')
+  return span
+}
+
+/** Fill the editor with one block's text, chips where the glyphs are unreadable. */
+function appendBlockContent(el: HTMLElement, block: TextBlock, blockIdx: number) {
+  const pushText = (from: number, to: number) => {
+    if (to <= from) return
+    const node = document.createTextNode(block.text.slice(from, to))
+    el.appendChild(node)
+    editorSegments.push({ blockIdx, node, start: from, end: to, chip: false })
+  }
+  let pos = 0
+  for (const run of protectedRuns(block)) {
+    pushText(pos, run.start)
+    const chip = makeGlyphChip(block, run)
+    el.appendChild(chip)
+    editorSegments.push({ blockIdx, node: chip, start: run.start, end: run.end, chip: true })
+    pos = run.end
+  }
+  pushText(pos, block.text.length)
+}
+
+/** The text offset in `block` under page-space x, measured on the real glyph boxes. */
+function charOffsetAt(block: TextBlock, px: number): number {
+  let off = 0
+  for (const ch of block.chars) {
+    const l = Math.min(ch.quad[0], ch.quad[4])
+    const r = Math.max(ch.quad[2], ch.quad[6])
+    if (px < l) return off
+    if (px < r) return px - l < (r - l) / 2 ? off : off + ch.c.length
+    off += ch.c.length
+  }
+  return off
+}
+
+/**
+ * Put the caret where the user clicked, as Acrobat does — not a select-all.
+ *
+ * The offset is found on the block's own glyph quads rather than by asking the
+ * browser where the click fell in the editor: the editor's face is only an
+ * approximation of the page's, and the quads are exact. No point (the
+ * multi-line button) puts the caret at the start.
+ */
+function placeCaret(block: TextBlock, group: TextBlock[], at?: ClientPoint) {
+  const el = editorRef.value
+  const sel = window.getSelection()
+  if (!el || !sel) return
+  const list = group.length > 1 ? group : [block]
+  let blockIdx = 0
+  let offset = 0
+  if (at && hostRef.value) {
+    const r = hostRef.value.getBoundingClientRect()
+    const px = (at.clientX - r.left) / scaleX.value
+    const py = (at.clientY - r.top) / scaleY.value
+    let idx = list.findIndex(b => px >= b.bbox[0] && px <= b.bbox[2] && py >= b.bbox[1] && py <= b.bbox[3])
+    if (idx < 0) idx = list.findIndex(b => py >= b.bbox[1] && py <= b.bbox[3])
+    if (idx < 0) idx = 0
+    blockIdx = idx
+    offset = charOffsetAt(list[idx], px)
+  }
+  const segs = editorSegments.filter(s => s.blockIdx === blockIdx)
+  if (segs.length === 0) { sel.collapse(el, 0); return }
+  const seg = segs.find(s => offset < s.end) ?? segs[segs.length - 1]
+  if (seg.chip) {
+    const parent = seg.node.parentNode
+    if (!parent) return
+    const i = Array.prototype.indexOf.call(parent.childNodes, seg.node)
+    const after = offset - seg.start > (seg.end - seg.start) / 2
+    sel.collapse(parent, after ? i + 1 : i)
+  } else {
+    sel.collapse(seg.node, Math.min(Math.max(offset - seg.start, 0), seg.end - seg.start))
+  }
+}
+
+/**
+ * How far the editor has to move so its text sits on the PAGE's baseline.
+ *
+ * Guessing the ascent from the font size is wrong by a few pixels for every
+ * face and wrong by more once a chip taller than the line raises the line box.
+ * Measured instead: a zero-size inline-block sits exactly on the baseline, so
+ * its bottom IS the editor's baseline in client pixels.
+ */
+const baselineNudge = ref(0)
+function alignToBaseline(block: TextBlock) {
+  const el = editorRef.value
+  const host = hostRef.value
+  if (!el || !host || editingGroup.value.length > 1) return
+  const origin = block.chars[0]?.origin
+  if (!origin) return
+  const probe = document.createElement('span')
+  probe.style.cssText = 'display:inline-block;width:0;height:0;vertical-align:baseline'
+  el.insertBefore(probe, el.firstChild)
+  const measured = probe.getBoundingClientRect().bottom
+  probe.remove()
+  const wanted = host.getBoundingClientRect().top + origin[1] * scaleY.value
+  if (Number.isFinite(measured) && Number.isFinite(wanted)) baselineNudge.value += wanted - measured
+}
+
+function openInlineEditor(block: TextBlock, group: TextBlock[] = [], at?: ClientPoint) {
   editingGroup.value = group.length > 1 ? group : []
   editingBlock.value = block
   editorPopulated = false
+  baselineNudge.value = 0
   nextTick(() => {
     // The element never mounted — the edit was cancelled underneath us. Leaving
     // an unpopulated editor open is how a blank one gets committed over real
     // text, so close it instead of leaving it there empty.
     if (!editorRef.value) { cancelEdit(); return }
     editorRef.value.textContent = ''
-    const texts = editingGroup.value.length > 1
-      ? editingGroup.value.map(b => b.text)
-      : [block.text]
-    texts.forEach((t, i) => {
+    editorSegments = []
+    const list = editingGroup.value.length > 1 ? editingGroup.value : [block]
+    list.forEach((b, i) => {
       if (i > 0) editorRef.value!.appendChild(document.createElement('br'))
-      editorRef.value!.appendChild(document.createTextNode(t))
+      appendBlockContent(editorRef.value!, b, i)
     })
     editorPopulated = true
 
     // Opening an editor must not move the page under the user.
     //
-    // A selection is scrolled to its FOCUS end, and the obvious way to select
-    // everything puts that end after the last word — so opening a line that is
-    // wider than the window threw the view to the right and the start of the
-    // line, which is where anyone begins reading and editing, went off-screen.
-    //
-    // The whole line is still selected, so typing still replaces it; the
-    // selection is just made BACKWARDS, with its focus at the first character.
-    // `preventScroll` stops the focus itself from scrolling, and the scroller's
-    // position is put back afterwards for anything that slips past both.
+    // The caret goes to the clicked character, which is where the reader is
+    // looking; `preventScroll` stops the focus itself from scrolling, and the
+    // scroller's position is put back afterwards for anything that slips past.
     const scroller = scrollAncestor(editorRef.value)
     const keepLeft = scroller?.scrollLeft ?? 0
     const keepTop = scroller?.scrollTop ?? 0
 
     editorRef.value.focus({ preventScroll: true })
-    const range = document.createRange()
-    range.selectNodeContents(editorRef.value)
-    const sel = window.getSelection()
-    sel?.removeAllRanges()
-    sel?.addRange(range)
-    sel?.setBaseAndExtent(range.endContainer, range.endOffset, range.startContainer, range.startOffset)
+    alignToBaseline(block)
+    placeCaret(block, list, at)
 
     editorRef.value.scrollLeft = 0
     if (scroller) { scroller.scrollLeft = keepLeft; scroller.scrollTop = keepTop }
@@ -710,6 +924,8 @@ function readEditor(el: HTMLElement | null): string {
     node.childNodes.forEach(child => {
       if (child.nodeType === Node.TEXT_NODE) { parts.push(child.textContent ?? ''); return }
       if (!(child instanceof HTMLElement)) return
+      // A glyph chip reads as the junk the engine matches on, never as its face.
+      if (child.dataset.text !== undefined) { parts.push(child.dataset.text); return }
       if (child.tagName === 'BR') { parts.push('\n'); return }
       // A contenteditable wraps every line after the first in its own block.
       if (child.tagName === 'DIV' || child.tagName === 'P') parts.push('\n')
@@ -742,13 +958,21 @@ function onBlur() {
   // the timer fires can commit block A's text under block B's id (or silently
   // drop the edit) if the user quick-clicks another block within 150 ms.
   const block = editingBlock.value
-  const text = readEditor(editorRef.value)
+  const el = editorRef.value
+  const text = readEditor(el)
   if (!block) return
 
   // The editor is filled a tick after it opens. A blur that lands in that
   // window reads an EMPTY editor, and committing that empties the block —
   // clicking through several lines quickly silently deleted one of them.
   if (!editorPopulated) { cancelEdit(); return }
+
+  // A blur caused by the editor LEAVING THE DOCUMENT is not a commit either.
+  // Chrome fires blur on a focused element that is removed, and this overlay
+  // is removed whenever the page it sits on stops being current — scrolling
+  // on while a line is open, or a hot reload. The ref is null or detached by
+  // then, the read comes back empty, and the empty commit deleted the line.
+  if (!el || !el.isConnected) { cancelEdit(); return }
   setTimeout(() => {
     if (!isCommitting) {
       commitEdit(block, text)
@@ -1165,6 +1389,32 @@ function familyOf(block: TextBlock): string {
   if (/courier|mono/i.test(name)) return 'Courier'
   if (/times|georgia|garamond|book|palatino|serif|roman/i.test(name)) return 'Times-Roman'
   return 'Helvetica'
+}
+
+/**
+ * A CSS font stack that starts with the PDF's own family name.
+ *
+ * `*Microsoft Sans Serif-Bold-1440`, `ABCDEF+Calibri,Bold`, `TimesNewRomanPSMT`
+ * all name faces the system very likely has; the subset prefix, the generator's
+ * numeric suffix, the style words and the PS/MT tails are stripped and CamelCase
+ * is spaced out. The family bucket stays behind it as the fallback.
+ */
+function cssFontStack(block: TextBlock): string {
+  const bucket = familyOf(block)
+  const fallback = bucket === 'Courier' ? '"Courier New", Courier, monospace'
+    : bucket === 'Times-Roman' ? '"Times New Roman", Times, serif'
+    : 'Helvetica, Arial, sans-serif'
+  const name = (block.fontName || '')
+    .replace(/^[A-Z]{6}\+/, '')
+    .replace(/^\*/, '')
+    .replace(/-Identity-[HV]$/, '')
+    .replace(/-\d{3,}$/, '')
+    .replace(/[-,]?(Bold|Italic|Oblique|Regular|Light|Medium|Semibold|Black)+$/i, '')
+    .replace(/(PSMT|MT|PS)$/, '')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[-_]+/g, ' ')
+    .trim()
+  return name ? `"${name}", ${fallback}` : fallback
 }
 
 /**
@@ -1808,9 +2058,21 @@ function onMarqueeEnd() {
   marqueeMoved.value = false
   if (!m) return
 
-  // A click on empty page with no drag just clears the selection.
+  // A click on empty page with no drag just clears the selection — unless the
+  // page is a scan that has not been recognised yet, in which case the click
+  // is the request: recognise it and open the line under the pointer.
   if (!dragged) {
     if (!m.additive) { clearSelection(); emit('bandCleared') }
+    if (editorStore.currentTool === 'edit' && blocks.value.length === 0 && ocrController && !ocrController.busy.value) {
+      const pageIndex = docStore.currentPage - 1
+      if (ocrStore.itemsFor(pageIndex).length === 0) {
+        ocrController.isScanLike(pageIndex).then(isScan => {
+          if (isScan && pageIndex === docStore.currentPage - 1) {
+            emit('scanClicked', m.x0 / scaleX.value, m.y0 / scaleY.value)
+          }
+        })
+      }
+    }
     return
   }
 
@@ -1972,7 +2234,7 @@ async function onDragEnd() {
     // drop the rest of the selection.
     if (ds && editorStore.currentTool === 'edit' && selectedBlocks.value.length >= 1) {
       const group = orderedForEditing(selectedBlocks.value)
-      openInlineEditor(group[0], group)
+      openInlineEditor(group[0], group, { clientX: ds.startMouseX, clientY: ds.startMouseY })
     }
     return
   }
@@ -2459,6 +2721,25 @@ defineExpose({ loadBlocks, deleteSelectedBlocks, selectAllBlocks, makeRoomAt, cl
 .inline-editor:focus {
   border-color: #1a73e8;
   background: rgba(255, 255, 255, 1);
+}
+
+/* Glyphs the font cannot name: the rendered page, cropped, standing in for
+   junk text. One atom to the caret and to Backspace. `:deep` because the chip
+   is built with the DOM API and carries no scope attribute — without it the
+   span stays inline, ignores its width and height, and shows nothing. */
+.inline-editor :deep(.glyph-chip) {
+  display: inline-block;
+  vertical-align: baseline;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 100% 100%;
+  border-bottom: 1px dotted rgba(66, 133, 244, 0.8);
+  cursor: default;
+  user-select: all;
+}
+.inline-editor :deep(.glyph-chip.no-image) {
+  color: #9aa0a6;
+  font-style: italic;
 }
 
 .inline-editor-wrapper {
