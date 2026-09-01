@@ -368,6 +368,35 @@ successes, no regressions. The same gate is why `N°` accepts `Nro`, `No`, `N`
 and `De` but not `zzz` — that font has no `z` — which reads as "some edits work
 and some don't" unless you know what to look at.
 
+### A space-padded table strip splits at its padding — but only a proven strip
+The fund-request form pads its amount row with literal SPACE GLYPHS —
+"S/    1,170.00S/    210.60S/ …" — so `splitBlocksAtGaps`, which only split
+at GEOMETRIC gaps, saw none: the gap is paved. Four columns arrived as ONE
+block and clicking one amount opened an editor spanning all of them. A run
+of ≥3 whitespace glyphs wider than the gap threshold now acts as a column
+separator (excluded from both segments — it belongs to neither cell), and
+once a line shows **two or more** such separators it is a padded strip, which
+also unlocks a tighter geometric threshold for that line — the cell border
+between a right-aligned amount and the next column's "S/" is 5.7pt at this
+5pt font, just under the prose threshold of 7.4.
+
+The ≥2-separator gate is not decoration. Applied to every line, the split
+took apart single-gap "label:   value" pairs across the corpus — three files
+churned (Corel datasheet, a timesheet, a valorización) for no user-facing
+gain, since the merged pair was already editable. Gated, the corpus is
+byte-identical to before the change; ungated it was −5.
+
+Two matcher guards were exposed by the finer targets and are now in:
+- **Step-3 exact matching compares space-free too.** Extraction invents
+  spaces the stream does not draw ("2 3.059,52" for a block reading
+  "23.059,52"), and collapse-only equality failed the very block the click
+  meant — leaving a sloppy fuzzy line-run 50pt away as the best offer.
+- **`applyLineReplacement`'s PRIMARY must also carry only target glyphs**
+  (when the run has other members): the primary is rewritten, so its own
+  foreign glyphs are deleted as surely as a blanked neighbour's — a currency
+  "$" led a fuzzy run for the amount beside it, took the replacement, and
+  vanished. Single-block runs are exempt; '?' placeholders are exempt.
+
 ### Td lives in the space the Tm MATRIX defines — compose it, or positions lie
 `scanShowOps` used to add Td operands straight onto the Tm translation, which
 is only right while the Tm matrix is the identity. The bilingual form's table

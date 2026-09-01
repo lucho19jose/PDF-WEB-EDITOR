@@ -594,27 +594,88 @@ function splitBlocksAtGaps(blocks: TextBlock[], pageIndex: number): TextBlock[] 
       const avgCharW = wCount > 0 ? totalW / wCount : block.fontSize * 0.6
       const gapThreshold = Math.max(avgCharW * 3, block.fontSize * 1.5)
 
-      // Find horizontal split points
-      const segments: TextChar[][] = []
-      let segStart = 0
-      for (let i = 1; i < lineChars.length; i++) {
-        const prev = lineChars[i - 1]
-        const curr = lineChars[i]
-        const prevEnd = Math.max(prev.quad[2], prev.quad[6])
-        const currStart = Math.min(curr.quad[0], curr.quad[4])
-        const gap = currStart - prevEnd
-
-        if (gap > gapThreshold) {
-          segments.push(lineChars.slice(segStart, i))
-          segStart = i
+      // Find horizontal split points. Two kinds of column separator:
+      //
+      // - a GEOMETRIC gap between glyphs (kern-jump producers — nothing drawn
+      //   between the cells);
+      // - a RUN of whitespace GLYPHS wide enough to be a column gap. This
+      //   fund-request form pads its amount strip with literal spaces —
+      //   "S/    1,170.00S/    210.60S/ …" — so the four cells had no
+      //   geometric gap anywhere and arrived as ONE block: clicking one
+      //   amount opened an editor spanning four columns. The separator run
+      //   is EXCLUDED from both segments (it belongs to neither cell); short
+      //   runs and runs at the line's ends stay attached, so ordinary word
+      //   spaces and trailing spaces read back exactly as before. A line of
+      //   nothing but whitespace is kept whole — a blank form field is a
+      //   legitimate block, not a separator.
+      const isWs = (c: TextChar) => !c.c || /^\s+$/.test(c.c)
+      const allWs = lineChars.every(isWs)
+      // Count the whitespace-run separators first: a line carrying TWO or
+      // more of them is a space-padded table strip, and there the cells that
+      // touch — an amount right-aligned against the next column's "S/" — sit
+      // a whole cell border apart (5.7pt here) yet under the prose threshold
+      // (7.4pt at this 5pt font). Prose never shows two wide space runs, so
+      // the evidence is cheap and the tighter geometric threshold applies to
+      // THIS line only; intra-word gaps are two orders of magnitude smaller.
+      let wsSeparators = 0
+      if (!allWs) {
+        for (let i = 0; i < lineChars.length;) {
+          if (!isWs(lineChars[i])) { i++; continue }
+          let j = i
+          while (j < lineChars.length && isWs(lineChars[j])) j++
+          if (j - i >= 3 && i > 0 && j < lineChars.length) {
+            const prevEnd = Math.max(lineChars[i - 1].quad[2], lineChars[i - 1].quad[6])
+            const nextStart = Math.min(lineChars[j].quad[0], lineChars[j].quad[4])
+            if (nextStart - prevEnd > gapThreshold) wsSeparators++
+          }
+          i = j
         }
       }
-      segments.push(lineChars.slice(segStart))
+      // The whole space-run treatment is gated on that same evidence: a line
+      // with a SINGLE padded gap ("AZUFRE:   0.045% Máximo") is a label and
+      // its value, and splitting those apart churned three corpus files for
+      // no user-facing gain — the merged block was already editable. Only a
+      // strip that pads BETWEEN several cells gets taken apart.
+      const isStrip = wsSeparators >= 2
+      const geomThreshold = isStrip
+        ? Math.min(gapThreshold, Math.max(avgCharW * 2, block.fontSize * 0.9))
+        : gapThreshold
+      const segments: TextChar[][] = []
+      let seg: TextChar[] = []
+      let i = 0
+      while (i < lineChars.length) {
+        const ch = lineChars[i]
+        if (isStrip && !allWs && isWs(ch)) {
+          let j = i
+          while (j < lineChars.length && isWs(lineChars[j])) j++
+          if (j - i >= 3 && i > 0 && j < lineChars.length) {
+            const prevEnd = Math.max(lineChars[i - 1].quad[2], lineChars[i - 1].quad[6])
+            const nextStart = Math.min(lineChars[j].quad[0], lineChars[j].quad[4])
+            if (nextStart - prevEnd > gapThreshold) {
+              if (seg.length) segments.push(seg)
+              seg = []
+              i = j
+              continue
+            }
+          }
+          seg.push(ch)
+          i++
+          continue
+        }
+        if (seg.length) {
+          const prev = seg[seg.length - 1]
+          const gap = Math.min(ch.quad[0], ch.quad[4]) - Math.max(prev.quad[2], prev.quad[6])
+          if (gap > geomThreshold) { segments.push(seg); seg = [] }
+        }
+        seg.push(ch)
+        i++
+      }
+      if (seg.length) segments.push(seg)
 
       // Create a block for each segment
-      for (const seg of segments) {
-        if (seg.length === 0) continue
-        result.push(makeBlock(seg, block))
+      for (const seg2 of segments) {
+        if (seg2.length === 0) continue
+        result.push(makeBlock(seg2, block))
       }
     }
   }
@@ -4135,7 +4196,13 @@ function replaceTextInContentStreamFontAware(
     const normalizedDecoded = block.decodedText.replace(/\s+/g, ' ').trim()
     if (!normalizedDecoded || normalizedDecoded.length < 2) continue
 
-    const exact = normalizedDecoded === normalizedTarget
+    // Space-free as well as collapsed: extraction invents spaces the stream
+    // does not draw ("2 3.059,52" for a block that reads "23.059,52"), and a
+    // collapse-only equality then failed the very block the click meant —
+    // leaving a sloppy fuzzy line-run 50pt away as the best offer, which ate
+    // the "$" beside the amount.
+    const exact = normalizedDecoded === normalizedTarget ||
+      normalizedDecoded.replace(/\s+/g, '') === normalizedTarget.replace(/\s+/g, '')
     if (exact || fuzzyTextMatch(normalizedDecoded, normalizedTarget)) {
       // Score by how much of the target this block actually CARRIES, not a flat
       // 1 for "fuzzy matched". A form draws "Código de Postulante" and its value
@@ -4719,6 +4786,16 @@ function applyLineReplacement(
         const bf = foldForMatch(b.decodedText).replace(/\s+/g, '')
         if (!bf || bf.includes('?')) continue
         if (!tFold.includes(bf)) return null
+      }
+      // The PRIMARY too, when the run has other members: it is REWRITTEN, so
+      // glyphs of its own that the target never named are deleted just as
+      // surely as a blanked neighbour's. A currency "$" drawn as its own block
+      // led a fuzzy run for the amount beside it, took the replacement, and
+      // the dollar sign vanished. A single-block run is exempt — there the
+      // primary IS the match the scorer accepted.
+      if (contributing.length > 1) {
+        const pf = foldForMatch(primary.decodedText).replace(/\s+/g, '')
+        if (pf && !pf.includes('?') && !tFold.includes(pf)) return null
       }
     }
   }
