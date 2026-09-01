@@ -1084,6 +1084,32 @@ text, so it could not be re-found and moved afterwards.
 The caller then makes `baselineDrop × 1.4 + gained × lineStep` of room below —
 the run's line box grew as well as multiplied.
 
+### The editor's backdrop is chosen against the text, not fixed
+The inline editor shows the line in ITS OWN colour — that is what makes it read
+as editing the text in place rather than in a dialog — so its panel cannot be a
+constant. It was `rgba(255,255,255,0.97)`, and a table header is white on dark
+blue: opening one showed an EMPTY box. The line was still there and still
+white, and simply could not be read while it was being typed. Any light colour
+does it — a yellow highlight, a pale grey caption — which is why `editorBackdrop`
+tests Rec. 709 LUMINANCE rather than "is it white", with the threshold above
+mid-grey so anything hard to read on white gets the dark panel instead.
+
+The colour goes on as an INLINE style, which outranks any selector, `:focus`
+included — the stylesheet still sets the light panel and would otherwise win
+back the moment the editor took focus. `caretColor` follows the text for the
+same reason the panel does.
+
+Measured on a Word table header: `getComputedStyle` reported
+`color: rgb(255,255,255)` on `background: rgba(255,255,255,0.97)` before, and on
+`rgba(32,33,36,0.97)` after; a body paragraph at `rgb(34,34,34)` still gets the
+light panel. The content-stream side was never at fault — the same edit measured
+2919→2857 dark and 961→999 white pixels in the cell, i.e. the replacement kept
+both the dark fill and the white glyphs.
+
+**The FreeText editor in `AnnotationLayer` has the same trap** — `.ft-editor`
+puts `editorStore.textColor` on a fixed near-white panel, so choosing white text
+there is invisible in the same way. Not fixed here.
+
 ### Reading a contenteditable: neither property will do
 `textContent` concatenates the div-per-line with nothing between them and
 destroys the break. `innerText` keeps the break but applies CSS rendering rules

@@ -418,6 +418,28 @@ const marqueeStyle = computed(() => {
   }
 })
 
+/**
+ * The editor shows the text in ITS OWN colour, so the backdrop has to be chosen
+ * against that colour rather than fixed.
+ *
+ * A table header is white on dark blue. The editor painted white on its own
+ * near-white panel, so opening one showed an empty box: the line was still
+ * there, still white, and simply could not be read while it was being typed —
+ * reported as "as it is white letter is hidden". Any light colour does it; a
+ * yellow highlight or a pale grey caption disappears the same way.
+ *
+ * Luminance, not a white test, for that reason. Rec. 709 coefficients, and the
+ * threshold sits above mid-grey so anything that would be hard to read on white
+ * gets the dark panel instead.
+ */
+function editorBackdrop(color: [number, number, number] | number[] | undefined) {
+  const [r, g, b] = color ?? [0, 0, 0]
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+  return lum > 0.62
+    ? 'rgba(32, 33, 36, 0.97)'   // light text — the app's own dark chrome
+    : 'rgba(255, 255, 255, 0.97)'
+}
+
 const editorStyle = computed(() => {
   if (!editingBlock.value) return {}
   const block = editingBlock.value
@@ -446,6 +468,10 @@ const editorStyle = computed(() => {
     fontWeight: block.isBold ? 'bold' : 'normal',
     fontStyle: block.isItalic ? 'italic' : 'normal',
     color: `rgb(${Math.round(block.color[0] * 255)}, ${Math.round(block.color[1] * 255)}, ${Math.round(block.color[2] * 255)})`,
+    // Beats the stylesheet's fixed panel, `:focus` rule included — an inline
+    // style outranks any selector.
+    background: editorBackdrop(block.color),
+    caretColor: `rgb(${Math.round(block.color[0] * 255)}, ${Math.round(block.color[1] * 255)}, ${Math.round(block.color[2] * 255)})`,
     lineHeight: '1.15'
   }
 })
