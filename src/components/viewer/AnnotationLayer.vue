@@ -425,7 +425,9 @@ function liveImgRect(img: ContentImageInfo): RectT {
  * image: it can still be moved, resized or deleted like any other.
  */
 const scanPage = computed(() => ocrStore.scanVerdicts.get(docStore.currentPage - 1) === true)
-const paperArea = computed(() => Math.max(1, props.pdfWidth * props.pdfHeight) * 0.5)
+// A twentieth of the page: a scan TILED into nine images (the supplier survey)
+// has no tile bigger than a ninth, and every tile is paper.
+const paperArea = computed(() => Math.max(1, props.pdfWidth * props.pdfHeight) * 0.05)
 
 const scaledContentImgs = computed(() => contentImages.value
   .map(img => {

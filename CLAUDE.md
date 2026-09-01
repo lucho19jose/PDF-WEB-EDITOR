@@ -2304,6 +2304,39 @@ Default language is `spa+chi_sim` (`OCR_DEFAULT_LANG`); Tesseract's Chinese
 model puts a word space between adjacent characters, which `buildItems` closes
 up. A page of both takes ~45 s including the sideways pass.
 
+### OCR on a ruled form: sparse segmentation, borders are not glyphs, a tiled scan is still a scan
+A Chinese supplier survey — one scan cut into NINE tiles, a table with ruled
+cells, a red stamp over the top right — "could not be edited": the edit tool
+said "0 text blocks found" and the OCR button returned half the cells. Four
+causes, each measured with `tools`-style node harnesses (tesseract.js runs in
+node against `public/tessdata`, MuPDF renders the page at 220 DPI):
+
+- **tesseract.js's default page segmentation is ONE uniform block** (mode 6),
+  and a form is a grid of short cells. On this page mode 6 finds 15 of 30
+  expected cells, automatic (3) 26, **sparse text (11) 28** with the fewest
+  borders read as glyphs. On a prose scan sparse still finds every expected
+  phrase at 94% against 95%, at about twice the time. `ensureWorker` sets it.
+- **A table's vertical rules come back as "|"**, on their own or stuck to the
+  word beside them, and glued two cells into one run. `buildItems` cuts the
+  line at a border-only word and shaves borders off word edges.
+- **A scan is detected by SUMMED image coverage** (`isScanLikePage`), not by
+  any one image covering half the page; and on a scan page every content image
+  of a twentieth of the paper or more is `paper` in the edit tool — transparent
+  to the pointer, so the click reaches the text overlay.
+- **CJK sideways is still CJK to the model.** The quarter-turn pass returned
+  seven confident sideways runs ("总 | E") on a page with none; sideways CJK
+  needs 78% and three real characters with no border in them. The pass also
+  reads a 0.7-scaled raster: a sideways label is never six-point body text,
+  and this halved a 45-second recognition to 17.
+
+Two sizing facts for CJK runs: an ideograph fills its em, so the Latin
+"no descender → box is 0.76 em" rule sized 10pt cells at 13pt
+(`GLYPH_BOX_PER_EM_CJK` = 0.92); and on a ruled form the WORD box swallows the
+cell border (a 6.5pt label in a 10.8pt box), so `cjkEm` takes the median GLYPH
+box instead. Runs the model hardly believes — the stamp read as "ci Y", "ee",
+"N" at 0–40% — are dropped by `isJunkRun`; two-character Chinese cells and
+numbers are kept whatever their confidence above 30.
+
 ### Writing text WinAnsi cannot hold: subset in a SCRATCH document, then graft
 The WASM build has no built-in CJK face, so `addTextToPage` fetches
 `public/fonts/NotoSansSC-Regular.otf` on the first run that needs it

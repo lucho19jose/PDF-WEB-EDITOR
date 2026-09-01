@@ -77,6 +77,67 @@ const GLYPH_BOX_PER_EM_MONO = 0.625
 const VERTICAL_ASPECT = 1.6
 /** Sideways recognition is speculative, so only confident runs are kept. */
 const VERTICAL_MIN_CONFIDENCE = 55
+/** Scale of the rotated raster the sideways pass reads (220 DPI × 0.7 ≈ 150 DPI). */
+const VERTICAL_SCALE = 0.7
+/**
+ * Sideways CJK needs more conviction than sideways Latin: a Chinese glyph
+ * turned a quarter turn still looks like a Chinese glyph to the model, so the
+ * stamp and the table borders came back as seven confident sideways runs
+ * ("总 | E", "> | 亚") on a page with no sideways text at all.
+ */
+const VERTICAL_MIN_CONFIDENCE_CJK = 78
+/** A CJK glyph's box as a fraction of its em — the ideograph fills the square. */
+const GLYPH_BOX_PER_EM_CJK = 0.92
+
+/**
+ * The em of a CJK run, from the MEDIAN glyph box.
+ *
+ * The word box will not do: on a ruled form it swallows the cell's border, and
+ * a 6.5pt label came back in a 10.8pt box. Glyph boxes are individually
+ * honest — a border inflates one or two of them, never the median. Fewer than
+ * two glyph boxes falls back to the run's own height.
+ */
+function cjkEm(run: any[], runHeight: number): number {
+  // An ideograph is square, so a glyph box taller than it is wide has
+  // swallowed a rule above or below: the smaller side is the honest one.
+  // (Measured: 公司地址 kept a 10.8pt height on every glyph, 6.5pt widths.)
+  const sides = run.flatMap((w: any) => (w.symbols ?? []).map((s: any) =>
+    Math.min(s.bbox.y1 - s.bbox.y0, (s.bbox.x1 - s.bbox.x0) * 1.05)))
+    .filter((h: number) => h > 0).sort((a: number, b: number) => a - b)
+  if (sides.length < 2) return runHeight / GLYPH_BOX_PER_EM_CJK
+  return sides[Math.floor(sides.length / 2)] / GLYPH_BOX_PER_EM_CJK
+}
+
+/** Han characters make up at least half of the letters. */
+function isMostlyCjk(text: string): boolean {
+  const letters = text.replace(/[^\p{L}\p{N}]/gu, '')
+  if (!letters) return false
+  const han = (letters.match(/\p{Script=Han}/gu) ?? []).length
+  return han * 2 >= letters.length
+}
+
+/**
+ * A run that is noise, not text.
+ *
+ * A stamp, a signature and a table's corners come back as a dozen boxes
+ * reading "ci Y", "ee", "N", "ze" at 0–40% — one box each over ink that is
+ * not a word. A run the model itself hardly believes is dropped, and so is a
+ * run of one or two letters it only half believes, unless it is Chinese (a
+ * two-character cell like 邮箱 is a whole label) or a number (a form's "1").
+ */
+function isJunkRun(text: string, confidence: number): boolean {
+  if (confidence < 30) return true
+  const letters = text.replace(/[^\p{L}\p{N}]/gu, '')
+  if (!letters) return true
+  if (letters.length <= 2 && confidence < 60 && !/[\p{Script=Han}\p{N}]/u.test(letters)) return true
+  return false
+}
+
+/** Table borders read as glyphs: a pipe on its own, or wrapped round a word. */
+const BORDER_WORD = /^[|｜丨]+$/
+function stripBorders(text: string): string {
+  return text.replace(/^[|｜丨]+|[|｜丨]+$/g, '')
+}
 
 interface Box { x0: number; y0: number; x1: number; y1: number }
 
@@ -147,6 +208,14 @@ function createOCR() {
         if (typeof m.status === 'string') stage.value = m.status
       }
     })
+    // SPARSE TEXT segmentation, not the library's default of one uniform
+    // block. A form is a grid of short cells, and read as a single block the
+    // Chinese supplier survey lost half of them — 公司地址, 联系人, the phone
+    // number, the SWIFT code all absent. Measured on that page: mode 6 finds
+    // 15 of 30 expected cells, automatic (3) 26, sparse (11) 28 with the fewest
+    // table borders read as "|". On a prose scan sparse finds every expected
+    // phrase at 94% against 95%, at about twice the time.
+    await w.setParameters({ tessedit_pageseg_mode: '11' as any })
     worker.value = w
     workerLang = lang
     return w
@@ -360,23 +429,39 @@ function createOCR() {
       for (const para of block.paragraphs ?? []) {
         const lines = para.lines ?? []
         for (const line of lines) {
-          const allWords = (line.words ?? []).filter((w: any) => (w.text ?? '').trim())
+          // A table's vertical rules come back as "|" glyphs — on their own or
+          // stuck to the word beside them — and a rule between two cells glued
+          // "辽宁泓瑞机电装备有限公司 | 法定代表人" into one run. A border-only
+          // word is a cell boundary: the line is cut there and the border
+          // dropped; a border on the edge of a word is shaved off it.
+          const rawWords = (line.words ?? [])
+            .map((w: any) => BORDER_WORD.test((w.text ?? '').trim()) ? w : { ...w, text: stripBorders(w.text ?? '') })
+            .filter((w: any) => (w.text ?? '').trim())
+          const segments: any[][] = [[]]
+          for (const w of rawWords) {
+            if (BORDER_WORD.test(w.text.trim())) { if (segments[segments.length - 1].length) segments.push([]); continue }
+            segments[segments.length - 1].push(w)
+          }
+          const allWords = rawWords.filter((w: any) => !BORDER_WORD.test(w.text.trim()))
           if (!allWords.length) continue
           const lineText = allWords.map((w: any) => w.text).join(' ')
           const lineEm = emOf(allWords, line.bbox.y1 - line.bbox.y0, lineText)
 
-          for (const run of splitRuns(allWords, lineEm)) {
+          for (const run of segments.filter(s => s.length).flatMap(seg => splitRuns(seg, lineEm))) {
             // Tesseract's Chinese model puts a "word" space between adjacent
             // characters; Chinese has none, so those are closed up again.
             const text = run.map(w => w.text).join(' ').replace(/\s+/g, ' ').trim()
-              .replace(/(\p{Script=Han})\s+(?=\p{Script=Han})/gu, '$1')
+              .replace(/([\p{Script=Han}　-〿＀-￯])\s+(?=[\p{Script=Han}　-〿＀-￯])/gu, '$1')
             if (!text) continue
 
             const bb = unionBox(run)
             const pxRect = { x: bb.x0, y: bb.y0, width: bb.x1 - bb.x0, height: bb.y1 - bb.y0 }
             if (pxRect.width < 2 || pxRect.height < 2) continue
 
-            const emPx = emOf(run, pxRect.height, text)
+            // A CJK glyph fills its em, ascender to descender, so the box IS
+            // the em; the Latin rule (tallest box = 0.76 of an em when nothing
+            // descends) sized a 10pt Chinese cell at 13pt.
+            const emPx = isMostlyCjk(text) ? cjkEm(run, pxRect.height) : emOf(run, pxRect.height, text)
             const { color } = sampleLineColors(ctx, pxRect)
             const background = samplePatchColor(ctx, pxRect)
 
@@ -410,6 +495,7 @@ function createOCR() {
               : 0
 
             const conf = run.reduce((s: number, w: any) => s + (w.confidence ?? 0), 0) / run.length
+            if (isJunkRun(text, conf)) continue
 
             items.push({
               id: `${pageIndex}:ocr:${seq.n++}`,
@@ -558,6 +644,13 @@ function createOCR() {
   ): Promise<OcrTextItem[]> {
     const H = source.height
 
+    // Read at a reduced scale: a sideways label is a chart axis or a margin
+    // note, never six-point body text, and the rotated pass of a full page in
+    // the Chinese model took four times as long as the upright one. The
+    // rotated raster is drawn at VERTICAL_SCALE and every box mapped back.
+    const k = VERTICAL_SCALE
+    // Full-size rotated copy for the face detector and the colour samplers,
+    // which read pixels at the boxes' own coordinates.
     const rot = document.createElement('canvas')
     rot.width = source.height
     rot.height = source.width
@@ -567,9 +660,35 @@ function createOCR() {
     rctx.translate(H, 0)
     rctx.rotate(Math.PI / 2)
     rctx.drawImage(source, 0, 0)
+    // The reduced copy the recogniser actually reads.
+    const small = document.createElement('canvas')
+    small.width = Math.max(1, Math.round(rot.width * k))
+    small.height = Math.max(1, Math.round(rot.height * k))
+    const sctx = small.getContext('2d')
+    if (!sctx) return []
+    sctx.drawImage(rot, 0, 0, small.width, small.height)
 
     stage.value = 'Looking for sideways text...'
-    const { data } = await w.recognize(rot, {}, { blocks: true })
+    const { data: rawData } = await w.recognize(small, {}, { blocks: true })
+    // Back to the unscaled rotated frame, so the mapping below is unchanged.
+    const unscale = (b: Box): Box => ({ x0: b.x0 / k, y0: b.y0 / k, x1: b.x1 / k, y1: b.y1 / k })
+    const data = {
+      ...rawData,
+      blocks: (rawData.blocks ?? []).map((b: any) => ({
+        ...b, bbox: unscale(b.bbox),
+        paragraphs: (b.paragraphs ?? []).map((p: any) => ({
+          ...p, bbox: unscale(p.bbox),
+          lines: (p.lines ?? []).map((l: any) => ({
+            ...l, bbox: unscale(l.bbox),
+            baseline: l.baseline ? { ...l.baseline, x0: l.baseline.x0 / k, y0: l.baseline.y0 / k, x1: l.baseline.x1 / k, y1: l.baseline.y1 / k } : l.baseline,
+            words: (l.words ?? []).map((wd: any) => ({
+              ...wd, bbox: unscale(wd.bbox),
+              symbols: (wd.symbols ?? []).map((s: any) => ({ ...s, bbox: unscale(s.bbox) }))
+            }))
+          }))
+        }))
+      }))
+    }
 
     const boxOf = (it: OcrTextItem): Box => ({
       x0: it.rect.x / toPt,
@@ -591,8 +710,13 @@ function createOCR() {
 
     const kept: OcrTextItem[] = []
     for (const item of found) {
-      if (item.confidence < VERTICAL_MIN_CONFIDENCE) continue
-      if (item.text.replace(/\s/g, '').length < 2) continue
+      const letters = item.text.replace(/[^\p{L}\p{N}]/gu, '')
+      const cjk = /\p{Script=Han}/u.test(item.text)
+      if (item.confidence < (cjk ? VERTICAL_MIN_CONFIDENCE_CJK : VERTICAL_MIN_CONFIDENCE)) continue
+      // Three real characters, and no table border in them: "总 | E" is a
+      // border and a stamp read sideways, not a label.
+      if (letters.length < 3) continue
+      if (/[|｜丨]/.test(item.text)) continue
       if (item.rect.height < item.rect.width * VERTICAL_ASPECT) continue
       const box = {
         x0: item.rect.x / toPt,

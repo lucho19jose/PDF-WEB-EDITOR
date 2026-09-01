@@ -187,11 +187,20 @@ async function isScanLikePage(pageIndex: number): Promise<boolean> {
     if (ocr.judgeScanned(chars).scanned) {
       const size = await pdfEngine.getPageSize(pageIndex)
       const paper = Math.max(1, size.width * size.height)
+      // Summed, not "any one image": the supplier survey is one scan TILED
+      // into nine images of a ninth of the page each, and no single tile
+      // covers half of anything. Each tile is clipped to the paper first so an
+      // image hanging off the edge cannot count for more than it shows.
       const images = await pdfEngine.listContentImages(pageIndex)
-      verdict = images.some(img => {
-        const [x0, y0, x1, y1] = img.rect
-        return Math.abs((x1 - x0) * (y1 - y0)) >= paper * 0.5
-      })
+      let covered = 0
+      for (const img of images) {
+        const x0 = Math.max(0, Math.min(img.rect[0], img.rect[2]))
+        const x1 = Math.min(size.width, Math.max(img.rect[0], img.rect[2]))
+        const y0 = Math.max(0, Math.min(img.rect[1], img.rect[3]))
+        const y1 = Math.min(size.height, Math.max(img.rect[1], img.rect[3]))
+        if (x1 > x0 && y1 > y0) covered += (x1 - x0) * (y1 - y0)
+      }
+      verdict = covered >= paper * 0.5
     }
   } catch (_) { verdict = false }
   ocrStore.scanVerdicts.set(pageIndex, verdict)
