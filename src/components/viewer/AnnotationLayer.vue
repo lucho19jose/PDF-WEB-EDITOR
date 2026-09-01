@@ -305,19 +305,42 @@ const captureCursor = computed(() => {
 const selectedAnnot = computed(() => annotations.value.find(a => a.index === selectedIndex.value) || null)
 
 // --- existing annotation rendering ---
+/**
+ * A hit-target this big is a click SHIELD: past this area (in PDF points —
+ * a 200x200pt square, 7x7cm, several times any signature, note or patch,
+ * and well under a screenshot-sized insert at ~470x300pt) an annotation's
+ * rectangle covers whole paragraphs, and at z 16 it took every click meant
+ * for the text (z 4) and the page's images (z 3) beneath it.
+ * Inserting one screenshot-sized image made the region under it completely
+ * dead — no text edit, no image move — reported as the editor breaking after
+ * an insert. The same rule the content images follow: the smaller target
+ * takes the click. A big annotation drops UNDER the text but stays above the
+ * content images, and comes back on top while SELECTED so it can be dragged
+ * from anywhere — selecting it needs one click on any uncovered part of it,
+ * or the band sweep.
+ */
+const BIG_ANNOT_AREA = 40000
 const scaledAnnots = computed(() => annotations.value.map(a => {
   const r = liveAnnotRect(a)
+  const area = Math.max(0, r[2] - r[0]) * Math.max(0, r[3] - r[1])
+  const big = area > BIG_ANNOT_AREA
+  const isSelected = selectedIndex.value === a.index || multiAnnots.value.has(a.index)
   return {
     index: a.index,
     title: `${a.type}${a.contents ? ': ' + a.contents : ''}`,
+    area,
     style: {
       left: `${r[0] * scaleX.value}px`,
       top: `${r[1] * scaleY.value}px`,
       width: `${Math.max(2, (r[2] - r[0]) * scaleX.value)}px`,
-      height: `${Math.max(2, (r[3] - r[1]) * scaleY.value)}px`
+      height: `${Math.max(2, (r[3] - r[1]) * scaleY.value)}px`,
+      zIndex: big && !isSelected ? 3 : 16
     }
   }
-}))
+  // Biggest first, so among the annotations themselves a signature sitting on
+  // an inserted screenshot still wins its own click — the same ordering the
+  // content images use for a frame around a photograph.
+}).sort((x, y) => y.area - x.area))
 
 type AnnotHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
 
@@ -1110,13 +1133,27 @@ function onAnnotMouseDown(e: MouseEvent, index: number) {
   }
   if (multiAnnots.value.has(index) && multiCount.value > 1) { startMultiMove(e); return }
   clearMultiSelection()
+  // A big annotation only sits above the text WHILE selected (see
+  // scaledAnnots) — so a plain click on it while selected must deselect, or
+  // the text underneath stays shielded with no way through: click once to
+  // pick the image up, click again to put it down and reach what it covers.
+  const wasSelected = selectedIndex.value === index
   selectedIndex.value = index
   selectedImgId.value = null
   const a = annotations.value.find(x => x.index === index)
   if (!a) return
   moveState.value = { kind: 'annot', index, startX: e.clientX, startY: e.clientY, dx: 0, dy: 0, moved: false, rect: a.rect }
+  const clickOff = wasSelected ? () => { if (moveState.value === null) selectedIndex.value = null } : null
   window.addEventListener('mousemove', onMoveMove)
   window.addEventListener('mouseup', onMoveUp)
+  if (clickOff) {
+    window.addEventListener('mouseup', function once(ev) {
+      window.removeEventListener('mouseup', once)
+      // onMoveUp has run by now (registered first): moveState is null and, if
+      // the mouse never moved, this was a plain second click — release.
+      if (Math.abs(ev.clientX - e.clientX) < 3 && Math.abs(ev.clientY - e.clientY) < 3) clickOff()
+    })
+  }
 }
 
 function onImgMouseDown(e: MouseEvent, id: number) {

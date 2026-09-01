@@ -368,6 +368,31 @@ successes, no regressions. The same gate is why `N°` accepts `Nro`, `No`, `N`
 and `De` but not `zzz` — that font has no `z` — which reads as "some edits work
 and some don't" unless you know what to look at.
 
+### A big annotation is a click SHIELD — the smaller target takes the click, again
+Inserting one screenshot-sized image (~470x300pt) made everything under its
+rectangle dead: the annotation hit-target sits at z 16, text at 4, content
+images at 3, so every click inside its footprint selected the stamp — no
+text edit, no image move, reported as "after I insert an image I can't do
+anything, maybe performance". Nothing was slow (a 12MB document commits a
+move in ~1.1s); the clicks simply never arrived.
+
+Same rule the content images already follow, extended to annotations:
+
+- An annotation over 40,000 pt² (200x200pt — several times any signature,
+  note or patch) drops to z 3: text and everything else win their clicks
+  over it, and it stays above the content images.
+- Among annotations, `scaledAnnots` sorts BIGGEST FIRST, so a signature
+  sitting on an inserted screenshot still wins its own click — the same
+  ordering the content images use for a frame around a photograph.
+- While SELECTED it comes back to z 16 so it can be dragged from anywhere —
+  and a plain click (no drag) on an already-selected annotation DESELECTS
+  it, or the text underneath would stay shielded with no way through: click
+  once to pick the image up, click again to put it down.
+
+Verified in the browser on the reported document: text under the inserted
+image opens its editor, the image itself moves, the second click releases
+it, and the signature widgets still take their own clicks.
+
 ### A space-padded table strip splits at its padding — but only a proven strip
 The fund-request form pads its amount row with literal SPACE GLYPHS —
 "S/    1,170.00S/    210.60S/ …" — so `splitBlocksAtGaps`, which only split
