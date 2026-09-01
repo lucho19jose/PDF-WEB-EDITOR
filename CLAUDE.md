@@ -368,6 +368,41 @@ successes, no regressions. The same gate is why `N°` accepts `Nro`, `No`, `N`
 and `De` but not `zzz` — that font has no `z` — which reads as "some edits work
 and some don't" unless you know what to look at.
 
+### Td lives in the space the Tm MATRIX defines — compose it, or positions lie
+`scanShowOps` used to add Td operands straight onto the Tm translation, which
+is only right while the Tm matrix is the identity. The bilingual form's table
+blocks set `0 1.00124 -1 0 e f Tm` (a quarter turn) and step between rows
+with `-713 -20.76 Td`: every op's tracked position lived in a frame nothing
+else uses, so the clicked cell could not be compared against anything.
+Positions are now accumulated in line space and pushed through the matrix —
+for an identity Tm the arithmetic is unchanged, and the sweep gained two
+MOVE experiments on the SUNAT guía that had never passed.
+
+Three consumers were fixed with it, all found through one report — "I edited
+the second row and the THIRD changed":
+
+- **`blockLocalPoint` maps ALL FOUR corners.** Probing only y-varied points
+  at bbox[0] collapses the local box to a single point under an axis-swapping
+  CTM (xEnd === x, yLo === yHi) — every overlap test then compared against
+  nothing. It also returns `unitScale` (√|det CTM|) so local-frame distances
+  can be stated in page points before being ranked against page-frame ones.
+- **Containment candidates rank by where the target is DRAWN, not where the
+  block starts** (`opRunDistanceToTarget`). One BT straddles table rows on
+  this producer, every row repeats "MSP-SIST-CS-2024-003-002", and the
+  block-origin ranking routinely picked the block drawing the NEXT row's copy
+  — the edit landed one row down while reporting success. The admission test
+  ALSO waves garbled blocks through: block-level decode does not follow
+  mid-block Tf switches, those cells decode as '?', and `wildcardIncludes`
+  treats '?' as a wildcard — so position is the only honest signal here. A
+  block whose ops decode to nothing keeps its origin distance rather than
+  being dropped.
+- The op-window and in-array choosers inside `applyPartialBlockReplacement`
+  compare the same corrected positions automatically.
+
+Measured: all eight rows' code cells edit their OWN row (was: off by one),
+every earlier page-2 case still lands with char_delta 0, and the sweep is
+262/228 — two experiments BETTER than baseline, none worse.
+
 ### Arriving on a page adopts BOTH its geometries, or the overlays lie
 `adoptCurrentGeometry` runs only when a page is RENDERED, and a page already
 painted is not re-rendered on arrival — so `pdfPageWidth/Height` kept the

@@ -4210,6 +4210,16 @@ function replaceTextInContentStreamFontAware(
           const runDist = runDistanceToTarget(block, normalizedTarget, pageIndex, stream, targetBlock, pageHeight)
           if (runDist === null || runDist > onTarget) continue
           dist = runDist
+        } else {
+          // Rank by where the target is DRAWN, not where the block starts.
+          // One BT can straddle table rows, and every row repeats the same
+          // value ("MSP-SIST-CS-2024-003-002" in eight rows): ranked by
+          // origin, the block nearest the click was routinely the one drawing
+          // the NEXT row's copy, and the edit landed one row down. Only when
+          // an op carrying the target is found — a block whose ops decode to
+          // '?' keeps its origin distance rather than being dropped.
+          const runDist = opRunDistanceToTarget(block, normalizedTarget, pageIndex, stream, targetBlock, pageHeight)
+          if (runDist !== null) dist = runDist
         }
         // Below every direct fuzzy score (>= 0.7): at equal distance a whole
         // match still beats a fragment of a bigger block.
@@ -5285,21 +5295,37 @@ function scanShowOps(
   )
 
   const ops: ShowOpInfo[] = []
-  let x = 0, y = 0, leading = 0
+  // Td translates the LINE matrix, so its operands live in the space the Tm
+  // MATRIX defines — adding them straight onto the translation is only right
+  // while that matrix is the identity. This bilingual form sets
+  // `0 1.00124 -1 0 e f Tm` (a quarter turn) and then steps between table
+  // rows with `-713 -20.76 Td`: raw addition put every op in a frame no other
+  // measurement uses, the clicked position could not be compared against
+  // anything, and editing a cell landed one ROW off — the wrong block won the
+  // ranking and nothing downstream could tell. Accumulate Td/T* in line space
+  // and push them through the matrix; for an identity Tm this is byte-for-byte
+  // the old arithmetic.
+  let ma = 1, mb = 0, mc = 0, md = 1 // Tm matrix in force
+  let ex = 0, ey = 0                 // Tm translation
+  let ux = 0, uy = 0                 // accumulated line-space Td offsets
+  let leading = 0
   let curFont: string | null = null
   let m: RegExpExecArray | null
   while ((m = re.exec(content)) !== null) {
-    if (m[1] !== undefined) { // Tm — take translation part
-      x = parseFloat(m[5]); y = parseFloat(m[6])
+    if (m[1] !== undefined) { // Tm — matrix AND translation
+      ma = parseFloat(m[1]); mb = parseFloat(m[2])
+      mc = parseFloat(m[3]); md = parseFloat(m[4])
+      ex = parseFloat(m[5]); ey = parseFloat(m[6])
+      ux = 0; uy = 0
       continue
     }
     if (m[7] !== undefined) { // Td / TD
-      x += parseFloat(m[7]); y += parseFloat(m[8])
+      ux += parseFloat(m[7]); uy += parseFloat(m[8])
       if (m[9] === 'TD') leading = -parseFloat(m[8])
       continue
     }
     if (m[10] !== undefined) { leading = parseFloat(m[10]); continue } // TL
-    if (m[0] === 'T*') { y -= leading; continue }
+    if (m[0] === 'T*') { uy -= leading; continue }
     if (m[14] !== undefined) { // Tf
       curFont = m[14]
       if (resolveFont) {
@@ -5315,7 +5341,7 @@ function scanShowOps(
       m[11] !== undefined ? 'TJ'
       : m[12] !== undefined ? 'dquote'
       : raw.trimEnd().endsWith("'") ? 'quote' : 'Tj'
-    if (kind === 'quote' || kind === 'dquote') { y -= leading } // implicit T*
+    if (kind === 'quote' || kind === 'dquote') { uy -= leading } // implicit T*
     ops.push({
       start: m.index,
       end: m.index + raw.length,
@@ -5323,7 +5349,8 @@ function scanShowOps(
       decoded: decodeBtBlockText(raw, encoding, simpleInfo),
       kind,
       isHex: /<[0-9A-Fa-f\s]*[0-9A-Fa-f]/.test(raw),
-      x, y,
+      x: ex + ma * ux + mc * uy,
+      y: ey + mb * ux + md * uy,
       fontRef: curFont
     })
   }
@@ -5636,7 +5663,7 @@ function blockLocalPoint(
   block: BtInfo,
   targetBlock: TextBlock,
   pageHeight?: number
-): { x: number; y: number; xEnd: number; yLo: number; yHi: number } | null {
+): { x: number; y: number; xEnd: number; yLo: number; yHi: number; unitScale: number } | null {
   if (pageHeight === undefined) return null
   const ctm = getFullCtmAtOffset(stream, block.start)
   const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
@@ -5645,20 +5672,73 @@ function blockLocalPoint(
     const ax = pageX - ctm[4], ay = pageY - ctm[5]
     return { x: (ax * ctm[3] - ay * ctm[2]) / det, y: (ay * ctm[0] - ax * ctm[1]) / det }
   }
-  const midY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2 // bottom-up
-  const a = map(targetBlock.bbox[0], midY)
   // The whole BOX, not one point. A run is judged by whether it overlaps the
   // clicked text, and neither a width nor a line height in page points is a
   // width or a height in the block's own space. The vertical span matters as
   // much as the horizontal: a baseline sits a few points below the middle of
   // the box it draws, and treating that as displacement rejects the very run
   // that drew it.
-  const top = map(targetBlock.bbox[0], pageHeight - targetBlock.bbox[1]).y
-  const bot = map(targetBlock.bbox[0], pageHeight - targetBlock.bbox[3]).y
-  return {
-    x: a.x, y: a.y, xEnd: map(targetBlock.bbox[2], midY).x,
-    yLo: Math.min(top, bot), yHi: Math.max(top, bot)
+  //
+  // ALL FOUR corners, because the CTM can swap the axes. On a /Rotate page the
+  // invocation CTM is a quarter turn, and probing only y-varied points at
+  // bbox[0] collapsed the local box to a single point (xEnd === x,
+  // yLo === yHi) — every overlap test then compared against nothing.
+  const xs: number[] = []
+  const ys: number[] = []
+  for (const px of [targetBlock.bbox[0], targetBlock.bbox[2]]) {
+    for (const py of [pageHeight - targetBlock.bbox[1], pageHeight - targetBlock.bbox[3]]) {
+      const p = map(px, py)
+      xs.push(p.x); ys.push(p.y)
+    }
   }
+  const xLo = Math.min(...xs), xHi = Math.max(...xs)
+  return {
+    x: xLo, y: (Math.min(...ys) + Math.max(...ys)) / 2, xEnd: xHi,
+    yLo: Math.min(...ys), yHi: Math.max(...ys),
+    // One local unit in PAGE points — multiply a local-frame distance by this
+    // before comparing it against page-frame ones (a 0.12-scaled stream's
+    // local distances are 8x the page's).
+    unitScale: Math.sqrt(Math.abs(det))
+  }
+}
+
+/**
+ * Distance (page points) from the clicked box to the nearest show op in
+ * `block` whose own decoded text carries the target (or a substantial piece
+ * of it) — or null when no op does.
+ *
+ * A block's ORIGIN is a lie on this producer: one BT straddles table rows, so
+ * the block nearest-by-origin to the clicked cell is routinely the one that
+ * draws the NEXT row's copy of the same value — every row repeats
+ * "MSP-SIST-CS-2024-003-002", and ranking the containment candidates by
+ * origin edited the row below the one clicked. The op that draws the value
+ * has a real position (Tm-matrix composed, see scanShowOps); measure THAT.
+ */
+function opRunDistanceToTarget(
+  block: BtInfo,
+  targetNorm: string,
+  pageIndex: number,
+  stream: string,
+  targetBlock: TextBlock,
+  pageHeight?: number
+): number | null {
+  const tFree = targetNorm.replace(/\s+/g, '')
+  if (!tFree) return null
+  const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
+  if (!local) return null
+  const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+  let best: number | null = null
+  for (const op of ops) {
+    const of = op.decoded.replace(/\s+/g, '')
+    if (!of) continue
+    if (!(of.includes(tFree) || (of.length >= 3 && tFree.includes(of)))) continue
+    const dx = op.x < local.x ? local.x - op.x : (op.x > local.xEnd ? op.x - local.xEnd : 0)
+    const dy = op.y < local.yLo ? local.yLo - op.y : (op.y > local.yHi ? op.y - local.yHi : 0)
+    const d = Math.hypot(dx, dy) * local.unitScale
+    if (best === null || d < best) best = d
+  }
+  return best
 }
 
 /** Horizontal advance of one Tj/TJ op, in text-space units, or null if unknown. */
