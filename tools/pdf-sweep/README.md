@@ -51,6 +51,23 @@ node tools/pdf-sweep/features.mjs
 node tools/pdf-sweep/report.mjs
 ```
 
+### Without a browser
+
+The engine can run in node (`node-harness.mjs` loads the worker through Vite's
+SSR loader with a fake `self`), which makes the sweep a one-minute job:
+
+```bash
+node tools/pdf-sweep/sweep-node.mjs new.json
+# baseline: a worktree of the last commit with node_modules and public/_sweep
+# junctioned in (cmd /c mklink /J), then
+PDF_ROOT=C:/path/to/baseline node tools/pdf-sweep/sweep-node.mjs base.json
+node tools/pdf-sweep/compare-sweeps.mjs base.json new.json
+```
+
+Visual similarity is not measured on this path (no viewer); everything else
+the driver judges is. Unlink the junctions with `cmd /c rmdir` before removing
+the worktree.
+
 ## Output
 
 - `reports/NNN.json` — one report per PDF: features, every experiment, per-strategy

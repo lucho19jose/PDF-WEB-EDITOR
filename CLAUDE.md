@@ -1402,10 +1402,9 @@ ratio (~0.97) — so the label won, was rewritten, and the value was left strand
 beside the new text while the edit reported success. Single-block candidates are
 now scored by `matchRatio`, i.e. by how much of the target they actually carry.
 
-### Reflow is OFF by default — but a DRAG always makes room
+### Reflow is OFF by default — and OFF, a drag moves only what was dragged
 `editorStore.reflowOnEdit` gates the line-count reflow, the page spill, the
-image room-making and the resize room-making. It does NOT gate the move
-collision, and gating it there was a mistake.
+image room-making, the resize room-making AND the move collision.
 
 The toggle is off by default because most documents people edit are not flowing
 prose. On a form or a table — labels and values drawn at fixed coordinates in
@@ -1414,15 +1413,19 @@ real inscription form one Enter turned 55 blocks into 68 and left "Teléfono 2"
 printed over "Teléfono". With the toggle off an edit changes only what was
 edited (measured: 55 → 56 blocks, 2 moved).
 
-Dropping a paragraph on top of another one is not that case. The user aimed at
-that spot; a content stream has no flow to make room by itself; and leaving the
-two overlaid is not the conservative outcome, it is the unreadable one. Ctrl+Z
-takes back the whole move, displacements included. Sweeping the drag in with the
-typing under one toggle made moving text silently start overlapping it —
-reported as "before this was fine, now it doesn't work".
-
-The distinction is between an edit that rearranges a page as a SIDE EFFECT and a
-gesture whose whole purpose is to put something somewhere.
+The move collision was for a while exempt from the toggle, on the argument
+that dropping a paragraph onto another leaves the two unreadable and the
+user plainly meant to put it there. That decision has been reversed by the
+same shape of evidence that set the default: on a Word pivot table whose
+rows sit 15pt apart, nudging the "0" in the first row a few points
+overlapped the row beneath, that row was pushed, it overlapped the next, and
+the cascade ran through all twelve rows to the foot of the page while every
+rule and coloured fill stayed put — "when I move it, it makes a disorder in
+its neighbourhood; in Adobe it works". Acrobat moves the block and nothing
+else. An overlap is visible and one Ctrl+Z (or one more drag) from fixed; a
+table torn off its borders is not. The collision plan is still built so the
+status line can say how many lines the drop landed on and that Reflow would
+push them aside; ON, the old behaviour stands for prose.
 
 ### Paging keys, and finding the element that actually scrolls
 Up and Down scroll the page they are on first and turn the page only once there
@@ -2748,6 +2751,46 @@ read as the edit having wrecked the line, and the second line of the same
 bullet (no bullet glyph) "worked". `textFaceOf` takes the first letter or
 digit's face and never uses a symbol face (Symbol, Wingdings, Webdings,
 Dingbats, Marlett, MT Extra) as a family; the bucket fallback stands in.
+
+### A one-character block is matched by position, and a missing digit is borrowed from a sibling subset
+A pivot table exported from Word (the "COMPROBANTES EMITIDOS" count sheet,
+signed through Intellisign) draws every count as its own BT — "    3",
+"  9", "         7" — and reported *"Could not find matching text in content
+stream"* for every single-digit cell while "2130" beside it edited fine.
+Step 3 of `replaceTextInContentStreamFontAware` skipped any block whose
+decoded text is under two characters, a floor meant to stop a lone letter
+fuzzy-matching half the page; no other pass admits a whole-block exact
+match, so the cell had zero candidates. A one-character block is now
+admitted only as an EXACT match that SITS on the click (`dist <= max(6,
+height)`), the same gate the blank-field and lone-label passes use.
+
+The same sheet embeds one CID subset of MinionPro per cell: `/C0_2` holds
+"3", "7" and a space, `/C0_1` every digit. Changing "33" to "34" could not
+be encoded in `/C0_2`, and the base-14 fallback drew a Helvetica "4" beside
+a Minion "3". `findSiblingSubset` in `planTextEncoding` now tries, before
+any foreign face, every OTHER Type0 font in the active resources whose
+/BaseFont matches with the subset prefix stripped, and returns a hex
+`subst` plan on the first whose ToUnicode encodes every line. Helvetica is
+only for what no subset on the page can draw ("2222" → "1884" in the Bold
+subsets, which hold only 0, 2 and 6).
+
+Measured with the node harness (below): all 14 numeric cells and the title
+edit and read back; the corpus sweep is experiment-identical to baseline
+(262 experiments, 229 successes, no strategy or substitution changed —
+the sweep's markers are 4+ Latin capitals, so neither path is exercised
+there).
+
+### The engine runs in node — reproduce first, browser second
+`tools/pdf-sweep/node-harness.mjs` loads the worker through Vite's SSR
+loader with a fake `self`, so a report can be reproduced in seconds without
+a browser (the chrome-devtools MCP profile is often locked by another
+session), and `tools/pdf-sweep/sweep-node.mjs` runs the sweep driver on it
+in under a minute against ~9 in the browser. To get a baseline, `git
+worktree add` the last commit, junction `node_modules` and `public/_sweep`
+into it (`cmd /c mklink /J`), run with `PDF_ROOT` pointing at it, and diff
+with `compare-sweeps.mjs`. Unlink the junctions with `cmd /c rmdir` BEFORE
+removing the worktree — `git worktree remove` fails on them, and `rm -rf`
+would walk into the real `node_modules`.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates

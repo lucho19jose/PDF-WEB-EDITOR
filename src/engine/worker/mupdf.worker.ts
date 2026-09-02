@@ -1978,9 +1978,68 @@ function substLiteral(plan: { byteLines: string[]; hex?: boolean; hexLines?: str
 }
 
 /**
+ * Another font resource in the ACTIVE resources with the same /BaseFont as
+ * `fontRef` (subset prefix stripped), a Type0 font with a ToUnicode CMap that
+ * can encode every line. Returns the first that can; null when none.
+ *
+ * Only Type0 siblings are considered: the plan that consumes this emits hex
+ * CIDs, which is what a CID font's Tj expects and what a simple font's is not.
+ */
+function findSiblingSubset(
+  pageIndex: number, fontRef: string, lines: string[]
+): { ref: string; baseFont: string; hexLines: string[] } | null {
+  if (!pdfDoc) return null
+  let page: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    const resources = resolveResources(page.getObject())
+    const fontDict = resources?.get('Font')
+    if (!fontDict || String(fontDict) === 'null') return null
+    const dict = fontDict.resolve?.() ?? fontDict
+    const describe = (val: any): { subtype: string; base: string } | null => {
+      try {
+        const f = val.resolve?.() ?? val
+        const base = f.get('BaseFont')
+        const subtype = f.get('Subtype')
+        return {
+          subtype: String(subtype?.asName?.() ?? subtype ?? '').replace(/^\//, ''),
+          base: normalizeFontName(String(base?.asName?.() ?? base ?? ''))
+        }
+      } catch (_) { return null }
+    }
+    const own = describe(dict.get(fontRef))
+    if (!own || !own.base) return null
+
+    let found: { ref: string; baseFont: string; hexLines: string[] } | null = null
+    dict.forEach((val: any, key: any) => {
+      if (found) return
+      const ref = String(key).replace(/^\//, '')
+      if (ref === fontRef) return
+      const d = describe(val)
+      if (!d || d.subtype !== 'Type0' || d.base !== own.base) return
+      const enc = getFontEncoding(pageIndex, ref)
+      if (!enc || enc.unicodeToGlyph.size === 0) return
+      const hexLines: string[] = []
+      for (const line of lines) {
+        const res = encodeTextForFont(line, enc)
+        if ('error' in res) return
+        hexLines.push(res.hex)
+      }
+      found = { ref, baseFont: d.base, hexLines }
+    })
+    return found
+  } catch (_) {
+    return null
+  } finally {
+    try { page?.destroy() } catch (_) { /* ignore */ }
+  }
+}
+
+/**
  * Decide how to encode replacement text for a BT block:
  * 1. Re-encode with the original font when every character is available.
- * 2. Otherwise substitute a matching standard font (Acrobat-style fallback).
+ * 2. Otherwise a sibling subset of the same face already on the page.
+ * 3. Otherwise substitute a matching standard font (Acrobat-style fallback).
  */
 function planTextEncoding(
   pageIndex: number,
@@ -2062,6 +2121,23 @@ function planTextEncoding(
     return block.mode === 'hex'
       ? { kind: 'keep-hex', hexLines: lines.map(() => '') }
       : { kind: 'keep-plain', byteLines: lines.map(() => '') }
+  }
+
+  // ── A sibling subset of the SAME face, before any foreign one ──
+  //
+  // Word writes a pivot table's numbers as one CID subset per cell:
+  // /C0_2 is MinionPro-Regular holding "3", "7" and a space, /C0_1 the same
+  // face holding every digit. Changing "33" to "34" cannot be encoded in
+  // /C0_2, and the base-14 fallback then drew a Helvetica "4" beside a
+  // Minion "3". The face the user wants is already embedded a few fonts
+  // over, so it is tried first, through its own ToUnicode; Helvetica is only
+  // for what NO subset on the page can draw.
+  if (block.encoding && !isEmpty) {
+    const sibling = findSiblingSubset(pageIndex, block.fontRef, lines)
+    if (sibling) {
+      console.log(`[MuPDF Worker] Substituting font ${block.fontRef} → sibling subset /${sibling.ref} (${sibling.baseFont})`)
+      return { kind: 'subst', fontRef: sibling.ref, fontName: sibling.baseFont, byteLines: [], hex: true, hexLines: sibling.hexLines }
+    }
   }
 
   // ── Substitution fallback ──
@@ -4824,10 +4900,27 @@ function replaceTextInContentStreamFontAware(
   }
 
   // Step 3: single-block matching (for PDFs where each text block is one BT)
+  const onClick = Math.max(6, targetBlock.height || 0)
   for (const block of allBlocks) {
     if (targetFontRef && !blockUsesFont(block, targetFontRef)) continue
     const normalizedDecoded = block.decodedText.replace(/\s+/g, ' ').trim()
-    if (!normalizedDecoded || normalizedDecoded.length < 2) continue
+    if (!normalizedDecoded) continue
+
+    // A ONE-character block is admitted only as an EXACT match that SITS on
+    // the click. A pivot table (Word/Excel) draws every count as its own BT —
+    // "    3", "  9", "         7" — and the two-character floor below, meant
+    // to keep a lone letter from fuzzy-matching half the page, refused the
+    // whole block outright: every single-digit cell reported "Could not find
+    // matching text" while "2130" beside it edited fine. Text this short
+    // identifies nothing on its own, so the position test does the work, the
+    // same way the blank-field and lone-label passes are gated.
+    if (normalizedDecoded.length < 2) {
+      if (normalizedDecoded !== normalizedTarget) continue
+      const dist = distOf(block)
+      if (dist > onClick) continue
+      candidates.push({ blocks: [block], score: 2, dist, line: false, order: candidates.length })
+      continue
+    }
 
     // Space-free as well as collapsed: extraction invents spaces the stream
     // does not draw ("2 3.059,52" for a block that reads "23.059,52"), and a
