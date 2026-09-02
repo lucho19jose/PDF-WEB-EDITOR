@@ -2738,6 +2738,17 @@ Two regexes lost their backslashes on the way through `node - <<'EOF'`
 the other made `subsequenceSimilarity` strip the letter "s" instead of
 whitespace. Write the patch script to a file and run it.
 
+### The inline editor is set in the font of the block's TEXT, never a symbol face
+`cssFontStack` put the PDF's own family first — from `block.fontName`,
+which is the FIRST character's font. Word draws a bullet in SymbolMT and
+the sentence in Arial, so the editor opened in "Symbol MT" and the browser
+drew every Latin letter as the Greek glyph at that code: "Βαχκυπσ
+αυτοματιζαδοσ" in the editor while the page underneath was untouched. It
+read as the edit having wrecked the line, and the second line of the same
+bullet (no bullet glyph) "worked". `textFaceOf` takes the first letter or
+digit's face and never uses a symbol face (Symbol, Wingdings, Webdings,
+Dingbats, Marlett, MT Extra) as a family; the bucket fallback stands in.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

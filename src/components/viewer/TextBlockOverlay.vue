@@ -1399,12 +1399,30 @@ function familyOf(block: TextBlock): string {
  * numeric suffix, the style words and the PS/MT tails are stripped and CamelCase
  * is spaced out. The family bucket stays behind it as the fallback.
  */
+/**
+ * The font the block's TEXT is set in — not the font of its first glyph.
+ *
+ * Word draws a bullet in SymbolMT and the sentence after it in Arial, and
+ * `block.fontName` is the first character's, so the editor opened in
+ * "Symbol MT": the browser drew every Latin letter of the sentence as the
+ * Greek glyph at that code — "Βαχκυπσ αυτοματιζαδοσ" — while the page
+ * underneath was untouched, and it read as the edit having wrecked the line.
+ * The first letter or digit's face is used, and a symbol face is never used
+ * as a family at all: the bucket fallback is what stands in for it.
+ */
+const SYMBOL_FACE = /symbol|wingding|webding|dingbat|marlett|mt extra|zapf/i
+function textFaceOf(block: TextBlock): string {
+  const letter = (block.chars || []).find(c => /[\p{L}\p{N}]/u.test(c.c) && c.fontName && !SYMBOL_FACE.test(c.fontName))
+  const name = letter?.fontName || block.fontName || ''
+  return SYMBOL_FACE.test(name) ? '' : name
+}
+
 function cssFontStack(block: TextBlock): string {
   const bucket = familyOf(block)
   const fallback = bucket === 'Courier' ? '"Courier New", Courier, monospace'
     : bucket === 'Times-Roman' ? '"Times New Roman", Times, serif'
     : 'Helvetica, Arial, sans-serif'
-  const name = (block.fontName || '')
+  const name = textFaceOf(block)
     .replace(/^[A-Z]{6}\+/, '')
     .replace(/^\*/, '')
     .replace(/-Identity-[HV]$/, '')
