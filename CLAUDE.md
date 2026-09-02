@@ -261,11 +261,14 @@ force for the blocks after it, which is the same class of silent damage in the
 other direction. Restoring beats resetting — the stream after the edit should
 behave like the stream before it.
 
-**Known limitation:** `fontAt`/`fontOpAt` are textual and do not replay q/Q, so
-a `Tf` set inside a `q…Q` before the block yields a stale operator — but that is
-the font the engine already believed the block used, so the restore is never
-more wrong than the match. A fontless block inside a Form XObject that inherits
-from the invoking stream still gets no `inheritedTf`, and no restore is emitted.
+`fontAt`/`fontOpAt` REPLAY q/Q (a stack over the literal-masked stream). They
+used to be textual, and a `Tf` set inside a `q…Q` before the block yielded a
+stale font: Word draws a bullet's tick in its own `q … BT /C2_0 Tf … ET Q` and
+the sentence after it as a fontless block inheriting the `/TT0` set before the
+`q` — read textually the sentence "inherited" the tick's font, decoded as
+`????????`, and every bullet of every technical report was uneditable.
+**Known limitation:** a fontless block inside a Form XObject that inherits from
+the invoking stream still gets no `inheritedTf`, and no restore is emitted.
 
 ### Don't re-encode the characters the edit didn't touch
 A replacement is encoded in ONE font, and a line is under no obligation to be

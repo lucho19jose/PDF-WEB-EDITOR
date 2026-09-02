@@ -3944,24 +3944,49 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
     }
   }
   void tfRe
-  /** Font in force at a stream offset. */
-  const fontAt = (offset: number): string | null => {
-    let found: string | null = null
-    for (const t of tfBefore) {
-      if (t.at > offset) break
-      found = t.name
+  // The font in force is GRAPHICS STATE, so q/Q save and restore it. Reading
+  // only the last Tf before a block is wrong whenever that Tf sat inside a
+  // q…Q that has since closed: Word draws a bullet's tick as its own
+  // `q … BT /C2_0 Tf <0039> Tj ET Q` and the sentence after it as a
+  // FONTLESS block inheriting the /TT0 set before the q. Read textually, the
+  // sentence "inherited" the Wingdings/CJK font, decoded as "????????" and
+  // could never be matched — every bullet of every technical report was
+  // uneditable, the whole body of the document. The timeline below replays
+  // q/Q with a stack; Tf inside BT…ET is state like any other (ET does not
+  // restore it), and an unbalanced Q keeps whatever was in force.
+  type FontState = { name: string; raw: string } | null
+  const fontEvents: { at: number; state: FontState }[] = []
+  {
+    const evRe = /\/[ ]*\s+[\d.-]+\s+Tf|(?<![A-Za-z0-9])[qQ](?![A-Za-z0-9])/g
+    let state: FontState = null
+    const stack: FontState[] = []
+    let e: RegExpExecArray | null
+    while ((e = evRe.exec(masked)) !== null) {
+      const tok = e[0]
+      if (tok === 'q') { stack.push(state); continue }
+      if (tok === 'Q') {
+        if (stack.length) state = stack.pop()!
+        fontEvents.push({ at: e.index, state })
+        continue
+      }
+      const nameMatch = stream.slice(e.index).match(/^\/([^\s<>[\]()/%]+)/)
+      if (!nameMatch) continue
+      state = { name: nameMatch[1], raw: stream.slice(e.index, e.index + tok.length) }
+      fontEvents.push({ at: e.index, state })
+    }
+  }
+  const fontStateAt = (offset: number): FontState => {
+    let found: FontState = null
+    for (const ev of fontEvents) {
+      if (ev.at > offset) break
+      found = ev.state
     }
     return found
   }
-  /** The whole Tf operator in force at a stream offset (`/TT1 11.04 Tf`). */
-  const fontOpAt = (offset: number): string | null => {
-    let found: string | null = null
-    for (const t of tfBefore) {
-      if (t.at > offset) break
-      found = t.raw
-    }
-    return found
-  }
+  /** Font in force at a stream offset, q/Q replayed. */
+  const fontAt = (offset: number): string | null => fontStateAt(offset)?.name ?? null
+  /** The whole Tf operator in force at a stream offset (`/TT1 11.04 Tf`), q/Q replayed. */
+  const fontOpAt = (offset: number): string | null => fontStateAt(offset)?.raw ?? null
 
   const re = /(?<![A-Za-z0-9])BT(?![A-Za-z0-9])([\s\S]*?)(?<![A-Za-z0-9])ET(?![A-Za-z0-9])/g
   const out: BtInfo[] = []
