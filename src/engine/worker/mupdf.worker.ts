@@ -5720,6 +5720,30 @@ function retagSpanActualText(
   return { start: dict.start, end: dict.end, text: `<<${body}/ActualText${value}>>` }
 }
 
+/**
+ * Content similarity of a candidate to the target: the longest common
+ * subsequence of the folded, space-free texts over the longer length. '?'
+ * placeholders are dropped from the candidate (unreadable is not wrong).
+ * Falls back to the length ratio when the product of lengths is too large
+ * for the quadratic table to be worth it.
+ */
+function subsequenceSimilarity(candidate: string, target: string): number {
+  const a = foldForMatch(candidate).replace(/[s?]/g, '')
+  const b = foldForMatch(target).replace(/s/g, '')
+  if (!a.length || !b.length) return 0
+  if (a.length * b.length > 60000) return matchRatio(candidate, target)
+  let prev = new Uint16Array(b.length + 1)
+  let cur = new Uint16Array(b.length + 1)
+  for (let i = 1; i <= a.length; i++) {
+    const ca = a.charCodeAt(i - 1)
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = ca === b.charCodeAt(j - 1) ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1])
+    }
+    const t = prev; prev = cur; cur = t
+  }
+  return prev[b.length] / Math.max(a.length, b.length)
+}
+
 /** Size-similarity of a candidate run to the target, ignoring case and '?'. */
 function matchRatio(candidate: string, target: string): number {
   const a = matchLength(candidate)
@@ -6936,6 +6960,7 @@ function narrowToChangedOps(
   newText: string
 ): { i: number; j: number; text: string } | null {
   let lo = i, text = newText
+  const targetFree = foldForMatch(newText).replace(/\s/g, '')
   while (lo < j) {
     // Space-FREE, like every other stream-vs-extraction compare: the op's
     // spaces are glyphs at stream positions, the target's are synthesised by
@@ -6946,8 +6971,17 @@ function narrowToChangedOps(
     const dFree = ops[lo].decoded.replace(/\s+/g, '')
     if (dFree) {
       const consumed = consumePrefixFree(text, dFree)
-      if (consumed === null) break
-      text = text.slice(consumed)
+      if (consumed === null) {
+        // A glyph the target never had at all — a superscript "º" that
+        // extraction put in its own block between "RUC N" and the digits —
+        // is not a change either: it stays where it is, drawn by its own op,
+        // and the walk goes on to the ops that ARE the target's. Blanking it
+        // with the window deleted the "º"; stopping here re-encoded it.
+        const foreign = !targetFree.includes(foldForMatch(dFree).replace(/\s/g, ''))
+        if (!foreign) break
+      } else {
+        text = text.slice(consumed)
+      }
     }
     lo++
   }
@@ -7058,13 +7092,25 @@ function applyPartialBlockReplacement(
       if (ratio < 0.7) continue
       let score = 0
       if (norm === targetNorm) score = 2
-      else if (fuzzyTextMatch(norm, targetNorm)) score = ratio
+      // Scored by CONTENT, not by length. `matchRatio` is a length ratio, so
+      // a window that drops the first "R" and the last "4" of a RUC but picks
+      // up the superscript "º" and a space between them scored a perfect 1.0
+      // against the 16-character target and beat the window holding all the
+      // text — the replacement was drawn at the second op with the stray "R"
+      // and "4" left in place ("RRUC N10 4…"). The longest common
+      // subsequence over the space-free text rewards the glyphs that are
+      // actually the target's.
+      else if (fuzzyTextMatch(norm, targetNorm)) score = subsequenceSimilarity(norm, targetNorm)
       if (score <= 0) continue
       const dist = targetLocal
         ? Math.abs(ops[i].x - targetLocal.x) + Math.abs(ops[i].y - targetLocal.y) * 4
         : 0
+      // Inside the tie band distance decides; at EQUAL distance (two windows
+      // starting on the same op) the better score does — without that, a
+      // window one op short of the target held on against the one holding
+      // all of it, and the last digit of a RUC was left standing outside.
       if (!best || score > best.score + 0.05 ||
-          (Math.abs(score - best.score) <= 0.05 && dist < best.dist)) {
+          (Math.abs(score - best.score) <= 0.05 && (dist < best.dist || (dist === best.dist && score > best.score)))) {
         best = { i, j, score, dist }
       }
     }

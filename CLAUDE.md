@@ -2647,6 +2647,27 @@ rewritten exactly as before; a differing end keeps its own face either way,
 so the "two faces in one line" objection to unconditional narrowing does
 not apply.
 
+### An op window is scored by CONTENT, and a foreign glyph inside it is stepped over
+Microsoft Print to PDF (the RNP constancia) draws "RUC N° 10706691184" as six
+ops: "R", "UC ", "N", a superscript "º " in another font, ten digits, and the
+last "4" in a third font. Extraction puts the superscript in its own block,
+so the target is "RUC N10706691184". Two things went wrong at once:
+
+- **`matchRatio` is a LENGTH ratio.** The window that drops the first "R" and
+  the last "4" but picks up "º " has exactly the target's length and scored
+  1.0, beating the window holding all the text — the replacement was drawn
+  from the second op with the stray "R" and "4" left standing ("RRUC N10 4…").
+  `subsequenceSimilarity` (longest common subsequence over folded,
+  space-free text) scores the glyphs that are actually the target's. Inside
+  the tie band, equal distance now falls back to the better score.
+- **`narrowToChangedOps` stopped at the "º".** A glyph the target never had
+  at all is not a change: it stays where it is, drawn by its own op, and the
+  walk goes on. Blanking it with the window deleted the "º"; stopping there
+  re-encoded the digits from the "º"'s position, one glyph to the left.
+
+Measured: the RUC edits to "RUC N° 1070669118455" entirely in Verdana-Bold,
+the "º" kept; the two year edits substitute only their changed tail.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
