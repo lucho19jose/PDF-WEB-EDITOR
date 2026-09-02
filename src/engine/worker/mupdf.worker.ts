@@ -719,19 +719,24 @@ function splitBlocksAtGaps(blocks: TextBlock[], pageIndex: number): TextBlock[] 
       continue
     }
 
-    // Step 1: Split into lines by Y position
-    // Group characters by baseline Y (chars on same line have similar Y)
-    const lineMap = new Map<number, TextChar[]>()
-    for (const ch of block.chars) {
-      // Use origin Y rounded to nearest 0.5 for grouping
-      const yKey = Math.round(ch.origin[1] * 2) / 2
-      if (!lineMap.has(yKey)) lineMap.set(yKey, [])
-      lineMap.get(yKey)!.push(ch)
+    // Step 1: Split into lines by baseline Y — by PROXIMITY, not by rounding
+    // to a 0.5pt grid. A grid has boundaries, and a baseline that sits on
+    // one (250.25 on the RNP constancia) had its glyphs land on either side
+    // of it by floating-point noise: "ANDAHUAYLAS" became "A" + "NDAHUAYLAS",
+    // a one-letter block that no move could address, so every reflow tore the
+    // word apart. Glyphs are sorted by baseline and a new line starts only
+    // where the baseline steps by more than the tolerance.
+    const byY = [...block.chars].sort((p, q) => p.origin[1] - q.origin[1])
+    const lines: TextChar[][] = []
+    let cur: TextChar[] = []
+    let curY = NaN
+    for (const ch of byY) {
+      const tol = Math.max(0.5, (ch.size || 0) * 0.08)
+      if (cur.length && Math.abs(ch.origin[1] - curY) > tol) { lines.push(cur); cur = [] }
+      if (!cur.length) curY = ch.origin[1]
+      cur.push(ch)
     }
-
-    // Sort lines by Y position (top to bottom in PDF coords)
-    const lineKeys = [...lineMap.keys()].sort((a, b) => a - b)
-    const lines: TextChar[][] = lineKeys.map(k => lineMap.get(k)!)
+    if (cur.length) lines.push(cur)
 
     // Step 2: For each line, split at horizontal gaps
     for (const lineChars of lines) {
@@ -2997,10 +3002,30 @@ function transformInSource(
         // expressed in Tm space — feeding it the CTM-space value moved this
         // block 5.9x too far on a page whose Tm scales by 0.17.
         const { tdx, tdy } = inTmSpace()
+        // An absolute Tm INSIDE the run resets the line matrix and undoes the
+        // leading Td for everything after it. Microsoft Print to PDF draws one
+        // visual line as "PAR" + `1 0 0 1 132 667 Tm` + "A SER PARTICIPANTE…":
+        // only "PAR" moved, and the inverse Td then shoved the NEXT line the
+        // other way — reported as words torn apart after a reflow. Every Tm
+        // inside the run is shifted by the same delta (in the CTM's space, as
+        // the whole-block Tm rewrite does), so the run moves as one; the
+        // inverse Td still cancels the shift for whatever follows.
+        const inner = block.content.slice(run.start, run.end)
+        const innerMasked = maskStreamLiterals(inner)
+        const tmInRun = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm(?![A-Za-z0-9])/g
+        let shifted = ''
+        let lastEnd = 0
+        let tm: RegExpExecArray | null
+        while ((tm = tmInRun.exec(innerMasked)) !== null) {
+          shifted += inner.slice(lastEnd, tm.index) +
+            `${tm[1]} ${tm[2]} ${tm[3]} ${tm[4]} ${fmtNum(parseFloat(tm[5]) + dxL)} ${fmtNum(parseFloat(tm[6]) + dyL)} Tm`
+          lastEnd = tm.index + tm[0].length
+        }
+        shifted += inner.slice(lastEnd)
         newContent =
           block.content.slice(0, run.start) +
           `${fmtNum(tdx)} ${fmtNum(tdy)} Td ` +
-          block.content.slice(run.start, run.end) +
+          shifted +
           ` ${fmtNum(-tdx)} ${fmtNum(-tdy)} Td` +
           block.content.slice(run.end)
         usedStrategy ??= 'td_bracket_run'
@@ -4359,13 +4384,30 @@ function findBtBlocksByPosition(
       const ny = Math.min(Math.max(y, Math.min(y0, y1)), Math.max(y0, y1))
       return Math.hypot(x - nx, y - ny)
     }
+    // A line positioned by Td alone has no governing Tm to read: the RNP
+    // constancia draws "Vigencia … Desde … Nota:" as one BT that opens with a
+    // Td and steps between rows with Td, so "Nota:" — 120pt below the block's
+    // origin — was refused and a reflow left the label behind while its note
+    // moved. Where the run is actually DRAWN (runDistanceToTarget, on real
+    // advances) is the distance that matters, and a line-leading run found by
+    // findTargetRun is as good an admission as a governing Tm: it is exactly
+    // what the td_bracket move goes on to use.
+    const runDist = (block: BtInfo): number => {
+      const r = runDistanceToTarget(block, targetBlock.text, pageIndex, stream, targetBlock, pageHeight)
+      return r === null ? Infinity : r
+    }
+    const lineRun = (block: BtInfo): boolean => {
+      const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
+      const run = findTargetRun(block, targetBlock.text, pageIndex, local)
+      return !!(run && run.startsLine)
+    }
     for (const fontFiltered of [true, false]) {
       for (const block of allBlocks) {
         if (fontFiltered && targetFontRef && !blockUsesFont(block, targetFontRef)) continue
         if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) continue
-        const d = Math.min(distOf(block), govDist(block))
+        const d = Math.min(distOf(block), govDist(block), runDist(block))
         if (!(d <= onTarget * 2)) continue
-        if (!findGoverningTm(block, targetBlock.text, pageIndex)) continue
+        if (!findGoverningTm(block, targetBlock.text, pageIndex) && !lineRun(block)) continue
         candidates.push({ blocks: [block], score: 1, dist: d, order: candidates.length })
       }
       if (candidates.length > 0 || !targetFontRef) break
@@ -4560,10 +4602,14 @@ function sameCharacters(a: string, b: string): boolean {
  * (an empty form field being filled in).
  */
 function trimBlankEnds(blocks: BtInfo[]): BtInfo[] {
-  let lo = 0, hi = blocks.length - 1
-  while (lo < hi && !blocks[lo].decodedText.trim()) lo++
-  while (hi > lo && !blocks[hi].decodedText.trim()) hi--
-  return lo === 0 && hi === blocks.length - 1 ? blocks : blocks.slice(lo, hi + 1)
+  // Only the LEADING blanks are dropped: they drag the anchor, and the anchor
+  // is what the run is ranked by. TRAILING blanks stay in the run — Word
+  // draws the space after the last word as its own BT, and once the rewritten
+  // line is longer that space sits inside the new text ("backu ps" on every
+  // readback). In the run, `applyLineReplacement` blanks it with the rest.
+  let lo = 0
+  while (lo < blocks.length - 1 && !blocks[lo].decodedText.trim()) lo++
+  return lo === 0 ? blocks : blocks.slice(lo)
 }
 
 /**
@@ -5400,7 +5446,19 @@ function applyLineReplacement(
     }
     const middleText = newText.slice(pos, end).trim()
     if (!middleText) return null
-    return applyLineReplacement(stream, reading.slice(head, tail), middleText,
+    // The middle keeps its whitespace-only blocks: `reading` holds only the
+    // contributing ones, and a retry on those alone left Word's per-space BTs
+    // standing between the rewritten words at their old positions —
+    // phantom spaces inside the words on every readback. A space block goes
+    // with the middle when it sits after the middle's first block and before
+    // the first block of the dropped tail (or anywhere after, when no tail
+    // was dropped).
+    const middle = reading.slice(head, tail)
+    const first = middle[0], nextTail = tail < reading.length ? reading[tail] : null
+    const spaces = sorted.filter(b => !contributes(b) && b.hasPos &&
+      readCmp(b, first) > 0 && (!nextTail || readCmp(b, nextTail) < 0))
+    const run = [...middle, ...spaces].sort((x, y) => x.start - y.start)
+    return applyLineReplacement(stream, run, middleText,
       pageIndex, targetBlock, pageWidth, rotation)
   }
 
@@ -5489,6 +5547,15 @@ function applyLineReplacement(
       }
     } else if (contributes(block)) {
       // Other blocks with text: blank them
+      newContent = replaceTjInBlock(block.content, '', block.mode, block.mode === 'hex' ? '' : undefined)
+    } else if (block.hasPos && primary.hasPos && readCmp(block, primary) > 0) {
+      // A whitespace-only block AFTER the primary is a space the primary now
+      // draws itself. Word emits every word AND every space as its own BT;
+      // left standing at its old position, a space glyph lands inside a word
+      // once the text shifts — nothing visible on the page, but extraction
+      // (and the inline editor, and copy) read "eficie nte  de  los backu ps",
+      // and the next edit of the line matched a target full of phantom
+      // spaces. Spaces BEFORE the primary belong to the untouched head.
       newContent = replaceTjInBlock(block.content, '', block.mode, block.mode === 'hex' ? '' : undefined)
     } else {
       continue // Skip whitespace-only blocks — nothing visible to erase
@@ -5770,8 +5837,8 @@ function retagSpanActualText(
  * for the quadratic table to be worth it.
  */
 function subsequenceSimilarity(candidate: string, target: string): number {
-  const a = foldForMatch(candidate).replace(/[s?]/g, '')
-  const b = foldForMatch(target).replace(/s/g, '')
+  const a = foldForMatch(candidate).replace(/[\s?]/g, '')
+  const b = foldForMatch(target).replace(/\s/g, '')
   if (!a.length || !b.length) return 0
   if (a.length * b.length > 60000) return matchRatio(candidate, target)
   let prev = new Uint16Array(b.length + 1)

@@ -2692,6 +2692,52 @@ With the Reflow toggle OFF the continuation line overlaps the line below,
 exactly as the rebuild path's wrapped lines do; ON, the rows below are
 pushed by the extra lines.
 
+### A bracketed run carries its own Tm operators with it
+The td_bracket move (one line out of a shared block) wraps the run in a
+`Td` and its inverse. Microsoft Print to PDF draws one visual line as
+"PAR" + `1 0 0 1 132 667 Tm` + "A SER PARTICIPANTE…": the absolute Tm
+inside the run reset the line matrix, only "PAR" moved, and the inverse
+Td then shoved the NEXT line the other way — every reflow on that
+producer tore words apart ("PAR" / "A SER…", "JOSÉ" / "LUIS…"). Every Tm
+inside the run is now shifted by the same delta (in the CTM's space, as the
+whole-block Tm rewrite does); the inverse Td still cancels the shift for
+whatever follows.
+
+### Lines are clustered by baseline PROXIMITY, never by a grid
+`splitBlocksAtGaps` grouped glyphs into lines by rounding the baseline to a
+0.5pt grid. A grid has boundaries, and a baseline that sits on one (250.25)
+had its glyphs land on either side by floating-point noise: "ANDAHUAYLAS"
+became "A" + "NDAHUAYLAS", a one-letter block no move could address, so
+reflows left the "A" behind. Glyphs are sorted by baseline and a new line
+starts only where it steps by more than max(0.5pt, 8% of the size).
+
+### A Td-positioned line is admitted to a move by where its run is DRAWN
+The move matcher's last-resort pass required `findGoverningTm` and ranked
+by the block's origin. "Nota:" is the last line of a BT that opens with a
+Td and steps between rows with Td — no Tm governs it and the origin is
+120pt away — so it was refused and a reflow moved the note but not its
+label. `runDistanceToTarget` (real advances) now counts as the distance
+and a line-leading run from `findTargetRun` as the admission: exactly what
+the td_bracket move goes on to use.
+
+### The middle of a narrowed line keeps its space blocks; trailing blanks stay in a run
+Word draws every word AND every space as its own BT. `narrowLineAndRetry`
+retried on the contributing blocks only, and `trimBlankEnds` dropped the
+run's trailing blank, so after a longer rewrite the old space glyphs stood
+inside the new words at their old positions: nothing visible, but every
+readback (extraction, the inline editor, copy) said "eficie nte  de  los
+backu ps" and the next edit matched a target full of phantom spaces. The
+middle takes the whitespace blocks between its first block and the
+dropped tail; a run keeps its trailing blanks (only leading ones move the
+anchor); and `applyLineReplacement` blanks a whitespace block that sits
+after the primary.
+
+### Never patch this file through a shell heredoc
+Two regexes lost their backslashes on the way through `node - <<'EOF'`
+(`[\d.]` became `[d.]`, `\s` became `s`) — one made the Tm shift a no-op,
+the other made `subsequenceSimilarity` strip the letter "s" instead of
+whitespace. Write the patch script to a file and run it.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
