@@ -5215,7 +5215,8 @@ function layoutReplacementLines(
  * block's left edge, the same measure `layoutReplacementLines` uses (a
  * base-14 stand-in calibrated against the width the block occupies today).
  */
-function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number, windowPageX: number): string[] | null {
+/** The stand-in face and the page points one em of it measures, calibrated to this block. */
+function wrapMeasure(targetBlock: TextBlock): { face: string; unit: number } | null {
   const face = pickSubstituteFont(null, targetBlock)
   const size = Math.max(targetBlock.fontSize, 0.01)
   const referenceEm = measureEm(targetBlock.text, face)
@@ -5223,6 +5224,13 @@ function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number,
     ? targetBlock.width / (referenceEm * size)
     : 1
   const unit = size * Math.min(Math.max(raw, 0.5), 2)
+  return unit > 0 ? { face, unit } : null
+}
+
+function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number, windowPageX: number): string[] | null {
+  const m = wrapMeasure(targetBlock)
+  if (!m) return null
+  const { face, unit } = m
   const roomFirst = pageWidth - PAGE_RIGHT_MARGIN - windowPageX
   const roomRest = pageWidth - PAGE_RIGHT_MARGIN - targetBlock.x
   if (!(roomRest > 0) || !(unit > 0)) return null
@@ -7351,18 +7359,31 @@ function applyPartialBlockReplacement(
       const m = tms[tms.length - 1]
       return !(Math.abs(Math.abs(+m[1]) - 1) < 1e-6 && Math.abs(+m[2]) < 1e-6 && Math.abs(+m[3]) < 1e-6 && Math.abs(Math.abs(+m[4]) - 1) < 1e-6)
     })()
-    if (stIn0 && stIn0.tfSize > 0 && followerResets && !tmScaled) {
-      const sameLine = ops.filter(o => Math.abs(o.y - ops[winI].y) < 0.01)
-      const lineStartX = Math.min(...sameLine.map(o => o.x))
+    // The window's own op must be positioned by a Td/TD/Tm/T* of its own (or
+    // open the block), so that the line-matrix origin IS the op's start and a
+    // Td relative to it can be stated from the measured prefix. Where the op
+    // is reached by the pen, the origin is somewhere to its left and the
+    // continuation would land in the wrong column — a LaTeX table draws every
+    // cell of a row inside one BT, and "the leftmost op on this y" is another
+    // CELL, which is exactly the mistake the first version made (a short cell
+    // edit wrapped into the column to its left).
+    const precededByReset = winI === 0 ||
+      /(^|[^A-Za-z])(Td|TD|Tm|T\*)(?![A-Za-z])/.test(maskStreamLiterals(block.content).slice(ops[winI - 1].end, ops[winI].start))
+    if (stIn0 && stIn0.tfSize > 0 && followerResets && !tmScaled && precededByReset) {
+      // The window starts where the untouched head of the NEW text ends —
+      // narrowing slices the new text from the front, so winText is its suffix.
+      const prefixNew = newText.slice(0, Math.max(0, newText.length - winText.length))
+      const m = wrapMeasure(targetBlock)
+      const prefixPage = m ? measureEm(prefixNew, m.face) * m.unit : 0
       const scale = targetBlock.fontSize / stIn0.tfSize
-      const windowPageX = targetBlock.x + (ops[winI].x - lineStartX) * scale
-      const wrapped = wrapWindowText(winText, targetBlock, pageWidth, windowPageX)
+      const windowPageX = targetBlock.x + prefixPage
+      const wrapped = m ? wrapWindowText(winText, targetBlock, pageWidth, windowPageX) : null
       if (wrapped && wrapped.length > 1) {
         const retry = planLinesFor(winI, wrapped)
         if (retry.kind !== 'error') {
           plan = retry
           wrapLines = wrapped
-          wrapDx = lineStartX - ops[winI].x
+          wrapDx = -prefixPage / scale
           wrapLead = stIn0.tfSize * LINE_LEADING
         }
       }
