@@ -52,6 +52,12 @@ export class MuPDFBridge {
 
       if (msg.type === 'error') {
         pending.reject(new Error(msg.error))
+        // A WASM trap answers as an ordinary error, and the worker that sent
+        // it is still running on a corrupted heap: every later call fails —
+        // measured, one "memory access out of bounds" in a sweep turned the
+        // 83 files after it into "No document loaded". It is a crash and is
+        // handled as one.
+        if (msg.fatal || isWasmFatal(msg.error)) this.markCrashed(msg.error)
       } else if (msg.type === 'success') {
         pending.resolve(msg.data)
       }
@@ -60,19 +66,7 @@ export class MuPDFBridge {
 
     this.worker.onerror = (err) => {
       console.error('[MuPDF Bridge] Worker error:', err)
-      // Reject all pending promises
-      for (const [, p] of this.pending) {
-        p.reject(new Error(`Worker error: ${err.message}`))
-      }
-      this.pending.clear()
-      // Tear down so future sends fail fast (reject) instead of hanging forever
-      // against a dead worker, and so init() can recreate it.
-      try { this.worker?.terminate() } catch (_) {}
-      this.worker = null
-      this._ready = false
-      this.initPromise = null
-      this.crashed = true
-      try { this.onCrash?.(err.message || 'the PDF engine stopped') } catch (_) { /* listener's problem */ }
+      this.markCrashed(err.message || 'the PDF engine stopped')
     }
 
     // Send init message and wait for WASM to load
@@ -96,6 +90,24 @@ export class MuPDFBridge {
   private recovering: Promise<void> | null = null
   /** Told when the worker dies and is brought back, so the UI can say so. */
   onCrash: ((reason: string) => void) | null = null
+
+  /**
+   * Tear the worker down after a crash so the next call recovers instead of
+   * hanging forever (`onerror`) or running on a corrupted heap (a WASM trap
+   * reported as an error message).
+   */
+  private markCrashed(reason: string): void {
+    for (const [, p] of this.pending) {
+      p.reject(new Error(`Worker error: ${reason}`))
+    }
+    this.pending.clear()
+    try { this.worker?.terminate() } catch (_) {}
+    this.worker = null
+    this._ready = false
+    this.initPromise = null
+    this.crashed = true
+    try { this.onCrash?.(reason) } catch (_) { /* listener's problem */ }
+  }
 
   /**
    * Bring a dead worker back with the document it had.
@@ -445,6 +457,11 @@ export class MuPDFBridge {
       }
     })
   }
+}
+
+/** The messages Emscripten's runtime produces when the WASM heap is gone. */
+function isWasmFatal(message: string | undefined): boolean {
+  return /memory access out of bounds|table index is out of bounds|unreachable|RuntimeError|null function or function signature mismatch|index out of bounds/i.test(message || '')
 }
 
 /** Singleton bridge instance */

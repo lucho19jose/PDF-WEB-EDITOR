@@ -401,7 +401,10 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
     }
   } catch (err: any) {
     console.error('[MuPDF Worker] Error handling message:', req.type, err)
-    respond({ id: req.id, type: 'error', error: err.message || String(err) })
+    // A trap in the WASM leaves this worker's heap unusable; the bridge
+    // needs to know so it can respawn rather than keep asking a dead engine.
+    const fatal = (typeof WebAssembly !== 'undefined' && err instanceof WebAssembly.RuntimeError)
+    respond({ id: req.id, type: 'error', error: err.message || String(err), ...(fatal ? { fatal: true } : {}) })
   }
 }
 

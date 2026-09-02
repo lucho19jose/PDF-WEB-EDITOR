@@ -58,7 +58,7 @@ export type WorkerRequest =
 // Messages from worker -> main thread
 export type WorkerResponse =
   | { id: number; type: 'success'; data: any }
-  | { id: number; type: 'error'; error: string }
+  | { id: number; type: 'error'; error: string; fatal?: boolean }
   | { id: number; type: 'progress'; progress: number }
 
 export type { PageTextData, Quad, Pt, RectT, AnnotationInfo, SearchHit, BlockTransformOp }
