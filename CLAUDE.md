@@ -2668,6 +2668,30 @@ so the target is "RUC N10706691184". Two things went wrong at once:
 Measured: the RUC edits to "RUC N° 1070669118455" entirely in Verdana-Bold,
 the "º" kept; the two year edits substitute only their changed tail.
 
+### The op-window path wraps too
+`applyPartialBlockReplacement` drew in place only, so appending a few words
+to a heading ran them off the right edge of the paper — in the file,
+invisible, and unrecoverable except by undo ("why doesn't the text wrap
+here?"). `wrapWindowText` measures the window's text the way
+`layoutReplacementLines` does (a base-14 stand-in calibrated against the
+width the block occupies today): the first line gets the room from where
+the window STARTS on the page to the right margin, every further line the
+full room from the block's left edge. Continuation lines are emitted inside
+the same op as `dx −lead Td (line) Tj`, starting at the visual line's left
+edge (the smallest x among the ops on the same y), and the line matrix is
+put back with the inverse `Td` so every later line of the block lands where
+it did. `lines` is returned so the client can make room. Three gates: the
+window must be the last pen-relative thing on its line (a Td/TD/Tm/T* or
+nothing follows), the block's Tm must carry no scale (Td operands live in
+that space; the print-to-PDF `0.24 cm` generators are gated out rather than
+mis-scaled), and the wrapped lines must still encode. The trailing-kern
+compensation is skipped for a wrapped window — the pen is not where a kern
+could reason about.
+
+With the Reflow toggle OFF the continuation line overlaps the line below,
+exactly as the rebuild path's wrapped lines do; ON, the rows below are
+pushed by the extra lines.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

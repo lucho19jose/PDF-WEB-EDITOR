@@ -4944,7 +4944,7 @@ function replaceTextInContentStreamFontAware(
       if (!effNewText.trim() && newText.trim()) continue
     }
     const result = c.partial
-      ? applyPartialBlockReplacement(stream, c.blocks[0], effNewText, pageIndex, targetBlock, pageHeight)
+      ? applyPartialBlockReplacement(stream, c.blocks[0], effNewText, pageIndex, targetBlock, pageHeight, pageWidth)
       : c.line
         ? applyLineReplacement(stream, c.blocks, effNewText, pageIndex, targetBlock, pageWidth, rotation)
         : applyBlockReplacement(stream, c.blocks, effNewText, pageIndex, targetBlock, pageWidth, pageHeight)
@@ -5022,7 +5022,7 @@ function applyBlockReplacement(
     const provablyHoldsMore = !!tFreeHere && dFree !== tFreeHere && !dFree.includes('?') &&
       dFree.includes(tFreeHere) && dFree.replace(tFreeHere, '').length > 0
     if (targetNorm && (blockGlyphs > targetNorm.length * 1.4 || provablyHoldsMore)) {
-      const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
+      const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight, pageWidth)
       if (partial) return partial
       // Falling through would rewrite the WHOLE block, and this block holds far
       // more than the target: Ghostscript draws an entire table column as one
@@ -5055,7 +5055,7 @@ function applyBlockReplacement(
     // Reached only after the whole-block encode has already failed, so a block
     // that rewrites today still rewrites the same way.
     if (targetBlock) {
-      const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight)
+      const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight, pageWidth)
       if (partial && !('error' in partial)) return partial
     }
     return { error: plan.error }
@@ -5205,6 +5205,40 @@ function layoutReplacementLines(
     out.push(...wrapToWidth(para, maxEm, face))
   }
   return out
+}
+
+/**
+ * Lines for a window rewrite that outgrows its line, or null when it fits.
+ *
+ * The first line gets the room between where the window STARTS on the page
+ * and the right margin; every further line gets the full room from the
+ * block's left edge, the same measure `layoutReplacementLines` uses (a
+ * base-14 stand-in calibrated against the width the block occupies today).
+ */
+function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number, windowPageX: number): string[] | null {
+  const face = pickSubstituteFont(null, targetBlock)
+  const size = Math.max(targetBlock.fontSize, 0.01)
+  const referenceEm = measureEm(targetBlock.text, face)
+  const raw = referenceEm > 0.01 && targetBlock.width > 0.01
+    ? targetBlock.width / (referenceEm * size)
+    : 1
+  const unit = size * Math.min(Math.max(raw, 0.5), 2)
+  const roomFirst = pageWidth - PAGE_RIGHT_MARGIN - windowPageX
+  const roomRest = pageWidth - PAGE_RIGHT_MARGIN - targetBlock.x
+  if (!(roomRest > 0) || !(unit > 0)) return null
+  if (measureEm(text, face) * unit <= Math.max(roomFirst, 0)) return null
+  const words = text.split(/\s+/).filter(Boolean)
+  let first = ''
+  let k = 0
+  for (; k < words.length; k++) {
+    const cand = first ? first + ' ' + words[k] : words[k]
+    if (measureEm(cand, face) * unit > roomFirst) break
+    first = cand
+  }
+  const rest = words.slice(k).join(' ')
+  const lines = first ? [first] : ['']
+  if (rest) lines.push(...wrapToWidth(rest, roomRest / unit, face))
+  return lines.length > 1 ? lines : null
 }
 
 function applyWrappedReplacement(
@@ -7057,7 +7091,8 @@ function applyPartialBlockReplacement(
   newText: string,
   pageIndex: number,
   targetBlock: TextBlock,
-  pageHeight?: number
+  pageHeight?: number,
+  pageWidth?: number
 ): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   const simpleInfo = getSimpleFontInfo(pageIndex, block.fontRef)
   const ops = scanShowOps(block.content, block.encoding, simpleInfo,
@@ -7262,13 +7297,14 @@ function applyPartialBlockReplacement(
     return null
   }
 
-  const planFor = (at: number, text: string) => {
+  const planLinesFor = (at: number, lines: string[]) => {
     const fr = encodingFor(ops[at])
     return planTextEncoding(pageIndex,
       { mode: ops[at].isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding,
         preferCodes: preferredGlyphCodes(ops, ops[at], block, fr.encoding) },
-      [text], targetBlock)
+      lines, targetBlock)
   }
+  const planFor = (at: number, text: string) => planLinesFor(at, [text])
 
   let winI = best.i, winJ = best.j, winText = newText
   let plan = planFor(winI, winText)
@@ -7290,6 +7326,60 @@ function applyPartialBlockReplacement(
       }
     }
     if (plan.kind === 'error') return { error: plan.error }
+  }
+
+  // A window that no longer fits its line is WRAPPED, the way the rebuild path
+  // wraps a whole block: this path used to draw in place only, so appending a
+  // few words to a heading ran them off the right edge of the paper — in the
+  // file, invisible, and unrecoverable except by undo. Continuation lines
+  // start at the visual line's left edge, one leading down, and the line
+  // matrix is put back afterwards so every later line of the block lands where
+  // it did. Only when nothing pen-relative follows on the same line, and only
+  // where the block's Tm carries no scale (Td operands live in that space).
+  let wrapLines: string[] | null = null
+  let wrapDx = 0, wrapLead = 0
+  if (pageWidth && winText.length > 0 && !/\n/.test(winText) && targetBlock.fontSize > 0) {
+    const stIn0 = textStateAtOp(block, ops, winI, pageIndex)
+    const next = ops[winJ + 1]
+    const betweenNext = next ? maskStreamLiterals(block.content).slice(ops[winJ].end, next.start) : ''
+    const followerResets = !next || next.kind === 'quote' || next.kind === 'dquote' ||
+      /(^|[^A-Za-z])(Td|TD|Tm|T\*)(?![A-Za-z])/.test(betweenNext)
+    const tmScaled = (() => {
+      const masked = maskStreamLiterals(block.content).slice(0, ops[winI].start)
+      const tms = [...masked.matchAll(/(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/g)]
+      if (!tms.length) return false
+      const m = tms[tms.length - 1]
+      return !(Math.abs(Math.abs(+m[1]) - 1) < 1e-6 && Math.abs(+m[2]) < 1e-6 && Math.abs(+m[3]) < 1e-6 && Math.abs(Math.abs(+m[4]) - 1) < 1e-6)
+    })()
+    if (stIn0 && stIn0.tfSize > 0 && followerResets && !tmScaled) {
+      const sameLine = ops.filter(o => Math.abs(o.y - ops[winI].y) < 0.01)
+      const lineStartX = Math.min(...sameLine.map(o => o.x))
+      const scale = targetBlock.fontSize / stIn0.tfSize
+      const windowPageX = targetBlock.x + (ops[winI].x - lineStartX) * scale
+      const wrapped = wrapWindowText(winText, targetBlock, pageWidth, windowPageX)
+      if (wrapped && wrapped.length > 1) {
+        const retry = planLinesFor(winI, wrapped)
+        if (retry.kind !== 'error') {
+          plan = retry
+          wrapLines = wrapped
+          wrapDx = lineStartX - ops[winI].x
+          wrapLead = stIn0.tfSize * LINE_LEADING
+        }
+      }
+    }
+  }
+  const lineLiteral = (n: number): string => {
+    if (plan.kind === 'keep-hex') return `<${plan.hexLines[n] ?? ''}>`
+    if (plan.kind === 'keep-plain') return `(${escapePdfString(plan.byteLines[n] ?? '')})`
+    if (plan.kind === 'subst') return plan.hex && plan.hexLines ? `<${plan.hexLines[n] ?? ''}>` : `(${escapePdfString(plan.byteLines[n] ?? '')})`
+    return '()'
+  }
+  let wrapExtra = ''
+  if (wrapLines) {
+    for (let n = 1; n < wrapLines.length; n++) {
+      wrapExtra += ` ${fmtNum(n === 1 ? wrapDx : 0)} ${fmtNum(-wrapLead)} Td ${lineLiteral(n)} Tj`
+    }
+    wrapExtra += ` ${fmtNum(-wrapDx)} ${fmtNum(wrapLead * (wrapLines.length - 1))} Td`
   }
 
   // What follows the window inside the same BT is placed by the PEN unless
@@ -7340,7 +7430,7 @@ function applyPartialBlockReplacement(
     if (!isFinite(delta) || Math.abs(delta) < 0.05) return ''
     return ` [${fmtNum(delta * 1000 / endSize)}] TJ`
   }
-  const kern = trailingKern()
+  const kern = wrapLines ? '' : trailingKern()
 
   let content = block.content
   let substitutedFont: string | undefined
@@ -7349,9 +7439,9 @@ function applyPartialBlockReplacement(
     let repl: string
     if (k === winI) {
       if (plan.kind === 'keep-hex') {
-        repl = buildShowOp(op.kind, `<${plan.hexLines[0]}>`, op.raw)
+        repl = buildShowOp(op.kind, `<${plan.hexLines[0]}>`, op.raw) + wrapExtra
       } else if (plan.kind === 'keep-plain') {
-        repl = buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw)
+        repl = buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw) + wrapExtra
       } else {
         // Substituted font applies to THIS op only — afterwards, restore the
         // font the ops AFTER the window actually inherit: the one in force at
@@ -7383,7 +7473,7 @@ function applyPartialBlockReplacement(
             : block.fontRef
               ? ` /${block.fontRef} ${endSize} Tf`
               : (tfMatch ? ` /${tfMatch[1]} ${fallbackSize} Tf` : '')
-        repl = `/${plan.fontRef} ${drawSize} Tf ${buildShowOp(op.kind, substLiteral(plan), op.raw)}${restore}`
+        repl = `/${plan.fontRef} ${drawSize} Tf ${buildShowOp(op.kind, substLiteral(plan), op.raw)}${wrapExtra}${restore}`
         substitutedFont = plan.fontName
       }
     } else {
@@ -7407,6 +7497,7 @@ function applyPartialBlockReplacement(
   return {
     stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end),
     substitutedFont,
+    lines: wrapLines ? wrapLines.length : undefined,
     retags: tag ? [tag] : []
   }
 }
