@@ -2378,6 +2378,30 @@ or by ink kept landing one ideograph off. Plain gaps cut only at 2.5 em, the
 bar `splitRuns` sets; at 1.2 em justified prose was cut mid-line and the
 re-read pieces came back with a space inside a word.
 
+### The engine worker comes back from a crash with its document
+MuPDF's WASM corrupted its heap on the 42nd document of a sweep — "table
+index is out of bounds", then "memory access out of bounds" from
+`getPageText` — and the same file opens cleanly in a fresh worker. Before,
+every later call answered "Worker not initialized" and 68 files failed until
+a reload. `MuPDFBridge` keeps the last document's bytes; on a crash it
+respawns the worker, reloads them and retries the call once (`recover`), and
+`onCrash` puts a line in the status bar. A document that kills the worker on
+reload is forgotten rather than reloaded again.
+
+### A dense scanned page in twenty seconds, not four minutes
+A slide deck's page took 226 s. Measured (`window.__prof` in the dev tab):
+the page itself was 5–12 s (the first WebGPU inference compiles shaders —
+the worker now warms on a tiny canvas at init), but cut pieces were re-read
+ONE CROP EACH (190 calls, 13 s) and the sideways pass re-read its huge
+rotated pieces (25 s). Now every cut piece on the page goes into one stacked
+sheet (chunked at 1800px so the detector does not shrink it), the sideways
+pass never re-reads, and the sheet's crops have almost no horizontal padding
+— at 60% of the height a 41pt title's pieces read back "SIL CAPACI" with a
+letter of the piece next door. Light-on-dark boxes are INVERTED before any
+profile (`inkMeasure`, `glyphCut`): read as ink, a title's letters were the
+"gaps" and its background the "rules", and it was cut between letters into
+190 fragments. Same page after: 27 clean runs in 19 s.
+
 ### The scan face: edited runs drawn with the scan's own glyphs
 Acrobat's "Editable text and images" traces the page into a font; here a face
 is built per page, lazily, from the runs the user edits (`scanFace.ts`). On

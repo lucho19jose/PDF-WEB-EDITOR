@@ -481,9 +481,11 @@ function createOCR() {
    * nearest space. Lines that already have words are returned untouched.
    */
   async function refineLines(lines: OcrLine[], ctx: CanvasRenderingContext2D, engine: OcrEngine, lang: string, reread = true): Promise<OcrLine[]> {
-    const out: OcrLine[] = []
+    type Piece = { line: OcrLine; text: string; ink: { x: number; y: number; width: number; height: number }; cut: boolean }
+    const pieces: Piece[] = []
+    const passthrough = new Set<OcrLine>()
     for (const line of lines) {
-      if (line.words?.length) { out.push(line); continue }
+      if (line.words?.length) { passthrough.add(line); continue }
       const rect = { x: line.box.x0, y: line.box.y0, width: line.box.x1 - line.box.x0, height: line.box.y1 - line.box.y0 }
       const ink = inkBounds(ctx, rect)
       const cjk = isMostlyCjk(line.text)
@@ -493,31 +495,32 @@ function createOCR() {
       // 1.2 em bar cut "En caso de incumplimiento…" in two and the re-read
       // pieces came back with a space inside a word. Rules cut regardless.
       const cuts = reread ? inkGaps(ctx, { x: ink.x, y: ink.y, width: ink.width, height: ink.height }, Math.max(6, emPx * 2.5)) : []
-      const pieces = cuts.length ? splitTextAtCuts(line.text, ink, cuts) : [{ text: line.text, x0: ink.x, x1: ink.x + ink.width }]
-      const inks = pieces.map(piece => {
-        const pieceRect = { x: piece.x0, y: ink.y, width: piece.x1 - piece.x0, height: ink.height }
-        return pieces.length > 1 ? inkBounds(ctx, pieceRect) : ink
-      })
-      // Cut boxes are READ AGAIN: sharing the text out by column occupancy
-      // is an estimate, and on the survey's "辽宁泓瑞机电装备有限公司 | 法定
-      // 代表人" it kept landing one ideograph off. All the pieces of a box go
-      // into ONE crop, stacked, so a slide cut into 190 cells costs 27
-      // inferences rather than 190 (measured: 13 s of re-reads on one page).
-      // The estimate stays as the fallback for a piece that reads as nothing.
-      const reads = pieces.length > 1 && reread ? await recognizeSheet(ctx, inks, engine, lang) : []
-      pieces.forEach((piece, i) => {
-        const pieceInk = inks[i]
-        if (pieceInk.width < 2 || pieceInk.height < 2) return
-        const text = reads[i] || piece.text
-        if (!text.trim()) return
-        const box = { x0: pieceInk.x, y0: pieceInk.y, x1: pieceInk.x + pieceInk.width, y1: pieceInk.y + pieceInk.height }
-        out.push({
-          ...line,
-          box,
-          text,
-          words: [{ text, box, confidence: line.confidence, symbols: [box] }]
-        })
-      })
+      const parts = cuts.length ? splitTextAtCuts(line.text, ink, cuts) : [{ text: line.text, x0: ink.x, x1: ink.x + ink.width }]
+      for (const part of parts) {
+        const partRect = { x: part.x0, y: ink.y, width: part.x1 - part.x0, height: ink.height }
+        pieces.push({ line, text: part.text, ink: parts.length > 1 ? inkBounds(ctx, partRect) : ink, cut: parts.length > 1 })
+      }
+    }
+    // Cut boxes are READ AGAIN: sharing the text out by column occupancy is
+    // an estimate, and on the survey's "辽宁泓瑞机电装备有限公司 | 法定代表人"
+    // it kept landing one ideograph off. EVERY cut piece on the page goes
+    // into one stacked sheet — one inference. Per box it was 22 sheets at
+    // half a second each on a slide cut into 190 cells; per piece, 190 calls
+    // and 13 s. The estimate stays as the fallback for a piece that reads as
+    // nothing.
+    const toRead = pieces.filter(p => p.cut && reread)
+    const reads = toRead.length ? await recognizeSheet(ctx, toRead.map(p => p.ink), engine, lang) : []
+    toRead.forEach((p, i) => { if (reads[i]) p.text = reads[i]! })
+
+    const out: OcrLine[] = []
+    for (const line of lines) {
+      if (passthrough.has(line)) { out.push(line); continue }
+      for (const p of pieces) {
+        if (p.line !== line) continue
+        if (p.ink.width < 2 || p.ink.height < 2 || !p.text.trim()) continue
+        const box = { x0: p.ink.x, y0: p.ink.y, x1: p.ink.x + p.ink.width, y1: p.ink.y + p.ink.height }
+        out.push({ ...line, box, text: p.text, words: [{ text: p.text, box, confidence: line.confidence, symbols: [box] }] })
+      }
     }
     return out
   }
@@ -529,12 +532,40 @@ function createOCR() {
    * its centre falls in. A band with no line reads as null.
    */
   async function recognizeSheet(ctx: CanvasRenderingContext2D, inks: { x: number; y: number; width: number; height: number }[], engine: OcrEngine, lang: string): Promise<(string | null)[]> {
+    // The detector shrinks anything taller than ~1900px, so a page's worth of
+    // pieces is read in sheets of at most SHEET_MAX_H, in order.
+    const SHEET_MAX_H = 1800
+    if (inks.length > 1) {
+      let total = 0
+      for (const ink of inks) total += ink.height + Math.round(ink.height * 0.6) * 2
+      if (total > SHEET_MAX_H) {
+        const out: (string | null)[] = []
+        let batch: typeof inks = [], batchH = 0
+        const flush = async () => { if (batch.length) out.push(...await recognizeSheetOnce(ctx, batch, engine, lang)); batch = []; batchH = 0 }
+        for (const ink of inks) {
+          const h = ink.height + Math.round(ink.height * 0.6) * 2
+          if (batch.length && batchH + h > SHEET_MAX_H) await flush()
+          batch.push(ink); batchH += h
+        }
+        await flush()
+        return out
+      }
+    }
+    return recognizeSheetOnce(ctx, inks, engine, lang)
+  }
+
+  async function recognizeSheetOnce(ctx: CanvasRenderingContext2D, inks: { x: number; y: number; width: number; height: number }[], engine: OcrEngine, lang: string): Promise<(string | null)[]> {
+    // Room above and below so the detector finds a line; almost none to the
+    // sides, or the crop takes its neighbours' letters with it — at 60% of
+    // the height a 41pt title's pieces read back "SIL CAPACI", "SINE
+    // CAPACITACIÓ", each with a letter of the piece next door.
     const pad = (h: number) => Math.round(h * 0.6)
+    const padX = (h: number) => Math.round(h * 0.12) + 2
     const bands: { y: number; h: number; ok: boolean }[] = []
     let sheetW = 0, sheetH = 0
     for (const ink of inks) {
-      const p = pad(ink.height)
-      const w = ink.width + p * 2, h = ink.height + p * 2
+      const p = pad(ink.height), px = padX(ink.height)
+      const w = ink.width + px * 2, h = ink.height + p * 2
       const ok = ink.width >= 2 && ink.height >= 2
       bands.push({ y: sheetH, h, ok })
       sheetW = Math.max(sheetW, w)
@@ -550,9 +581,9 @@ function createOCR() {
     sctx.fillRect(0, 0, sheetW, sheetH)
     inks.forEach((ink, i) => {
       if (!bands[i].ok) return
-      const p = pad(ink.height)
-      const x = Math.max(0, ink.x - p), y = Math.max(0, ink.y - p)
-      const w = Math.min(ctx.canvas.width - x, ink.width + p * 2)
+      const p = pad(ink.height), px = padX(ink.height)
+      const x = Math.max(0, ink.x - px), y = Math.max(0, ink.y - p)
+      const w = Math.min(ctx.canvas.width - x, ink.width + px * 2)
       const h = Math.min(ctx.canvas.height - y, ink.height + p * 2)
       if (w > 0 && h > 0) sctx.drawImage(ctx.canvas, x, y, w, h, 0, bands[i].y, w, h)
     })

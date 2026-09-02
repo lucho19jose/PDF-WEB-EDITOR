@@ -45,11 +45,18 @@ function profile(ctx: CanvasRenderingContext2D, rect: InkRect): Profile | null {
   if (hi - lo < 24) return null
   const threshold = (lo + hi) / 2
   const ink = new Uint8Array(w * h)
+  let dark = 0
+  for (let j = 0; j < gray.length; j++) { if (gray[j] < threshold) { ink[j] = 1; dark++ } }
+  // Light text on a dark band: the dark side is the paper there. Read as
+  // ink, every letter became a "gap" and every stretch of background a
+  // "rule", and a slide's title was cut between its letters and re-read as
+  // "S CAP", "IN PACITAC", "ER CIÓN PRO". More than half dark means flip.
+  if (dark > gray.length * 0.5) for (let j = 0; j < ink.length; j++) ink[j] = 1 - ink[j]
   const rawCols = new Uint16Array(w)
   const rawRows = new Uint16Array(h)
   for (let yy = 0; yy < h; yy++) {
     for (let xx = 0; xx < w; xx++) {
-      if (gray[yy * w + xx] < threshold) { ink[yy * w + xx] = 1; rawCols[xx]++; rawRows[yy]++ }
+      if (ink[yy * w + xx]) { rawCols[xx]++; rawRows[yy]++ }
     }
   }
   // Table rules are not glyphs. A column inked down most of the box is a
