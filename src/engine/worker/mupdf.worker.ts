@@ -2071,8 +2071,11 @@ function planTextEncoding(
     // WinAnsi cannot hold it. For Chinese — the bilingual forms this editor
     // lives on end half their lines in 不适用 — a tiny font built from the
     // shipped CJK face draws the WHOLE run (it has Latin glyphs too), in the
-    // resources the block's Tf resolves against. Anything else is an error.
-    const cjk = lines.some(hasCjk) ? miniCjkFontFor(lines.join(' ')) : null
+    // resources the block's Tf resolves against. The same face is the
+    // answer for any character WinAnsi lacks that it holds: a thesis line
+    // with a real MINUS SIGN (U+2212, "Q(s) − G") used to refuse outright.
+    // Anything the face lacks either is an error.
+    const cjk = lines.some(needsWideFont) ? miniCjkFontFor(lines.join(' ')) : null
     if (cjk) {
       const hexLines: string[] = []
       let ok = true
@@ -2284,8 +2287,19 @@ function hasCjk(text: string): boolean {
  * — the writers themselves are synchronous — and a failure is remembered as
  * "no font" rather than thrown, so the writer can say so in its own words.
  */
+/** CJK, or any character outside WinAnsi — what only the shipped wide face can draw. */
+function needsWideFont(text: string): boolean {
+  if (hasCjk(text)) return true
+  const table = unicodeToWinAnsi()
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!
+    if (cp > 127 && !table.has(cp)) return true
+  }
+  return false
+}
+
 async function ensureCjkFontFor(text: string): Promise<void> {
-  if (cjkFont || !mupdf || !hasCjk(text)) return
+  if (cjkFont || !mupdf || !needsWideFont(text)) return
   if (!cjkFontLoading) {
     cjkFontLoading = (async () => {
       try {
@@ -3783,22 +3797,32 @@ function widenClipForText(
   }
 
   const midY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3]) / 2
-  const [needX] = toClip(targetBlock.bbox[0] + newWidthPage, midY)
+  // Where the text will END, in the clip's own space. Both coordinates are
+  // taken: on a /Rotate 90 page (the Ghostscript fund-request forms) the line
+  // runs along the clip's HEIGHT, so its end lands outside in y while x is
+  // untouched — reading only x left the cell clip exactly as long as the old
+  // text and the typed letter was drawn and clipped away, the edit reporting
+  // success while the page showed nothing. For an upright line the end
+  // point's y is inside the clip already and only x can grow.
+  const endPt = toClip(targetBlock.bbox[0] + newWidthPage, midY)
   // The foot of the text once the extra lines are under it. The CTM may flip y,
   // so the mapped point is included in the rect rather than assumed to be below.
   const footY = pageHeight - (targetBlock.bbox[1] + targetBlock.bbox[3] + extraHeightPage)
-  const [, needY] = toClip(targetBlock.bbox[0], footY)
+  const footPt = toClip(targetBlock.bbox[0], footY)
 
   const [rx, ry, rw, rh] = clip.rect
   let x0 = Math.min(rx, rx + rw), x1 = Math.max(rx, rx + rw)
   let y0 = Math.min(ry, ry + rh), y1 = Math.max(ry, ry + rh)
   let grew = false
-
-  if (Number.isFinite(needX) && needX > x1 + 0.5) { x1 = needX; grew = true }
-  if (extraHeightPage > 0 && Number.isFinite(needY)) {
-    if (needY < y0 - 0.5) { y0 = needY; grew = true }
-    else if (needY > y1 + 0.5) { y1 = needY; grew = true }
+  const include = (px: number, py: number) => {
+    if (!Number.isFinite(px) || !Number.isFinite(py)) return
+    if (px > x1 + 0.5) { x1 = px; grew = true }
+    else if (px < x0 - 0.5) { x0 = px; grew = true }
+    if (py > y1 + 0.5) { y1 = py; grew = true }
+    else if (py < y0 - 0.5) { y0 = py; grew = true }
   }
+  include(endPt[0], endPt[1])
+  if (extraHeightPage > 0) include(footPt[0], footPt[1])
   if (!grew) return null
   return `${fmtNum(x0)} ${fmtNum(y0)} ${fmtNum(x1 - x0)} ${fmtNum(y1 - y0)} re`
 }
@@ -5650,7 +5674,15 @@ function retagSpanActualText(
   const body = stripActualText(stream.slice(dict.start + 2, dict.end - 2))
   // An emptied span says nothing, and must not go on claiming the words whose
   // glyphs were just erased.
-  const value = text.length > 0 ? `<${utf16beHex(text)}>` : '()'
+  //
+  // A NO-BREAK SPACE is written as a plain space. Word marks every nbsp with
+  // its own `/Span <</ActualText <FEFF00A0>>>`, so an extracted line carries
+  // U+00A0 and a retyped line brings it back — and MuPDF's extraction, given
+  // an ActualText holding U+00A0, read "S.A.A. 0000" back as "S.A.A. 0 0000"
+  // (measured: the same override with U+0020 reads back clean). The glyph
+  // drawn is a space either way.
+  const plain = text.replace(/[   ]/g, ' ')
+  const value = plain.length > 0 ? `<${utf16beHex(plain)}>` : '()'
   return { start: dict.start, end: dict.end, text: `<<${body}/ActualText${value}>>` }
 }
 
