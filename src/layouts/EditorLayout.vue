@@ -319,7 +319,7 @@ async function bakeOcrEdits(): Promise<number> {
     const plan = planOcrExport(page.items, item => {
       const face = ocr.faceOf(pageIndex, styleKeyOf(item))
       return face && registered.has(face.familyName) ? face.familyName : undefined
-    })
+    }, page.pageWidth)
     if (plan.patches.length === 0 && plan.texts.length === 0) continue
 
     await exclusiveOp(async () => {

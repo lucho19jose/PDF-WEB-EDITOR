@@ -749,6 +749,12 @@ function createOCR() {
 
         const conf = run.reduce((s, w) => s + (w.confidence ?? 0), 0) / run.length
         if (isJunkRun(text, conf)) continue
+        // A horizontal run of several characters cannot be narrower than it
+        // is tall: a 26×81pt box reading "O pa: F 是一 053 89" is a stamp or a
+        // sideways column read the wrong way, and baked as an 85pt line it
+        // ran off the page.
+        const letters = text.replace(/[^\p{L}\p{N}]/gu, '').length
+        if (!vertical && letters >= 3 && pxRect.width < pxRect.height) continue
 
         items.push({
           id: `${pageIndex}:ocr:${seq.n++}`,

@@ -115,7 +115,27 @@ function plainColor(c: readonly number[] | undefined): [number, number, number] 
  *
  * @param items every run on the page; untouched ones are skipped here
  */
-export function planOcrExport(items: OcrTextItem[], faceIdFor?: (item: OcrTextItem) => string | undefined): OcrExportPlan {
+/**
+ * The size a replacement can be drawn at without leaving the paper.
+ *
+ * A base-14 face is often wider than the scan's: Helvetica-Bold's "=" is
+ * 0.58 em where a typewriter's is a third of that, so a run of them appended
+ * to ended 80pt past the page edge and read back truncated. The run may
+ * grow past its own box — that is what an edit does — but not past the
+ * page, less a small margin; the size comes down just enough, never below
+ * half the original.
+ */
+function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined): number {
+  const size = item.fontSize
+  if (!pageWidth || item.vertical) return size
+  const margin = 12
+  const room = Math.max(20, pageWidth - margin - item.rect.x)
+  const width = approxWidth(text, size, item.fontFamily)
+  if (width <= room) return size
+  return Math.max(size * 0.5, Math.round(size * (room / width) * 10) / 10)
+}
+
+export function planOcrExport(items: OcrTextItem[], faceIdFor?: (item: OcrTextItem) => string | undefined, pageWidth?: number): OcrExportPlan {
   const patches: PatchOp[] = []
   const texts: TextOp[] = []
 
@@ -163,7 +183,7 @@ export function planOcrExport(items: OcrTextItem[], faceIdFor?: (item: OcrTextIt
       text: String(item.text),
       x: Number(x),
       y: Number(baselineY),
-      fontSize: Number(item.fontSize),
+      fontSize: Number(fitSize(item, item.text, pageWidth)),
       fontName,
       color: plainColor(item.color),
       rotation: 0,
