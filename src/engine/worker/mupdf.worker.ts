@@ -5303,7 +5303,7 @@ function applyLineReplacement(
    * no line that encodes today changes, and the recursion terminates because
    * each pass strictly shrinks the run or stops.
    */
-  const narrowLineAndRetry = (): ReturnType<typeof applyLineReplacement> => {
+  const narrowLineAndRetry = (fontChangeOnly = false): ReturnType<typeof applyLineReplacement> => {
     if (!contributing.every(b => b.hasPos)) return null
     const reading = [...contributing].sort(readCmp)
     // Consume a block's space-free text from newText at `pos` forward (or
@@ -5339,6 +5339,23 @@ function applyLineReplacement(
       end = p; tail--
     }
     if (head === 0 && tail === reading.length) return null // nothing to drop
+    if (fontChangeOnly) {
+      // Proactive form: drop an untouched end only when it is set in a
+      // DIFFERENT font from the block the change begins in. Word draws a
+      // bullet as its own SymbolMT block in front of Arial words, and the
+      // leftmost block is the primary, so the whole sentence was re-encoded
+      // for the BULLET's font — the Symbol CMap claims Latin letters for its
+      // Greek glyphs, the encode "succeeded", and "Backups automatizados"
+      // came back as "Βαχκυπσ αυτοματιζαδοσ". Same-font ends are left alone,
+      // so a line that encodes in one face today is rewritten exactly as
+      // before; a differing end keeps its own face either way.
+      const fontOf = (b: BtInfo) => b.fontRef ?? b.inheritedTf ?? null
+      const headDiffers = head > 0 && fontOf(reading[0]) !== fontOf(reading[head])
+      const tailDiffers = tail < reading.length && fontOf(reading[tail]) !== fontOf(reading[tail - 1])
+      if (!headDiffers) { head = 0; pos = 0 }
+      if (!tailDiffers) { tail = reading.length; end = newText.length }
+      if (head === 0 && tail === reading.length) return null
+    }
     const middleText = newText.slice(pos, end).trim()
     if (!middleText) return null
     return applyLineReplacement(stream, reading.slice(head, tail), middleText,
@@ -5403,6 +5420,11 @@ function applyLineReplacement(
         ? layoutReplacementLines(newText, targetBlock, pageWidth)
         : [newText]
       drawnLines = lines.length
+
+      // An untouched end set in another font is not this edit's to rewrite —
+      // see the fontChangeOnly branch of narrowLineAndRetry.
+      const proactive = narrowLineAndRetry(true)
+      if (proactive && !('error' in proactive)) return proactive
 
       const plan = planTextEncoding(pageIndex, block, lines, targetBlock)
       if (plan.kind === 'error') {

@@ -2632,6 +2632,21 @@ expands U+FB00–FB06 first; the sweep is unchanged.
   order form in a long sweep and not in a fresh worker; recovery reloads
   the document and the rest of the run is unaffected.
 
+### An untouched end of a line set in ANOTHER font is not the edit's to rewrite
+Word draws a bullet as its own SymbolMT block in front of one Arial block
+per word, and `applyLineReplacement` takes the leftmost block as primary —
+so the whole sentence was re-encoded for the BULLET's font. The Symbol
+subset's ToUnicode claims Latin letters for its Greek glyphs, the encode
+"succeeded" (keep-hex), and "Backups automatizados" rendered as
+"Βαχκυπσ αυτοματιζαδοσ": page 8 of the VEEAM order, reported as "rare
+symbols". `narrowLineAndRetry(true)` now runs BEFORE the plan: a leading or
+trailing run of blocks the edit did not change is dropped when its font
+differs from the block where the change begins, and the middle is edited
+on its own. Same-font ends are left alone, so a single-face line is
+rewritten exactly as before; a differing end keeps its own face either way,
+so the "two faces in one line" objection to unconditional narrowing does
+not apply.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
