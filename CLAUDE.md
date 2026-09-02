@@ -2378,6 +2378,21 @@ or by ink kept landing one ideograph off. Plain gaps cut only at 2.5 em, the
 bar `splitRuns` sets; at 1.2 em justified prose was cut mid-line and the
 re-read pieces came back with a space inside a word.
 
+### A baked replacement is fitted to the page; a run narrower than tall is not a run
+`planOcrExport` brings a replacement's size down (never below half) when a
+base-14 face would carry it past the paper: Helvetica-Bold's "=" is 0.58 em
+where a typewriter's is a third of that, and appending to a line of them
+ended 80pt past the page edge and read back truncated. And a horizontal run
+of three or more characters cannot be narrower than it is tall — a 26×81pt
+box reading "O pa: F 是一 053" is a stamp or a sideways column read the wrong
+way, baked as an 85pt line it left the page; `buildItems` drops it.
+
+**Sweep (110 PDFs from Downloads, `ocr-driver.js`, run 2):** 172 pages, 24
+scans, 0 page errors, 63 of 69 scan edits read back (the six: two junk runs
+now dropped, two runs that left the page now fitted, one non-edit, one
+transient), 30 traced, 139 of 145 text edits (the rest: a `????` font, a
+`✓` line, re-grouped readbacks).
+
 ### The engine worker comes back from a crash with its document
 MuPDF's WASM corrupted its heap on the 42nd document of a sweep — "table
 index is out of bounds", then "memory access out of bounds" from
@@ -2505,6 +2520,25 @@ FreeType "invalid argument" warnings during subsetting are MuPDF's and harmless.
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
 - **Text position**: Replaced text uses the same position/size as original — no automatic reflow; justified TJ kerning is not regenerated
 - **Substituted fonts are not embedded** (standard base-14, always available in viewers)
+
+## Deploying
+`npm run build` → `dist/` (≈85 MB without `public/_sweep`, which is
+gitignored and must not be shipped: delete `dist/_sweep` before upload). What
+production MUST provide, all of which `public/.htaccess` does for Apache:
+- **Cross-origin isolation headers** — `Cross-Origin-Opener-Policy:
+  same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on every
+  response. Without them there is no SharedArrayBuffer and the workers lose
+  their threads (ONNX Runtime falls back to one, MuPDF may fail to start).
+- **MIME types** for `.wasm` (application/wasm), `.mjs` (javascript), `.ort`
+  (octet-stream), `.otf`, and `.traineddata.gz` served as-is (tesseract.js
+  inflates it itself — a server that sets `Content-Encoding: gzip` on it
+  breaks OCR).
+- **Long caching** for `/paddle/*`, `/fonts/*`, `/tessdata/*`: 31 MB of
+  models and an 8 MB font that never change under the same name; the app
+  also stores the models in the Cache Storage API after the first load.
+- Nothing is fetched from a CDN: ORT's WASM is a Vite asset, models and
+  fonts are under `public/`. The only network calls are the ones the user
+  opts into (Mistral OCR).
 
 ## Vite Config Notes
 - COEP/COOP headers needed for SharedArrayBuffer (WASM)

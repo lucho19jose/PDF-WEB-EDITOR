@@ -1,0 +1,34 @@
+# Served with the built app (Vite copies public/ into dist/).
+#
+# Cross-origin isolation is REQUIRED: MuPDF and ONNX Runtime run in workers on
+# SharedArrayBuffer, which browsers only expose under these two headers. The
+# dev and preview servers set them in vite.config.ts; production must too.
+<IfModule mod_headers.c>
+  Header always set Cross-Origin-Opener-Policy "same-origin"
+  Header always set Cross-Origin-Embedder-Policy "require-corp"
+  # The models and fonts are large and never change under the same name.
+  <FilesMatch "\.(ort|onnx|otf|ttf|gz|wasm)$">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+  </FilesMatch>
+</IfModule>
+
+<IfModule mod_mime.c>
+  AddType application/wasm .wasm
+  AddType application/javascript .mjs
+  AddType application/octet-stream .ort .onnx .traineddata
+  AddType font/otf .otf
+  AddType font/ttf .ttf
+  # tessdata is shipped gzipped and decompressed by tesseract.js itself.
+  <FilesMatch "\.traineddata\.gz$">
+    ForceType application/octet-stream
+    Header unset Content-Encoding
+  </FilesMatch>
+</IfModule>
+
+# Single-page app: unknown paths go to index.html.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteRule . /index.html [L]
+</IfModule>
