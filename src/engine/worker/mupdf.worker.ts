@@ -1564,6 +1564,57 @@ interface SimpleFontInfo {
    * control characters and nothing on the page can be matched.
    */
   differences: Map<number, string> | null
+  /**
+   * The embedded Type1/CFF program as a MuPDF font, when it can be asked
+   * which glyphs it holds — see `loadFontProgram`. Null for TrueType (its
+   * symbolic cmaps answer nothing useful about Unicode), for non-embedded
+   * fonts, and for programs whose glyph names FreeType cannot map.
+   */
+  program: any | null
+}
+
+/**
+ * pdfTeX writes the TFM width of EVERY character into /Widths, used or not:
+ * `X` is 750 in a 94-glyph subset that has no X at all. The Widths test in
+ * `encodeForSimpleFont` is therefore blind on LaTeX output, and the typed
+ * letter went into the file and drew NOTHING — the sweep read the edit as
+ * applied and the page showed the line unchanged. The embedded program is
+ * the only thing that knows, so it is loaded (FreeType synthesises a Unicode
+ * charmap from the glyph names) and asked per character.
+ *
+ * Trusted only after a sanity check: at least one single-letter name from
+ * the font's /Differences array must resolve, or — without Differences — at
+ * least one ASCII letter. A program whose names FreeType cannot map (Corel
+ * and some Distiller subsets name glyphs /g17) resolves none, and would
+ * otherwise declare every glyph missing and substitute fonts everywhere.
+ * "Every named letter" is the wrong test: pdfTeX writes the WHOLE encoding
+ * vector into /Differences, unused names included, so the very font this
+ * exists for fails it.
+ */
+function loadFontProgram(fdr: any, baseFont: string, differences: Map<number, string> | null): any | null {
+  if (!mupdf) return null
+  for (const key of ['FontFile', 'FontFile3']) {
+    const ref = fdr.get(key)
+    if (!ref || String(ref) === 'null') continue
+    let font: any
+    try {
+      // readStream() on the INDIRECT reference — resolved first it reads empty.
+      const bytes = ref.readStream().asUint8Array()
+      font = new mupdf.Font(baseFont.replace(/^[A-Z]{6}\+/, '') || 'embedded', bytes)
+    } catch (_) { return null }
+    const probe = (cp: number) => { try { return font.encodeCharacter(cp) !== 0 } catch (_) { return false } }
+    const named = differences ? [...differences.values()].filter(n => /^[A-Za-z0-9]$/.test(n)) : []
+    if (named.length) {
+      return named.some(n => probe(n.charCodeAt(0))) ? font : null
+    }
+    for (let cp = 0x41; cp <= 0x7a; cp++) if ((cp <= 0x5a || cp >= 0x61) && probe(cp)) return font
+    return null
+  }
+  return null
+}
+
+function programHasGlyph(program: any, cp: number): boolean {
+  try { return program.encodeCharacter(cp) !== 0 } catch (_) { return true }
 }
 
 const simpleFontInfoCache = new Map<string, SimpleFontInfo | null>()
@@ -1651,6 +1702,7 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
       let flags = 0
       let isEmbedded = false
       let missingWidth = 0
+      let program: any | null = null
       try {
         const fd = r.get('FontDescriptor')
         if (fd && String(fd) !== 'null') {
@@ -1659,6 +1711,7 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
           isEmbedded = ['FontFile', 'FontFile2', 'FontFile3']
             .some(k => String(fdr.get(k) || 'null') !== 'null')
           missingWidth = Number(String(fdr.get('MissingWidth') || '0')) || 0
+          try { program = loadFontProgram(fdr, baseFont, differences) } catch (_) { program = null }
         }
       } catch (_) { /* ignore */ }
 
@@ -1681,7 +1734,8 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
         isEmbedded,
         isSubset: /^[A-Z]{6}\+/.test(baseFont),
         missingWidth,
-        isType0: subtype === '/Type0'
+        isType0: subtype === '/Type0',
+        program
       }
     }
     page.destroy()
@@ -1732,6 +1786,13 @@ function encodeForSimpleFont(
         missing.push(ch)
         continue
       }
+    }
+    // A non-zero width is not proof the glyph exists — see loadFontProgram.
+    // The space is exempt: it draws nothing whether or not the program has
+    // it, and its advance comes from /Widths (LaTeX fonts have no space).
+    if (info.program && cp !== 32 && !programHasGlyph(info.program, cp)) {
+      missing.push(ch)
+      continue
     }
     bytes += String.fromCharCode(byte)
   }
@@ -6184,7 +6245,14 @@ function replaceInsideTjArray(
     // timesheet by 53 blocks while reporting success. Losing the edit is
     // recoverable; shifting every later cell of a table is not.
     if (!oldKnown || oldGlyphs === 0) return null
-    if (!simpleInfo || simpleInfo.encodingName === 'Unknown' || simpleInfo.isType0) return null
+    if (!simpleInfo || simpleInfo.isType0) return null
+    // An UNKNOWN encoding is fine while the codes are single BYTES: /Widths
+    // is indexed by code whatever the code means, which is exactly how the
+    // viewer advances a symbolic TrueType subset (the bilingual form draws
+    // "Normal / Urgente / Urgente e Importante" as one such array inside a
+    // SimSun block, and refusing it read as "could not find"). Two-byte codes
+    // read as bytes index garbage, and stay refused.
+    if (simpleInfo.encodingName === 'Unknown' && (encoding?.codeBytes ?? 1) !== 1) return null
     const avgAdvance = oldW / oldGlyphs
     if (!(avgAdvance >= 150 && avgAdvance <= 1500)) return null
     // Split the array around the run and draw the run in the substitute font.
@@ -7080,6 +7148,56 @@ function applyPartialBlockReplacement(
     if (plan.kind === 'error') return { error: plan.error }
   }
 
+  // What follows the window inside the same BT is placed by the PEN unless
+  // a Td/TD/Tm/T* resets it. pdfTeX sets a table-of-contents line as text,
+  // leader dots and the page number in ONE line of ops, the number reached by
+  // a kern: widening the text pushed the "9" ten points to the right. The
+  // difference between what the window drew and what it draws now is
+  // cancelled with a kern after it, when every width involved is known.
+  const trailingKern = (): string => {
+    const next = ops[winJ + 1]
+    if (!next || next.kind === 'quote' || next.kind === 'dquote') return ''
+    const between = maskStreamLiterals(block.content).slice(ops[winJ].end, next.start)
+    if (/(^|[^A-Za-z])(Td|TD|Tm|T\*)(?![A-Za-z])/.test(between)) return ''
+    let oldAdv = 0
+    for (let k = winI; k <= winJ; k++) {
+      const fr = encodingFor(ops[k])
+      const st = textStateAtOp(block, ops, k, pageIndex)
+      const w = st ? showOpAdvance(ops[k], fr.encoding, fr.simpleInfo ?? null, st.tfSize, 0, 0) : null
+      if (w === null) return ''
+      oldAdv += w
+    }
+    const stIn = textStateAtOp(block, ops, winI, pageIndex)
+    if (!stIn || !(stIn.tfSize > 0)) return ''
+    let newAdv = 0
+    if (plan.kind === 'keep-plain') {
+      const si = encodingFor(ops[winI]).simpleInfo
+      if (!si?.widths) return ''
+      for (const b of plan.byteLines[0]) {
+        const cw = si.widths[b.charCodeAt(0) - si.firstChar]
+        if (cw === undefined) return ''
+        newAdv += cw / 1000 * stIn.tfSize
+      }
+    } else if (plan.kind === 'subst' && !plan.hex) {
+      const f = measureFace(plan.fontName)
+      if (!f) return ''
+      for (const ch of winText) {
+        let g = 0
+        try { g = f.encodeCharacter(ch.codePointAt(0)!) } catch (_) { g = 0 }
+        if (!g) return ''
+        newAdv += f.advanceGlyph(g) * stIn.tfSize
+      }
+    } else {
+      return ''
+    }
+    const stOut = winJ === winI ? stIn : textStateAtOp(block, ops, winJ, pageIndex)
+    const endSize = stOut?.tfSize && stOut.tfSize > 0 ? stOut.tfSize : stIn.tfSize
+    const delta = newAdv - oldAdv
+    if (!isFinite(delta) || Math.abs(delta) < 0.05) return ''
+    return ` [${fmtNum(delta * 1000 / endSize)}] TJ`
+  }
+  const kern = trailingKern()
+
   let content = block.content
   let substitutedFont: string | undefined
   for (let k = winJ; k >= winI; k--) {
@@ -7129,6 +7247,7 @@ function applyPartialBlockReplacement(
       // subsequent line advances stay correct
       repl = buildShowOp(op.kind, op.isHex ? '<>' : '()', op.raw)
     }
+    if (k === winJ) repl += kern
     content = content.slice(0, op.start) + repl + content.slice(op.end)
   }
 

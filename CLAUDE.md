@@ -2515,6 +2515,70 @@ currently draw would be gone and a later edit needing one would be pushed into
 a substitute. Measured: 39 KB per run, 242 ms, extracts back as written. The
 FreeType "invalid argument" warnings during subsetting are MuPDF's and harmless.
 
+### A WASM trap reported as an error message is still a crash
+MuPDF's "memory access out of bounds" (and "table index is out of bounds")
+arrive through the worker's own try/catch as an ordinary `error` reply, NOT
+through `worker.onerror`, so the crash recovery in `bridge.ts` never fired:
+the worker stayed up on a corrupted heap and answered "No document loaded"
+to everything after — in the OCR sweep one such file took the 83 after it.
+The worker flags a `WebAssembly.RuntimeError` as `fatal`, the bridge also
+recognises the runtime's messages (`isWasmFatal`), and both go through the
+same `markCrashed()` teardown `onerror` uses, so the next call respawns the
+worker and reloads the document. Recovery is only as good as `lastDoc`: an
+engine-level test that never went through `loadDocument` has nothing to
+come back to.
+
+### pdfTeX's /Widths lists EVERY glyph, held or not
+The glyph-availability test in `encodeForSimpleFont` reads a zero in
+/Widths as "missing from the subset". pdfTeX writes the TFM width of the
+whole encoding — `X` = 750 in a 94-glyph LMRoman10 subset with no X — so on
+LaTeX output the test is blind: the typed letter went into the file, drew
+NOTHING, and the sweep scored the edit as applied while the page showed the
+line unchanged. `loadFontProgram` loads the embedded Type1/CFF program
+(`FontFile`/`FontFile3`, `readStream()` on the indirect reference) into a
+`mupdf.Font`, FreeType synthesises a Unicode charmap from the glyph names,
+and `programHasGlyph` is asked per character. Never for TrueType: a
+symbolic (3,0) cmap answers nothing about Unicode and every glyph would
+read as missing. The sanity gate is "at least ONE single-letter name in
+/Differences resolves" — "every named letter" was tried first and fails on
+exactly this producer, because pdfTeX writes the whole encoding vector into
+/Differences, unused names included. The space is exempt: LaTeX fonts have
+no space glyph, it draws nothing either way, and its advance comes from
+/Widths.
+
+### What follows a rewritten window is placed by the PEN
+Inside one BT, the ops after an edited run are positioned relative to the
+pen unless a Td/TD/Tm/T* resets it. A LaTeX table of contents sets the
+entry, its leader dots and its page number as one line of ops, the number
+reached by a kern — widening the text pushed the "9" ten points right.
+`applyPartialBlockReplacement` measures what the window drew (per-op
+`showOpAdvance`) against what it draws now (the kept font's /Widths, or the
+substitute base-14 face's advances) and appends `[k] TJ` after the window
+to cancel the difference — only when every width is known and nothing in
+between resets the line matrix. Same physics `replaceInsideTjArray` already
+applies inside an array, one level out.
+
+### A page operation forgets the OCR results
+OCR results and scan verdicts are keyed by page index and measured on the
+page's geometry. Insert, delete, duplicate, move, merge and rotate make
+every index after the change describe a different page; `forgetOcr()` in
+`EditorLayout` drops them after each such op, and says so when unbaked
+edits went with them. Recognising again costs seconds; editing the wrong
+page costs a document.
+
+### An UNKNOWN encoding with single-byte codes can still take an in-array substitution
+`replaceInsideTjArray`'s substitution branch refused every font whose
+`encodingName` is `Unknown` — which is every symbolic TrueType subset with
+no /Encoding, the commonest font Word and Ghostscript emit. The bilingual
+form draws "Normal / Urgente / Urgente e Importante" as ONE such array
+inside a SimSun block, so typing a letter the subset lacks reported "Could
+not find matching text" after the block had in fact been found. /Widths is
+indexed by CODE whatever the code means, so with one-byte codes
+(`encoding.codeBytes === 1`) the old-run width the compensation kern needs
+is exactly what the viewer advances by. Two-byte codes read as bytes index
+garbage and stay refused, as does Type0. Measured: the caption edits to a
+Times-Bold substitute with its neighbours untouched, and edits back.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
