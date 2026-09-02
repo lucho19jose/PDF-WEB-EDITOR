@@ -115,7 +115,7 @@ function plainColor(c: readonly number[] | undefined): [number, number, number] 
  *
  * @param items every run on the page; untouched ones are skipped here
  */
-export function planOcrExport(items: OcrTextItem[], faceId?: string): OcrExportPlan {
+export function planOcrExport(items: OcrTextItem[], faceIdFor?: (item: OcrTextItem) => string | undefined): OcrExportPlan {
   const patches: PatchOp[] = []
   const texts: TextOp[] = []
 
@@ -140,7 +140,7 @@ export function planOcrExport(items: OcrTextItem[], faceId?: string): OcrExportP
         fontName,
         color: plainColor(item.color),
         rotation: 90,
-        faceId
+        faceId: faceIdFor?.(item)
       })
       continue
     }
@@ -167,7 +167,7 @@ export function planOcrExport(items: OcrTextItem[], faceId?: string): OcrExportP
       fontName,
       color: plainColor(item.color),
       rotation: 0,
-      faceId
+      faceId: faceIdFor?.(item)
     })
   }
 

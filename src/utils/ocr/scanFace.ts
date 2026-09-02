@@ -43,16 +43,34 @@ export interface ScanFace {
   fontFace: FontFace | null
 }
 
-const faces = new Map<number, ScanFace>()
+const faces = new Map<string, ScanFace>()
 let potraceReady: Promise<void> | null = null
 
-export function scanFaceFor(pageIndex: number): ScanFace {
-  let f = faces.get(pageIndex)
+/**
+ * One face per STYLE on a page: weight, slant and point size. A letterhead
+ * sets its footer in a 9pt italic serif and its body in a 12pt sans, and a
+ * face keyed by page alone drew the footer's "e" with the body's — or worse,
+ * the body's "e" with a footer cell that was cut wrong.
+ */
+export function styleKeyOf(item: { bold: boolean; italic: boolean; fontSize: number }): string {
+  return `${item.bold ? 'b' : 'r'}${item.italic ? 'i' : ''}${Math.round(item.fontSize)}`
+}
+
+export function scanFaceFor(pageIndex: number, styleKey: string): ScanFace {
+  const key = `${pageIndex}|${styleKey}`
+  let f = faces.get(key)
   if (!f) {
-    f = { pageIndex, familyName: `ScanFace-p${pageIndex + 1}`, glyphs: new Map(), bytes: null, version: 0, fontFace: null }
-    faces.set(pageIndex, f)
+    f = { pageIndex, familyName: `ScanFace-p${pageIndex + 1}-${styleKey}`, glyphs: new Map(), bytes: null, version: 0, fontFace: null }
+    faces.set(key, f)
   }
   return f
+}
+
+/** Every face of a page that has glyphs. */
+export function scanFacesOf(pageIndex: number): ScanFace[] {
+  const out: ScanFace[] = []
+  for (const f of faces.values()) if (f.pageIndex === pageIndex && f.glyphs.size) out.push(f)
+  return out
 }
 
 export function clearScanFaces() {
@@ -106,7 +124,7 @@ export async function traceRunIntoFace(
   const bottom = inkRect.y + inkRect.height
   let added = 0
   for (const [index, cell] of cut.cells.entries()) {
-    if (!trusted(index)) continue
+    if (!trusted(index) || cell.suspect) continue
     if (face.glyphs.has(cell.char)) continue
     const bmp = cellBitmap(ctx, cell, top, bottom, cut.threshold)
     if (!bmp) continue
@@ -251,7 +269,12 @@ function parsePathData(d: string): Seg[] {
 /** Compile the glyph library into font bytes and (re)register the preview face. */
 async function rebuild(face: ScanFace) {
   const notdef = new opentype.Glyph({ name: '.notdef', advanceWidth: Math.round(UPM * 0.5), path: new opentype.Path() })
-  const glyphs = [notdef]
+  // A space glyph, always: the engine encodes a whole segment in one face,
+  // and a face that cannot encode the space between two traced words made
+  // "N° 377-3000888581" fall back to Helvetica entirely while single words
+  // traced fine. A third of an em is what a text face's space measures.
+  const space = new opentype.Glyph({ name: 'space', unicode: 32, advanceWidth: Math.round(UPM * 0.3), path: new opentype.Path() })
+  const glyphs = [notdef, space]
   for (const g of face.glyphs.values()) {
     const cp = g.char.codePointAt(0)!
     glyphs.push(new opentype.Glyph({ name: `uni${cp.toString(16).toUpperCase().padStart(4, '0')}`, unicode: cp, advanceWidth: g.advance, path: g.path }))

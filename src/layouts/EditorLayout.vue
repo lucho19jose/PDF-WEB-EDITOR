@@ -81,6 +81,7 @@ import { useOcrStore } from '@/stores/ocr'
 import { useOCR, OCR_DEFAULT_LANG } from '@/composables/useOCR'
 
 import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
+import { styleKeyOf } from '@/utils/ocr/scanFace'
 
 /** OCR reads the page at 220 DPI; PDF user space is 72 to the inch. */
 const OCR_RENDER_SCALE = 220 / 72
@@ -300,15 +301,18 @@ async function bakeOcrEdits(): Promise<number> {
   let written = 0
 
   for (const [pageIndex, page] of ocrStore.pages) {
-    // The page's traced scan face, embedded once per bake so the runs that
-    // name it draw with the document's own glyphs.
-    const face = ocr.faceOf(pageIndex)
-    let faceId: string | undefined
-    if (face?.bytes) {
+    // The page's traced scan faces — one per style — embedded once per bake
+    // so the runs that name them draw with the document's own glyphs.
+    const registered = new Set<string>()
+    for (const face of ocr.facesOf(pageIndex)) {
+      if (!face.bytes) continue
       const ok = await pdfEngine.registerFace(face.familyName, face.bytes.slice(0)).catch(() => false)
-      if (ok) faceId = face.familyName
+      if (ok) registered.add(face.familyName)
     }
-    const plan = planOcrExport(page.items, faceId)
+    const plan = planOcrExport(page.items, item => {
+      const face = ocr.faceOf(pageIndex, styleKeyOf(item))
+      return face && registered.has(face.familyName) ? face.familyName : undefined
+    })
     if (plan.patches.length === 0 && plan.texts.length === 0) continue
 
     await exclusiveOp(async () => {

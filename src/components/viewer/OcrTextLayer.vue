@@ -65,6 +65,7 @@ import { ref, computed, nextTick, watch } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useOcrStore } from '@/stores/ocr'
 import { useOCR } from '@/composables/useOCR'
+import { styleKeyOf } from '@/utils/ocr/scanFace'
 import { rgb01ToCss } from '@/utils/color'
 import type { OcrTextItem, OcrRect } from '@/utils/ocr/ocrTypes'
 
@@ -191,7 +192,7 @@ const ocr = useOCR()
  */
 function faceStack(item: OcrTextItem): string {
   void ocr.faceVersion.value
-  const face = ocr.faceOf(item.pageIndex)
+  const face = ocr.faceOf(item.pageIndex, styleKeyOf(item))
   const base = cssFamily(item.fontFamily)
   return face && face.fontFace ? `"${face.familyName}", ${base}` : base
 }

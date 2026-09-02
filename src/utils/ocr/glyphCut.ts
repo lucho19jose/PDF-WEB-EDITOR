@@ -18,6 +18,8 @@ export interface GlyphCell {
   /** Canvas pixel columns, inclusive–exclusive. */
   x0: number
   x1: number
+  /** The cell's width contradicts its character; do not trace it. */
+  suspect?: boolean
 }
 
 export interface GlyphCutResult {
@@ -118,6 +120,11 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | nu
   }
   if (!runs.length) return null
   const target = chars.length
+  // Letters that mostly TOUCH cannot be cut by profile: an italic serif
+  // footer gave 69 characters in far fewer ink runs, and however the runs were
+  // shared out, every second cell held the wrong letter. Tesseract's glyph
+  // boxes are the only honest cut for such a line; without them, refuse.
+  if (runs.length < target * 0.6) return null
   const budget = Math.max(1, Math.round(target * 0.35))
   let edits = 0
 
@@ -154,7 +161,71 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | nu
       x = x1
     })
   }
+  // Every cell's width against its character. An italic serif footer whose
+  // letters touch fit the least-squares partition well enough as a WHOLE and
+  // still gave a 5px "b" beside a 12px "i" — and those shapes went into the
+  // face as b and i. A cell off by more than 40% is not traced; a run with
+  // more than a quarter of them so is not cut at all.
+  const totalW = cells.reduce((s, c) => s + (c.x1 - c.x0), 0)
+  const totalE = chars.reduce((s, c) => s + expectedAdvance(c), 0) || 1
+  let suspects = 0
+  for (const c of cells) {
+    const want = expectedAdvance(c.char) / totalE * totalW
+    const got = c.x1 - c.x0
+    if (Math.abs(got - want) > Math.max(3, want * 0.4)) { c.suspect = true; suspects++ }
+  }
+  // And each cell's SHAPE against its letter: a cell shifted by one letter
+  // keeps a plausible width, which is how "República" came back reading
+  // "Rpúbbiica". An x-height letter must neither rise nor descend, a
+  // descender must descend, an ascender or a capital must rise — measured
+  // against the run's own x-height and baseline.
+  suspects += flagByShape(bin, cells)
+  if (suspects > cells.length * 0.1) return null
   return cells
+}
+
+const X_HEIGHT_CHARS = /^[aceimnorsuvwxzáéíóúñäëïöüàèìòùâêîôû]$/
+const ASCENDER_CHARS = /^[bdfhklt]$/
+const DESCENDER_ONLY = /^[gpqy]$/
+const TALL_CHARS = /^[A-Z0-9ÁÉÍÓÚÑ]$/
+
+/** Mark cells whose ink extent contradicts their letter's class; returns how many. */
+function flagByShape(bin: Bin, cells: GlyphCell[]): number {
+  const extents = cells.map(c => {
+    const x0 = Math.max(0, c.x0 - bin.x), x1 = Math.min(bin.w, c.x1 - bin.x)
+    let top = -1, bottom = -1
+    for (let yy = 0; yy < bin.h; yy++) {
+      let on = false
+      for (let xx = x0; xx < x1; xx++) if (bin.ink[yy * bin.w + xx]) { on = true; break }
+      if (on) { if (top < 0) top = yy; bottom = yy }
+    }
+    return { top, bottom }
+  })
+  // Baseline and x-height from the cells that define them.
+  const bottoms: number[] = [], xTops: number[] = []
+  cells.forEach((c, i) => {
+    if (extents[i].top < 0) return
+    if (!DESCENDER_ONLY.test(c.char) && !/[,;()]/.test(c.char)) bottoms.push(extents[i].bottom)
+    if (X_HEIGHT_CHARS.test(c.char)) xTops.push(extents[i].top)
+  })
+  if (bottoms.length < 2 || xTops.length < 2) return 0
+  bottoms.sort((a, b) => a - b); xTops.sort((a, b) => a - b)
+  const baseline = bottoms[Math.floor(bottoms.length / 2)]
+  const xTop = xTops[Math.floor(xTops.length / 2)]
+  const xh = Math.max(3, baseline - xTop)
+  let flagged = 0
+  cells.forEach((c, i) => {
+    const e = extents[i]
+    if (e.top < 0 || c.suspect) return
+    const rise = (xTop - e.top) / xh          // how far above the x-height line
+    const drop = (e.bottom - baseline) / xh   // how far below the baseline
+    let bad = false
+    if (X_HEIGHT_CHARS.test(c.char)) bad = rise > 0.3 || drop > 0.25
+    else if (DESCENDER_ONLY.test(c.char)) bad = drop < 0.15 || rise > 0.3
+    else if (ASCENDER_CHARS.test(c.char) || TALL_CHARS.test(c.char)) bad = rise < 0.12 || drop > 0.25
+    if (bad) { c.suspect = true; flagged++ }
+  })
+  return flagged
 }
 
 /**

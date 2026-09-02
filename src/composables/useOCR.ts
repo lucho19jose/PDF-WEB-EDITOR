@@ -8,7 +8,8 @@ import { TesseractEngine } from '@/utils/ocr/engines/tesseractEngine'
 import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
 import { inkBounds, inkGaps, type InkCut } from '@/utils/ocr/inkMeasure'
-import { scanFaceFor, traceRunIntoFace, clearScanFaces, type ScanFace } from '@/utils/ocr/scanFace'
+import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace } from '@/utils/ocr/scanFace'
+import { cutGlyphs } from '@/utils/ocr/glyphCut'
 
 /**
  * Recognising the text in a scanned page.
@@ -211,7 +212,7 @@ function createOCR() {
     const k = 1 / raster.toPt
     const rect = { x: item.inkRect.x * k, y: item.inkRect.y * k, width: item.inkRect.width * k, height: item.inkRect.height * k }
     const symbols = item.symbols?.map(s => ({ x0: s.x * k, y0: s.y * k, x1: (s.x + s.width) * k, y1: (s.y + s.height) * k }))
-    const face = scanFaceFor(item.pageIndex)
+    const face = scanFaceFor(item.pageIndex, styleKeyOf(item))
     try {
       const added = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, symbols, item.text)
       if (added) faceVersion.value++
@@ -222,10 +223,26 @@ function createOCR() {
     }
   }
 
-  /** The page's scan face, if any glyph has been traced for it. */
-  function faceOf(pageIndex: number): ScanFace | null {
-    const f = scanFaceFor(pageIndex)
+  /** How an item's ink would be cut into glyph cells — for tests and the harness. */
+  function cutFor(item: OcrTextItem): { cells: { char: string; x0: number; x1: number }[]; emPx: number; baselineY: number; toPt: number } | null {
+    const raster = rasters.get(item.pageIndex)
+    if (!raster) return null
+    const k = 1 / raster.toPt
+    const rect = { x: item.inkRect.x * k, y: item.inkRect.y * k, width: item.inkRect.width * k, height: item.inkRect.height * k }
+    const symbols = item.symbols?.map(s => ({ x0: s.x * k, y0: s.y * k, x1: (s.x + s.width) * k, y1: (s.y + s.height) * k }))
+    const cut = cutGlyphs(raster.ctx, rect, item.originalText, symbols)
+    return cut ? { cells: cut.cells, emPx: cut.emPx, baselineY: cut.baselineY, toPt: raster.toPt } : null
+  }
+
+  /** The page's scan face for a run's style, if any glyph has been traced for it. */
+  function faceOf(pageIndex: number, styleKey: string): ScanFace | null {
+    const f = scanFaceFor(pageIndex, styleKey)
     return f.glyphs.size ? f : null
+  }
+
+  /** Every face of a page with glyphs — the bake registers them all. */
+  function facesOf(pageIndex: number): ScanFace[] {
+    return scanFacesOf(pageIndex)
   }
 
   /** Forget rasters and faces — a different document is being opened. */
@@ -945,5 +962,5 @@ function createOCR() {
     engines.clear()
   }
 
-  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, faceOf, reset, destroy }
+  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, cutFor, faceOf, facesOf, reset, destroy }
 }
