@@ -6957,10 +6957,12 @@ function narrowToChangedOps(
   ops: ShowOpInfo[],
   i: number,
   j: number,
-  newText: string
+  newText: string,
+  oldText?: string
 ): { i: number; j: number; text: string } | null {
   let lo = i, text = newText
-  const targetFree = foldForMatch(newText).replace(/\s/g, '')
+  const newFree = foldForMatch(newText).replace(/\s/g, '')
+  const oldFree = oldText !== undefined ? foldForMatch(oldText).replace(/\s/g, '') : null
   while (lo < j) {
     // Space-FREE, like every other stream-vs-extraction compare: the op's
     // spaces are glyphs at stream positions, the target's are synthesised by
@@ -6972,12 +6974,17 @@ function narrowToChangedOps(
     if (dFree) {
       const consumed = consumePrefixFree(text, dFree)
       if (consumed === null) {
-        // A glyph the target never had at all — a superscript "º" that
-        // extraction put in its own block between "RUC N" and the digits —
-        // is not a change either: it stays where it is, drawn by its own op,
-        // and the walk goes on to the ops that ARE the target's. Blanking it
-        // with the window deleted the "º"; stopping here re-encoded it.
-        const foreign = !targetFree.includes(foldForMatch(dFree).replace(/\s/g, ''))
+        // A glyph NEITHER text ever had — a superscript "º" that extraction
+        // put in its own block between "RUC N" and the digits, so it is in
+        // neither the old target nor the new — is not a change either: it
+        // stays where it is, drawn by its own op, and the walk goes on to the
+        // ops that ARE the target's. Blanking it with the window deleted the
+        // "º"; stopping here re-encoded the digits from its position. Judged
+        // against BOTH texts: against the new text alone, every letter of a
+        // replaced word ("Quiz" → "SWEEPMARK") read as foreign and was kept,
+        // which lost eight sweep experiments at once.
+        const g = foldForMatch(dFree).replace(/\s/g, '')
+        const foreign = oldFree !== null && !newFree.includes(g) && !oldFree.includes(g)
         if (!foreign) break
       } else {
         text = text.slice(consumed)
@@ -7275,7 +7282,7 @@ function applyPartialBlockReplacement(
     // ("fHi :lEl M:" for 开始日期), the substitution DRAWS that garbage in
     // place of the ideographs. Where the run already encodes in its own font,
     // nothing is trimmed and the rewrite stays exactly as wide as it was.
-    const narrowed = narrowToChangedOps(ops, winI, winJ, winText)
+    const narrowed = narrowToChangedOps(ops, winI, winJ, winText, targetBlock.text)
     if (narrowed) {
       const retry = planFor(narrowed.i, narrowed.text)
       if (retry.kind !== 'error') {
