@@ -5497,7 +5497,19 @@ function applyLineReplacement(
  * candidate to the click still wins.
  */
 function foldForMatch(s: string): string {
-  return s.replace(/\s+/g, ' ').trim().toLowerCase()
+  return s.replace(/[\uFB00-\uFB06]/g, ch => LIGATURE_FOLD[ch] ?? ch).replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+/**
+ * A ToUnicode CMap maps an "fi" glyph to U+FB01 while MuPDF's extraction
+ * expands it to "fi", so the stream decode of "perfil" read "perﬁl" and never
+ * equalled the extracted target. On the Intellisign manual that made the line
+ * group ("perﬁl”" + "选项") lose to a fuzzy single-block match on the Latin
+ * half alone, which took the whole replacement and left the CJK block on the
+ * page — the ideographs drew TWICE, offset. Folded, the group matches exactly.
+ */
+const LIGATURE_FOLD: Record<string, string> = {
+  '\uFB00': 'ff', '\uFB01': 'fi', '\uFB02': 'fl', '\uFB03': 'ffi', '\uFB04': 'ffl', '\uFB05': 'ft', '\uFB06': 'st'
 }
 
 /**

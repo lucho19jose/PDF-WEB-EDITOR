@@ -2582,6 +2582,56 @@ is exactly what the viewer advances by. Two-byte codes read as bytes index
 garbage and stay refused, as does Type0. Measured: the caption edits to a
 Times-Bold substitute with its neighbours untouched, and edits back.
 
+### A clip grows toward wherever the text ENDS, on both axes
+`widenClipForText` mapped the replacement's end point into the clip's own
+space and compared only its x. On a /Rotate 90 page (the Ghostscript
+fund-request forms) a line runs along the clip's HEIGHT: the end lands
+outside in y with x untouched, so the cell clip stayed exactly as long as
+the old text, the typed letter was drawn and clipped away, and the edit
+reported success while the page showed nothing — MuPDF's extraction honours
+the clip too, so nothing read it back either. Both coordinates are taken as
+a union now; for an upright line the end point's y is already inside the
+clip and only x can grow, so nothing changes there.
+
+### Any character WinAnsi lacks takes the wide face, not only CJK
+`planTextEncoding` routed only `hasCjk` text to the mini Noto font, so a
+thesis line with a real MINUS SIGN (U+2212, "Q(s) − G") refused with
+"Cannot encode characters: −". `needsWideFont` is CJK OR any code point
+outside WinAnsi, and `ensureCjkFontFor` loads the face on the same test.
+What the face lacks either still errors.
+
+### An ActualText override never carries a no-break space
+Word marks every nbsp with `/Span <</ActualText <FEFF00A0>>>`, so an
+extracted line carries U+00A0 and a retyped line brings it back into the
+span override — and MuPDF's extraction, given an ActualText holding U+00A0,
+read "S.A.A. 0000" back as "S.A.A. 0 0000" (measured on the saved file:
+the same override with U+0020 reads back clean; the ink was right all
+along). `retagSpanActualText` writes U+00A0/U+202F/U+2007 as a plain space.
+
+### Ligatures are folded before any comparison
+A ToUnicode CMap maps an "fi" glyph to U+FB01 while MuPDF's extraction
+expands it to "fi", so the stream decode of "perfil" read "perﬁl" and never
+equalled the extracted target. On the Intellisign manual that made the line
+group ("perﬁl”" + "选项") lose to a fuzzy single-block match on the Latin
+half alone, which took the whole replacement and left the CJK block on the
+page — the ideographs drew TWICE, offset by a few points. `foldForMatch`
+expands U+FB00–FB06 first; the sweep is unchanged.
+
+### Known limitations found by the overnight sweep (2026-09-02)
+- **A fully justified line has no room.** Appending to a line that already
+  touches the right margin draws the new word past the page edge (the
+  op-level rescue paths draw in place and do not wrap). Only the rebuild
+  path wraps, and it is not reached when the edit is narrowed to one op.
+- **Identical text drawn twice in the same place** (Intellisign stamps its
+  ID strip once per signing pass, in separate content chunks) extracts as
+  ONE line; an edit rewrites one copy and the other still shows the old
+  text. The shuffle matcher only sees interleaved overlaps.
+- A faint watermark-grey logo recognised by OCR ("MOUXIN") is redrawn in
+  its sampled colour, i.e. nearly invisible — faithful, but reads as lost.
+- MuPDF's WASM traps ("memory access out of bounds") on one Ghostscript
+  order form in a long sweep and not in a fresh worker; recovery reloads
+  the document and the rest of the run is unaffected.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
