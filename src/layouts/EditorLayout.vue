@@ -220,6 +220,21 @@ async function isScanLikePage(pageIndex: number): Promise<boolean> {
 }
 
 /**
+ * OCR results and scan verdicts are keyed by PAGE INDEX and measured on a
+ * page's geometry. A page inserted, deleted, moved, duplicated, merged or
+ * rotated makes every index and every box after it a lie — boxes would sit
+ * on the wrong page. They are dropped; recognising again costs seconds,
+ * editing the wrong page costs a document. Unbaked edits go with them, so
+ * the status says so when there were any.
+ */
+function forgetOcr() {
+  const hadEdits = ocrStore.hasEdits
+  ocrStore.clear()
+  ocr.reset()
+  if (hadEdits) editorStore.setStatus('Page structure changed — unsaved OCR edits were discarded; recognise the page again')
+}
+
+/**
  * What the editing layers need in order to recognise a scan on a click:
  * the verdict, the runner (no "already has text" dialog — the caller has
  * proved the page is a scan) and whether one is already running.
@@ -801,7 +816,7 @@ async function rotatePage(degrees: number) {
   if (!docStore.loaded) return
   await exclusiveOp(async () => {
     const ok = await pdfEngine.rotatePage(docStore.currentPage - 1, degrees)
-    if (ok) { pushUndo(); await syncAfterEdit(); editorStore.setStatus(`Page rotated ${degrees > 0 ? 'right' : 'left'}`) }
+    if (ok) { pushUndo(); forgetOcr(); await syncAfterEdit(); editorStore.setStatus(`Page rotated ${degrees > 0 ? 'right' : 'left'}`) }
     else editorStore.setStatus(`Rotate failed: ${pdfEngine.error.value}`)
   })
 }
@@ -838,6 +853,7 @@ async function mergePdfFile(file: File) {
         return
       }
       pushUndo()
+      forgetOcr()
       await syncAfterEdit()
       docStore.setPage(at + 1)
       editorStore.setStatus(`${file.name} merged — ${r.added} page(s) added after page ${at}, ${r.pages} in total`)
@@ -852,7 +868,7 @@ async function insertBlankPage() {
   await exclusiveOp(async () => {
     const size = await pdfEngine.getPageSize(docStore.currentPage - 1).catch(() => ({ width: 612, height: 792 }))
     const r = await pdfEngine.insertBlankPage(docStore.currentPage, size.width, size.height)
-    if (r !== false) { pushUndo(); await syncAfterEdit(); docStore.setPage(docStore.currentPage + 1); editorStore.setStatus('Blank page inserted') }
+    if (r !== false) { pushUndo(); forgetOcr(); await syncAfterEdit(); docStore.setPage(docStore.currentPage + 1); editorStore.setStatus('Blank page inserted') }
     else editorStore.setStatus(`Insert failed: ${pdfEngine.error.value}`)
   })
 }
@@ -860,7 +876,7 @@ async function deletePage() {
   if (!docStore.loaded) return
   await exclusiveOp(async () => {
     const r = await pdfEngine.deletePage(docStore.currentPage - 1)
-    if (r !== false) { pushUndo(); await syncAfterEdit(); editorStore.setStatus('Page deleted') }
+    if (r !== false) { pushUndo(); forgetOcr(); await syncAfterEdit(); editorStore.setStatus('Page deleted') }
     else editorStore.setStatus(`Delete failed: ${pdfEngine.error.value}`)
   })
 }
@@ -868,7 +884,7 @@ async function duplicatePage() {
   if (!docStore.loaded) return
   await exclusiveOp(async () => {
     const r = await pdfEngine.duplicatePage(docStore.currentPage - 1)
-    if (r !== false) { pushUndo(); await syncAfterEdit(); editorStore.setStatus('Page duplicated') }
+    if (r !== false) { pushUndo(); forgetOcr(); await syncAfterEdit(); editorStore.setStatus('Page duplicated') }
     else editorStore.setStatus(`Duplicate failed: ${pdfEngine.error.value}`)
   })
 }
@@ -876,7 +892,7 @@ async function movePage(from: number, to: number) {
   if (!docStore.loaded || from === to) return
   await exclusiveOp(async () => {
     const r = await pdfEngine.movePage(from, to)
-    if (r !== false) { pushUndo(); await syncAfterEdit(); docStore.setPage(to + 1); editorStore.setStatus('Page moved') }
+    if (r !== false) { pushUndo(); forgetOcr(); await syncAfterEdit(); docStore.setPage(to + 1); editorStore.setStatus('Page moved') }
     else editorStore.setStatus(`Move failed: ${pdfEngine.error.value}`)
   })
 }
