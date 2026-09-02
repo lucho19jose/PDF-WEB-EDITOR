@@ -1,5 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { persistedRef } from '@/utils/persist'
+import type { OcrEngineId } from '@/utils/ocr/ocrEngine'
 
 export type Tool =
   | 'select' | 'edit' | 'addText'
@@ -41,6 +43,16 @@ export const useEditorStore = defineStore('editor', () => {
    * it is one click away.
    */
   const reflowOnEdit = ref(false)
+
+  /**
+   * Which recogniser reads a scanned page. PaddleOCR by default (better on
+   * Chinese and mixed scripts, faster); Tesseract as the fallback it drops to
+   * on its own when it cannot start; Mistral only when the user has pasted a
+   * key and accepted that the page image leaves the machine. Remembered
+   * across reloads — the first persisted settings in the app.
+   */
+  const ocrEngine = persistedRef<OcrEngineId>('ocrEngine', 'paddle')
+  const mistralApiKey = persistedRef<string>('mistralApiKey', '')
 
   const imagePlacement = ref<'above' | 'below'>('below')
   /**
@@ -102,7 +114,7 @@ export const useEditorStore = defineStore('editor', () => {
 
   return {
     currentTool, statusMessage, fontFamily, fontSize, textColor,
-    imagePlacement, imageWrap, imageWidthPct, reflowOnEdit, ocrMode,
+    imagePlacement, imageWrap, imageWidthPct, reflowOnEdit, ocrMode, ocrEngine, mistralApiKey,
     highlightColor, strokeColor, fillColor, fillEnabled, strokeWidth, opacity,
     isAnnotationTool, isMarkupTool, propertyContext,
     setTool, setStatus

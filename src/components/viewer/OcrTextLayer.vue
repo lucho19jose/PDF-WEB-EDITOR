@@ -64,6 +64,7 @@
 import { ref, computed, nextTick, watch } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useOcrStore } from '@/stores/ocr'
+import { useOCR } from '@/composables/useOCR'
 import { rgb01ToCss } from '@/utils/color'
 import type { OcrTextItem, OcrRect } from '@/utils/ocr/ocrTypes'
 
@@ -158,7 +159,7 @@ const scaled = computed(() =>
     boxStyle: styleFor(item),
     textStyle: {
       fontSize: `${item.fontSize * scaleY.value}px`,
-      fontFamily: cssFamily(item.fontFamily),
+      fontFamily: faceStack(item),
       fontWeight: item.bold ? '700' : '400',
       fontStyle: item.italic ? 'italic' : 'normal',
       color: rgb01ToCss(item.color),
@@ -178,6 +179,21 @@ function cssFamily(family: string): string {
   if (family.startsWith('Times')) return 'Times New Roman, Times, serif'
   if (family.startsWith('Courier')) return 'Courier New, Courier, monospace'
   return 'Helvetica, Arial, sans-serif'
+}
+
+const ocr = useOCR()
+
+/**
+ * The page's traced scan face first, the base family behind it: a character
+ * the scan showed renders as the scan drew it, one it never showed falls
+ * through to the base face. `faceVersion` is read so the style recomputes
+ * when tracing adds glyphs.
+ */
+function faceStack(item: OcrTextItem): string {
+  void ocr.faceVersion.value
+  const face = ocr.faceOf(item.pageIndex)
+  const base = cssFamily(item.fontFamily)
+  return face && face.fontFace ? `"${face.familyName}", ${base}` : base
 }
 
 /**
@@ -209,7 +225,7 @@ const editorStyle = computed(() => {
     width: `max(${base.width}, ${Math.round(minAlong)}px)`,
     height: `max(${base.height}, ${Math.round(minAcross)}px)`,
     fontSize: `${item.fontSize * scaleY.value}px`,
-    fontFamily: cssFamily(item.fontFamily),
+    fontFamily: faceStack(item),
     fontWeight: item.bold ? '700' : '400',
     fontStyle: item.italic ? 'italic' : 'normal',
     color: rgb01ToCss(item.color),
@@ -314,9 +330,13 @@ function beginEdit(id: string, caretAt?: number) {
  */
 function editAt(x: number, y: number): boolean {
   const items = ocrStore.itemsFor(pageIndex.value)
-  const hit = items.find(i => !i.removed &&
-    x >= i.rect.x && x <= i.rect.x + i.rect.width &&
-    y >= i.rect.y && y <= i.rect.y + i.rect.height)
+  // A few points of slack: the boxes hug the ink now, and a click on the
+  // paper just under a label is a click on the label.
+  const pad = 3
+  const inside = (i: OcrTextItem, p: number) =>
+    x >= i.rect.x - p && x <= i.rect.x + i.rect.width + p &&
+    y >= i.rect.y - p && y <= i.rect.y + i.rect.height + p
+  const hit = items.find(i => !i.removed && inside(i, 0)) ?? items.find(i => !i.removed && inside(i, pad))
   if (!hit) return false
   const along = hit.vertical
     ? (hit.rect.y + hit.rect.height - y) / Math.max(hit.rect.height, 1)
@@ -330,6 +350,11 @@ function commitEdit() {
   const id = editing.value
   editing.value = null
   ocrStore.updateItem(id, { text: draft.value.replace(/\s+/g, ' ').trim() })
+  // The scan face learns this run's ORIGINAL glyphs, so the replacement — on
+  // screen now, in the file at export — is drawn with the document's own
+  // letterforms wherever it can be.
+  const item = ocrStore.itemsFor(pageIndex.value).find(i => i.id === id)
+  if (item?.edited) void ocr.traceItem(item)
 }
 
 function cancelEdit() {

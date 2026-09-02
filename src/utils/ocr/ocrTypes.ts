@@ -50,6 +50,8 @@ export interface OcrTextItem {
   inkRect: OcrRect
   /** Word boxes inside the line, page space — kept for measurement and debugging. */
   words: OcrRect[]
+  /** Per-glyph boxes, page space, one per non-space character — when the engine reported them. */
+  symbols?: OcrRect[]
 
   /** Point size estimated from the line's ascender-to-descender height. */
   fontSize: number
@@ -97,6 +99,10 @@ export interface OcrPageResult {
   lang: string
   /** How many runs were read sideways — worth reporting, it is optional work. */
   verticalCount?: number
+  /** Which recogniser produced this — the status line says so, and a fallback is visible. */
+  engine?: 'paddle' | 'tesseract' | 'mistral'
+  /** Set when the chosen engine could not run and another read the page instead. */
+  fallbackNote?: string
 }
 
 /** Why a page was judged to need OCR — reported so the decision is not a black box. */

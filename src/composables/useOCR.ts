@@ -1,8 +1,14 @@
-import { ref, shallowRef } from 'vue'
-import { createWorker, type Worker as TesseractWorker } from 'tesseract.js'
+import { ref } from 'vue'
 import type { OcrPageResult, OcrTextItem, OcrAlign, ScannedVerdict } from '@/utils/ocr/ocrTypes'
 import { sampleLineColors, samplePatchColor } from '@/utils/ocr/ocrSampling'
 import { detectFace, advancesAreUniform } from '@/utils/ocr/ocrFontDetect'
+import type { OcrEngine, OcrEngineId, OcrLine, OcrRecognition, OcrWord, OcrBox } from '@/utils/ocr/ocrEngine'
+import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
+import { TesseractEngine } from '@/utils/ocr/engines/tesseractEngine'
+import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
+import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
+import { inkBounds, inkGaps, type InkCut } from '@/utils/ocr/inkMeasure'
+import { scanFaceFor, traceRunIntoFace, clearScanFaces, type ScanFace } from '@/utils/ocr/scanFace'
 
 /**
  * Recognising the text in a scanned page.
@@ -97,13 +103,13 @@ const GLYPH_BOX_PER_EM_CJK = 0.92
  * honest — a border inflates one or two of them, never the median. Fewer than
  * two glyph boxes falls back to the run's own height.
  */
-function cjkEm(run: any[], runHeight: number): number {
+function cjkEm(run: OcrWord[], runHeight: number): number {
   // An ideograph is square, so a glyph box taller than it is wide has
   // swallowed a rule above or below: the smaller side is the honest one.
   // (Measured: 公司地址 kept a 10.8pt height on every glyph, 6.5pt widths.)
-  const sides = run.flatMap((w: any) => (w.symbols ?? []).map((s: any) =>
-    Math.min(s.bbox.y1 - s.bbox.y0, (s.bbox.x1 - s.bbox.x0) * 1.05)))
-    .filter((h: number) => h > 0).sort((a: number, b: number) => a - b)
+  const sides = run.flatMap(w => (w.symbols ?? []).map(s =>
+    Math.min(s.y1 - s.y0, (s.x1 - s.x0) * 1.05)))
+    .filter(h => h > 0).sort((a, b) => a - b)
   if (sides.length < 2) return runHeight / GLYPH_BOX_PER_EM_CJK
   return sides[Math.floor(sides.length / 2)] / GLYPH_BOX_PER_EM_CJK
 }
@@ -139,7 +145,7 @@ function stripBorders(text: string): string {
   return text.replace(/^[|｜丨]+|[|｜丨]+$/g, '')
 }
 
-interface Box { x0: number; y0: number; x1: number; y1: number }
+type Box = OcrBox
 
 /** The languages recognised by default: the document's Spanish and its Chinese labels. */
 export const OCR_DEFAULT_LANG = 'spa+chi_sim'
@@ -162,8 +168,72 @@ function createOCR() {
   const progress = ref(0)
   const stage = ref('')
   const error = ref<string | null>(null)
-  const worker = shallowRef<TesseractWorker | null>(null)
-  let workerLang = ''
+
+  /** One instance per engine, made on first use and kept warm. */
+  const engines = new Map<OcrEngineId, OcrEngine>()
+  function engineFor(id: OcrEngineId): OcrEngine {
+    let e = engines.get(id)
+    if (!e) {
+      e = id === 'paddle' ? new PaddleEngine()
+        : id === 'mistral' ? new MistralEngine()
+        : new TesseractEngine()
+      engines.set(id, e)
+    }
+    return e
+  }
+  const onProgress = (s: string, pct: number) => { stage.value = s; progress.value = pct }
+
+  /**
+   * The 220 DPI raster each page was recognised on, kept for the scan face:
+   * tracing a glyph needs the very pixels the boxes were measured on. Two
+   * pages at most (~19 MB each) — the current one and the last.
+   */
+  const rasters = new Map<number, { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; toPt: number }>()
+  function keepRaster(pageIndex: number, entry: { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; toPt: number }) {
+    rasters.delete(pageIndex)
+    rasters.set(pageIndex, entry)
+    while (rasters.size > 2) rasters.delete(rasters.keys().next().value!)
+  }
+  /** Bumped whenever a page's scan face gains glyphs; the layer's styles watch it. */
+  const faceVersion = ref(0)
+
+  /**
+   * Trace an edited run's ORIGINAL glyphs into its page's scan face.
+   *
+   * Runs when the user commits an edit, on the run's ink box and original
+   * text — what the scan shows, not what was typed. Quiet on every failure:
+   * a run that cannot be cut simply contributes no glyphs and the export
+   * falls back to the base font for them.
+   */
+  async function traceItem(item: OcrTextItem): Promise<number> {
+    const raster = rasters.get(item.pageIndex)
+    if (!raster || item.vertical) return 0
+    const k = 1 / raster.toPt
+    const rect = { x: item.inkRect.x * k, y: item.inkRect.y * k, width: item.inkRect.width * k, height: item.inkRect.height * k }
+    const symbols = item.symbols?.map(s => ({ x0: s.x * k, y0: s.y * k, x1: (s.x + s.width) * k, y1: (s.y + s.height) * k }))
+    const face = scanFaceFor(item.pageIndex)
+    try {
+      const added = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, symbols)
+      if (added) faceVersion.value++
+      return added
+    } catch (err) {
+      console.warn('[OCR] scan face tracing failed:', err)
+      return 0
+    }
+  }
+
+  /** The page's scan face, if any glyph has been traced for it. */
+  function faceOf(pageIndex: number): ScanFace | null {
+    const f = scanFaceFor(pageIndex)
+    return f.glyphs.size ? f : null
+  }
+
+  /** Forget rasters and faces — a different document is being opened. */
+  function reset() {
+    rasters.clear()
+    clearScanFaces()
+    faceVersion.value++
+  }
 
   /**
    * Does this page need OCR?
@@ -188,37 +258,6 @@ function createOCR() {
         ? 'the page has no text at all, only an image'
         : `the page has only ${extractedChars} characters of text, too few to be a text page`
     }
-  }
-
-  /** Start the OCR worker, or reuse the running one when the language matches. */
-  async function ensureWorker(lang: string): Promise<TesseractWorker> {
-    if (worker.value && workerLang === lang) return worker.value
-    if (worker.value) {
-      await worker.value.terminate().catch(() => {})
-      worker.value = null
-    }
-    stage.value = 'Loading the recogniser...'
-    // Language data is served from this app, not a CDN: OCR then works offline
-    // and starts in a fraction of the time.
-    const w = await createWorker(lang, 1, {
-      langPath: '/tessdata',
-      gzip: true,
-      logger: (m: any) => {
-        if (m.status === 'recognizing text') progress.value = Math.round((m.progress ?? 0) * 100)
-        if (typeof m.status === 'string') stage.value = m.status
-      }
-    })
-    // SPARSE TEXT segmentation, not the library's default of one uniform
-    // block. A form is a grid of short cells, and read as a single block the
-    // Chinese supplier survey lost half of them — 公司地址, 联系人, the phone
-    // number, the SWIFT code all absent. Measured on that page: mode 6 finds
-    // 15 of 30 expected cells, automatic (3) 26, sparse (11) 28 with the fewest
-    // table borders read as "|". On a prose scan sparse finds every expected
-    // phrase at 94% against 95%, at about twice the time.
-    await w.setParameters({ tessedit_pageseg_mode: '11' as any })
-    worker.value = w
-    workerLang = lang
-    return w
   }
 
   /**
@@ -265,13 +304,13 @@ function createOCR() {
    * pieces of text. Prose can never trigger it: a line of prose always contains
    * a real word space, and a word space is about a third of an em.
    */
-  function splitRuns(words: any[], emPx: number): any[][] {
-    const ordered = [...words].sort((a, b) => a.bbox.x0 - b.bbox.x0)
+  function splitRuns(words: OcrWord[], emPx: number): OcrWord[][] {
+    const ordered = [...words].sort((a, b) => a.box.x0 - b.box.x0)
     if (ordered.length < 2) return [ordered]
 
     const gaps: number[] = []
     for (let i = 1; i < ordered.length; i++) {
-      gaps.push(Math.max(0, ordered[i].bbox.x0 - ordered[i - 1].bbox.x1))
+      gaps.push(Math.max(0, ordered[i].box.x0 - ordered[i - 1].box.x1))
     }
     const sorted = [...gaps].sort((a, b) => a - b)
     const median = sorted[Math.floor(sorted.length / 2)] || 0
@@ -279,7 +318,7 @@ function createOCR() {
     const relative = Math.max(emPx * 1.1, median * 2.5, 1)
     const noWordSpaces = sorted[0] > emPx * 1.2
 
-    const runs: any[][] = [[ordered[0]]]
+    const runs: OcrWord[][] = [[ordered[0]]]
     for (let i = 1; i < ordered.length; i++) {
       const gap = gaps[i - 1]
       if (noWordSpaces || gap > obvious || gap > relative) runs.push([ordered[i]])
@@ -309,11 +348,11 @@ function createOCR() {
    * page of x-height), so p80 lands in the x-height band and reads a 12pt line
    * as 9pt. What is wanted is not a lower rank, it is the outlier gone.
    */
-  function emOf(words: any[], fallbackHeight: number, text: string): number {
+  function emOf(words: OcrWord[], fallbackHeight: number, text: string): number {
     const heights: number[] = []
     for (const word of words) {
       for (const sym of word.symbols ?? []) {
-        const h = sym.bbox.y1 - sym.bbox.y0
+        const h = sym.y1 - sym.y0
         if (h > 1) heights.push(h)
       }
     }
@@ -325,12 +364,12 @@ function createOCR() {
     return capPx > 1 ? capPx / perEm : fallbackHeight * 1.05
   }
 
-  function unionBox(words: any[]): Box {
+  function unionBox(words: OcrWord[]): Box {
     return {
-      x0: Math.min(...words.map(w => w.bbox.x0)),
-      y0: Math.min(...words.map(w => w.bbox.y0)),
-      x1: Math.max(...words.map(w => w.bbox.x1)),
-      y1: Math.max(...words.map(w => w.bbox.y1))
+      x0: Math.min(...words.map(w => w.box.x0)),
+      y0: Math.min(...words.map(w => w.box.y0)),
+      x1: Math.max(...words.map(w => w.box.x1)),
+      y1: Math.max(...words.map(w => w.box.y1))
     }
   }
 
@@ -410,122 +449,261 @@ function createOCR() {
   }
 
   /**
+   * Lines from an engine without word boxes, measured on their ink.
+   *
+   * Two things the detector box cannot say: how tall the glyphs are (the box
+   * is padded — a 6.5pt label arrived in an 11.5pt box) and whether the box
+   * spans two table cells (the survey's "辽宁泓瑞机电装备有限公司法定代表人" is
+   * two cells the detector read across the rule between them). The ink says
+   * both. Each line gets one word whose single "glyph box" is the tight ink
+   * box, and a box with an empty column run wider than 1.2 em inside it is
+   * cut there, the text shared out by cumulative advance — an ideograph one
+   * em, a Latin letter half, a space a third — with Latin cuts snapped to the
+   * nearest space. Lines that already have words are returned untouched.
+   */
+  async function refineLines(lines: OcrLine[], ctx: CanvasRenderingContext2D, engine: OcrEngine, lang: string): Promise<OcrLine[]> {
+    const out: OcrLine[] = []
+    for (const line of lines) {
+      if (line.words?.length) { out.push(line); continue }
+      const rect = { x: line.box.x0, y: line.box.y0, width: line.box.x1 - line.box.x0, height: line.box.y1 - line.box.y0 }
+      const ink = inkBounds(ctx, rect)
+      const cjk = isMostlyCjk(line.text)
+      const emPx = ink.height / (cjk ? GLYPH_BOX_PER_EM_CJK : (DESCENDERS.test(line.text) ? GLYPH_BOX_PER_EM : GLYPH_BOX_PER_EM_NO_DESCENDER))
+      // Only an UNMISTAKABLE gap cuts (two and a half ems — the same bar
+      // `splitRuns` sets): justified prose opens word gaps past an em, and a
+      // 1.2 em bar cut "En caso de incumplimiento…" in two and the re-read
+      // pieces came back with a space inside a word. Rules cut regardless.
+      const cuts = inkGaps(ctx, { x: ink.x, y: ink.y, width: ink.width, height: ink.height }, Math.max(6, emPx * 2.5))
+      const pieces = cuts.length ? splitTextAtCuts(line.text, ink, cuts) : [{ text: line.text, x0: ink.x, x1: ink.x + ink.width }]
+      for (const piece of pieces) {
+        const pieceRect = { x: piece.x0, y: ink.y, width: piece.x1 - piece.x0, height: ink.height }
+        const pieceInk = pieces.length > 1 ? inkBounds(ctx, pieceRect) : ink
+        if (pieceInk.width < 2 || pieceInk.height < 2) continue
+        // A cut box is READ AGAIN as its own crop: sharing the text out by
+        // column occupancy is an estimate, and on the survey's "辽宁泓瑞机电
+        // 装备有限公司 | 法定代表人" it kept landing one ideograph off. The
+        // crop costs one small inference; the estimate stays as the fallback.
+        let text = piece.text
+        if (pieces.length > 1) {
+          const read = await recognizeCrop(ctx, pieceInk, engine, lang)
+          if (read) text = read
+        }
+        if (!text.trim()) continue
+        const box = { x0: pieceInk.x, y0: pieceInk.y, x1: pieceInk.x + pieceInk.width, y1: pieceInk.y + pieceInk.height }
+        out.push({
+          ...line,
+          box,
+          text,
+          words: [{ text, box, confidence: line.confidence, symbols: [box] }]
+        })
+      }
+    }
+    return out
+  }
+
+  /** Recognise one box of the page on its own; null when nothing readable comes back. */
+  async function recognizeCrop(ctx: CanvasRenderingContext2D, ink: { x: number; y: number; width: number; height: number }, engine: OcrEngine, lang: string): Promise<string | null> {
+    // Room around the glyphs: the detector wants a margin to find the line.
+    const pad = Math.round(ink.height * 0.6)
+    const x = Math.max(0, ink.x - pad), y = Math.max(0, ink.y - pad)
+    const w = Math.min(ctx.canvas.width - x, ink.width + pad * 2)
+    const h = Math.min(ctx.canvas.height - y, ink.height + pad * 2)
+    if (w < 4 || h < 4) return null
+    const crop = document.createElement('canvas')
+    crop.width = w
+    crop.height = h
+    const cctx = crop.getContext('2d')
+    if (!cctx) return null
+    cctx.fillStyle = '#fff'
+    cctx.fillRect(0, 0, w, h)
+    cctx.drawImage(ctx.canvas, x, y, w, h, 0, 0, w, h)
+    try {
+      const res = await engine.recognize(crop, { lang })
+      const text = res.lines
+        .filter(l => l.text.trim() && l.confidence >= 30)
+        .sort((a, b) => a.box.x0 - b.box.x0)
+        .map(l => l.text.trim()).join(' ')
+        .replace(/([\p{Script=Han}　-〿＀-￯])\s+(?=[\p{Script=Han}　-〿＀-￯])/gu, '$1')
+      return text || null
+    } catch (_) {
+      return null
+    }
+  }
+
+  /** Advance weight of a character, in ems, for sharing text across a cut box. */
+  function advanceOf(ch: string): number {
+    if (/\p{Script=Han}|[　-〿＀-￯]/u.test(ch)) return 1
+    if (ch === ' ') return 0.33
+    if (/[iljtfrI.,;:'!|()\[\]]/.test(ch)) return 0.3
+    if (/[mwMW@%]/.test(ch)) return 0.85
+    return 0.55
+  }
+
+  function splitTextAtCuts(text: string, ink: { x: number; width: number }, cuts: InkCut[]): { text: string; x0: number; x1: number }[] {
+    const chars = [...text]
+    const weights = chars.map(advanceOf)
+    const total = weights.reduce((s, w) => s + w, 0) || 1
+    const cum: number[] = []
+    let acc = 0
+    for (const w of weights) { acc += w; cum.push(acc / total) }
+    const pieces: { text: string; x0: number; x1: number }[] = []
+    let start = 0
+    let x0 = ink.x
+    for (const { x: cut, inkShare } of cuts) {
+      // The glyph whose cumulative advance first reaches the ink share left
+      // of the cut is the first glyph of the NEXT piece — the share is the
+      // ink of whole glyphs, so a glyph straddling the boundary is rare and
+      // the nearer side wins.
+      const frac = inkShare
+      let idx = cum.findIndex(c => c >= frac - 1e-6)
+      if (idx < 0) idx = chars.length - 1
+      if (idx > 0 && Math.abs(cum[idx - 1] - frac) < Math.abs(cum[idx] - frac)) idx -= 1
+      idx += 1
+      // Latin text: cut at the nearest space so a word is never torn in two.
+      if (!isMostlyCjk(text)) {
+        let best = -1
+        for (let i = start; i < chars.length; i++) if (chars[i] === ' ' && Math.abs(i - idx) < Math.abs(best - idx)) best = i
+        if (best >= 0 && Math.abs(best - idx) <= 3) idx = best
+      }
+      if (idx <= start) continue
+      pieces.push({ text: chars.slice(start, idx).join('').trim(), x0, x1: cut })
+      start = idx
+      x0 = cut
+    }
+    pieces.push({ text: chars.slice(start).join('').trim(), x0, x1: ink.x + ink.width })
+    return pieces
+  }
+
+  /**
    * Build the editable runs for one recognition pass.
    *
    * @param mapBox turns a box in THIS pass's pixel space into page-space points
    */
-  function buildItems(
-    data: any,
+  async function buildItems(
+    data: OcrRecognition,
     ctx: CanvasRenderingContext2D,
     pageIndex: number,
     toPt: number,
     seq: { n: number },
     vertical: boolean,
-    mapBox: (b: Box) => { x: number; y: number; width: number; height: number }
-  ): OcrTextItem[] {
+    mapBox: (b: Box) => { x: number; y: number; width: number; height: number },
+    engine: OcrEngine,
+    lang: string
+  ): Promise<OcrTextItem[]> {
     const items: OcrTextItem[] = []
 
-    for (const block of data.blocks ?? []) {
-      for (const para of block.paragraphs ?? []) {
-        const lines = para.lines ?? []
-        for (const line of lines) {
-          // A table's vertical rules come back as "|" glyphs — on their own or
-          // stuck to the word beside them — and a rule between two cells glued
-          // "辽宁泓瑞机电装备有限公司 | 法定代表人" into one run. A border-only
-          // word is a cell boundary: the line is cut there and the border
-          // dropped; a border on the edge of a word is shaved off it.
-          const rawWords = (line.words ?? [])
-            .map((w: any) => BORDER_WORD.test((w.text ?? '').trim()) ? w : { ...w, text: stripBorders(w.text ?? '') })
-            .filter((w: any) => (w.text ?? '').trim())
-          const segments: any[][] = [[]]
-          for (const w of rawWords) {
-            if (BORDER_WORD.test(w.text.trim())) { if (segments[segments.length - 1].length) segments.push([]); continue }
-            segments[segments.length - 1].push(w)
-          }
-          const allWords = rawWords.filter((w: any) => !BORDER_WORD.test(w.text.trim()))
-          if (!allWords.length) continue
-          const lineText = allWords.map((w: any) => w.text).join(' ')
-          const lineEm = emOf(allWords, line.bbox.y1 - line.bbox.y0, lineText)
+    for (const line of await refineLines(data.lines, ctx, engine, lang)) {
+      // An engine that reports no words (PaddleOCR: one box per text region)
+      // gets the line as its one word, carrying the INK's box as its one
+      // glyph box so the em is measured on the glyphs, not on the detector's
+      // padded box. Its detector already boxes per cell — and where it merged
+      // two, `refineLines` has cut them apart on the empty columns between.
+      const hasWords = !!line.words?.length
+      const sourceWords: OcrWord[] = hasWords
+        ? line.words!
+        : [{ text: line.text, box: line.box, confidence: line.confidence }]
 
-          for (const run of segments.filter(s => s.length).flatMap(seg => splitRuns(seg, lineEm))) {
-            // Tesseract's Chinese model puts a "word" space between adjacent
-            // characters; Chinese has none, so those are closed up again.
-            const text = run.map(w => w.text).join(' ').replace(/\s+/g, ' ').trim()
-              .replace(/([\p{Script=Han}　-〿＀-￯])\s+(?=[\p{Script=Han}　-〿＀-￯])/gu, '$1')
-            if (!text) continue
+      // A table's vertical rules come back as "|" glyphs — on their own or
+      // stuck to the word beside them — and a rule between two cells glued
+      // "辽宁泓瑞机电装备有限公司 | 法定代表人" into one run. A border-only
+      // word is a cell boundary: the line is cut there and the border
+      // dropped; a border on the edge of a word is shaved off it.
+      const rawWords = sourceWords
+        .map(w => BORDER_WORD.test((w.text ?? '').trim()) ? w : { ...w, text: stripBorders(w.text ?? '') })
+        .filter(w => (w.text ?? '').trim())
+      const segments: OcrWord[][] = [[]]
+      for (const w of rawWords) {
+        if (BORDER_WORD.test(w.text.trim())) { if (segments[segments.length - 1].length) segments.push([]); continue }
+        segments[segments.length - 1].push(w)
+      }
+      const allWords = rawWords.filter(w => !BORDER_WORD.test(w.text.trim()))
+      if (!allWords.length) continue
+      const lineText = allWords.map(w => w.text).join(' ')
+      const lineEm = emOf(allWords, line.box.y1 - line.box.y0, lineText)
 
-            const bb = unionBox(run)
-            const pxRect = { x: bb.x0, y: bb.y0, width: bb.x1 - bb.x0, height: bb.y1 - bb.y0 }
-            if (pxRect.width < 2 || pxRect.height < 2) continue
+      const runs = hasWords
+        ? segments.filter(s => s.length).flatMap(seg => splitRuns(seg, lineEm))
+        : segments.filter(s => s.length)
+      for (const run of runs) {
+        // Tesseract's Chinese model puts a "word" space between adjacent
+        // characters; Chinese has none, so those are closed up again.
+        const text = run.map(w => w.text).join(' ').replace(/\s+/g, ' ').trim()
+          .replace(/([\p{Script=Han}　-〿＀-￯])\s+(?=[\p{Script=Han}　-〿＀-￯])/gu, '$1')
+        if (!text) continue
 
-            // A CJK glyph fills its em, ascender to descender, so the box IS
-            // the em; the Latin rule (tallest box = 0.76 of an em when nothing
-            // descends) sized a 10pt Chinese cell at 13pt.
-            const emPx = isMostlyCjk(text) ? cjkEm(run, pxRect.height) : emOf(run, pxRect.height, text)
-            const { color } = sampleLineColors(ctx, pxRect)
-            const background = samplePatchColor(ctx, pxRect)
+        const bb = unionBox(run)
+        const pxRect = { x: bb.x0, y: bb.y0, width: bb.x1 - bb.x0, height: bb.y1 - bb.y0 }
+        if (pxRect.width < 2 || pxRect.height < 2) continue
 
-            // The baseline OCR reports is the whole LINE's, and a run taken out
-            // of that line sits on the same one. The face detector needs it:
-            // without it, it would look for serif feet in the middle of the
-            // x-height and measure stroke widths across a crossbar.
-            const baseY = line.baseline
-              ? (line.baseline.y0 + line.baseline.y1) / 2
-              : bb.y1 - pxRect.height * 0.2
-            const cues = detectFace(ctx, pxRect, emPx, baseY)
-            const uniform = advancesAreUniform(
-              run.flatMap((w: any) => (w.symbols ?? []).map((s: any) => s.bbox)),
-              text
-            )
-            const face = chooseFace(cues, uniform, run[0]?.font_name)
-            // The em has to be re-derived once the family is known: it comes
-            // from the tallest glyph box, and how much of an em that is depends
-            // on the face.
-            const emCorrected = face.fontFamily === 'Courier'
-              ? emPx * (GLYPH_BOX_PER_EM / GLYPH_BOX_PER_EM_MONO)
-              : emPx
+        // A CJK glyph fills its em, ascender to descender, so the box IS
+        // the em; the Latin rule (tallest box = 0.76 of an em when nothing
+        // descends) sized a 10pt Chinese cell at 13pt.
+        const emPx = isMostlyCjk(text) ? cjkEm(run, pxRect.height) : emOf(run, pxRect.height, text)
+        const { color } = sampleLineColors(ctx, pxRect)
+        const background = samplePatchColor(ctx, pxRect)
 
+        // The baseline OCR reports is the whole LINE's, and a run taken out
+        // of that line sits on the same one. The face detector needs it:
+        // without it, it would look for serif feet in the middle of the
+        // x-height and measure stroke widths across a crossbar.
+        const baseY = line.baseline
+          ? (line.baseline.y0 + line.baseline.y1) / 2
+          : bb.y1 - pxRect.height * 0.2
+        const cues = detectFace(ctx, pxRect, emPx, baseY)
+        const uniform = advancesAreUniform(run.flatMap(w => w.symbols ?? []), text)
+        const face = chooseFace(cues, uniform, undefined)
+        // The em has to be re-derived once the family is known: it comes
+        // from the tallest glyph box, and how much of an em that is depends
+        // on the face.
+        const emCorrected = face.fontFamily === 'Courier'
+          ? emPx * (GLYPH_BOX_PER_EM / GLYPH_BOX_PER_EM_MONO)
+          : emPx
 
-            // The baseline's slope is the line's own skew. A sideways pass has
-            // already been turned upright, so its slope is measured in that
-            // frame and says nothing about how the run sits on the page.
-            const base = line.baseline
-            const rotation = !vertical && base
-              ? Math.round(Math.atan2(base.y1 - base.y0, Math.max(base.x1 - base.x0, 1)) * (180 / Math.PI) * 10) / 10
-              : 0
+        // The baseline's slope is the line's own skew. A sideways pass has
+        // already been turned upright, so its slope is measured in that
+        // frame and says nothing about how the run sits on the page.
+        const base = line.baseline
+        const rotation = vertical ? 0
+          : base ? Math.round(Math.atan2(base.y1 - base.y0, Math.max(base.x1 - base.x0, 1)) * (180 / Math.PI) * 10) / 10
+          : line.angle ? Math.round(line.angle * 10) / 10
+          : 0
 
-            const conf = run.reduce((s: number, w: any) => s + (w.confidence ?? 0), 0) / run.length
-            if (isJunkRun(text, conf)) continue
+        const conf = run.reduce((s, w) => s + (w.confidence ?? 0), 0) / run.length
+        if (isJunkRun(text, conf)) continue
 
-            items.push({
-              id: `${pageIndex}:ocr:${seq.n++}`,
-              pageIndex,
-              originalText: text,
-              text,
-              rect: mapBox(bb),
-              // Same box to begin with, and the one that stays put when the run
-              // is dragged — it is where the scan's own ink is.
-              inkRect: mapBox(bb),
-              words: run.map((word: any) => mapBox(word.bbox)),
-              fontSize: Math.max(4, Math.round(emCorrected * toPt * 10) / 10),
-              fontFamily: face.fontFamily,
-              bold: face.bold,
-              italic: face.italic,
-              color,
-              background,
-              // A run split out of a line IS its own box, so there is nothing
-              // left for it to be aligned within; only a whole line can say.
-              align: run.length === allWords.length
-                ? inferAlign(bb, para.bbox, lines.length)
-                : 'left',
-              rotation,
-              vertical,
-              confidence: Math.round(conf),
-              edited: false,
-              removed: false
-            })
-          }
-        }
+        items.push({
+          id: `${pageIndex}:ocr:${seq.n++}`,
+          pageIndex,
+          originalText: text,
+          text,
+          rect: mapBox(bb),
+          // Same box to begin with, and the one that stays put when the run
+          // is dragged — it is where the scan's own ink is.
+          inkRect: mapBox(bb),
+          words: hasWords ? run.map(word => mapBox(word.box)) : [],
+          // One box per non-space character, for the scan face's tracer.
+          // Tesseract reports them; an engine without them leaves this out and
+          // the tracer cuts the run on its column profile instead.
+          symbols: hasWords && run.every(w => w.symbols?.length)
+            ? run.flatMap(w => w.symbols!.map(mapBox))
+            : undefined,
+          fontSize: Math.max(4, Math.round(emCorrected * toPt * 10) / 10),
+          fontFamily: face.fontFamily,
+          bold: face.bold,
+          italic: face.italic,
+          color,
+          background,
+          // A run split out of a line IS its own box, so there is nothing
+          // left for it to be aligned within; only a whole line can say.
+          align: run.length === allWords.length && line.paragraph
+            ? inferAlign(bb, line.paragraph.box, line.paragraph.lineCount)
+            : 'left',
+          rotation,
+          vertical,
+          confidence: Math.round(conf),
+          edited: false,
+          removed: false
+        })
       }
     }
     return items
@@ -546,7 +724,8 @@ function createOCR() {
     pageWidth: number,
     pageHeight: number,
     lang = OCR_DEFAULT_LANG,
-    readVertical = true
+    readVertical = true,
+    engineId: OcrEngineId = 'paddle'
   ): Promise<OcrPageResult | null> {
     if (busy.value) return null
     busy.value = true
@@ -563,28 +742,44 @@ function createOCR() {
       if (!tctx) throw new Error('Could not prepare the page for recognition')
       tctx.drawImage(canvas, 0, 0, target.width, target.height)
 
-      const w = await ensureWorker(lang)
-      stage.value = 'Recognising text...'
-      const { data } = await w.recognize(target, {}, { blocks: true })
+      // The chosen engine, or Tesseract when it cannot run here. Only the
+      // in-browser default falls back on its own: a cloud call that fails is
+      // something the user asked for and must hear about, not paper over.
+      let engine = engineFor(engineId)
+      let fallbackNote: string | undefined
+      let data: OcrRecognition
+      try {
+        stage.value = 'Recognising text...'
+        data = await engine.recognize(target, { lang, onProgress })
+      } catch (err: any) {
+        if (engineId !== 'paddle') throw err
+        fallbackNote = `${ENGINE_LABELS.paddle} could not run (${err?.message || err}); read with ${ENGINE_LABELS.tesseract} instead`
+        engine = engineFor('tesseract')
+        stage.value = 'Recognising text...'
+        data = await engine.recognize(target, { lang, onProgress })
+      }
 
       // Canvas pixels -> page points.
       const toPt = pageWidth / target.width
       const seq = { n: 0 }
-      const items = buildItems(data, tctx, pageIndex, toPt, seq, false, b => ({
+      const items = await buildItems(data, tctx, pageIndex, toPt, seq, false, b => ({
         x: b.x0 * toPt,
         y: b.y0 * toPt,
         width: (b.x1 - b.x0) * toPt,
         height: (b.y1 - b.y0) * toPt
-      }))
+      }), engine, lang)
 
       let verticalCount = 0
-      if (readVertical) {
-        const sideways = await addVerticalRuns(target, tctx, pageIndex, toPt, seq, items, w)
+      // A cloud call costs money and a round trip; sideways text is rare.
+      if (readVertical && engine.id !== 'mistral') {
+        const sideways = await addVerticalRuns(target, tctx, pageIndex, toPt, seq, items, engine, lang)
         verticalCount = sideways.length
       }
 
       let confSum = 0
       for (const it of items) confSum += it.confidence
+
+      keepRaster(pageIndex, { canvas: target, ctx: tctx, toPt })
 
       return {
         pageIndex,
@@ -593,7 +788,9 @@ function createOCR() {
         pageHeight,
         confidence: items.length ? Math.round(confSum / items.length) : 0,
         lang,
-        verticalCount
+        verticalCount,
+        engine: engine.id,
+        fallbackNote
       }
     } catch (err: any) {
       error.value = err?.message || String(err)
@@ -640,7 +837,8 @@ function createOCR() {
     toPt: number,
     seq: { n: number },
     into: OcrTextItem[],
-    w: TesseractWorker
+    engine: OcrEngine,
+    lang: string
   ): Promise<OcrTextItem[]> {
     const H = source.height
 
@@ -669,24 +867,16 @@ function createOCR() {
     sctx.drawImage(rot, 0, 0, small.width, small.height)
 
     stage.value = 'Looking for sideways text...'
-    const { data: rawData } = await w.recognize(small, {}, { blocks: true })
+    const raw = await engine.recognize(small, { lang, onProgress: (s, p) => { progress.value = p; stage.value = s } })
     // Back to the unscaled rotated frame, so the mapping below is unchanged.
     const unscale = (b: Box): Box => ({ x0: b.x0 / k, y0: b.y0 / k, x1: b.x1 / k, y1: b.y1 / k })
-    const data = {
-      ...rawData,
-      blocks: (rawData.blocks ?? []).map((b: any) => ({
-        ...b, bbox: unscale(b.bbox),
-        paragraphs: (b.paragraphs ?? []).map((p: any) => ({
-          ...p, bbox: unscale(p.bbox),
-          lines: (p.lines ?? []).map((l: any) => ({
-            ...l, bbox: unscale(l.bbox),
-            baseline: l.baseline ? { ...l.baseline, x0: l.baseline.x0 / k, y0: l.baseline.y0 / k, x1: l.baseline.x1 / k, y1: l.baseline.y1 / k } : l.baseline,
-            words: (l.words ?? []).map((wd: any) => ({
-              ...wd, bbox: unscale(wd.bbox),
-              symbols: (wd.symbols ?? []).map((s: any) => ({ ...s, bbox: unscale(s.bbox) }))
-            }))
-          }))
-        }))
+    const data: OcrRecognition = {
+      lines: raw.lines.map((l: OcrLine): OcrLine => ({
+        ...l,
+        box: unscale(l.box),
+        baseline: l.baseline ? { x0: l.baseline.x0 / k, y0: l.baseline.y0 / k, x1: l.baseline.x1 / k, y1: l.baseline.y1 / k } : undefined,
+        paragraph: l.paragraph ? { box: unscale(l.paragraph.box), lineCount: l.paragraph.lineCount } : undefined,
+        words: l.words?.map(wd => ({ ...wd, box: unscale(wd.box), symbols: wd.symbols?.map(unscale) }))
       }))
     }
 
@@ -700,13 +890,13 @@ function createOCR() {
       .filter(it => it.text.replace(/\s/g, '').length >= 4 && it.confidence >= 60)
       .map(boxOf)
 
-    const found = buildItems(data, rctx, pageIndex, toPt, seq, true, b => ({
+    const found = await buildItems(data, rctx, pageIndex, toPt, seq, true, b => ({
       // Inverse of the quarter turn: rotated (x', y') came from (y', H - x').
       x: b.y0 * toPt,
       y: (H - b.x1) * toPt,
       width: (b.y1 - b.y0) * toPt,
       height: (b.x1 - b.x0) * toPt
-    }))
+    }), engine, lang)
 
     const kept: OcrTextItem[] = []
     for (const item of found) {
@@ -751,12 +941,9 @@ function createOCR() {
   }
 
   async function destroy() {
-    if (worker.value) {
-      await worker.value.terminate().catch(() => {})
-      worker.value = null
-      workerLang = ''
-    }
+    for (const [, e] of engines) await e.destroy().catch(() => {})
+    engines.clear()
   }
 
-  return { busy, progress, stage, error, judgeScanned, recognizePage, destroy }
+  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, faceOf, reset, destroy }
 }

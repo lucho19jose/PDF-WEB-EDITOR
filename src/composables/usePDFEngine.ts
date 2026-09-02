@@ -155,10 +155,11 @@ export function usePDFEngine() {
     fontSize: number,
     fontName: string,
     color?: [number, number, number],
-    rotation?: number
+    rotation?: number,
+    faceId?: string
   ): Promise<boolean> {
     try {
-      const result = await bridge.addText(pageIndex, x, y, text, fontSize, fontName, color, rotation)
+      const result = await bridge.addText(pageIndex, x, y, text, fontSize, fontName, color, rotation, faceId)
       if (result.success) {
         pageTextCache.delete(pageIndex)
       } else {
@@ -169,6 +170,13 @@ export function usePDFEngine() {
       error.value = `Failed to add text: ${err.message}`
       throw err
     }
+  }
+
+  /** Register a traced scan face (OpenType bytes) for `addText` runs that name it. */
+  async function registerFace(faceId: string, bytes: ArrayBuffer): Promise<boolean> {
+    const result = await bridge.registerFace(faceId, bytes)
+    if (!result.success) error.value = result.error || 'Could not register the scan face'
+    return result.success
   }
 
   /**
@@ -469,7 +477,7 @@ export function usePDFEngine() {
     debugBtBlocks,
     readContentStream,
     replaceText,
-    addText,
+    addText, registerFace,
     transformTextBlock,
     transformTextBlocks,
     restyleTextBlocks,

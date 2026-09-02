@@ -80,8 +80,12 @@ import { useSearchStore } from '@/stores/search'
 import { useOcrStore } from '@/stores/ocr'
 import { useOCR, OCR_DEFAULT_LANG } from '@/composables/useOCR'
 
+import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
+
 /** OCR reads the page at 220 DPI; PDF user space is 72 to the inch. */
 const OCR_RENDER_SCALE = 220 / 72
+/** The user said yes to sending a page image to the cloud, this session. */
+let cloudConsentGiven = false
 import { planOcrExport } from '@/utils/ocr/ocrExport'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
@@ -238,9 +242,33 @@ async function runOcrNow(pageIndex: number, lang: string) {
       : stage ? `${stage[0].toUpperCase()}${stage.slice(1)}` : 'Recognising text on this page...'
     editorStore.setStatus(label)
   })
+  // The engine the user chose. A cloud engine sends the page image away, so
+  // it needs a key and, once per session, an explicit yes.
+  const engineId = editorStore.ocrEngine
+  if (engineId === 'mistral') {
+    const mistral = ocr.engineFor('mistral') as any
+    mistral.apiKey = editorStore.mistralApiKey
+    if (!editorStore.mistralApiKey) {
+      stopProgress()
+      editorStore.setStatus('Mistral OCR needs an API key — open OCR settings from the OCR menu')
+      return
+    }
+    if (!cloudConsentGiven) {
+      const ok = await new Promise<boolean>(resolve => {
+        $q.dialog({
+          title: 'Send this page to Mistral?',
+          message: 'The page image will be uploaded to Mistral\'s OCR service to be read. Nothing is sent for any other engine.',
+          ok: 'Send', cancel: true, persistent: true, dark: true
+        }).onOk(() => resolve(true)).onCancel(() => resolve(false)).onDismiss(() => resolve(false))
+      })
+      if (!ok) { stopProgress(); editorStore.setStatus('Cloud recognition cancelled'); return }
+      cloudConsentGiven = true
+    }
+  }
+
   let result: Awaited<ReturnType<typeof ocr.recognizePage>> = null
   try {
-    result = await ocr.recognizePage(canvas, pageIndex, size.width, size.height, lang)
+    result = await ocr.recognizePage(canvas, pageIndex, size.width, size.height, lang, true, engineId)
   } finally {
     stopProgress()
   }
@@ -252,9 +280,11 @@ async function runOcrNow(pageIndex: number, lang: string) {
   const sideways = result.verticalCount
     ? `, ${result.verticalCount} of them sideways`
     : ''
+  const by = result.engine ? ` by ${ENGINE_LABELS[result.engine]}` : ''
+  const note = result.fallbackNote ? ` (${result.fallbackNote})` : ''
   editorStore.setStatus(result.items.length === 0
-    ? 'No text was recognised on this page'
-    : `${result.items.length} text areas detected${sideways} — ${result.confidence}% average confidence. Click one to select it, click again to edit, drag to move.`)
+    ? `No text was recognised on this page${by}${note}`
+    : `${result.items.length} text areas detected${by}${sideways} — ${result.confidence}% average confidence${note}. Click one to select it, click again to edit, drag to move.`)
 }
 
 /**
@@ -270,7 +300,15 @@ async function bakeOcrEdits(): Promise<number> {
   let written = 0
 
   for (const [pageIndex, page] of ocrStore.pages) {
-    const plan = planOcrExport(page.items)
+    // The page's traced scan face, embedded once per bake so the runs that
+    // name it draw with the document's own glyphs.
+    const face = ocr.faceOf(pageIndex)
+    let faceId: string | undefined
+    if (face?.bytes) {
+      const ok = await pdfEngine.registerFace(face.familyName, face.bytes.slice(0)).catch(() => false)
+      if (ok) faceId = face.familyName
+    }
+    const plan = planOcrExport(page.items, faceId)
     if (plan.patches.length === 0 && plan.texts.length === 0) continue
 
     await exclusiveOp(async () => {
@@ -282,7 +320,7 @@ async function bakeOcrEdits(): Promise<number> {
       }
       for (const t of plan.texts) {
         // addText takes a bottom-left origin baseline; OCR works top-left.
-        await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation)
+        await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId)
         written++
       }
     })
@@ -319,6 +357,7 @@ async function loadBytes(bytes: Uint8Array, name: string) {
   historyStore.clear()
   searchStore.clear()
   ocrStore.clear()
+  ocr.reset()
 
   const rendered = await pdfViewer.loadDocument(bytes, name)
   if (!rendered?.success) {
@@ -970,6 +1009,7 @@ async function handleDrop(e: DragEvent) {
 
 // ===== PROVIDE to whole tree =====
 provide('runOcrOnPage', runOcrOnPage)
+provide('bakeOcrEdits', bakeOcrEdits)
 provide('openFile', openFile)
 provide('openPdfFile', openPdfFile)
 provide('mergePdfFile', mergePdfFile)

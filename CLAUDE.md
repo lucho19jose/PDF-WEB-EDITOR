@@ -2337,6 +2337,77 @@ box instead. Runs the model hardly believes — the stamp read as "ci Y", "ee",
 "N" at 0–40% — are dropped by `isJunkRun`; two-character Chinese cells and
 numbers are kept whatever their confidence above 30.
 
+### Three OCR engines behind one contract; PaddleOCR reads first
+`src/utils/ocr/ocrEngine.ts` is what every recogniser answers to — lines with
+a box, text and confidence, and OPTIONAL words, glyph boxes, baseline and
+paragraph — and `buildItems` degrades honestly when the optional parts are
+missing. `TesseractEngine` is the old path unchanged (sparse segmentation,
+words, symbols). `PaddleEngine` runs PP-OCRv6 small (`public/paddle/`, 31 MB,
+Chinese + Latin in one model) on ONNX Runtime Web inside
+`paddle.worker.ts`, WebGPU when the browser has it. `MistralEngine` posts the
+page image to the cloud, opt-in, key in localStorage, one consent per session.
+`editorStore.ocrEngine` (persisted through `persistedRef`, the app's first
+persisted setting) picks; Paddle falls back to Tesseract ON ITS OWN when it
+cannot start, and the status line says which engine read the page and why.
+
+Measured on the supplier survey: Paddle 50–53 runs at 99% in 11–14 s (Tesseract
+sparse: 57 at 91% in 17 s) and it reads the e-mail, phone and SWIFT cells
+Tesseract missed; on the Spanish prose scan 43 runs at 93% with bold headings
+detected. Three things the worker had to get right:
+
+- **ORT's WASM cannot be a package subpath** — `onnxruntime-web`'s `exports`
+  map hides `dist/*.wasm`, so `import … from 'onnxruntime-web/dist/x.wasm?url'`
+  fails to resolve. `new URL('../../../../node_modules/…', import.meta.url)`
+  works in dev and build. The SDK sets `ort.env.wasm.wasmPaths` to a CDN on
+  import when it is empty, so the env is set BEFORE the SDK is imported.
+- **Models are fetched through the Cache Storage API** and handed over as
+  ArrayBuffers: a second visit costs no download, and nothing reaches out to
+  Hugging Face (COEP would refuse it anyway).
+- **The SDK's `processing.engine` is `canvas-native`**: no OpenCV WASM to load.
+
+An engine without word boxes is measured on its INK (`inkMeasure.ts`):
+Paddle's detector pads its boxes — a 6.5pt label arrived in an 11.5pt box —
+so the tight ink box is the glyph height, with table rules excluded from the
+profile on the axis they cross (a 3px vertical rule put ink on every row of a
+blank box, so no row ever read as empty). A box the detector read across two
+cells is cut at an INTERIOR vertical rule, looked for on a box stretched half
+its height up and down — in the tight glyph box every stem of a 司 spans most
+of the height and read as a rule, shredding the page into 276 pieces. A cut
+piece is then RECOGNISED AGAIN as its own crop: sharing the text out by width
+or by ink kept landing one ideograph off. Plain gaps cut only at 2.5 em, the
+bar `splitRuns` sets; at 1.2 em justified prose was cut mid-line and the
+re-read pieces came back with a space inside a word.
+
+### The scan face: edited runs drawn with the scan's own glyphs
+Acrobat's "Editable text and images" traces the page into a font; here a face
+is built per page, lazily, from the runs the user edits (`scanFace.ts`). On
+commit, `useOCR.traceItem` cuts the run's ORIGINAL ink into one cell per
+character (`glyphCut.ts`: Tesseract's glyph boxes when they agree with the
+text, else the column profile merged or split to the character count, refusing
+when that takes more than a third of the count in edits), binarises each cell,
+traces it with Potrace (`esm-potrace-wasm`, GPL-2 like MuPDF's AGPL) and
+scales the outline onto a 1000-unit em with the baseline at the mode of the
+cell bottoms. opentype.js compiles the library into an OpenType font; the same
+bytes register as a `FontFace` for the preview (`faceStack` puts the face
+first, the base family behind it) and go to the worker through `registerFace`
+before a bake. `addTextToPage` lays a run out as SEGMENTS inside one BT — a
+stretch the face can encode gets `/FSCNn Tf <gids> Tj`, a stretch it cannot
+goes to WinAnsi or the CJK fallback — and the text matrix carries the pen, so
+no advances are computed. Measured: 营业执照 edited to 营业执照编号 renders the
+four traced glyphs, 编号 from a 2 KB Noto subset and "Nro 5" in Helvetica on
+one baseline, extracts back as written, and grows the file by 5 KB.
+
+**MuPDF's CFF subsetter is not to be trusted with the Noto face.** For some
+runs it fails ("Insufficient operators on the stack", "Index bounds") and the
+document then carries the whole 8 MB font; the run 编号 also drew as ONE wrong
+glyph. The fallback face is now parsed by opentype.js once and a tiny font is
+built per run from the glyph outlines (`miniCjkFontFor`), the same route the
+traced face takes — MuPDF embeds a few KB it can handle.
+
+The binarisation threshold sits at 0.42 of the box's range, not the midpoint:
+a scan's strokes are ringed with anti-aliased grey and the midpoint kept the
+ring, so the traced glyphs came out visibly heavier than the page.
+
 ### Writing text WinAnsi cannot hold: subset in a SCRATCH document, then graft
 The WASM build has no built-in CJK face, so `addTextToPage` fetches
 `public/fonts/NotoSansSC-Regular.otf` on the first run that needs it

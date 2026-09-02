@@ -47,6 +47,33 @@
       >
         <q-tooltip>Recognise the text on a scanned page and make it editable</q-tooltip>
       </q-btn>
+      <!-- Which recogniser reads a scan. PaddleOCR by default; Tesseract as the
+           fallback it drops to on its own; Mistral only with a key and consent. -->
+      <q-btn-dropdown flat dense size="sm" dropdown-icon="expand_more" :disable="!docStore.loaded" auto-close>
+        <q-tooltip>OCR engine</q-tooltip>
+        <q-list dense dark class="bg-grey-9">
+          <q-item-label header class="text-grey-5">Engine</q-item-label>
+          <q-item v-for="opt in engineOptions" :key="opt.value" clickable @click="editorStore.ocrEngine = opt.value">
+            <q-item-section side>
+              <q-icon :name="editorStore.ocrEngine === opt.value ? 'radio_button_checked' : 'radio_button_unchecked'" size="xs" />
+            </q-item-section>
+            <q-item-section>
+              <q-item-label>{{ opt.label }}</q-item-label>
+              <q-item-label caption class="text-grey-5">{{ opt.caption }}</q-item-label>
+            </q-item-section>
+          </q-item>
+          <q-separator dark />
+          <q-item clickable :disable="!docStore.loaded || ocr.busy.value" @click="runOcr">
+            <q-item-section side><q-icon name="refresh" size="xs" /></q-item-section>
+            <q-item-section>Recognise this page again</q-item-section>
+          </q-item>
+          <q-item clickable @click="ocrSettingsOpen = true">
+            <q-item-section side><q-icon name="settings" size="xs" /></q-item-section>
+            <q-item-section>OCR settings…</q-item-section>
+          </q-item>
+        </q-list>
+      </q-btn-dropdown>
+      <OcrSettingsDialog v-model="ocrSettingsOpen" />
 
       <q-separator vertical inset class="q-mx-xs" />
 
@@ -190,6 +217,8 @@
 import { computed, inject, ref, watch } from 'vue'
 import { useOcrStore } from '@/stores/ocr'
 import { useOCR, OCR_DEFAULT_LANG } from '@/composables/useOCR'
+import type { OcrEngineId } from '@/utils/ocr/ocrEngine'
+import OcrSettingsDialog from '@/components/dialogs/OcrSettingsDialog.vue'
 import { hexToRgb01, rgb01ToHex } from '@/utils/color'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, type Tool } from '@/stores/editor'
@@ -246,6 +275,12 @@ function patchOcr(patch: Record<string, unknown>) {
 async function runOcr() {
   await runOcrOnPage(OCR_DEFAULT_LANG)
 }
+const ocrSettingsOpen = ref(false)
+const engineOptions: { value: OcrEngineId; label: string; caption: string }[] = [
+  { value: 'paddle', label: 'PaddleOCR', caption: 'In the browser, offline. Best on Chinese and mixed text.' },
+  { value: 'tesseract', label: 'Tesseract', caption: 'In the browser, offline. Spanish + Chinese models.' },
+  { value: 'mistral', label: 'Mistral OCR (cloud)', caption: 'Sends the page image to Mistral. Needs an API key.' }
+]
 const fonts = ['Helvetica', 'Times-Roman', 'Courier']
 
 const toolGroups: { label: string; tools: { name: Tool; label: string; icon: string; shortcut?: string }[] }[] = [

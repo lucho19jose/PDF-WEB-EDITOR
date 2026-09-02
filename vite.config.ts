@@ -21,9 +21,20 @@ export default defineConfig({
       'Cross-Origin-Embedder-Policy': 'require-corp'
     }
   },
+  preview: {
+    port: 9000,
+    headers: {
+      // The same isolation as the dev server: without it `vite preview` has no
+      // SharedArrayBuffer, so MuPDF and ONNX Runtime lose their threads.
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp'
+    }
+  },
   optimizeDeps: {
-    // Don't pre-bundle mupdf — it has WASM and top-level await
-    exclude: ['mupdf']
+    // Don't pre-bundle mupdf — it has WASM and top-level await. ONNX Runtime
+    // and the PaddleOCR SDK locate their WASM and workers by URL, which
+    // pre-bundling rewrites out from under them.
+    exclude: ['mupdf', 'onnxruntime-web', 'ppu-paddle-ocr', 'ppu-ocv']
   },
   worker: {
     format: 'es'

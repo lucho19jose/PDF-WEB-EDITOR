@@ -2,6 +2,7 @@
 
 import type { WorkerRequest, WorkerResponse } from './worker-protocol'
 import { glyphNameToUnicode } from './glyphNames'
+import * as opentype from 'opentype.js'
 import type {
   TextBlock, TextChar, TextLine, PageTextData,
   BlockTransformOp, BlockStyleOp, BlockTransformResult, ContentImageInfo,
@@ -98,9 +99,20 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         const addResult = addTextToPage(
           req.data.pageIndex, req.data.x, req.data.y,
           req.data.text, req.data.fontSize, req.data.fontName, req.data.color,
-          req.data.rotation
+          req.data.rotation, req.data.faceId
         )
         respond({ id: req.id, type: 'success', data: addResult })
+        break
+      }
+
+      case 'registerFace': {
+        if (!mupdf) throw new Error('MuPDF not initialized')
+        try {
+          scanFaces.set(req.data.faceId, new mupdf.Font(req.data.faceId, new Uint8Array(req.data.bytes)))
+          respond({ id: req.id, type: 'success', data: { success: true } })
+        } catch (err: any) {
+          respond({ id: req.id, type: 'success', data: { success: false, error: err?.message || String(err) } })
+        }
         break
       }
 
@@ -2021,7 +2033,9 @@ function addTextToPage(
   fontName: string,
   color?: [number, number, number],
   /** Degrees counter-clockwise. 90 sets the text reading up the page. */
-  rotation = 0
+  rotation = 0,
+  /** A registered traced scan face: its glyphs draw the characters it has. */
+  faceId?: string
 ): { success: boolean; error?: string } {
   if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
 
@@ -2029,29 +2043,46 @@ function addTextToPage(
     const page = pdfDoc.loadPage(pageIndex)
     const pageObj = page.getObject()
 
-    // 1–3. Font and show operator. WinAnsi in a base-14 face where it can be
-    // — serializing raw Unicode with "& 0xFF" would silently mangle €, smart
-    // quotes, dashes… — and, for text WinAnsi cannot hold (an OCR'd Chinese
-    // label), a subset of the shipped CJK face. The whole run goes into the
-    // CJK face then: it has Latin glyphs, and one op is simpler than two.
-    const winAnsi = encodeWinAnsiText(text)
-    let fontRefName: string
-    let showOp: string
-    if ('missing' in winAnsi) {
-      const cjk = hasCjk(text) ? registerCjkRun(pageObj, text) : null
-      if (!cjk) {
-        page.destroy()
-        const why = hasCjk(text) && !cjkFont
-          ? ' (the CJK font could not be loaded)'
-          : ''
-        return { success: false, error: `Characters not supported by ${fontName}: ${winAnsi.missing.join(', ')}${why}` }
-      }
-      fontRefName = cjk.refName
-      showOp = `<${cjk.hex}> Tj`
-    } else {
-      fontRefName = ensureStandardFont(pageObj, fontName)
-      showOp = `(${escapePdfString(winAnsi.bytes)}) Tj`
+    // 1–3. Fonts and show operators, one per SEGMENT. The run is cut into
+    // maximal stretches the scan face can draw (glyphs traced from the page
+    // itself) and stretches it cannot (characters the user typed that the
+    // page never showed); each stretch gets its own Tf + Tj inside the one
+    // BT, and the text matrix carries the pen from one to the next, so no
+    // advances have to be computed here. A stretch outside the face goes to
+    // WinAnsi in the base-14 face where it can — serializing raw Unicode with
+    // "& 0xFF" would silently mangle €, smart quotes, dashes… — and to a
+    // subset of the shipped CJK face for text WinAnsi cannot hold.
+    const face = faceId ? scanFaces.get(faceId) : null
+    const segments: { text: string; traced: boolean }[] = []
+    for (const ch of text) {
+      const traced = !!face && ch !== ' ' && face.encodeCharacter(ch.codePointAt(0)!) !== 0
+      const last = segments[segments.length - 1]
+      // A space joins whichever segment it follows; it draws nothing.
+      if (last && (last.traced === traced || ch === ' ')) last.text += ch
+      else segments.push({ text: ch, traced })
     }
+    const ops: string[] = []
+    for (const seg of segments) {
+      if (seg.traced && face) {
+        const run = registerEmbeddedRun(pageObj, face, seg.text, 'FSCN')
+        if (run) { ops.push(`/${run.refName} ${fontSize} Tf <${run.hex}> Tj`); continue }
+      }
+      const winAnsi = encodeWinAnsiText(seg.text)
+      if ('missing' in winAnsi) {
+        const cjk = hasCjk(seg.text) ? registerCjkRun(pageObj, seg.text) : null
+        if (!cjk) {
+          page.destroy()
+          const why = hasCjk(seg.text) && !cjkFont
+            ? ' (the CJK font could not be loaded)'
+            : ''
+          return { success: false, error: `Characters not supported by ${fontName}: ${winAnsi.missing.join(', ')}${why}` }
+        }
+        ops.push(`/${cjk.refName} ${fontSize} Tf <${cjk.hex}> Tj`)
+      } else {
+        ops.push(`/${ensureStandardFont(pageObj, fontName)} ${fontSize} Tf (${escapePdfString(winAnsi.bytes)}) Tj`)
+      }
+    }
+    const showOps = ops.join('\n')
 
     // 2. Read existing content stream
     const existingStream = readContentStream(pageIndex)
@@ -2087,7 +2118,7 @@ function addTextToPage(
       if (endInv) tm = matConcat(tm, endInv)
     }
     const fmt = (n: number) => (Math.abs(n) < 1e-6 ? '0' : n.toFixed(4))
-    const newBlock = `\nBT\n${r} ${g} ${b} rg\n/${fontRefName} ${fontSize} Tf\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOp}\nET\n`
+    const newBlock = `\nBT\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\n`
 
     // 4. Append to content stream
     const combined = existingStream + newBlock
@@ -2129,6 +2160,8 @@ function addTextToPage(
 const CJK_FONT_URL = '/fonts/NotoSansSC-Regular.otf'
 let cjkFont: any = null
 let cjkFontLoading: Promise<void> | null = null
+/** Traced scan faces by id (`ScanFace-p<n>`), registered by the client before a bake. */
+const scanFaces = new Map<string, any>()
 
 /** Han, kana, hangul, CJK punctuation and full-width forms. */
 function hasCjk(text: string): boolean {
@@ -2147,8 +2180,12 @@ async function ensureCjkFontFor(text: string): Promise<void> {
       try {
         const res = await fetch(CJK_FONT_URL)
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const bytes = new Uint8Array(await res.arrayBuffer())
-        cjkFont = new mupdf!.Font('NotoSansSC', bytes)
+        // Parsed by opentype.js, not handed to MuPDF whole: MuPDF's CFF
+        // subsetter fails on this face for some runs ("Insufficient operators
+        // on the stack", "Index bounds") and then embeds all 8 MB. A tiny
+        // font is built per run from the glyph outlines instead, and THAT is
+        // what MuPDF embeds — the same route the traced scan faces take.
+        cjkFont = opentype.parse(await res.arrayBuffer())
       } catch (err) {
         console.warn('[MuPDF Worker] CJK font unavailable:', err)
         cjkFont = null
@@ -2156,6 +2193,37 @@ async function ensureCjkFontFor(text: string): Promise<void> {
     })()
   }
   await cjkFontLoading
+}
+
+/**
+ * A font holding exactly the glyphs of `text`, from the parsed CJK face.
+ *
+ * Built with opentype.js from the outlines, so it is small (a few KB per
+ * glyph) and clean; MuPDF embeds it as it is. Null when a character has no
+ * glyph in the face.
+ */
+function miniCjkFontFor(text: string): any | null {
+  if (!cjkFont || !mupdf) return null
+  const seen = new Map<number, opentype.Glyph>()
+  for (const ch of text) {
+    if (ch === ' ') continue
+    const cp = ch.codePointAt(0)!
+    if (seen.has(cp)) continue
+    const g = cjkFont.charToGlyph(ch)
+    if (!g || g.index === 0) return null
+    seen.set(cp, new opentype.Glyph({ name: `uni${cp.toString(16).toUpperCase().padStart(4, '0')}`, unicode: cp, advanceWidth: g.advanceWidth, path: g.path }))
+  }
+  const space = cjkFont.charToGlyph(' ')
+  const notdef = new opentype.Glyph({ name: '.notdef', advanceWidth: Math.round(cjkFont.unitsPerEm * 0.5), path: new opentype.Path() })
+  const glyphs = [notdef, ...seen.values()]
+  if (text.includes(' ') && space && space.index !== 0) {
+    glyphs.push(new opentype.Glyph({ name: 'space', unicode: 32, advanceWidth: space.advanceWidth, path: new opentype.Path() }))
+  }
+  const mini = new opentype.Font({
+    familyName: 'NotoSansSC', styleName: 'Regular',
+    unitsPerEm: cjkFont.unitsPerEm, ascender: cjkFont.ascender, descender: cjkFont.descender, glyphs
+  })
+  return new mupdf.Font('NotoSansSC', new Uint8Array(mini.toArrayBuffer()))
 }
 
 /**
@@ -2171,17 +2239,28 @@ async function ensureCjkFontFor(text: string): Promise<void> {
  * extracts back as the characters that were written.
  */
 function registerCjkRun(pageObj: any, text: string): { refName: string; hex: string } | null {
-  if (!mupdf || !pdfDoc || !cjkFont) return null
+  const mini = miniCjkFontFor(text)
+  if (!mini) return null
+  return registerEmbeddedRun(pageObj, mini, text, 'FCJK')
+}
+
+/**
+ * Register a SUBSET of `font` holding exactly this run's glyphs under a fresh
+ * `<prefix>n` name in the page's fonts, and encode the run as Identity-H hex.
+ * Shared by the CJK fallback face and the traced scan faces.
+ */
+function registerEmbeddedRun(pageObj: any, font: any, text: string, prefix: string): { refName: string; hex: string } | null {
+  if (!mupdf || !pdfDoc || !font) return null
   let hex = ''
   for (const ch of text) {
-    const gid = cjkFont.encodeCharacter(ch.codePointAt(0)!)
+    const gid = font.encodeCharacter(ch.codePointAt(0)!)
     if (!gid) return null
     hex += gid.toString(16).padStart(4, '0')
   }
   let scratch: any = null
   try {
     scratch = new mupdf.PDFDocument()
-    const fontRef = scratch.addFont(cjkFont)
+    const fontRef = scratch.addFont(font)
     const res = scratch.newDictionary()
     const fd = scratch.newDictionary()
     fd.put('F1', fontRef)
@@ -2205,11 +2284,11 @@ function registerCjkRun(pageObj: any, text: string): { refName: string; hex: str
     fontDict = fontDict.resolve()
     let n = 1
     while (true) {
-      const existing = fontDict.get(`FCJK${n}`)
+      const existing = fontDict.get(`${prefix}${n}`)
       if (!existing || String(existing) === 'null') break
       n++
     }
-    const refName = `FCJK${n}`
+    const refName = `${prefix}${n}`
     fontDict.put(refName, grafted)
     return { refName, hex }
   } catch (err) {

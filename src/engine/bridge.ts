@@ -140,9 +140,15 @@ export class MuPDFBridge {
     fontSize: number,
     fontName: string,
     color?: [number, number, number],
-    rotation?: number
+    rotation?: number,
+    faceId?: string
   ): Promise<{ success: boolean; error?: string }> {
-    return this.send('addText', { pageIndex, x, y, text, fontSize, fontName, color, rotation })
+    return this.send('addText', { pageIndex, x, y, text, fontSize, fontName, color, rotation, faceId })
+  }
+
+  /** Hand the worker a traced scan face to embed for runs that name it. */
+  async registerFace(faceId: string, bytes: ArrayBuffer): Promise<{ success: boolean; error?: string }> {
+    return this.send('registerFace', { faceId, bytes })
   }
 
   /**

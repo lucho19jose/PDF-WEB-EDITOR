@@ -10,7 +10,9 @@ export type WorkerRequest =
   | { id: number; type: 'readContentStream'; data: { pageIndex: number } }
   | { id: number; type: 'writeContentStream'; data: { pageIndex: number; streamBytes: ArrayBuffer } }
   | { id: number; type: 'replaceText'; data: { pageIndex: number; blockId: string; newText: string } }
-  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number } }
+  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number; faceId?: string } }
+  /** A traced scan face (OpenType bytes) the worker keeps by id for `addText` runs that name it. */
+  | { id: number; type: 'registerFace'; data: { faceId: string; bytes: ArrayBuffer } }
   | { id: number; type: 'transformTextBlock'; data: { pageIndex: number; blockId: string; dx: number; dy: number; sx: number; sy: number; anchorX: number; anchorY: number } }
   | { id: number; type: 'transformTextBlocks'; data: { pageIndex: number; ops: BlockTransformOp[] } }
   | { id: number; type: 'restyleTextBlocks'; data: { pageIndex: number; ops: BlockStyleOp[] } }

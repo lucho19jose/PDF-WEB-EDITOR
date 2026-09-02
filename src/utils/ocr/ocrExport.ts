@@ -37,6 +37,11 @@ export interface TextOp {
   color: [number, number, number]
   /** Degrees counter-clockwise. 90 for a run that reads up the page. */
   rotation: number
+  /**
+   * The page's traced scan face, when it has glyphs: the engine draws every
+   * character the face holds with it and the rest with `fontName`, in one run.
+   */
+  faceId?: string
 }
 
 export interface OcrExportPlan {
@@ -110,7 +115,7 @@ function plainColor(c: readonly number[] | undefined): [number, number, number] 
  *
  * @param items every run on the page; untouched ones are skipped here
  */
-export function planOcrExport(items: OcrTextItem[]): OcrExportPlan {
+export function planOcrExport(items: OcrTextItem[], faceId?: string): OcrExportPlan {
   const patches: PatchOp[] = []
   const texts: TextOp[] = []
 
@@ -134,7 +139,8 @@ export function planOcrExport(items: OcrTextItem[]): OcrExportPlan {
         fontSize: Number(item.fontSize),
         fontName,
         color: plainColor(item.color),
-        rotation: 90
+        rotation: 90,
+        faceId
       })
       continue
     }
@@ -160,7 +166,8 @@ export function planOcrExport(items: OcrTextItem[]): OcrExportPlan {
       fontSize: Number(item.fontSize),
       fontName,
       color: plainColor(item.color),
-      rotation: 0
+      rotation: 0,
+      faceId
     })
   }
 
