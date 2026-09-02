@@ -132,32 +132,75 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | nu
     runs.splice(best - 1, 2, { x0: runs[best - 1].x0, x1: runs[best].x1 })
     if (++edits > budget) return null
   }
-  // Too few: touching letters. Split the run that is widest relative to what
-  // a single character should occupy, by expected advances of the characters
-  // it would hold.
-  while (runs.length < target) {
-    let best = -1, bestRatio = 0
-    for (let i = 0; i < runs.length; i++) {
-      const ratio = (runs[i].x1 - runs[i].x0) / emPx
-      if (ratio > bestRatio) { bestRatio = ratio; best = i }
+  // Too few: touching letters. Which run holds which characters is decided
+  // by WIDTH, not by splitting the widest run — the widest run in
+  // "Atentamente," is the m, and cutting it in half made an m out of two
+  // half-glyphs and shifted every letter after it. Characters are assigned
+  // to runs in order, each run taking one or more, minimising how far each
+  // run's width is from the expected advances of the letters it holds; a run
+  // that took several is then divided among them by those advances.
+  const groups = assignByWidth(runs, chars, emPx)
+  if (!groups) return null
+  const cells: GlyphCell[] = []
+  for (let i = 0; i < runs.length; i++) {
+    const r = runs[i]
+    const held = groups[i]
+    const sum = held.reduce((s, c) => s + expectedAdvance(c), 0) || 1
+    let x = r.x0
+    held.forEach((c, k) => {
+      const w = (r.x1 - r.x0) * (expectedAdvance(c) / sum)
+      const x1 = k === held.length - 1 ? r.x1 : x + w
+      cells.push({ char: c, x0: bin.x + Math.round(x), x1: bin.x + Math.round(x1) })
+      x = x1
+    })
+  }
+  return cells
+}
+
+/**
+ * Partition `chars` into `runs.length` consecutive non-empty groups so that
+ * each run's pixel width matches the expected advances of its group as
+ * closely as possible (least squares, dynamic programming). Null when even
+ * the best partition leaves the widths far from the letters — a run the
+ * text does not describe is not one to trace.
+ */
+function assignByWidth(runs: { x0: number; x1: number }[], chars: string[], emPx: number): string[][] | null {
+  const R = runs.length, N = chars.length
+  if (R > N || R === 0) return null
+  const widths = runs.map(r => (r.x1 - r.x0) / emPx)
+  const adv = chars.map(expectedAdvance)
+  // Scale expectations so the totals agree: the face's letters may be wider
+  // or narrower than the table assumes, uniformly.
+  const scale = widths.reduce((s, w) => s + w, 0) / Math.max(adv.reduce((s, a) => s + a, 0), 1e-6)
+  const prefix = [0]
+  for (const a of adv) prefix.push(prefix[prefix.length - 1] + a * scale)
+  // best[i][j]: min cost placing the first j chars into the first i runs.
+  const INF = Number.POSITIVE_INFINITY
+  const best: number[][] = Array.from({ length: R + 1 }, () => new Array(N + 1).fill(INF))
+  const from: number[][] = Array.from({ length: R + 1 }, () => new Array(N + 1).fill(-1))
+  best[0][0] = 0
+  for (let i = 1; i <= R; i++) {
+    for (let j = i; j <= N - (R - i); j++) {
+      for (let k = i - 1; k < j; k++) {
+        if (best[i - 1][k] === INF) continue
+        const want = prefix[j] - prefix[k]
+        const d = widths[i - 1] - want
+        const cost = best[i - 1][k] + d * d
+        if (cost < best[i][j]) { best[i][j] = cost; from[i][j] = k }
+      }
     }
-    if (best < 0 || bestRatio < 0.6) return null
-    const r = runs[best]
-    const mid = Math.round((r.x0 + r.x1) / 2)
-    runs.splice(best, 1, { x0: r.x0, x1: mid }, { x0: mid, x1: r.x1 })
-    if (++edits > budget) return null
   }
-  // Sanity: the widths should track the expected advances, loosely.
-  const total = runs.reduce((s, r) => s + (r.x1 - r.x0), 0)
-  const expectedTotal = chars.reduce((s, c) => s + expectedAdvance(c), 0)
-  let mismatch = 0
-  for (let i = 0; i < target; i++) {
-    const got = (runs[i].x1 - runs[i].x0) / Math.max(total, 1)
-    const want = expectedAdvance(chars[i]) / expectedTotal
-    if (Math.abs(got - want) > Math.max(0.12, want * 1.2)) mismatch++
+  if (best[R][N] === INF) return null
+  // Reject a fit whose average error is a third of an em per run or more.
+  if (Math.sqrt(best[R][N] / R) > 0.34) return null
+  const groups: string[][] = []
+  let j = N
+  for (let i = R; i >= 1; i--) {
+    const k = from[i][j]
+    groups.unshift(chars.slice(k, j))
+    j = k
   }
-  if (mismatch > budget) return null
-  return runs.map((r, i) => ({ char: chars[i], x0: bin.x + r.x0, x1: bin.x + r.x1 }))
+  return groups
 }
 
 /** The baseline: where most non-descending glyphs end. */

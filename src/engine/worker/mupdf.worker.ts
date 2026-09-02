@@ -8675,13 +8675,26 @@ function fillRect(
     const y = pageHeight - top - h
 
     const r = color[0] ?? 1, g = color[1] ?? 1, b = color[2] ?? 1
+    const existing = readContentStream(pageIndex)
+
+    // The patch is APPENDED, so it is drawn under whatever CTM the stream
+    // leaves in force at its end. A scanned letter opens with an unbracketed
+    // `0.36 0 0 0.36 0 0 cm` for its image and never restores it, so a patch
+    // written in page units landed at a third of its size in the corner while
+    // the replacement text — which already undoes the end CTM — sat over the
+    // old ink. Same compensation as `addTextToPage`.
+    const endCtm = getCtmAtOffset(existing, existing.length)
+    let undo = ''
+    if (endCtm.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
+      const inv = matInvert(endCtm)
+      if (inv) undo = `${inv.map(v => fmtNum(v)).join(' ')} cm `
+    }
     // q/Q so the fill colour does not leak into whatever is drawn next.
     const op = `
-q ${fmtNum(r)} ${fmtNum(g)} ${fmtNum(b)} rg ` +
+q ${undo}${fmtNum(r)} ${fmtNum(g)} ${fmtNum(b)} rg ` +
                `${fmtNum(x)} ${fmtNum(y)} ${fmtNum(w)} ${fmtNum(h)} re f Q
 `
 
-    const existing = readContentStream(pageIndex)
     const combined = existing + op
     const bytes = new Uint8Array(combined.length)
     for (let i = 0; i < combined.length; i++) bytes[i] = combined.charCodeAt(i) & 0xFF

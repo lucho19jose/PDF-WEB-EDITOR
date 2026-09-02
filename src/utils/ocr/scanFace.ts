@@ -82,7 +82,9 @@ export async function traceRunIntoFace(
   ctx: CanvasRenderingContext2D,
   inkRect: { x: number; y: number; width: number; height: number },
   text: string,
-  symbols?: OcrBox[]
+  symbols?: OcrBox[],
+  /** What the user made of the run; characters they changed are not traced. */
+  editedText?: string
 ): Promise<number> {
   const wanted = [...text].filter(c => c !== ' ' && !face.glyphs.has(c))
   if (!wanted.length) return 0
@@ -91,11 +93,20 @@ export async function traceRunIntoFace(
   if (!potraceReady) potraceReady = potraceInit()
   await potraceReady
 
+  // Only glyphs the engine and the user AGREE on. A scan's broken "m" read
+  // as "rh" by both engines at 99%, and tracing on the engine's text stored
+  // the two halves of the m as the face's "r" and "h" — every later r and h
+  // on the page would have drawn as half an m. Where the user corrected the
+  // run, the changed stretch is trusted by neither side: those characters
+  // fall back to the base font, and no wrong shape enters the face.
+  const trusted = trustedCells(cut.cells.length, [...text].filter(c => c !== ' '), editedText ? [...editedText].filter(c => c !== ' ') : null)
+
   const scale = UPM / cut.emPx
   const top = inkRect.y
   const bottom = inkRect.y + inkRect.height
   let added = 0
-  for (const cell of cut.cells) {
+  for (const [index, cell] of cut.cells.entries()) {
+    if (!trusted(index)) continue
     if (face.glyphs.has(cell.char)) continue
     const bmp = cellBitmap(ctx, cell, top, bottom, cut.threshold)
     if (!bmp) continue
@@ -114,6 +125,24 @@ export async function traceRunIntoFace(
   }
   if (added) await rebuild(face)
   return added
+}
+
+/**
+ * Which cells (by index into the run's non-space characters) both the engine's
+ * reading and the user's text vouch for: the common prefix and the common
+ * suffix of the two. With no edit, or an identical one, every cell.
+ */
+function trustedCells(count: number, original: string[], edited: string[] | null): (index: number) => boolean {
+  if (!edited) return () => true
+  let prefix = 0
+  while (prefix < original.length && prefix < edited.length && original[prefix] === edited[prefix]) prefix++
+  let suffix = 0
+  while (
+    suffix < original.length - prefix && suffix < edited.length - prefix &&
+    original[original.length - 1 - suffix] === edited[edited.length - 1 - suffix]
+  ) suffix++
+  const cut = Math.min(count, original.length)
+  return (index: number) => index < prefix || index >= cut - suffix
 }
 
 /**

@@ -213,7 +213,7 @@ function createOCR() {
     const symbols = item.symbols?.map(s => ({ x0: s.x * k, y0: s.y * k, x1: (s.x + s.width) * k, y1: (s.y + s.height) * k }))
     const face = scanFaceFor(item.pageIndex)
     try {
-      const added = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, symbols)
+      const added = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, symbols, item.text)
       if (added) faceVersion.value++
       return added
     } catch (err) {

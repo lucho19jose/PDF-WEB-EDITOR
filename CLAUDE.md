@@ -2404,6 +2404,22 @@ glyph. The fallback face is now parsed by opentype.js once and a tiny font is
 built per run from the glyph outlines (`miniCjkFontFor`), the same route the
 traced face takes — MuPDF embeds a few KB it can handle.
 
+**Only glyphs the engine and the user AGREE on enter the face.** A scanned
+letter's "Atentamente," reads "Atentarhente," in BOTH engines at 99% — the m
+is broken in the ink — and tracing on the engine's text stored the two halves
+of the m as the face's "r" and "h", so every later r and h on the page would
+have drawn as half an m. `trustedCells` keeps the common prefix and suffix of
+the engine's text and the user's; the changed stretch is trusted by neither
+side and falls back to the base font. Cells are assigned to ink runs by
+WIDTH (`assignByWidth`, least-squares DP over expected advances), never by
+splitting the widest run — the widest run in that word is the m itself.
+
+**`fillRect` undoes the CTM the stream leaves in force**, as `addTextToPage`
+does. The letter's stream opens with an unbracketed `0.36 0 0 0.36 0 0 cm` for
+its scan and never restores it; a patch written in page units landed at a
+third of its size in the corner, and the replacement text sat over the old
+ink — "the text is like this after I remove a character".
+
 The binarisation threshold sits at 0.42 of the box's range, not the midpoint:
 a scan's strokes are ringed with anti-aliased grey and the midpoint kept the
 ring, so the traced glyphs came out visibly heavier than the page.
