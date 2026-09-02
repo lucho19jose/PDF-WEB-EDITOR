@@ -2306,16 +2306,22 @@ async function onDragEnd() {
     ]
   })
 
-  // A DRAG always displaces what it lands on, whatever the Reflow toggle says.
+  // A drag moves ONLY what was dragged unless Reflow is on — Acrobat's rule.
   //
-  // The toggle exists because an EDIT should not rearrange a page: someone
-  // typing into a form wants that field changed and nothing else, and pushing
-  // every row below it tears labels away from their values. Dropping a
-  // paragraph on top of another one is not that. The user aimed at that spot,
-  // there is no flow in a content stream to make room by itself, and leaving
-  // the two overlaid is not a conservative outcome — it is an unreadable one.
-  // Ctrl+Z takes back the whole move, displacements included.
+  // This used to displace whatever the text landed on regardless of the
+  // toggle, on the argument that dropping a paragraph onto another leaves
+  // them unreadable. On a table it is far worse: rows sit 15pt apart, so
+  // nudging one count a few points overlapped the row beneath, that row was
+  // pushed, it overlapped the next, and the cascade ran to the foot of the
+  // page while every rule and coloured fill stayed where it was — a pivot
+  // table's twelve rows torn off their borders by a drag of the "0" in its
+  // first row. An overlap is visible and one Ctrl+Z (or one more drag) from
+  // fixed; a cascaded table is not. The plan is still built so the status
+  // line can say what the drop landed on, and Reflow ON keeps the old
+  // behaviour for prose, where making room is what a drop means.
   const collision = buildCollisionOps(destRects)
+  const displace = editorStore.reflowOnEdit
+  if (!displace) collision.ops = []
 
   const selOps: BlockTransformOp[] = sel.map(block => ({
     blockId: block.id,
@@ -2359,7 +2365,7 @@ async function onDragEnd() {
       const selResults = result.results.slice(collision.ops.length)
       const selApplied = selResults.filter(r => r.success).length
 
-      editorStore.setStatus(describeTransform(selApplied, sel.length, collision, isMove))
+      editorStore.setStatus(describeTransform(selApplied, sel.length, collision, isMove, displace))
       emit('textChanged')
       await loadBlocks()
     })
@@ -2381,14 +2387,15 @@ function describeTransform(
   selApplied: number,
   selCount: number,
   collision: { rowsPushed: number; blocked: number; capped: boolean },
-  isMove: boolean
+  isMove: boolean,
+  displaced: boolean
 ): string {
   const verb = isMove ? 'moved' : 'resized'
   const parts: string[] = []
 
   if (selApplied === 0) {
     parts.push(`Could not be ${verb} — no matching text found in the content stream`)
-    if (collision.rowsPushed > 0) {
+    if (displaced && collision.rowsPushed > 0) {
       parts.push(`${collision.rowsPushed} line(s) were already shifted aside; press Ctrl+Z to undo`)
     }
     return parts.join(' — ')
@@ -2397,6 +2404,13 @@ function describeTransform(
   parts.push(selApplied === selCount
     ? `${selCount === 1 ? 'Text block' : `${selCount} text blocks`} ${verb}`
     : `Partially ${verb} — ${selApplied} of ${selCount} blocks`)
+
+  if (!displaced) {
+    if (collision.rowsPushed > 0) {
+      parts.push(`overlaps ${collision.rowsPushed} line(s); nothing else was moved (turn Reflow on to push them aside)`)
+    }
+    return parts.join(' — ')
+  }
 
   if (collision.rowsPushed > 0) {
     parts.push(`${collision.rowsPushed} line(s) shifted to make room`)

@@ -117,8 +117,9 @@
         <q-separator vertical inset class="q-mx-sm" />
         <q-toggle v-model="editorStore.reflowOnEdit" label="Reflow" dense size="sm" color="primary">
           <q-tooltip>
-            Move the rest of the page when an edit changes how many lines the text takes.
-            Leave it off for forms and tables — it pulls labels away from their values.
+            Move the rest of the page when an edit changes how many lines the text takes,
+            and push lines aside when dragged text lands on them.
+            Leave it off for forms and tables — a drag then moves only what you dragged, as Acrobat does.
           </q-tooltip>
         </q-toggle>
       </template>
