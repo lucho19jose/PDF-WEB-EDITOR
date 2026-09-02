@@ -88,6 +88,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 
       case 'replaceText': {
         if (!pdfDoc) throw new Error('No document loaded')
+        // The CJK face is the substitute for text WinAnsi cannot hold; it is
+        // fetched once, here, because the writers below are synchronous.
+        await ensureCjkFontFor(req.data.newText)
         const result = replaceTextInStream(req.data.pageIndex, req.data.blockId, req.data.newText)
         respond({ id: req.id, type: 'success', data: result })
         break
@@ -1893,8 +1896,17 @@ function rebuildBtContent(
 type EncodingPlan =
   | { kind: 'keep-hex'; hexLines: string[] }
   | { kind: 'keep-plain'; byteLines: string[] }
-  | { kind: 'subst'; fontRef: string; fontName: string; byteLines: string[] }
+  | { kind: 'subst'; fontRef: string; fontName: string; byteLines: string[]; hex?: boolean; hexLines?: string[] }
   | { kind: 'error'; error: string }
+
+/** The substitute's lines as the rebuild wants them: hex for an embedded CJK face. */
+function substLines(plan: { byteLines: string[]; hex?: boolean; hexLines?: string[] }): string[] {
+  return plan.hex && plan.hexLines ? plan.hexLines : plan.byteLines
+}
+/** The substitute's first line as a PDF string literal. */
+function substLiteral(plan: { byteLines: string[]; hex?: boolean; hexLines?: string[] }): string {
+  return plan.hex && plan.hexLines ? `<${plan.hexLines[0] ?? ''}>` : `(${escapePdfString(plan.byteLines[0] ?? '')})`
+}
 
 /**
  * Decide how to encode replacement text for a BT block:
@@ -1985,12 +1997,47 @@ function planTextEncoding(
 
   // ── Substitution fallback ──
   const byteLines: string[] = []
+  let missing: string[] | null = null
   for (const line of lines) {
     const res = encodeWinAnsiText(line)
-    if ('missing' in res) {
-      return { kind: 'error', error: `Cannot encode characters: ${res.missing.join(', ')} (not supported by fallback font)` }
-    }
+    if ('missing' in res) { missing = res.missing; break }
     byteLines.push(res.bytes)
+  }
+  if (missing) {
+    // WinAnsi cannot hold it. For Chinese — the bilingual forms this editor
+    // lives on end half their lines in 不适用 — a tiny font built from the
+    // shipped CJK face draws the WHOLE run (it has Latin glyphs too), in the
+    // resources the block's Tf resolves against. Anything else is an error.
+    const cjk = lines.some(hasCjk) ? miniCjkFontFor(lines.join(' ')) : null
+    if (cjk) {
+      const hexLines: string[] = []
+      let ok = true
+      for (const line of lines) {
+        let hex = ''
+        for (const ch of line) {
+          const gid = cjk.encodeCharacter(ch.codePointAt(0)!)
+          if (!gid) { ok = false; break }
+          hex += gid.toString(16).padStart(4, '0')
+        }
+        if (!ok) break
+        hexLines.push(hex)
+      }
+      if (ok) {
+        try {
+          const dict = activeResources
+            ? (activeResources.dict.resolve?.() ?? activeResources.dict)
+            : (() => { const page = pdfDoc.loadPage(pageIndex); const r = page.getObject().get('Resources'); page.destroy(); return r })()
+          const fontRef = registerFontIn(dict, cjk, 'FCJK')
+          if (fontRef) {
+            console.log(`[MuPDF Worker] Substituting font ${block.fontRef} → NotoSansSC (/${fontRef}) for CJK`)
+            return { kind: 'subst', fontRef, fontName: 'NotoSansSC', byteLines: [], hex: true, hexLines }
+          }
+        } catch (err) {
+          console.warn('[MuPDF Worker] CJK substitute failed:', err)
+        }
+      }
+    }
+    return { kind: 'error', error: `Cannot encode characters: ${missing.join(', ')} (not supported by fallback font)` }
   }
 
   const info = getSimpleFontInfo(pageIndex, block.fontRef)
@@ -2238,6 +2285,31 @@ function miniCjkFontFor(text: string): any | null {
  * Grafting carries the subset's own W array and ToUnicode, so the run
  * extracts back as the characters that were written.
  */
+/**
+ * Put an already-minimal font (opentype-built: a traced face, a CJK mini
+ * font) into a Resources dictionary under a fresh `<prefix>n` name. No
+ * scratch document and no subsetting: there is nothing to cut.
+ */
+function registerFontIn(resources: any, font: any, prefix: string): string | null {
+  if (!pdfDoc || !resources || String(resources) === 'null') return null
+  const res = resources.resolve?.() ?? resources
+  let fontDict = res.get('Font')
+  if (!fontDict || String(fontDict) === 'null') {
+    fontDict = pdfDoc.newDictionary()
+    res.put('Font', fontDict)
+  }
+  fontDict = fontDict.resolve?.() ?? fontDict
+  let n = 1
+  while (true) {
+    const existing = fontDict.get(`${prefix}${n}`)
+    if (!existing || String(existing) === 'null') break
+    n++
+  }
+  const refName = `${prefix}${n}`
+  fontDict.put(refName, pdfDoc.addFont(font))
+  return refName
+}
+
 function registerCjkRun(pageObj: any, text: string): { refName: string; hex: string } | null {
   const mini = miniCjkFontFor(text)
   if (!mini) return null
@@ -3205,7 +3277,7 @@ function restyleInSource(
           ? rebuildBtContent(block.content, plan.hexLines, null, true, sizeOverride, colorOp)
           : plan.kind === 'keep-plain'
             ? rebuildBtContent(block.content, plan.byteLines, null, false, sizeOverride, colorOp)
-            : rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, sizeOverride, colorOp, block.inheritedTf)
+            : rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, sizeOverride, colorOp, block.inheritedTf)
 
         inner = stripActualText(inner)
         inner = dropBaselineInBlock(inner, stream, block.start, baselineDrop)
@@ -4883,7 +4955,7 @@ function applyBlockReplacement(
   } else if (plan.kind === 'keep-plain') {
     newContent = replaceTjInBlock(block.content, plan.byteLines[0], 'plain')
   } else {
-    newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, undefined, undefined, block.inheritedTf)
+    newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf)
     substitutedFont = plan.fontName
   }
 
@@ -5043,7 +5115,7 @@ function applyWrappedReplacement(
   } else if (plan.kind === 'keep-plain') {
     newContent = rebuildBtContent(block.content, plan.byteLines, null)
   } else {
-    newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, undefined, undefined, block.inheritedTf)
+    newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf)
     substitutedFont = plan.fontName
   }
 
@@ -5227,7 +5299,7 @@ function applyLineReplacement(
         return narrowLineAndRetry() ?? { error: plan.error }
       }
       if (plan.kind === 'subst') {
-        newContent = rebuildBtContent(block.content, plan.byteLines, plan.fontRef, false, undefined, undefined, block.inheritedTf)
+        newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf)
         substitutedFont = plan.fontName
       } else if (lines.length > 1) {
         newContent = plan.kind === 'keep-hex'
@@ -6938,7 +7010,7 @@ function applyPartialBlockReplacement(
       if (plan.kind === 'subst') {
         // The cell's subsetted font lacks the replacement's glyphs. Split the
         // array and draw just this run in the substitute face.
-        const newLit = { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [] as number[] }
+        const newLit = { literal: substLiteral(plan), codes: [] as number[] }
         newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, tfSize, {
           fontRef: plan.fontRef,
           origFontRef: op.fontRef ?? block.fontRef,
@@ -7046,7 +7118,7 @@ function applyPartialBlockReplacement(
             : block.fontRef
               ? ` /${block.fontRef} ${endSize} Tf`
               : (tfMatch ? ` /${tfMatch[1]} ${fallbackSize} Tf` : '')
-        repl = `/${plan.fontRef} ${drawSize} Tf ${buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw)}${restore}`
+        repl = `/${plan.fontRef} ${drawSize} Tf ${buildShowOp(op.kind, substLiteral(plan), op.raw)}${restore}`
         substitutedFont = plan.fontName
       }
     } else {

@@ -90,6 +90,7 @@ let cloudConsentGiven = false
 import { planOcrExport } from '@/utils/ocr/ocrExport'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
+import { getMuPDFBridge } from '@/engine/bridge'
 import { enqueueOp, settleTransactions, transactionOpen } from '@/utils/opQueue'
 import MainToolbar from '@/components/toolbar/MainToolbar.vue'
 import PageThumbnails from '@/components/sidebar/PageThumbnails.vue'
@@ -112,6 +113,12 @@ provide('pdfViewer', pdfViewer)
 provide('pdfEngine', pdfEngine)
 ;(window as any).__pdfEngine = pdfEngine
 ;(window as any).__pdfViewer = pdfViewer
+// A crashed engine worker is respawned by the bridge with the document it
+// had; the user still deserves to know, and to know the unsaved edits made
+// since the last save→reload are in the document the bridge reloaded.
+getMuPDFBridge().onCrash = (reason: string) => {
+  editorStore.setStatus(`The PDF engine stopped (${reason}) and was restarted — check the last edit`)
+}
 
 function handleBeforeUnload(e: BeforeUnloadEvent) {
   if (docStore.isModified) {
@@ -1014,6 +1021,13 @@ async function handleDrop(e: DragEvent) {
 // ===== PROVIDE to whole tree =====
 provide('runOcrOnPage', runOcrOnPage)
 provide('bakeOcrEdits', bakeOcrEdits)
+// For the sweep drivers (public/_sweep/*.js): a production build strips the
+// Vue internals they used to walk to these, so they are put on window like
+// __pdfEngine and __pdfViewer already are.
+;(window as any).__pdfHooks = {
+  ocrController: { isScanLike: isScanLikePage, recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG), busy: ocr.busy },
+  bakeOcrEdits, runOcrOnPage, undo, redo, ocr
+}
 provide('openFile', openFile)
 provide('openPdfFile', openPdfFile)
 provide('mergePdfFile', mergePdfFile)

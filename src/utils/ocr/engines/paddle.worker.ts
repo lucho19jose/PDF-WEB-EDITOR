@@ -72,6 +72,15 @@ async function init(id: number): Promise<void> {
         recognition: { strategy: 'per-box', minimumConfidence: 0.3, mainThreadYieldMs: 0 } as any
       })
       await svc.initialize()
+      // Warm the pipeline: the first inference compiles the WebGPU shaders
+      // and cost 11.6 s against 5.1 s for the second on the same page. A tiny
+      // blank canvas pays that while the user is still looking at the page.
+      try {
+        const warm = new OffscreenCanvas(96, 48)
+        const wctx = warm.getContext('2d')
+        if (wctx) { wctx.fillStyle = '#fff'; wctx.fillRect(0, 0, 96, 48); wctx.fillStyle = '#000'; wctx.font = '24px sans-serif'; wctx.fillText('ab', 10, 32) }
+        await svc.recognize(warm as any, { flatten: true, noCache: true })
+      } catch (_) { /* warm-up only */ }
       service = svc
     })().catch(err => { initPromise = null; throw err })
   }

@@ -9,7 +9,7 @@ import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
 import { inkBounds, inkGaps, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace } from '@/utils/ocr/scanFace'
-import { cutGlyphs } from '@/utils/ocr/glyphCut'
+import { cutGlyphs, lastCutReason } from '@/utils/ocr/glyphCut'
 
 /**
  * Recognising the text in a scanned page.
@@ -224,14 +224,16 @@ function createOCR() {
   }
 
   /** How an item's ink would be cut into glyph cells — for tests and the harness. */
-  function cutFor(item: OcrTextItem): { cells: { char: string; x0: number; x1: number }[]; emPx: number; baselineY: number; toPt: number } | null {
+  function cutFor(item: OcrTextItem): { cells: { char: string; x0: number; x1: number; suspect?: boolean }[]; emPx: number; baselineY: number; toPt: number; reason?: string } | null {
     const raster = rasters.get(item.pageIndex)
     if (!raster) return null
     const k = 1 / raster.toPt
     const rect = { x: item.inkRect.x * k, y: item.inkRect.y * k, width: item.inkRect.width * k, height: item.inkRect.height * k }
     const symbols = item.symbols?.map(s => ({ x0: s.x * k, y0: s.y * k, x1: (s.x + s.width) * k, y1: (s.y + s.height) * k }))
     const cut = cutGlyphs(raster.ctx, rect, item.originalText, symbols)
-    return cut ? { cells: cut.cells, emPx: cut.emPx, baselineY: cut.baselineY, toPt: raster.toPt } : null
+    return cut
+      ? { cells: cut.cells, emPx: cut.emPx, baselineY: cut.baselineY, toPt: raster.toPt }
+      : { cells: [], emPx: 0, baselineY: 0, toPt: raster.toPt, reason: lastCutReason() }
   }
 
   /** The page's scan face for a run's style, if any glyph has been traced for it. */
@@ -478,7 +480,7 @@ function createOCR() {
    * em, a Latin letter half, a space a third — with Latin cuts snapped to the
    * nearest space. Lines that already have words are returned untouched.
    */
-  async function refineLines(lines: OcrLine[], ctx: CanvasRenderingContext2D, engine: OcrEngine, lang: string): Promise<OcrLine[]> {
+  async function refineLines(lines: OcrLine[], ctx: CanvasRenderingContext2D, engine: OcrEngine, lang: string, reread = true): Promise<OcrLine[]> {
     const out: OcrLine[] = []
     for (const line of lines) {
       if (line.words?.length) { out.push(line); continue }
@@ -490,22 +492,24 @@ function createOCR() {
       // `splitRuns` sets): justified prose opens word gaps past an em, and a
       // 1.2 em bar cut "En caso de incumplimiento…" in two and the re-read
       // pieces came back with a space inside a word. Rules cut regardless.
-      const cuts = inkGaps(ctx, { x: ink.x, y: ink.y, width: ink.width, height: ink.height }, Math.max(6, emPx * 2.5))
+      const cuts = reread ? inkGaps(ctx, { x: ink.x, y: ink.y, width: ink.width, height: ink.height }, Math.max(6, emPx * 2.5)) : []
       const pieces = cuts.length ? splitTextAtCuts(line.text, ink, cuts) : [{ text: line.text, x0: ink.x, x1: ink.x + ink.width }]
-      for (const piece of pieces) {
+      const inks = pieces.map(piece => {
         const pieceRect = { x: piece.x0, y: ink.y, width: piece.x1 - piece.x0, height: ink.height }
-        const pieceInk = pieces.length > 1 ? inkBounds(ctx, pieceRect) : ink
-        if (pieceInk.width < 2 || pieceInk.height < 2) continue
-        // A cut box is READ AGAIN as its own crop: sharing the text out by
-        // column occupancy is an estimate, and on the survey's "辽宁泓瑞机电
-        // 装备有限公司 | 法定代表人" it kept landing one ideograph off. The
-        // crop costs one small inference; the estimate stays as the fallback.
-        let text = piece.text
-        if (pieces.length > 1) {
-          const read = await recognizeCrop(ctx, pieceInk, engine, lang)
-          if (read) text = read
-        }
-        if (!text.trim()) continue
+        return pieces.length > 1 ? inkBounds(ctx, pieceRect) : ink
+      })
+      // Cut boxes are READ AGAIN: sharing the text out by column occupancy
+      // is an estimate, and on the survey's "辽宁泓瑞机电装备有限公司 | 法定
+      // 代表人" it kept landing one ideograph off. All the pieces of a box go
+      // into ONE crop, stacked, so a slide cut into 190 cells costs 27
+      // inferences rather than 190 (measured: 13 s of re-reads on one page).
+      // The estimate stays as the fallback for a piece that reads as nothing.
+      const reads = pieces.length > 1 && reread ? await recognizeSheet(ctx, inks, engine, lang) : []
+      pieces.forEach((piece, i) => {
+        const pieceInk = inks[i]
+        if (pieceInk.width < 2 || pieceInk.height < 2) return
+        const text = reads[i] || piece.text
+        if (!text.trim()) return
         const box = { x0: pieceInk.x, y0: pieceInk.y, x1: pieceInk.x + pieceInk.width, y1: pieceInk.y + pieceInk.height }
         out.push({
           ...line,
@@ -513,39 +517,64 @@ function createOCR() {
           text,
           words: [{ text, box, confidence: line.confidence, symbols: [box] }]
         })
-      }
+      })
     }
     return out
   }
 
-  /** Recognise one box of the page on its own; null when nothing readable comes back. */
-  async function recognizeCrop(ctx: CanvasRenderingContext2D, ink: { x: number; y: number; width: number; height: number }, engine: OcrEngine, lang: string): Promise<string | null> {
-    // Room around the glyphs: the detector wants a margin to find the line.
-    const pad = Math.round(ink.height * 0.6)
-    const x = Math.max(0, ink.x - pad), y = Math.max(0, ink.y - pad)
-    const w = Math.min(ctx.canvas.width - x, ink.width + pad * 2)
-    const h = Math.min(ctx.canvas.height - y, ink.height + pad * 2)
-    if (w < 4 || h < 4) return null
-    const crop = document.createElement('canvas')
-    crop.width = w
-    crop.height = h
-    const cctx = crop.getContext('2d')
-    if (!cctx) return null
-    cctx.fillStyle = '#fff'
-    cctx.fillRect(0, 0, w, h)
-    cctx.drawImage(ctx.canvas, x, y, w, h, 0, 0, w, h)
+  /**
+   * Read several boxes of the page in one inference: each is drawn on its own
+   * band of a sheet, a gap of its height between bands so the detector sees
+   * separate lines, and every line the engine returns is handed to the band
+   * its centre falls in. A band with no line reads as null.
+   */
+  async function recognizeSheet(ctx: CanvasRenderingContext2D, inks: { x: number; y: number; width: number; height: number }[], engine: OcrEngine, lang: string): Promise<(string | null)[]> {
+    const pad = (h: number) => Math.round(h * 0.6)
+    const bands: { y: number; h: number; ok: boolean }[] = []
+    let sheetW = 0, sheetH = 0
+    for (const ink of inks) {
+      const p = pad(ink.height)
+      const w = ink.width + p * 2, h = ink.height + p * 2
+      const ok = ink.width >= 2 && ink.height >= 2
+      bands.push({ y: sheetH, h, ok })
+      sheetW = Math.max(sheetW, w)
+      sheetH += h
+    }
+    if (sheetW < 4 || sheetH < 4) return inks.map(() => null)
+    const sheet = document.createElement('canvas')
+    sheet.width = sheetW
+    sheet.height = sheetH
+    const sctx = sheet.getContext('2d')
+    if (!sctx) return inks.map(() => null)
+    sctx.fillStyle = '#fff'
+    sctx.fillRect(0, 0, sheetW, sheetH)
+    inks.forEach((ink, i) => {
+      if (!bands[i].ok) return
+      const p = pad(ink.height)
+      const x = Math.max(0, ink.x - p), y = Math.max(0, ink.y - p)
+      const w = Math.min(ctx.canvas.width - x, ink.width + p * 2)
+      const h = Math.min(ctx.canvas.height - y, ink.height + p * 2)
+      if (w > 0 && h > 0) sctx.drawImage(ctx.canvas, x, y, w, h, 0, bands[i].y, w, h)
+    })
     try {
-      const res = await engine.recognize(crop, { lang })
-      const text = res.lines
-        .filter(l => l.text.trim() && l.confidence >= 30)
-        .sort((a, b) => a.box.x0 - b.box.x0)
-        .map(l => l.text.trim()).join(' ')
-        .replace(/([\p{Script=Han}　-〿＀-￯])\s+(?=[\p{Script=Han}　-〿＀-￯])/gu, '$1')
-      return text || null
+      const res = await engine.recognize(sheet, { lang })
+      const perBand: OcrLine[][] = inks.map(() => [])
+      for (const l of res.lines) {
+        if (!l.text.trim() || l.confidence < 30) continue
+        const cy = (l.box.y0 + l.box.y1) / 2
+        const i = bands.findIndex(b => cy >= b.y && cy < b.y + b.h)
+        if (i >= 0) perBand[i].push(l)
+      }
+      return perBand.map(ls => {
+        if (!ls.length) return null
+        return ls.sort((a, b) => a.box.x0 - b.box.x0).map(l => l.text.trim()).join(' ')
+          .replace(/([\p{Script=Han}　-〿＀-￯])\s+(?=[\p{Script=Han}　-〿＀-￯])/gu, '$1') || null
+      })
     } catch (_) {
-      return null
+      return inks.map(() => null)
     }
   }
+
 
   /** Advance weight of a character, in ems, for sharing text across a cut box. */
   function advanceOf(ch: string): number {
@@ -605,11 +634,13 @@ function createOCR() {
     vertical: boolean,
     mapBox: (b: Box) => { x: number; y: number; width: number; height: number },
     engine: OcrEngine,
-    lang: string
+    lang: string,
+    /** Re-read cut boxes (upright pass); the sideways pass skips it. */
+    reread = true
   ): Promise<OcrTextItem[]> {
     const items: OcrTextItem[] = []
 
-    for (const line of await refineLines(data.lines, ctx, engine, lang)) {
+    for (const line of await refineLines(data.lines, ctx, engine, lang, reread)) {
       // An engine that reports no words (PaddleOCR: one box per text region)
       // gets the line as its one word, carrying the INK's box as its one
       // glyph box so the em is measured on the glyphs, not on the detector's
@@ -913,7 +944,7 @@ function createOCR() {
       y: (H - b.x1) * toPt,
       width: (b.y1 - b.y0) * toPt,
       height: (b.x1 - b.x0) * toPt
-    }), engine, lang)
+    }), engine, lang, false)
 
     const kept: OcrTextItem[] = []
     for (const item of found) {

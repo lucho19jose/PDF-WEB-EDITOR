@@ -30,9 +30,16 @@ export interface GlyphCutResult {
   emPx: number
   /** Threshold used, so the tracer binarises the same way. */
   threshold: number
+  /** Light glyphs on a dark ground — the tracer must flip the bitmap too. */
+  inverted: boolean
 }
 
-interface Bin { x: number; y: number; w: number; h: number; ink: Uint8Array; threshold: number }
+interface Bin { x: number; y: number; w: number; h: number; ink: Uint8Array; threshold: number; inverted: boolean }
+
+/** Why the last cut was refused — for the sweep, which counts the reasons. */
+let refusedBecause = ''
+export function lastCutReason(): string { return refusedBecause }
+function refuse(why: string): null { refusedBecause = why; return null }
 
 const DESCENDER_CHARS = /[gjpqyQ,;()\[\]{}]/
 const CJK = /[\p{Script=Han}　-〿＀-￯]/u
@@ -58,8 +65,23 @@ function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; w
   // goes and the stems keep their width.
   const threshold = lo + (hi - lo) * 0.42
   const ink = new Uint8Array(w * h)
-  for (let j = 0; j < gray.length; j++) ink[j] = gray[j] < threshold ? 1 : 0
-  return { x, y, w, h, ink, threshold }
+  let dark = 0
+  for (let j = 0; j < gray.length; j++) { const on = gray[j] < threshold ? 1 : 0; ink[j] = on; dark += on }
+  // Light text on a dark band (a slide's title bar, a table header): the
+  // dark side is the paper there, and read as ink it made the whole box ONE
+  // run ("1 runs for 21 characters"). More than half the box dark means the
+  // glyphs are the light side; flip it.
+  const inverted = dark > gray.length * 0.5
+  if (inverted) for (let j = 0; j < ink.length; j++) ink[j] = 1 - ink[j]
+  // A rule across the box — an underline, a cell border — joins every glyph
+  // column into one run and drags the baseline down. Rows inked across most
+  // of the width are not glyph rows; clear them.
+  for (let yy = 0; yy < h; yy++) {
+    let n = 0
+    for (let xx = 0; xx < w; xx++) n += ink[yy * w + xx]
+    if (n >= w * 0.8) for (let xx = 0; xx < w; xx++) ink[yy * w + xx] = 0
+  }
+  return { x, y, w, h, ink, threshold, inverted }
 }
 
 /** Expected width of a character as a fraction of the em. */
@@ -83,9 +105,10 @@ export function cutGlyphs(
   symbols?: OcrBox[]
 ): GlyphCutResult | null {
   const chars = [...text].filter(c => c !== ' ')
-  if (!chars.length) return null
+  if (!chars.length) return refuse('no characters')
   const bin = binarise(ctx, rect)
-  if (!bin) return null
+  if (!bin) return refuse('blank or unreadable box')
+  refusedBecause = ''
 
   const cjk = chars.filter(c => CJK.test(c)).length * 2 >= chars.length
   const emPx = bin.h / (cjk ? 0.92 : (chars.some(c => DESCENDER_CHARS.test(c)) ? 0.95 : 0.76))
@@ -99,7 +122,7 @@ export function cutGlyphs(
   if (!cells) return null
 
   const baselineY = baselineOf(bin, cells)
-  return { cells, baselineY, emPx, threshold: bin.threshold }
+  return { cells, baselineY, emPx, threshold: bin.threshold, inverted: bin.inverted }
 }
 
 function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | null {
@@ -118,13 +141,13 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | nu
       if (blank > 1 || xx === bin.w) { runs.push({ x0: start, x1: xx - blank + 1 }); start = -1; blank = 0 }
     }
   }
-  if (!runs.length) return null
+  if (!runs.length) return refuse('no ink runs')
   const target = chars.length
   // Letters that mostly TOUCH cannot be cut by profile: an italic serif
   // footer gave 69 characters in far fewer ink runs, and however the runs were
   // shared out, every second cell held the wrong letter. Tesseract's glyph
   // boxes are the only honest cut for such a line; without them, refuse.
-  if (runs.length < target * 0.6) return null
+  if (runs.length < target * 0.6) return refuse(`letters touch (${runs.length} runs for ${target} characters)`)
   const budget = Math.max(1, Math.round(target * 0.35))
   let edits = 0
 
@@ -137,7 +160,7 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | nu
       if (gap < bestGap) { bestGap = gap; best = i }
     }
     runs.splice(best - 1, 2, { x0: runs[best - 1].x0, x1: runs[best].x1 })
-    if (++edits > budget) return null
+    if (++edits > budget) return refuse(`too many fragments (${runs.length + edits} runs for ${target} characters)`)
   }
   // Too few: touching letters. Which run holds which characters is decided
   // by WIDTH, not by splitting the widest run — the widest run in
@@ -147,7 +170,7 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | nu
   // run's width is from the expected advances of the letters it holds; a run
   // that took several is then divided among them by those advances.
   const groups = assignByWidth(runs, chars, emPx)
-  if (!groups) return null
+  if (!groups) return refuse('widths do not fit the letters')
   const cells: GlyphCell[] = []
   for (let i = 0; i < runs.length; i++) {
     const r = runs[i]
@@ -180,7 +203,11 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | nu
   // descender must descend, an ascender or a capital must rise — measured
   // against the run's own x-height and baseline.
   suspects += flagByShape(bin, cells)
-  if (suspects > cells.length * 0.1) return null
+  // A fifth: suspect cells are never traced anyway, so the bar is about
+  // whether the REST can be trusted. Measured on 22 files, honest runs came
+  // back with 2 of 18 or 2 of 15 suspect (a comma, an accent) and were being
+  // refused whole at a tenth; the shifted italic footer was 16 of 69.
+  if (suspects > cells.length * 0.2) return refuse(`${suspects} of ${cells.length} cells suspect`)
   return cells
 }
 
@@ -298,7 +325,8 @@ export function cellBitmap(
   top: number,
   bottom: number,
   threshold: number,
-  pad = 1
+  pad = 1,
+  invert = false
 ): { image: ImageData; x: number; y: number } | null {
   const x = Math.max(0, cell.x0 - pad), y = Math.max(0, Math.floor(top) - pad)
   const w = Math.min(ctx.canvas.width - x, cell.x1 - cell.x0 + pad * 2)
@@ -310,7 +338,8 @@ export function cellBitmap(
   const d = src.data, o = out.data
   for (let i = 0; i < d.length; i += 4) {
     const g = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000
-    const v = g < threshold ? 0 : 255
+    const isInk = invert ? g >= threshold : g < threshold
+    const v = isInk ? 0 : 255
     o[i] = v; o[i + 1] = v; o[i + 2] = v; o[i + 3] = 255
   }
   return { image: out, x, y }

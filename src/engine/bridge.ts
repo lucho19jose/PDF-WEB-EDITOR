@@ -71,6 +71,8 @@ export class MuPDFBridge {
       this.worker = null
       this._ready = false
       this.initPromise = null
+      this.crashed = true
+      try { this.onCrash?.(err.message || 'the PDF engine stopped') } catch (_) { /* listener's problem */ }
     }
 
     // Send init message and wait for WASM to load
@@ -82,7 +84,48 @@ export class MuPDFBridge {
    * Load a PDF document from raw bytes.
    */
   async loadDocument(bytes: ArrayBuffer): Promise<{ pageCount: number }> {
+    // Kept so a crashed worker can be given the document back — see `send`.
+    this.lastDoc = bytes.slice(0)
     return this.send('loadDocument', { bytes }, [bytes])
+  }
+
+  /** The document most recently loaded, for putting back after a crash. */
+  private lastDoc: ArrayBuffer | null = null
+  /** Set by `onerror`; cleared once a fresh worker holds the document again. */
+  private crashed = false
+  private recovering: Promise<void> | null = null
+  /** Told when the worker dies and is brought back, so the UI can say so. */
+  onCrash: ((reason: string) => void) | null = null
+
+  /**
+   * Bring a dead worker back with the document it had.
+   *
+   * MuPDF's WASM aborts on some malformed files and takes the whole worker
+   * with it; before this, every later call answered "Worker not initialized"
+   * and the app was dead until a reload (measured: one bad PDF in a sweep
+   * of 110 failed the 68 that followed). The worker is respawned and the
+   * last document reloaded; the call that found it dead is then retried
+   * once. If the document itself is what kills the worker, the reload fails
+   * and the caller gets that error rather than a hang.
+   */
+  private async recover(): Promise<void> {
+    if (this.recovering) return this.recovering
+    this.recovering = (async () => {
+      await this.init()
+      if (this.lastDoc) {
+        const copy = this.lastDoc.slice(0)
+        try {
+          await this.send('loadDocument', { bytes: copy }, [copy])
+        } catch (err) {
+          // The document itself kills the worker: forget it, so the next
+          // recovery yields an empty engine instead of another crash.
+          this.lastDoc = null
+          throw err
+        }
+      }
+      this.crashed = false
+    })().finally(() => { this.recovering = null })
+    return this.recovering
   }
 
   /**
@@ -383,6 +426,11 @@ export class MuPDFBridge {
    */
   private send(type: string, data?: any, transfer?: Transferable[]): Promise<any> {
     if (!this.worker) {
+      // Dead after a crash: bring it back with its document, then carry on
+      // with this call. Recovery's own sends run once the worker exists.
+      if (this.crashed && type !== 'init') {
+        return this.recover().then(() => this.send(type, data, transfer))
+      }
       return Promise.reject(new Error('Worker not initialized'))
     }
 

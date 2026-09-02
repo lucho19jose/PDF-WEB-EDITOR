@@ -366,6 +366,9 @@ function cancelEdit() {
 watch(pageIndex, () => { editing.value = null })
 
 defineExpose({ beginEdit, editAt })
+// For the sweep drivers, which cannot reach a component's exposed API in a
+// production build.
+;(window as any).__ocrLayer = { beginEdit, editAt, ocr }
 </script>
 
 <style scoped>

@@ -126,7 +126,7 @@ export async function traceRunIntoFace(
   for (const [index, cell] of cut.cells.entries()) {
     if (!trusted(index) || cell.suspect) continue
     if (face.glyphs.has(cell.char)) continue
-    const bmp = cellBitmap(ctx, cell, top, bottom, cut.threshold)
+    const bmp = cellBitmap(ctx, cell, top, bottom, cut.threshold, 1, cut.inverted)
     if (!bmp) continue
     let svg: string
     try {

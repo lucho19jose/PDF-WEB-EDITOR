@@ -23,7 +23,10 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 const norm = (s) => (s || '').replace(/\s+/g, '')
 
 function provides() {
-  let inst = document.querySelector('.q-layout').__vueParentComponent
+  // The layout puts its hooks on window (a production build strips the Vue
+  // internals); the DOM walk is the dev-only fallback.
+  if (window.__pdfHooks) return window.__pdfHooks
+  let inst = document.querySelector('.q-layout')?.__vueParentComponent
   while (inst) { if (inst.provides && inst.provides.ocrController) return inst.provides; inst = inst.parent }
   return null
 }
@@ -59,9 +62,10 @@ async function gotoPage(n) {
 }
 
 function ocrLayerApi() {
-  const el = document.querySelector('.ocr-layer')
-  if (!el) return null
-  const inst = el.__vueParentComponent
+  if (!document.querySelector('.ocr-layer')) return null
+  if (window.__ocrLayer) return { api: window.__ocrLayer, ocr: window.__ocrLayer.ocr }
+  const inst = document.querySelector('.ocr-layer').__vueParentComponent
+  if (!inst) return null
   return { api: inst.exposed || inst.setupState, ocr: inst.setupState.ocr }
 }
 
@@ -128,7 +132,7 @@ export async function runPdf(entry, opts = {}) {
             const newText = b.text.trim() + ' X'
             const ok = await withTimeout(window.__pdfEngine.replaceText(pageIndex, b.id, newText), 60000, 'replaceText')
             const after = await withTimeout(window.__pdfEngine.getTextBlocks(pageIndex), 30000, 'getTextBlocks')
-            page.textEdit = { block: b.text.slice(0, 40), ok: !!(ok && (ok.success ?? ok)), found: after.some(x => norm(x.text).includes(norm(newText))) }
+            page.textEdit = { block: b.text.slice(0, 40), ok: !!(ok && (ok.success ?? ok)), found: norm(after.map(x => x.text).join('')).includes(norm(newText)), error: ok && ok.error ? ok.error : (window.__pdfEngine.error?.value || null) }
           }
           continue
         }
@@ -153,7 +157,7 @@ export async function runPdf(entry, opts = {}) {
           page.edits.push(e)
           try {
             const cut = layer.ocr.cutFor(item)
-            e.cut = cut ? { cells: cut.cells.length, suspects: cut.cells.filter(c => c.suspect).length } : null
+            e.cut = cut ? { cells: cut.cells.length, suspects: cut.cells.filter(c => c.suspect).length, reason: cut.reason || null } : null
             const ed = editsFor(item.text, k)
             e.kind = ed.kind; e.text = ed.text
             layer.api.beginEdit(item.id); await sleep(250)
@@ -176,9 +180,12 @@ export async function runPdf(entry, opts = {}) {
         page.bytesAdded = (doc.pdfBytes?.byteLength ?? 0) - bytesBefore
         page.viewerOk = !!window.__pdfViewer.pdfDoc.value
         const after = await withTimeout(window.__pdfEngine.getTextBlocks(pageIndex), 30000, 'getTextBlocks after')
+        // Read back against the whole page's text, not block by block: a
+        // long replacement wraps or re-groups into several blocks.
+        const pageText = norm(after.map(x => x.text).join(''))
         for (const e of page.edits) {
           if (!e.text) continue
-          e.found = after.some(x => norm(x.text).includes(norm(e.text)))
+          e.found = pageText.includes(norm(e.text))
           const drawn = after.find(x => norm(x.text).includes(norm(e.text)))
           e.font = drawn?.fontName || null
           try { e.ink = e.rect ? await inkFraction(p, e.rect) : null } catch (_) { e.ink = null }

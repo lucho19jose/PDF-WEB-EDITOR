@@ -2420,9 +2420,48 @@ its scan and never restores it; a patch written in page units landed at a
 third of its size in the corner, and the replacement text sat over the old
 ink — "the text is like this after I remove a character".
 
+**A face must carry a space glyph.** The engine encodes a whole segment in
+one face, and a face that could not encode the space between two traced
+words made "N° 377-3000888581" fall back to Helvetica entirely while single
+words traced fine. Faces are keyed by weight, slant and point size
+(`styleKeyOf`), one font each: a 9pt italic footer never shares glyphs with a
+12pt body line, and the bake registers every face of the page.
+
+**The cut refuses what it cannot vouch for.** A run with fewer ink runs than
+60% of its characters is letters that touch (the italic serif footer) and is
+not cut at all — sharing 69 characters across its runs put the wrong letter in
+every second cell with plausible widths, and "República" came back
+"Rpúbbiica". Cells are assigned to runs by WIDTH (`assignByWidth`, least
+squares over expected advances), never by splitting the widest run (the widest
+run in "Atentamente" is the m); each cell's width is checked against its
+letter and its SHAPE against its class (`flagByShape`: an x-height letter must
+neither rise nor descend, a descender must descend, an ascender or capital
+must rise, measured on the run's own baseline and x-height); more than a
+tenth suspect refuses the run. What is refused draws in the base font — a
+visible seam, never a wrong glyph.
+
+`public/_sweep/ocr-driver.js` edits scanned pages the way a person would
+(delete a character, reverse a word, append) across `public/_sweep/dl/*.pdf`
+(gitignored, staged from Downloads) and judges recognition, the bake, the
+scan face and the viewer; `scratchpad/analyze-ocr.mjs`-style summaries are
+what to read after a run.
+
 The binarisation threshold sits at 0.42 of the box's range, not the midpoint:
 a scan's strokes are ringed with anti-aliased grey and the midpoint kept the
 ring, so the traced glyphs came out visibly heavier than the page.
+
+### A text edit that WinAnsi cannot hold substitutes the CJK face, not an error
+The bilingual forms this editor lives on end half their lines in 不适用, and
+appending a word to "NO APLICA 不适用" failed with "Cannot encode characters"
+because the substitution fallback knew only WinAnsi and the base-14 faces
+(and the tail cannot be narrowed away — see "Trimming the TAIL is wrong").
+`planTextEncoding` now returns a HEX substitute plan (`hex`, `hexLines`)
+drawn in a mini Noto font built for the run (`miniCjkFontFor`), registered
+in the resources the block's Tf resolves against (`registerFontIn`, page or
+Form XObject), and every consumer emits `<hex>` through `substLines` /
+`substLiteral`. `replaceText`'s message case awaits `ensureCjkFontFor`
+because the writers are synchronous. Measured on the check-list form: the
+line reads back "NO APLICA 不适用 X" in NotoSansSC, the file size unchanged.
 
 ### Writing text WinAnsi cannot hold: subset in a SCRATCH document, then graft
 The WASM build has no built-in CJK face, so `addTextToPage` fetches
