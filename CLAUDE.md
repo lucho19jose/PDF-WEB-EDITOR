@@ -3191,6 +3191,28 @@ measurement, not a spot check. Refusing when several candidates share one
 position would be the cheaper half-measure: it turns a silent wrong edit into an
 honest failure, which is the trade this codebase already prefers elsewhere.
 
+### An op window BLANKS a foreign glyph inside it — and keeping it is worse
+A LaTeX author line carries a superscript footnote mark between two names,
+"Abel De la Cruz-Moran *, [1,] Hemerson Lizarbe-Alarcon", drawn by its own op
+in the middle of the window. Editing the line DELETES it: char_delta 2 on an
+edit that should change only its own text, and a citation silently gone.
+
+Keeping such an op instead of blanking it — the rule `narrowToChangedOps`
+already follows when it steps over a glyph the target never had — was
+implemented and REVERTED. The "foreign" test (the op's folded, space-free
+decode is not a substring of the target, '?' exempt) is far too loose on a
+justified paragraph: TeX's kerned spaces and hyphenation mean many ops of the
+very line being replaced fail the substring test, so they were kept and the
+OLD line stayed drawn under the new one — measured on `r3/011.pdf`,
+char_delta 0 → 59 and 0 → 24 on two paragraphs. Two experiments gained across
+the corpora, one lost, and the loss leaves 59 characters of stale text on the
+page where the bug it fixes loses 2.
+
+A narrower test would be needed: the op must be foreign by FONT or by size (a
+superscript is set smaller, and in a different face here) rather than by text,
+since text alone cannot tell "not part of this line" from "decoded
+differently". Not implemented.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
