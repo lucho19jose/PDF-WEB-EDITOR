@@ -2742,7 +2742,7 @@ function replaceTextInStream(
     let lastError: string | null = null
     const searched: string[] = []
     const perSourceDiag: string[] = []
-    for (const src of getContentSources(pageIndex)) {
+    for (const src of sourcesNearestFirst(pageIndex, targetBlock, pageHeight)) {
       searched.push(src.key)
       const outcome = withSource(src, () => {
         const stream = src.stream
@@ -3751,26 +3751,60 @@ function matConcat(A: Mat6, B: Mat6): Mat6 {
   ]
 }
 
-/**
- * Compute the effective CTM at a given stream offset by replaying q/Q/cm
- * operators. String literals are masked first so 'q' bytes inside text
- * can't corrupt the graphics-state stack.
- */
-function getCtmAtOffset(stream: string, offset: number): Mat6 {
-  let masked = stream.slice(0, offset)
-  masked = masked.replace(/\((?:\\.|[^()\\])*\)/g, m => ' '.repeat(m.length))
-  masked = masked.replace(/<[0-9A-Fa-f\s]*>/g, m => ' '.repeat(m.length))
+const STR_LIT_RE_G = /\((?:\\.|[^()\\])*\)/g
+const HEX_LIT_RE_G = /<[0-9A-Fa-f\s]*>/g
+const CM_QQ_RE_G = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+cm\b|(?:^|[\s\]>])([qQ])(?=[\s(<\[/%]|$)/g
 
+/**
+ * Every q/Q/cm in a stream, with the CTM in force just AFTER it, scanned once.
+ *
+ * `getCtmAtOffset` used to re-scan from the start on every call: mask the
+ * literals of the whole prefix, then run the q/Q/cm regex over it. That is
+ * O(stream) per call and the matchers ask it once per BT block, so on a
+ * Ghostscript scan with 1389 blocks on one page a single edit took 78 seconds
+ * — 83% of it inside that one regex, which in the app is a frozen tab.
+ * Scanned once and binary-searched it is O(stream + blocks log n).
+ *
+ * Keyed by stream IDENTITY (===), never by content: the callers pass the same
+ * string instance throughout an operation, and a rewritten stream is a new
+ * instance, so a stale entry can never be returned for edited content.
+ */
+let ctmScanCache: { stream: string; offsets: number[]; ctms: Mat6[] } | null = null
+
+function ctmScanOf(stream: string): { offsets: number[]; ctms: Mat6[] } {
+  if (ctmScanCache && ctmScanCache.stream === stream) return ctmScanCache
+  let masked = stream
+  masked = masked.replace(STR_LIT_RE_G, m => ' '.repeat(m.length))
+  masked = masked.replace(HEX_LIT_RE_G, m => ' '.repeat(m.length))
+
+  const offsets: number[] = []
+  const ctms: Mat6[] = []
   const stack: Mat6[] = []
   let ctm: Mat6 = [1, 0, 0, 1, 0, 0]
-  const re = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+cm\b|(?:^|[\s\]>])([qQ])(?=[\s(<\[/%]|$)/g
+  const re = CM_QQ_RE_G
+  re.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = re.exec(masked)) !== null) {
     if (m[7] === 'q') stack.push([...ctm] as Mat6)
     else if (m[7] === 'Q') ctm = stack.pop() || [1, 0, 0, 1, 0, 0]
     else ctm = matConcat([+m[1], +m[2], +m[3], +m[4], +m[5], +m[6]], ctm)
+    // The operator's own END: an event at or before an offset has taken effect.
+    offsets.push(m.index + m[0].length)
+    ctms.push(ctm)
   }
-  return ctm
+  ctmScanCache = { stream, offsets, ctms }
+  return ctmScanCache
+}
+
+/** The effective CTM at a stream offset, from the single scan above. */
+function getCtmAtOffset(stream: string, offset: number): Mat6 {
+  const { offsets, ctms } = ctmScanOf(stream)
+  let lo = 0, hi = offsets.length - 1, found = -1
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    if (offsets[mid] <= offset) { found = mid; lo = mid + 1 } else hi = mid - 1
+  }
+  return found < 0 ? ([1, 0, 0, 1, 0, 0] as Mat6) : ctms[found]
 }
 
 /**
@@ -4209,6 +4243,37 @@ function governingTmIsExclusive(
     if (m.index < run.start || m.index >= run.end) return false
   }
   return true
+}
+
+/**
+ * Content sources ordered so the one NEAREST the clicked text is searched
+ * first — forms only, the page stream keeps its place at the front.
+ *
+ * The search returns on the first source that matches, which is arbitrary
+ * when the same words are drawn in two different forms. An Excel export gives
+ * every cell its own Form XObject placed by its own Matrix, so a row reading
+ * "AREQUIPA … AREQUIPA" is two identical forms: clicking the right-hand one
+ * edited the left-hand one, silently and while reporting success. Ranking by
+ * how far each form's placement sits from the target bbox picks the one the
+ * click meant. The page source is left first because a page-level match
+ * already wins today, so nothing that works can change.
+ */
+function sourcesNearestFirst(
+  pageIndex: number,
+  targetBlock: TextBlock,
+  pageHeight: number
+): ReturnType<typeof getContentSources> {
+  const all = getContentSources(pageIndex)
+  const [x0, y0, x1, y1] = targetBlock.bbox
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2
+  const distOf = (src: any): number => {
+    const m = src.invokeCtm
+    if (!m) return -1 // the page stream: keep it first
+    const px = m[4]
+    const py = pageHeight - m[5]
+    return Math.hypot(px - cx, py - cy)
+  }
+  return [...all].sort((a, b) => distOf(a) - distOf(b))
 }
 
 function expandClipForTransform(

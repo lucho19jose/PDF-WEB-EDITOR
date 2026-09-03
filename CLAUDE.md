@@ -3041,6 +3041,47 @@ baseline 262/237 (was 235), round 2 439/394 (was 392), round 3 466/406 (was
 404), zero lost — so the malformed token was silently damaging documents in
 every corpus, not just the invoice it was found on.
 
+### The nearest Form XObject is searched first — identical cells are told apart by POSITION
+`replaceTextInStream` returns on the FIRST content source that matches, which
+is arbitrary when the same words are drawn in two different forms. An Excel
+export gives every cell its own Form XObject placed by its own /Matrix, so a
+row reading "AREQUIPA … AREQUIPA" is two identical one-line forms: clicking
+the right-hand cell edited the LEFT-hand one, silently and while reporting
+success. `sourcesNearestFirst` ranks the forms by how far each placement sits
+from the target bbox; the page stream keeps its place at the front, because a
+page-level match already wins today and nothing that works can change.
+
+**The "lost first letter" on this document is NOT data loss, and checking that
+mattered.** The same edit read back as "ZZZ" for "ZZZZ", which looks exactly
+like the truncation bugs above. The saved stream holds `(ZZZZ) Tj`, the form's
+/BBox is untouched, and pdf.js reads "ZZZZ" at the right position out of the
+saved file — only MuPDF's own re-extraction of the edited form drops the
+leading glyph, the same class as the spurious spaces already documented after
+a substitution. An independent reader is what settles this; the sweep's
+`char_delta` cannot.
+
+### The CTM is scanned ONCE per stream, not replayed per block
+`getCtmAtOffset` masked the literals of the whole prefix and re-ran the q/Q/cm
+regex from the start of the stream on every call. That is O(stream) per call,
+and every matcher asks it once per BT block: on a Ghostscript scan that draws
+one page as 1389 blocks a single `replaceText` took 78 seconds and 83% of the
+profile sat inside that one regex. In the app that is not a slow edit, it is a
+frozen tab — and the sweep appeared to hang on the file rather than merely
+being slow.
+
+`ctmScanOf` walks the stream once, recording the CTM after every q/Q/cm, and
+`getCtmAtOffset` binary-searches it. Measured on the same file: 78 s to 2.7 s,
+27x. The cache is keyed by stream IDENTITY (`===`), never by content — the
+callers pass one string instance through an operation and a rewritten stream
+is a new instance, so a stale entry cannot be returned for edited content.
+
+All four corpora are experiment-identical after the change (262/237, 439/394,
+466/406, 462/412) and the baseline sweep runs in 18 s.
+
+**Profile before optimising.** The suspicion was the new source ordering; the
+file has ONE content source, so that change could not be involved, and the
+profiler named the real cost immediately.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
