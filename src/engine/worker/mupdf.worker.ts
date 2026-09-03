@@ -4892,13 +4892,42 @@ function replaceTextInContentStreamFontAware(
   // and no multi-block line could ever be assembled: the page read as almost
   // entirely uneditable while single-block cells edited fine.
   const sideways = rotation === 90 || rotation === 270
+  // Grouped in PAGE space wherever the page height is known — see the same
+  // change in `findBtBlocksByPosition`. `yPos` is the origin inside whatever
+  // `cm` is in force, so a producer that wraps each region of the page in its
+  // own transform reuses one text-space y across unrelated runs and fuses them
+  // into a single bogus "line". Page space also removes the need for the
+  // rotation special-case: the invocation CTM already carries /Rotate, so a
+  // visual line is constant page y whichever way the paper is turned. The
+  // text-space key remains the fallback when no page height was passed.
+  const linePos = new Map<number, number>()
+  const lineKeyOf = (b: BtInfo): number => {
+    let v = linePos.get(b.start)
+    if (v === undefined) {
+      if (pageHeight === undefined) v = sideways ? b.xPos : b.yPos
+      else {
+        const ctm = getFullCtmAtOffset(stream, b.start)
+        v = pageHeight - (b.xPos * ctm[1] + b.yPos * ctm[3] + ctm[5])
+      }
+      linePos.set(b.start, v)
+    }
+    return v
+  }
   const lineGroups = new Map<number, BtInfo[]>()
-  for (const block of allBlocks) {
-    if (!block.hasPos) continue
-    // Round to nearest 0.5 to group same-line blocks
-    const key = Math.round((sideways ? block.xPos : block.yPos) * 2) / 2
-    if (!lineGroups.has(key)) lineGroups.set(key, [])
-    lineGroups.get(key)!.push(block)
+  {
+    // Clustered by proximity, not rounded onto a grid: a baseline sitting on a
+    // grid boundary lands either side of it by floating-point noise.
+    const positioned = allBlocks.filter(b => b.hasPos)
+    const byLine = [...positioned].sort((a, b) => lineKeyOf(a) - lineKeyOf(b))
+    let key = 0
+    let prev: number | null = null
+    for (const block of byLine) {
+      const v = lineKeyOf(block)
+      if (prev === null || Math.abs(v - prev) > LINE_CLUSTER_PT) key++
+      prev = v
+      if (!lineGroups.has(key)) lineGroups.set(key, [])
+      lineGroups.get(key)!.push(block)
+    }
   }
 
   for (const [, lineBlocks] of lineGroups) {

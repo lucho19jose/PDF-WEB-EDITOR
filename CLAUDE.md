@@ -2868,8 +2868,15 @@ ends in one and its blank is part of the run, while "Sonido" does not and the
 blank near it belongs to another cell: carrying that one appended a space to
 a run the user never touched, which cost four experiments before the gate.
 
-Sweeps after both changes: baseline 262/232 (was 229), round 2 439/391 (was
-379 when the round was staged), zero lost on either.
+The REPLACE matcher grouped lines the same way and now shares the page-space
+clustering. Page space also retires the `sideways` special-case there: the
+invocation CTM already carries /Rotate, so a visual line is constant page y
+whichever way the paper is turned. It moves eleven baseline experiments from
+`single_block` to `line_group` with identical output (char_delta 0, same text)
+and gains one.
+
+Sweeps after all three changes: baseline 262/232 (was 229), round 2 439/392
+(was 379 when the round was staged), zero lost on either.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
