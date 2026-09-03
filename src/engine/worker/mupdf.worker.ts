@@ -3219,11 +3219,18 @@ function transformInSource(
           lastEnd = tm.index + tm[0].length
         }
         shifted += inner.slice(lastEnd)
+        // A SPACE before the injected Td, always. The run can begin straight
+        // after an operator that takes no operands — `T*` on this PDF24
+        // invoice — and concatenating produced the token `T*20.0115`, which
+        // is not an operator at all: MuPDF reported "unknown keyword" and
+        // every line after it drew shifted and short (" Sello de Detracción"
+        // came back "o de Detracción", 10 characters gone from a MOVE).
+        // Trailing space for the same reason on the inverse.
         newContent =
           block.content.slice(0, run.start) +
-          `${fmtNum(tdx)} ${fmtNum(tdy)} Td ` +
+          ` ${fmtNum(tdx)} ${fmtNum(tdy)} Td ` +
           shifted +
-          ` ${fmtNum(-tdx)} ${fmtNum(-tdy)} Td` +
+          ` ${fmtNum(-tdx)} ${fmtNum(-tdy)} Td ` +
           block.content.slice(run.end)
         usedStrategy ??= 'td_bracket_run'
       } else if (tmMatch && tmSource && tmRewritable) {

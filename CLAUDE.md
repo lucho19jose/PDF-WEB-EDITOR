@@ -3027,6 +3027,20 @@ sites. Measured on the reported receipt: the page now loses exactly the old
 field and gains exactly the new. Round 4 gains 4 experiments (294/…), the
 other three corpora byte-identical.
 
+### An injected operator needs whitespace on BOTH sides
+The td_bracket move writes `dx dy Td` immediately before the run it shifts.
+The run can begin straight after an operator that takes no operands — `T*` on
+a PDF24 invoice — and concatenating produced the token `T*20.0115`, which is
+not an operator at all. MuPDF reported "unknown keyword" and every line after
+it drew shifted and short: " Sello de Detracción…" read back as
+"o de Detracción…", 10 characters gone from a MOVE, which must change none.
+
+A leading and trailing space costs nothing (a content stream ignores extra
+whitespace) and the same hazard applies to any injected operator. Measured:
+baseline 262/237 (was 235), round 2 439/394 (was 392), round 3 466/406 (was
+404), zero lost — so the malformed token was silently damaging documents in
+every corpus, not just the invoice it was found on.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
