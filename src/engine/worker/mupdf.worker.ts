@@ -3115,12 +3115,9 @@ function transformInSource(
       // Tm that actually governs the clicked text: a BT block can hold several
       // lines, each with its own Tm.
       const tmRegex = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/
-      const governing = findGoverningTm(block, targetBlock.text, pageIndex)
+      const governingRaw = findGoverningTm(block, targetBlock.text, pageIndex)
       const fallback = maskStreamLiterals(block.content).match(tmRegex)
-      const tmSource = governing
-        ? { index: governing.index, text: governing.text }
-        : (fallback ? { index: fallback.index!, text: fallback[0] } : null)
-      const tmMatch = tmSource ? tmSource.text.match(tmRegex) : null
+
 
       // When the block draws MORE than the target, the Tm is shared with other
       // lines and moving it drags them along. Shift just this run instead, by
@@ -3137,6 +3134,22 @@ function transformInSource(
         ? findTargetRun(block, targetBlock.text, pageIndex, local)
         : null
 
+      // The governing Tm is always the one to MEASURE in — `inTmSpace` converts
+      // the page-space delta through it, and a Td bracket fed the wrong
+      // matrix's scale lands the run short (measured: 10pt off on a Word
+      // datasheet when the block's first Tm was used instead).
+      const governing = governingRaw
+      const tmSource = governing
+        ? { index: governing.index, text: governing.text }
+        : (fallback ? { index: fallback.index!, text: fallback[0] } : null)
+      const tmMatch = tmSource ? tmSource.text.match(tmRegex) : null
+
+      // Whether it may be REWRITTEN is a different question. Rewriting a Tm
+      // moves every show op it governs, so on a block that draws more than the
+      // target it is only safe when the target's run is all it positions.
+      const tmRewritable = !holdsMoreThanTarget ||
+        (!!governingRaw && governingTmIsExclusive(block.content, governingRaw.index, run))
+
       /**
        * Last chance before refusing: the target may not be a show OP at all,
        * but a run of glyphs inside one TJ array.
@@ -3149,7 +3162,7 @@ function transformInSource(
        * Consulted ONLY where every other strategy has already given up, so no
        * move that works today can change.
        */
-      const seg = (holdsMoreThanTarget && pureTranslate && !(run && run.startsLine) && !governing)
+      const seg = (holdsMoreThanTarget && pureTranslate && !(run && run.startsLine) && !tmRewritable)
         ? findTargetSegment(block, targetBlock, pageIndex, stream, pageHeight)
         : null
 
@@ -3158,7 +3171,7 @@ function transformInSource(
       // strategy moves OTHER text: rewriting the first Tm dragged a table's
       // header row when a cell 50pt below it was asked to move. Refuse the
       // block — a loud "could not find matching text" beats a silent wrong drag.
-      if (holdsMoreThanTarget && !(run && run.startsLine) && !seg && !governing) continue
+      if (holdsMoreThanTarget && !(run && run.startsLine) && !seg && !tmRewritable) continue
 
       /** The page-space delta expressed in the text matrix's own space. */
       const inTmSpace = (): { tdx: number; tdy: number } => {
@@ -3213,7 +3226,7 @@ function transformInSource(
           ` ${fmtNum(-tdx)} ${fmtNum(-tdy)} Td` +
           block.content.slice(run.end)
         usedStrategy ??= 'td_bracket_run'
-      } else if (tmMatch && tmSource) {
+      } else if (tmMatch && tmSource && tmRewritable) {
         const a = parseFloat(tmMatch[1])
         const bVal = parseFloat(tmMatch[2])
         const c = parseFloat(tmMatch[3])
@@ -4145,6 +4158,50 @@ function deltaInSourceSpace(src: { invokeCtm?: Mat6 }, dx: number, dy: number): 
     ddx: (dx * m[3] - dy * m[2]) / det,
     ddy: (dy * m[0] - dx * m[1]) / det
   }
+}
+
+/**
+ * Does this Tm position ONLY the target's run?
+ *
+ * Rewriting a Tm moves every show op that follows it until the next Tm — a
+ * `Td`-stepped line inherits the Tm it steps from. `findGoverningTm` walks
+ * back to the last Tm before the target's run, which on a letter drawn as one
+ * BT with a single Tm at the top is the SAME Tm that positions every line
+ * above it: dragging "De nuestra consideración:" 20pt also moved the subject
+ * line, its value and the "Inmediata" beneath it — four blocks for a
+ * one-block gesture, reported as success.
+ *
+ * The Tm may be rewritten only when every show op it governs lies inside the
+ * run being moved. Otherwise the caller shifts the run itself
+ * (`findTargetSegment`) or refuses, and a loud failure beats dragging text
+ * the user never selected.
+ */
+function governingTmIsExclusive(
+  content: string,
+  tmIndex: number,
+  run: { start: number; end: number } | null
+): boolean {
+  if (!run) return false
+  const masked = maskStreamLiterals(content)
+  // Past this Tm's own operator, or the search re-matches its tail: the six
+  // operands plus "Tm" sit right there, the span collapses to one character,
+  // and every Tm looks exclusive because no show op fits inside it.
+  const opEnd = masked.indexOf('Tm', tmIndex)
+  const from = opEnd === -1 ? tmIndex + 1 : opEnd + 2
+  const after = masked.slice(from)
+  const nextTm = after.search(/(-?[\d.]+\s+){6}Tm(?![A-Za-z0-9])/)
+  const spanEnd = nextTm === -1 ? content.length : from + nextTm
+  // Match the OPERATOR, not the literal's closing delimiter: masking replaces
+  // a literal and its brackets with spaces, so a delimiter-anchored scan finds
+  // nothing at all and every Tm then looks exclusive.
+  const showRe = /(?:^|[\s\]>)])(TJ|Tj|'|")(?![A-Za-z0-9])/g
+  showRe.lastIndex = from
+  let m: RegExpExecArray | null
+  while ((m = showRe.exec(masked)) !== null) {
+    if (m.index >= spanEnd) break
+    if (m.index < run.start || m.index >= run.end) return false
+  }
+  return true
 }
 
 function expandClipForTransform(

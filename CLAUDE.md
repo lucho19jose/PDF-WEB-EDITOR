@@ -2958,6 +2958,39 @@ for a fixed-width cell. All three corpora are byte-identical before and after
 (262/235, 439/392, 466/401) — the sweep's markers never take this path, which
 is why this class of defect needs a hand-built case.
 
+### A Tm may be MEASURED in without being rewritable
+Rewriting a Tm moves every show op it governs until the next Tm — a
+`Td`-stepped line inherits the matrix it steps from. `findGoverningTm` walks
+back to the last Tm before the target's run, and on a letter that draws its
+whole body from ONE BT with a single Tm at the top that is the same matrix
+positioning every line above it: dragging "De nuestra consideración:" 20pt
+also moved the subject line, its value and the "Inmediata" beneath it — four
+blocks for a one-block gesture, reported as success. `blocks_touched` of 3 is
+inside the sweep's tolerance, which is why this survived so long.
+
+`governingTmIsExclusive` scans the span from that Tm to the next one and
+answers whether every show op in it lies inside the run being moved. When it
+does not, the move falls to `findTargetSegment` (shift the run itself) or
+refuses.
+
+**The two roles of the matrix must not be conflated, and conflating them cost
+four moves before the sweep caught it.** The governing Tm is also the frame
+`inTmSpace` converts the page-space delta through, so nulling it for the
+REWRITE decision silently changed the MEASUREMENT too: the Td bracket was fed
+the block's first matrix instead, and four moves on other producers landed
+about 10pt short while still reporting success and touching one block.
+`tmSource`/`tmMatch` therefore always come from the governing Tm; a separate
+`tmRewritable` gates the rewrite branch, and is simply true when the block
+does not hold more than the target.
+
+Two scanning mistakes inside the helper each made it silently pass, and both
+are worth knowing: matching a show op by its closing delimiter finds nothing
+because `maskStreamLiterals` blanks the brackets with the literal, and
+searching for "the next Tm" from `tmIndex + 1` re-matches the tail of the
+SAME operator, collapsing the span to one character so no op can fall outside
+it. Measured after the fix: baseline 262/235, round 2 439/392, round 3
+466/401 — the same totals as before the guard, with the four-block drag gone.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
