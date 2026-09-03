@@ -2924,6 +2924,40 @@ replace path's, expanding the clips in force at each nested `Do` with
 Measured across three corpora: baseline 262/235 (was 232), round 2 439/392
 unchanged, round 3 466/401 (was 398), zero lost anywhere.
 
+### A CID font's widths live in /W, and without them a shared row is untouchable
+`replaceInsideTjArray` refused every Type0 font outright. The comment said
+why: substituting inside a shared array needs the OLD run's width, or the
+compensating kern is wrong and every later cell of the row shifts. A simple
+font's /Widths gives it; a CID font's does not exist, so the answer was "no".
+
+Microsoft Print to PDF and Ghostscript draw a whole form row as ONE array in
+a CID subset, so on those producers a label could only ever be edited to
+letters its own subset already held — measured, "DPTO:" accepted "TOPD:" and
+refused "AREA:" with "could not find matching text", which reads as the
+editor simply not working on that document.
+
+`readCidWidths` parses the descendant font's `/W` (both `c [w…]` and
+`cFirst cLast w` forms) with `/DW` as the default, and ONLY for an Identity
+CMap — there the show-op's two-byte code IS the CID, so /W can be indexed by
+the code directly. Any other CMap needs a code→CID mapping this engine does
+not read, and answering nothing keeps those fonts refused exactly as before.
+
+**The occurrence chooser needed the same table, and finding that mattered
+more than the fix itself.** With the widths added but the chooser still gated
+on `simpleInfo.widths`, the edit succeeded and rewrote the WRONG cell: this
+row draws two "DPTO:" labels in one array, and `occ[0]` is the left-hand one
+while the click was on the right. An honest refusal had become a silent wrong
+edit. `advanceOf` now answers from whichever table the font has.
+
+Measured on the reported form: "DPTO:" → "AREA:" lands at x=329 where the
+click was, the label at x=64 is untouched, the row's other cells keep their
+positions, and the page's character multiset changes by exactly the eight
+letters involved. Replacements up to about eight characters go through; a
+longer one still meets the separate length guard, which is the right answer
+for a fixed-width cell. All three corpora are byte-identical before and after
+(262/235, 439/392, 466/401) — the sweep's markers never take this path, which
+is why this class of defect needs a hand-built case.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

@@ -1593,6 +1593,16 @@ interface SimpleFontInfo {
   missingWidth: number
   isType0: boolean
   /**
+   * CID -> width, from a Type0 font's descendant /W array, with /DW as the
+   * default. This is what the VIEWER advances by, so it is what a
+   * compensating kern inside a shared TJ array has to be computed from.
+   * Only populated for an Identity CMap, where the show-op's 2-byte code IS
+   * the CID; any other CMap needs a code->CID mapping this engine does not
+   * read, and leaving it null keeps those fonts refused as before.
+   */
+  cidWidths?: Map<number, number>
+  cidDefaultWidth?: number
+  /**
    * Byte code -> glyph NAME, from the font's /Encoding /Differences array.
    *
    * This is what makes a LaTeX document readable. pdfTeX names every character
@@ -1655,6 +1665,62 @@ function programHasGlyph(program: any, cp: number): boolean {
 }
 
 const simpleFontInfoCache = new Map<string, SimpleFontInfo | null>()
+
+/**
+ * A Type0 font's CID widths: the descendant's /W array and /DW default.
+ *
+ * `/W` is `[ c [w1 w2 …]  cFirst cLast w  … ]` — a start CID followed either
+ * by an array of consecutive widths or by an end CID and one shared width.
+ *
+ * Returned only for an IDENTITY CMap. With Identity-H/V the two bytes of a
+ * show-op code are the CID itself, so /W can be indexed by the code directly;
+ * under any other CMap the code has to be mapped to a CID first, which this
+ * engine does not do, and answering nothing keeps such fonts on the old
+ * refusal path rather than shifting a table by a wrong width.
+ */
+function readCidWidths(fontDict: any): { cidWidths?: Map<number, number>; cidDefaultWidth?: number } {
+  try {
+    const enc = String(fontDict.get('Encoding') || '')
+    if (!/Identity/.test(enc)) return {}
+    const df = fontDict.get('DescendantFonts')
+    if (!df || String(df) === 'null') return {}
+    const d0 = (df.resolve ? df.resolve() : df).get(0)
+    if (!d0 || String(d0) === 'null') return {}
+    const desc = d0.resolve ? d0.resolve() : d0
+    const dwRaw = desc.get('DW')
+    const dw = dwRaw && String(dwRaw) !== 'null' ? Number(String(dwRaw)) : 1000
+    const wArr = desc.get('W')
+    const widths = new Map<number, number>()
+    if (wArr && String(wArr) !== 'null') {
+      const arr = wArr.resolve ? wArr.resolve() : wArr
+      const n = arr.length
+      let i = 0
+      while (i < n) {
+        const first = Number(String(arr.get(i)))
+        const next = arr.get(i + 1)
+        if (next && next.isArray && next.isArray()) {
+          const list = next.resolve ? next.resolve() : next
+          for (let k = 0; k < list.length; k++) {
+            const w = Number(String(list.get(k)))
+            if (Number.isFinite(first) && Number.isFinite(w)) widths.set(first + k, w)
+          }
+          i += 2
+        } else {
+          const last = Number(String(arr.get(i + 1)))
+          const w = Number(String(arr.get(i + 2)))
+          if (Number.isFinite(first) && Number.isFinite(last) && Number.isFinite(w) &&
+              last >= first && last - first < 65536) {
+            for (let c = first; c <= last; c++) widths.set(c, w)
+          }
+          i += 3
+        }
+      }
+    }
+    return { cidWidths: widths, cidDefaultWidth: Number.isFinite(dw) ? dw : 1000 }
+  } catch (_) {
+    return {}
+  }
+}
 
 /**
  * Read encoding + glyph availability info for a simple (non-CID) font.
@@ -1772,7 +1838,8 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
         isSubset: /^[A-Z]{6}\+/.test(baseFont),
         missingWidth,
         isType0: subtype === '/Type0',
-        program
+        program,
+        ...(subtype === '/Type0' ? readCidWidths(r) : {})
       }
     }
     page.destroy()
@@ -6734,9 +6801,19 @@ function replaceInsideTjArray(
   // Pick the occurrence nearest the clicked x when we can estimate positions
   // (identical values repeat across table columns)
   let chosen = occ[0]
-  if (occ.length > 1 && targetLocalX !== null && simpleInfo?.widths && tfSize > 0) {
-    const w = simpleInfo.widths
-    const fc = simpleInfo.firstChar
+  // The advance table, whichever kind of font this is. A Type0 font has no
+  // /Widths, so this test used to fail for one and `occ[0]` was taken — the
+  // FIRST occurrence in the array, not the clicked one. On a Print-to-PDF
+  // form that draws a row's two "DPTO:" labels in one array, editing the
+  // right-hand one rewrote the left-hand one instead, silently and while
+  // reporting success. Same /W table the width compensation uses.
+  const advanceOf: ((code: number) => number) | null =
+    simpleInfo?.isType0 && simpleInfo.cidWidths
+      ? (code: number) => simpleInfo.cidWidths!.get(code) ?? simpleInfo.cidDefaultWidth ?? 1000
+      : simpleInfo?.widths
+        ? (code: number) => simpleInfo.widths![code - simpleInfo.firstChar] || 500
+        : null
+  if (occ.length > 1 && targetLocalX !== null && advanceOf && tfSize > 0) {
     const xAt: number[] = []  // x offset of each char, in 1000-unit width space
     let acc = 0
     let ci = 0
@@ -6744,7 +6821,7 @@ function replaceInsideTjArray(
       if (it.isLiteral) {
         for (const code of it.codes) {
           xAt[ci++] = acc
-          acc += (w[code - fc] || 500)
+          acc += advanceOf(code)
         }
       } else {
         acc -= (it.value || 0)
@@ -6802,7 +6879,20 @@ function replaceInsideTjArray(
 
   // width compensation
   let oldW = 0, oldKnown = true, oldGlyphs = 0
-  if (simpleInfo?.widths) {
+  if (simpleInfo?.isType0 && simpleInfo.cidWidths) {
+    // Identity CMap: the show-op code IS the CID, so /W answers directly.
+    const cw = simpleInfo.cidWidths
+    const dw = simpleInfo.cidDefaultWidth ?? 1000
+    for (let k = first.item; k <= lastItem; k++) {
+      const it = items[k]
+      if (it.isLiteral) for (const code of it.codes) {
+        oldGlyphs++
+        oldW += cw.get(code) ?? dw
+      } else {
+        oldW -= (it.value || 0)
+      }
+    }
+  } else if (simpleInfo?.widths) {
     const w = simpleInfo.widths
     const fc = simpleInfo.firstChar
     for (let k = first.item; k <= lastItem; k++) {
@@ -6831,7 +6921,17 @@ function replaceInsideTjArray(
     // timesheet by 53 blocks while reporting success. Losing the edit is
     // recoverable; shifting every later cell of a table is not.
     if (!oldKnown || oldGlyphs === 0) return null
-    if (!simpleInfo || simpleInfo.isType0) return null
+    // A Type0 font is admitted only when its widths are KNOWN: an Identity
+    // CMap makes the show-op code the CID, so the descendant's /W array is
+    // the same table the viewer advances by. Without it the old run's width
+    // cannot be computed and the compensating kern would shift every later
+    // cell of the row — the failure this gate exists to prevent. Microsoft
+    // Print to PDF and Ghostscript draw a whole form row as one such array,
+    // and refusing them meant a label could only ever be edited to letters
+    // its subset already held ("DPTO:" accepted "TOPD:" and rejected
+    // anything else).
+    if (!simpleInfo) return null
+    if (simpleInfo.isType0 && !simpleInfo.cidWidths) return null
     // An UNKNOWN encoding is fine while the codes are single BYTES: /Widths
     // is indexed by code whatever the code means, which is exactly how the
     // viewer advances a symbolic TrueType subset (the bilingual form draws
