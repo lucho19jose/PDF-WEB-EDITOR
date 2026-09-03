@@ -3338,6 +3338,35 @@ this fixes went from 0.23 and 0.00 similarity to 0.70 and clean; average over
 34 edits 0.79; the seven still under 0.5 are separate leads on three other
 documents.
 
+### On a dark run the INK is the light side - both colours came out the same
+`sampleLineColors` read the ink from the darkest fifth of a box and the paper
+from the lightest. On a navy cover page, a slide's title bar or a table header
+the glyphs are the LIGHT side, so the ink colour came back as the background's
+own navy - and since the patch is painted in `background` and the replacement in
+`color`, both were navy. Editing one character of a white logo made the line
+DISAPPEAR: measured on an Ingenium cover page, the re-recognised bake read
+nothing at all where the title had been (similarity 0.05 against what was
+typed), and the page showed a navy rectangle.
+
+The rule is the one `cutByProfile` already uses to decide whether to invert a
+box before profiling it, at the same 0.42 threshold: text covers a MINORITY of
+its box, so over half of it dark means the light side is the glyphs. Ink then
+comes from the lightest fifth and paper from the darkest. Neither is ever read
+from the middle of the distribution, inverted or not - those are anti-aliased
+edge pixels, which are both.
+
+The no-ink branch got the same treatment for the same reason: it returned black
+whatever the paper was, so a colour picked there would have been invisible on a
+dark band. It now returns whichever of black or white contrasts.
+
+Measured: the reported logo edits to white-on-navy (colour sampled
+0.87/0.86/0.83 against a 0.00/0.09/0.22 background) and renders legibly.
+
+**Known limitation:** the detector's box for that 93pt logo is 88pt tall and
+swallows the 28pt tagline beneath it, so patching the logo also paints over
+"--Empresas y Gobierno". Splitting a patch around the runs it overlaps is not
+implemented.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

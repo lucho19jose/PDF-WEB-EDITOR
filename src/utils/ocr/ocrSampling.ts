@@ -69,17 +69,43 @@ export function sampleLineColors(
   const darkest = px[0].l
   const lightest = px[px.length - 1].l
 
-  // Nothing but paper here — no ink to measure.
+  // Nothing but paper here — no ink to measure. The colour still has to
+  // CONTRAST with it, or an edit made in this box would be invisible.
   if (lightest - darkest < 24) {
     const mean = px[Math.floor(px.length / 2)]
-    return { color: [0, 0, 0], background: [mean.r / 255, mean.g / 255, mean.b / 255] }
+    const dark = luma(mean.r, mean.g, mean.b) < 128
+    return {
+      color: dark ? [1, 1, 1] : [0, 0, 0],
+      background: [mean.r / 255, mean.g / 255, mean.b / 255]
+    }
   }
 
+  /**
+   * Which side of the distribution is the INK.
+   *
+   * Text covers a minority of its box, so the majority is paper. A slide's
+   * title bar, a table header, a navy cover page: the glyphs are the LIGHT
+   * side there, and reading the darkest fifth as the ink returned the
+   * background's own colour. The patch is painted in `background` and the
+   * replacement in `color`, so both came out navy and editing one character of
+   * a white logo made the whole line disappear - measured on an Ingenium cover
+   * page, where the re-recognised bake read nothing at all where the title had
+   * been.
+   *
+   * Same rule and same threshold `cutByProfile` already uses to decide whether
+   * to invert a box before profiling it: over half of it dark means the light
+   * side is the text.
+   */
+  const threshold = darkest + (lightest - darkest) * 0.42
+  let darkCount = 0
+  for (const p of px) if (p.l < threshold) darkCount++
+  const inverted = darkCount > px.length * 0.5
+
   const inkCount = Math.max(1, Math.floor(px.length * 0.2))
-  const ink = px.slice(0, inkCount)
-  // Paper is read from the lightest fifth for the same reason ink is read from
-  // the darkest: the middle of the distribution is edge pixels, which are both.
-  const paper = px.slice(px.length - inkCount)
+  // Ink from one end, paper from the other, and never from the middle of the
+  // distribution: those are anti-aliased edge pixels, which are both.
+  const ink = inverted ? px.slice(px.length - inkCount) : px.slice(0, inkCount)
+  const paper = inverted ? px.slice(0, inkCount) : px.slice(px.length - inkCount)
 
   const mean = (list: typeof px): Rgb01 => {
     let r = 0, g = 0, b = 0
