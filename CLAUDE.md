@@ -3367,6 +3367,34 @@ swallows the 28pt tagline beneath it, so patching the logo also paints over
 "--Empresas y Gobierno". Splitting a patch around the runs it overlaps is not
 implemented.
 
+### Tried and dropped: choosing the binarisation threshold by piece count
+A supplier form's "DOCUMENTOS ADJUNTO" traced as "DCCUMENTCS ADJUNTC": at the
+0.42-of-range threshold the U's stems were severed from its bowl (four blank
+rows across the cell, continuous at the midpoint). Three rules were tried in
+turn and each is worth knowing about:
+
+- **Midpoint when the biased cut keeps under 70% of the midpoint's ink** fired
+  on nothing - a broken join is a negligible share of a box's pixels.
+- **The same at 85%** fixed the U and broke a letterhead: on "AV. REPUBLICA DE
+  CHILE" the midpoint FUSED "CA", "DE" and "LE" into single cells, the cut
+  passed at exactly the 20% suspect bar, and the face drew a jumble.
+- **Whichever threshold's count of connected pieces is nearer the character
+  count** got both of those right and, applied to plain HEAD, RE-ADMITTED the
+  misaligned title cut on the reported contract: the border fragment fused into
+  the first letter, no sliver was left for the guard, and the title baked as
+  "M EJIOR MMIEIR TM DR ..." - the original report, back.
+
+The cause was upstream. `recognizePage` floored one canvas size and rounded
+the other, so every page was resampled by one row and its whole raster
+blurred by a half-pixel blend; the tracer read those pixels. With the 1:1
+copy and the rule-span clearing in place, the piece-count rule changes
+NOTHING on the three lines above (DOCUMENTOS traces at 1 of 17 suspect and
+re-reads exactly, AV. REPUBLICA is refused at 10 of 50 and falls back, the
+contract's title traces at 0 of 39 and re-reads exactly - identical with and
+without it, measured on two isolated static builds). A second mechanism with
+no measured gain and a demonstrated failure mode is not kept. The threshold
+stays 0.42.
+
 ### Known limitation: a faint crossbar is lost at 220 DPI, so a traced "t" reads as "l"
 Two unrelated forms both bake "Cta. Cte" as "Cla. Cle" in the scan face. The
 cut is right - the "t" cell holds the stem - but at 220 DPI this blurred bold
@@ -3382,6 +3410,97 @@ which the page rasters are not; not implemented.
 The 110-document ink re-read (67 scanned-page edits, average similarity 0.94)
 found no other class: the remaining sub-0.5 cases were the re-read matching a
 neighbouring run, a miscount of "=" signs, and this one.
+
+### A skewed table border is a rule for PART of a box, and the OCR raster was a blurred copy
+The bilingual contract approval form (MSP-SIST-CS-2026-001, a scan signed
+through Intellisign) edited its title into "MEJOR MIIIEI TAI DR IIIFORMAEDRUEROR"
+and drew its amount line at 13.8pt where the neighbours are 10.3 - the edited
+text then ran off the page in the inline editor. The sliver refusal above
+turned the scramble into a Helvetica fallback, which is the honest failure;
+this is what it took to make the line trace CORRECTLY, and there were six
+defects in the way, each measured on the page.
+
+- **The border is not level.** A scanned rule crosses a pixel row for 15-30%
+  of the box's width and then leaves it, so the "inked across 80% of the row"
+  test never saw it. Inside the box it did two things: it FUSED every letter
+  column under it into one ink run (the title's first seven letters came out
+  as one cell, and every cell after held the letter to its left), and it was
+  counted as the top of the ink, so the box was ten rows too tall and the size
+  followed (13.8pt for 9.6). What tells a rule from glyphs is not how much of
+  the row it covers but how FAR it runs unbroken: `clearRuleSpans` blanks any
+  contiguous span longer than two ems (2.5 in the glyph cut), and only the
+  span, never the row. The em is GUESSED FROM THE TEXT - the box's width over
+  the advances its characters are expected to take - because the height is
+  the one thing the fragment inflates; a bar set from 1.5x the detector's
+  padded height missed a 193px fragment on the very next line. A span cut off
+  by the box's own edge gets 0.6 of the bar (46 columns of a 200-column rule
+  showed).
+- **The OCR raster was resampled.** `recognizePage` copied the 220 DPI render
+  into a target sized by `Math.round` while the viewer sizes by
+  `Math.floor`; one row of difference made `drawImage` blend every row with
+  its neighbour across the whole page. That smeared the rule's fringe into
+  crumbs no span test can see, and the tracer read the same blurred pixels.
+  A canvas already within 2px of the OCR size is copied pixel for pixel.
+- **A neighbouring line's tips inside the padded box** (the foot of the CJK
+  line above, 18 px in the top row) made a 10pt line 15.8pt. `inkBounds`
+  strips a band at either edge that is cut off from the body by three empty
+  rows and holds under 1.5% of the ink, accumulating across smaller breaks
+  (the crumbs a cleared rule leaves are several thin rows with single gaps).
+  An accent band on a lowercase line is several percent and stays.
+- **Two letters that touch are not split by their advances.** "EJ" was one
+  20px run; the halfway cut fell three columns inside the E and the J cell
+  carried the E's bar ends into the face - the J drew with a bar on top.
+  `splitAt` takes the emptiest column within a fifth of an em of the
+  proportional point.
+- **The baseline is a LINE.** Letter bottoms drifted four rows across the
+  677px title, so one median baseline set the left glyphs two pixels low and
+  the right ones two high - a ragged line from good ink. `baselineOf` fits by
+  least squares (outliers over 1.5px dropped once), `baselineAt(x)` places
+  each glyph, and `flagByShape` de-tilts its extents with the same line: a
+  capital "S" read as "s" at the low end of the amount line had passed the
+  rise test by the tilt alone and every "s" on the line drew as "S".
+- **The tracer takes its bitmaps from the cut's own cleaned `bin`**, never
+  from the pixels again, so whatever the cutter removed stays removed.
+
+Smaller things found on the same page: the end-sliver test skipped for thin
+characters and CJK punctuation (a "." is a third of its advance, "。" a
+tenth - every sentence on the page was being refused), thin cells suspect
+only for being too WIDE (a 3px sans "I" against a want of 8 was never
+traced), one-pixel column runs dropped (a border's fringe at the box edge
+took the last cell), and a run 48pt or taller read under 70% confidence
+dropped as junk (the red stamp came back as "maa b" at 116pt once the raster
+was sharp).
+
+Verified in the browser: the title edits to "…RED LAM" and bakes level in the
+scan's own letterforms (15 glyphs traced, none refused), the amount line and a
+prose line bake legibly, and the page's sizes agree with their neighbours
+(9.5/9.6/11.4pt). Page-1 refusals are now all "N of M cells suspect" on the
+bold touching lines, which fall back to Helvetica - a visible seam, never a
+wrong glyph.
+
+Measured on the 14-document OCR corpus (`public/_sweep/ocr`, 25 scanned
+pages, 71 edits, HEAD baseline from a static build of `5da32a0`): edits read
+back 69 → 70, runs traced in the scan face 24 → 27, cuts refused 40 → 36,
+average ink re-read similarity 0.873 → 0.879. Two rows that were wrong at
+HEAD are right now: a DNI's "REPÚBLICA DEL PERÚ" traced as nonsense
+(similarity 0) now re-reads at 0.94, and a report's "Test Parameters at 1550
+nm" that was refused AND not read back is traced at 0.94. The suspect bar is
+now "a fifth or more": with one fewer suspect the RJ notice's address line
+(10 of 50) was admitted and drew as half-height capitals; refused, it falls
+back as it did at HEAD.
+
+**Known limitations.** (1) Two lines that TOUCH on the scan - a bold caps
+line whose baseline meets the cap tops of the line beneath (the RJ notice's
+"EMPRESA MINERA…" over "AV. REPUBLICA…") - share a box: no empty row
+separates them, so the stray-band strip cannot cut there, the lower line's
+box starts 1.3pt inside the upper one (was 3pt at HEAD) and the bake's patch
+shaves the bottom of the line above. Separating them needs a column-aware
+cut, not a row one. (2) A detector box that spans two visual lines
+(014.pdf's "N° Const / Detracción") is sized to both; `refineLines` cuts only
+on horizontal gaps. (3) One 4-letter run ("Zone", 011.pdf page 3) went from
+traced at 1.0 to refused at 0.2 in the sweep, with its box growing from 9 to
+13.4pt; the page could not be re-inspected because pdf.js does not return a
+render of that 79-page scan's page 3 within 90 s outside the sweep.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates

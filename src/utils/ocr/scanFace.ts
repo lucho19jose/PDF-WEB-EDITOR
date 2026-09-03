@@ -127,19 +127,17 @@ export async function traceRunIntoFace(
   const trusted = trustedCells(cut.cells.length, [...text].filter(c => c !== ' '), editedText ? [...editedText].filter(c => c !== ' ') : null)
 
   const scale = UPM / cut.emPx
-  const top = inkRect.y
-  const bottom = inkRect.y + inkRect.height
   let added = 0
   for (const [index, cell] of cut.cells.entries()) {
     if (!trusted(index) || cell.suspect) continue
     if (face.glyphs.has(cell.char)) continue
-    const bmp = cellBitmap(ctx, cell, top, bottom, cut.threshold, 1, cut.inverted)
+    const bmp = cellBitmap(cut, cell, 1)
     if (!bmp) continue
     let svg: string
     try {
       svg = await potrace(bmp.image, { turdsize: 1, alphamax: 1, opticurve: 1, opttolerance: 0.2, pathonly: false, extractcolors: false })
     } catch (_) { continue }
-    const path = svgToGlyphPath(svg, bmp, cell, cut.baselineY, scale)
+    const path = svgToGlyphPath(svg, bmp, cell, cut.baselineAt((cell.x0 + cell.x1) / 2), scale)
     if (!path) continue
     // Side bearings of a twentieth of an em each; the advance is the cell's
     // width plus both, so traced text sets at the scan's own spacing.

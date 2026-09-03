@@ -9,7 +9,7 @@ import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
 import { inkBounds, inkGaps, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
-import { cutGlyphs, lastCutReason } from '@/utils/ocr/glyphCut'
+import { cutGlyphs, lastCutReason, expectedAdvance } from '@/utils/ocr/glyphCut'
 
 /**
  * Recognising the text in a scanned page.
@@ -487,18 +487,25 @@ function createOCR() {
     for (const line of lines) {
       if (line.words?.length) { passthrough.add(line); continue }
       const rect = { x: line.box.x0, y: line.box.y0, width: line.box.x1 - line.box.x0, height: line.box.y1 - line.box.y0 }
-      const ink = inkBounds(ctx, rect)
+      // An em guessed from the TEXT, before any ink is measured: the box's
+      // width over the advances its characters are expected to take. The
+      // measurers use it to tell a skewed table border from glyphs — a span no
+      // glyph could reach — and a bar set that way does not move when a border
+      // fragment or a neighbouring line inflates the box's height, which is
+      // exactly when it is needed.
+      const emGuess = rect.width / Math.max(1, [...line.text].filter(c => c !== ' ').reduce((s, c) => s + expectedAdvance(c), 0))
+      const ink = inkBounds(ctx, rect, emGuess)
       const cjk = isMostlyCjk(line.text)
       const emPx = ink.height / (cjk ? GLYPH_BOX_PER_EM_CJK : (DESCENDERS.test(line.text) ? GLYPH_BOX_PER_EM : GLYPH_BOX_PER_EM_NO_DESCENDER))
       // Only an UNMISTAKABLE gap cuts (two and a half ems — the same bar
       // `splitRuns` sets): justified prose opens word gaps past an em, and a
       // 1.2 em bar cut "En caso de incumplimiento…" in two and the re-read
       // pieces came back with a space inside a word. Rules cut regardless.
-      const cuts = reread ? inkGaps(ctx, { x: ink.x, y: ink.y, width: ink.width, height: ink.height }, Math.max(6, emPx * 2.5)) : []
+      const cuts = reread ? inkGaps(ctx, { x: ink.x, y: ink.y, width: ink.width, height: ink.height }, Math.max(6, emPx * 2.5), emGuess) : []
       const parts = cuts.length ? splitTextAtCuts(line.text, ink, cuts) : [{ text: line.text, x0: ink.x, x1: ink.x + ink.width }]
       for (const part of parts) {
         const partRect = { x: part.x0, y: ink.y, width: part.x1 - part.x0, height: ink.height }
-        pieces.push({ line, text: part.text, ink: parts.length > 1 ? inkBounds(ctx, partRect) : ink, cut: parts.length > 1 })
+        pieces.push({ line, text: part.text, ink: parts.length > 1 ? inkBounds(ctx, partRect, emGuess) : ink, cut: parts.length > 1 })
       }
     }
     // Cut boxes are READ AGAIN: sharing the text out by column occupancy is
@@ -749,6 +756,11 @@ function createOCR() {
 
         const conf = run.reduce((s, w) => s + (w.confidence ?? 0), 0) / run.length
         if (isJunkRun(text, conf)) continue
+        // A red stamp over the signatures read as "maa b" at 53% — four letters
+        // 116pt tall on a page of 10pt text, with one ink run for the lot. A
+        // genuine title that size is read with confidence; a doubtful reading
+        // that large is a picture.
+        if (emCorrected * toPt >= 48 && conf < 70) continue
         // A horizontal run of several characters cannot be narrower than it
         // is tall: a 26×81pt box reading "O pa: F 是一 053 89" is a stamp or a
         // sideways column read the wrong way, and baked as an 85pt line it
@@ -823,6 +835,17 @@ function createOCR() {
       const target = document.createElement('canvas')
       target.width = Math.round(pageWidth * (OCR_DPI / PDF_DPI))
       target.height = Math.round(pageHeight * (OCR_DPI / PDF_DPI))
+      // A canvas already rendered at OCR resolution is copied PIXEL FOR PIXEL.
+      // The viewer floors its size and this rounds, so the two differed by one
+      // row, and `drawImage` then resampled the whole page — every row a blend
+      // of two — which smeared a thin skewed table border into crumbs that no
+      // rule test could see and left a line measured 40 rows tall for 33 rows
+      // of glyphs. The glyph tracer reads these same pixels, so the smear went
+      // into the scan face as well.
+      if (Math.abs(canvas.width - target.width) <= 2 && Math.abs(canvas.height - target.height) <= 2) {
+        target.width = canvas.width
+        target.height = canvas.height
+      }
       const tctx = target.getContext('2d', { willReadFrequently: true })
       if (!tctx) throw new Error('Could not prepare the page for recognition')
       tctx.drawImage(canvas, 0, 0, target.width, target.height)

@@ -1,4 +1,5 @@
 import type { OcrBox } from './ocrEngine'
+import { clearRuleSpans } from './inkMeasure'
 
 /**
  * Cutting a recognised run into one cell per character, on the scan's pixels.
@@ -24,14 +25,29 @@ export interface GlyphCell {
 
 export interface GlyphCutResult {
   cells: GlyphCell[]
-  /** Canvas y of the baseline — the mode of the cell bottoms, descenders excluded. */
+  /** Canvas y of the baseline at the box's centre — fitted through the cell bottoms, descenders excluded. */
   baselineY: number
+  /**
+   * The baseline at canvas x. A scanned line is rarely level: on a title 677px
+   * wide the letter bottoms drifted four rows from left to right, and one
+   * baseline for the lot set the left-hand glyphs two pixels low and the
+   * right-hand ones two high — a ragged line drawn from perfectly good ink.
+   */
+  baselineAt: (x: number) => number
   /** Em in canvas pixels. */
   emPx: number
   /** Threshold used, so the tracer binarises the same way. */
   threshold: number
   /** Light glyphs on a dark ground — the tracer must flip the bitmap too. */
   inverted: boolean
+  /**
+   * The binarised box the cut was made on — rules and their fragments already
+   * cleared, light-on-dark already flipped. The tracer takes its cell bitmaps
+   * from HERE, never from the pixels again: re-reading them put the crumbs of a
+   * cleared border fragment back on top of the letters under it, and a title
+   * came out with a bar over its J, E and T.
+   */
+  bin: { x: number; y: number; w: number; h: number; ink: Uint8Array }
 }
 
 interface Bin { x: number; y: number; w: number; h: number; ink: Uint8Array; threshold: number; inverted: boolean }
@@ -44,7 +60,7 @@ function refuse(why: string): null { refusedBecause = why; return null }
 const DESCENDER_CHARS = /[gjpqyQ,;()\[\]{}]/
 const CJK = /[\p{Script=Han}　-〿＀-￯]/u
 
-function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; width: number; height: number }): Bin | null {
+function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; width: number; height: number }, ruleSpan: number): Bin | null {
   const x = Math.max(0, Math.floor(rect.x)), y = Math.max(0, Math.floor(rect.y))
   const w = Math.min(ctx.canvas.width - x, Math.ceil(rect.width)), h = Math.min(ctx.canvas.height - y, Math.ceil(rect.height))
   if (w < 3 || h < 3) return null
@@ -81,6 +97,13 @@ function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; w
     for (let xx = 0; xx < w; xx++) n += ink[yy * w + xx]
     if (n >= w * 0.8) for (let xx = 0; xx < w; xx++) ink[yy * w + xx] = 0
   }
+  // And a rule that crosses only PART of the box — a skewed border clipping
+  // one corner. It fused the first seven letters of a title into one ink run
+  // (see `clearRuleSpans`), which is the misalignment the sliver test below
+  // then refuses; better not to be misaligned at all. The bar is two and a
+  // half ems guessed from the text's expected advances — no glyph, CJK
+  // included, runs that wide, and a pair of fused bold letters does not either.
+  clearRuleSpans(ink, w, h, ruleSpan)
   return { x, y, w, h, ink, threshold, inverted }
 }
 
@@ -115,7 +138,8 @@ export function cutGlyphs(
 ): GlyphCutResult | null {
   const chars = [...text].filter(c => c !== ' ')
   if (!chars.length) return refuse('no characters')
-  const bin = binarise(ctx, rect)
+  const emGuess = rect.width / Math.max(1, chars.reduce((s, c) => s + expectedAdvance(c), 0))
+  const bin = binarise(ctx, rect, emGuess * 2.5)
   if (!bin) return refuse('blank or unreadable box')
   refusedBecause = ''
 
@@ -130,8 +154,10 @@ export function cutGlyphs(
   }
   if (!cells) return null
 
-  const baselineY = baselineOf(bin, cells)
-  return { cells, baselineY, emPx, threshold: bin.threshold, inverted: bin.inverted }
+  const base = baselineOf(bin, cells)
+  const centreX = bin.x + bin.w / 2
+  const baselineAt = (x: number) => base.y + base.slope * (x - centreX)
+  return { cells, baselineY: base.y, baselineAt, emPx, threshold: bin.threshold, inverted: bin.inverted, bin: { x: bin.x, y: bin.y, w: bin.w, h: bin.h, ink: bin.ink } }
 }
 
 function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): GlyphCell[] | null {
@@ -156,6 +182,14 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
     }
   }
   if (!runs.length) return refuse('no ink runs')
+  // A one-column run is a speck, not a glyph: at OCR resolution the thinnest
+  // stem is two pixels. The fringe of a cell border at the very edge of the
+  // box left one such column, it took the last cell, and "…de MSP" was refused
+  // as misaligned on the strength of a one-pixel "P".
+  if (runs.length > 1) {
+    const kept = runs.filter(r => r.x1 - r.x0 > 1)
+    if (kept.length) runs.splice(0, runs.length, ...kept)
+  }
   const target = chars.length
   // Letters that mostly TOUCH cannot be cut by profile: an italic serif
   // footer gave 69 characters in far fewer ink runs, and however the runs were
@@ -202,7 +236,14 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
     let x = r.x0
     held.forEach((c, k) => {
       const w = (r.x1 - r.x0) * (expectedAdvance(c) / sum)
-      const x1 = k === held.length - 1 ? r.x1 : x + w
+      // Not AT the proportional point but at the emptiest column near it. Two
+      // letters that touch ("EJ" on a scanned title, one 20px run) are not
+      // split by their advances: "E" is the wider of the pair, so the halfway
+      // cut fell three columns inside it and the "J" cell carried the ends of
+      // the E's bars into the face — the J then drew with a bar on top. The
+      // join between two letters is a column with little ink; look for it
+      // within a fifth of an em either side.
+      const x1 = k === held.length - 1 ? r.x1 : splitAt(cols, x + w, x, r.x1, emPx)
       cells.push({ char: c, x0: bin.x + Math.round(x), x1: bin.x + Math.round(x1) })
       x = x1
     })
@@ -218,7 +259,12 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
   for (const c of cells) {
     const want = expectedAdvance(c.char) / totalE * totalW
     const got = c.x1 - c.x0
-    if (Math.abs(got - want) > Math.max(3, want * 0.4)) { c.suspect = true; suspects++ }
+    // `expectedAdvance` is an ADVANCE; a thin letter's ink is a third of it (a
+    // sans "I" is a three-pixel stem against a want of eight), so a thin cell
+    // is only suspect for being too WIDE. Narrow is what it is meant to be.
+    const thinChar = /[iljtfrI.,;:'!|1]/.test(c.char)
+    const off = thinChar ? Math.max(0, got - want) : Math.abs(got - want)
+    if (off > Math.max(3, want * 0.4) || got < 2) { c.suspect = true; suspects++ }
   }
   // And each cell's SHAPE against its letter: a cell shifted by one letter
   // keeps a plausible width, which is how "República" came back reading
@@ -254,8 +300,21 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
   // either way, took tracing from 25 runs to 20 with 19 refusals; the end test
   // alone keeps 24 with 7 refusals, the reported title among them. All three
   // variants read back 69 of 71 edits, so the traces lost were pure fidelity.
+  //
+  // A THIN character at an end says nothing. `expectedAdvance` gives "." and
+  // "i" three tenths of an em, which is their ADVANCE; their ink is a tenth,
+  // so a full stop at the end of "sin incluir IGV." measured three pixels
+  // against a want of nine and read as a sliver — and every sentence on the
+  // page, ending as sentences do, was refused. Where the end cell is thin the
+  // test is skipped; a misaligned cut still shows up wherever the end cell is
+  // a letter with a body ("M" two pixels wide against twenty).
+  // CJK punctuation is thin too: "）" and "。" take a full-em advance and put
+  // a few pixels of ink in one corner of it, so a Chinese line ending as most
+  // do ("…不含增值税。") read as misaligned every time.
+  const thin = /[iljtfrI.,;:'!|1（）「」『』【】《》〈〉、。，；：！？·]/
   const sliver = (i: number) => {
     const c = cells[i]
+    if (thin.test(c.char)) return false
     const want = expectedAdvance(c.char) / totalE * totalW
     return want > 2 && (c.x1 - c.x0) < want * 0.35
   }
@@ -266,8 +325,31 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
   // whether the REST can be trusted. Measured on 22 files, honest runs came
   // back with 2 of 18 or 2 of 15 suspect (a comma, an accent) and were being
   // refused whole at a tenth; the shifted italic footer was 16 of 69.
-  if (suspects > cells.length * 0.2) return refuse(`${suspects} of ${cells.length} cells suspect`)
+  // A fifth OR MORE. "AV. REPUBLICA DE CHILE Nº 262,08 (OCTAVO PISO)- JESUS
+  // MARIA" on the RJ notice cut to exactly 10 of 50 suspect and, admitted, drew
+  // as a jumble of half-height capitals: its box takes in the bottom rows of
+  // the bold line touching it above, so the em is inflated and every cell
+  // carries a sliver of the neighbour. At the bar is not under it.
+  if (suspects >= cells.length * 0.2) return refuse(`${suspects} of ${cells.length} cells suspect`)
   return cells
+}
+
+/**
+ * The column to cut a fused run at: the one with the least ink within a fifth
+ * of an em of `want`, ties going to the nearer. Kept a pixel or more inside
+ * (`lo`, `hi`) so neither side is left empty.
+ */
+function splitAt(cols: Uint16Array, want: number, lo: number, hi: number, emPx: number): number {
+  const win = Math.max(2, Math.round(emPx * 0.2))
+  const from = Math.max(Math.ceil(lo) + 1, Math.round(want) - win)
+  const to = Math.min(Math.floor(hi) - 1, Math.round(want) + win)
+  if (from > to) return want
+  let best = Math.round(want), bestInk = Infinity
+  for (let xx = from; xx <= to; xx++) {
+    const ink = cols[xx]
+    if (ink < bestInk || (ink === bestInk && Math.abs(xx - want) < Math.abs(best - want))) { bestInk = ink; best = xx }
+  }
+  return best
 }
 
 const X_HEIGHT_CHARS = /^[aceimnorsuvwxzáéíóúñäëïöüàèìòùâêîôû]$/
@@ -277,6 +359,13 @@ const TALL_CHARS = /^[A-Z0-9ÁÉÍÓÚÑ]$/
 
 /** Mark cells whose ink extent contradicts their letter's class; returns how many. */
 function flagByShape(bin: Bin, cells: GlyphCell[]): number {
+  // Extents are measured against the line's TILT, not the page's rows: on a
+  // scan whose baseline drifts four rows across the box, a capital "S" read as
+  // "s" at the low end sat two rows lower than the level median expected and
+  // its rise came out 0.27 - under the bar - so a cap-height shape went into
+  // the face as the lowercase letter, and every "s" on the line drew as "S".
+  const line = baselineOf(bin, cells)
+  const centreX = bin.x + bin.w / 2
   const extents = cells.map(c => {
     const x0 = Math.max(0, c.x0 - bin.x), x1 = Math.min(bin.w, c.x1 - bin.x)
     let top = -1, bottom = -1
@@ -285,7 +374,9 @@ function flagByShape(bin: Bin, cells: GlyphCell[]): number {
       for (let xx = x0; xx < x1; xx++) if (bin.ink[yy * bin.w + xx]) { on = true; break }
       if (on) { if (top < 0) top = yy; bottom = yy }
     }
-    return { top, bottom }
+    if (top < 0) return { top, bottom }
+    const tilt = line.slope * ((c.x0 + c.x1) / 2 - centreX)
+    return { top: top - tilt, bottom: bottom - tilt }
   })
   // Baseline and x-height from the cells that define them.
   const bottoms: number[] = [], xTops: number[] = []
@@ -360,46 +451,74 @@ function assignByWidth(runs: { x0: number; x1: number }[], chars: string[], emPx
   return groups
 }
 
-/** The baseline: where most non-descending glyphs end. */
-function baselineOf(bin: Bin, cells: GlyphCell[]): number {
-  const bottoms: number[] = []
+/**
+ * The baseline: a LINE fitted through where the non-descending glyphs end,
+ * given as its height at the box's centre and its slope. The median alone
+ * used to serve, and on a level scan it still would — but a tilted line puts
+ * every glyph's bottom a little further from the median the further it sits
+ * from the middle, and the traced face then carried that offset into each
+ * glyph. Fitted by least squares with the outliers (a broken letter, a comma
+ * that slipped past the descender test) dropped once and the fit remade.
+ */
+function baselineOf(bin: Bin, cells: GlyphCell[]): { y: number; slope: number } {
+  const pts: { x: number; y: number }[] = []
   for (const c of cells) {
     if (DESCENDER_CHARS.test(c.char)) continue
     const x0 = Math.max(0, c.x0 - bin.x), x1 = Math.min(bin.w, c.x1 - bin.x)
     for (let yy = bin.h - 1; yy >= 0; yy--) {
       let on = false
       for (let xx = x0; xx < x1; xx++) if (bin.ink[yy * bin.w + xx]) { on = true; break }
-      if (on) { bottoms.push(bin.y + yy + 1); break }
+      if (on) { pts.push({ x: (c.x0 + c.x1) / 2, y: bin.y + yy + 1 }); break }
     }
   }
-  if (!bottoms.length) return bin.y + bin.h
-  bottoms.sort((a, b) => a - b)
-  return bottoms[Math.floor(bottoms.length / 2)]
+  const centreX = bin.x + bin.w / 2
+  if (!pts.length) return { y: bin.y + bin.h, slope: 0 }
+  const median = (vals: number[]) => { const s = [...vals].sort((a, b) => a - b); return s[Math.floor(s.length / 2)] }
+  const fit = (p: { x: number; y: number }[]) => {
+    if (p.length < 3) return { y: median(p.map(q => q.y)), slope: 0 }
+    let sx = 0, sy = 0, sxx = 0, sxy = 0
+    for (const q of p) { const dx = q.x - centreX; sx += dx; sy += q.y; sxx += dx * dx; sxy += dx * q.y }
+    const n = p.length
+    const denom = n * sxx - sx * sx
+    if (Math.abs(denom) < 1e-6) return { y: median(p.map(q => q.y)), slope: 0 }
+    const slope = (n * sxy - sx * sy) / denom
+    return { y: (sy - slope * sx) / n, slope }
+  }
+  let line = fit(pts)
+  const kept = pts.filter(q => Math.abs(q.y - (line.y + line.slope * (q.x - centreX))) <= 1.5)
+  if (kept.length >= 3 && kept.length < pts.length) line = fit(kept)
+  // A slope steeper than a few degrees is not a scan's tilt; fall back to level.
+  if (Math.abs(line.slope) > 0.05) line = { y: median(pts.map(q => q.y)), slope: 0 }
+  return line
 }
 
-/** Binarised ImageData of one cell, black ink on white, for the tracer. */
+/**
+ * Binarised ImageData of one cell, black ink on white, for the tracer — sliced
+ * from the cut's own cleaned bitmap (`cut.bin`), the full height of the box
+ * plus `pad` white pixels all round. `x`/`y` are the bitmap's origin in canvas
+ * pixels, which is what the outline is placed by.
+ */
 export function cellBitmap(
-  ctx: CanvasRenderingContext2D,
+  cut: Pick<GlyphCutResult, 'bin'>,
   cell: GlyphCell,
-  top: number,
-  bottom: number,
-  threshold: number,
-  pad = 1,
-  invert = false
+  pad = 1
 ): { image: ImageData; x: number; y: number } | null {
-  const x = Math.max(0, cell.x0 - pad), y = Math.max(0, Math.floor(top) - pad)
-  const w = Math.min(ctx.canvas.width - x, cell.x1 - cell.x0 + pad * 2)
-  const h = Math.min(ctx.canvas.height - y, Math.ceil(bottom) - Math.floor(top) + pad * 2)
+  const { bin } = cut
+  const x = cell.x0 - pad, y = bin.y - pad
+  const w = cell.x1 - cell.x0 + pad * 2
+  const h = bin.h + pad * 2
   if (w < 2 || h < 2) return null
-  let src: ImageData
-  try { src = ctx.getImageData(x, y, w, h) } catch (_) { return null }
   const out = new ImageData(w, h)
-  const d = src.data, o = out.data
-  for (let i = 0; i < d.length; i += 4) {
-    const g = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000
-    const isInk = invert ? g >= threshold : g < threshold
-    const v = isInk ? 0 : 255
-    o[i] = v; o[i + 1] = v; o[i + 2] = v; o[i + 3] = 255
+  const o = out.data
+  for (let yy = 0; yy < h; yy++) {
+    const by = yy - pad
+    for (let xx = 0; xx < w; xx++) {
+      const bx = x + xx - bin.x
+      const on = by >= 0 && by < bin.h && bx >= 0 && bx < bin.w && bin.ink[by * bin.w + bx] === 1
+      const v = on ? 0 : 255
+      const i = (yy * w + xx) * 4
+      o[i] = v; o[i + 1] = v; o[i + 2] = v; o[i + 3] = 255
+    }
   }
   return { image: out, x, y }
 }
