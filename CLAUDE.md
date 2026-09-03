@@ -3082,6 +3082,25 @@ All four corpora are experiment-identical after the change (262/237, 439/394,
 file has ONE content source, so that change could not be involved, and the
 profiler named the real cost immediately.
 
+### The segment MOVE reads /W too, or a CID cell cannot be shifted
+`findTargetSegment` — the path that shifts a run inside a shared TJ array —
+asked for `simpleInfo.widths` and gave up when it was missing. A Type0 font
+has no /Widths, so the whole segment path was unavailable on every CID subset:
+a cell EDITED fine (the edit path had already been taught to read the
+descendant's /W) and the same cell reported "could not find matching text"
+when dragged. Both now go through the same table behind the same
+Identity-CMap gate. Measured: round 3 gains two moves that used to refuse
+("72875047" on a Print-to-PDF form, "BXB-866" on another) with no strategy or
+result changing anywhere else — baseline 262/237, round 2 439/394, round 3
+466/408, round 4 462/412.
+
+**It did NOT fix the case that prompted it**, and that is worth recording: a
+Ghostscript timesheet still refuses to move "16:00". The refusal happens
+earlier, in `findBtBlocksByPosition` — a mid-line cell of a shared-Tm block
+has neither a governing Tm nor a line-leading run, so the last-resort pass
+never admits the block and `findTargetSegment` is never reached. Admitting a
+block on a segment hit would be the next step and is not implemented.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

@@ -7501,9 +7501,19 @@ function findTargetSegment(
     const fr = op.fontRef && op.fontRef !== block.fontRef
       ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
       : { encoding: block.encoding, simpleInfo: getSimpleFontInfo(pageIndex, block.fontRef) }
-    const widths = fr.simpleInfo?.widths
-    if (!widths) continue
-    const fc = fr.simpleInfo!.firstChar
+    // Advance per code, from whichever table this font has. A Type0 font has
+    // no /Widths, so this used to `continue` and the whole segment path was
+    // unavailable on CID subsets: moving a cell of a Ghostscript timesheet
+    // ("16:00" inside one big TJ array) reported "could not find matching
+    // text" while the same cell EDITED fine, because the edit path had
+    // already been taught to read /W. Same table, same Identity-CMap gate.
+    const advanceOf: ((code: number) => number) | null =
+      fr.simpleInfo?.isType0 && fr.simpleInfo.cidWidths
+        ? (code: number) => fr.simpleInfo!.cidWidths!.get(code) ?? fr.simpleInfo!.cidDefaultWidth ?? 1000
+        : fr.simpleInfo?.widths
+          ? (code: number) => fr.simpleInfo!.widths![code - fr.simpleInfo!.firstChar]
+          : null
+    if (!advanceOf) continue
 
     const items = parseTjItems(op.raw, fr.encoding, fr.simpleInfo)
     if (!items.length) continue
@@ -7521,8 +7531,8 @@ function findTargetSegment(
       // One code per character, or the x table does not line up with the text.
       if (it.decoded.length !== it.codes.length) { usable = false; break }
       for (let c = 0; c < it.decoded.length; c++) {
-        const cw = widths[it.codes[c] - fc]
-        if (cw === undefined) { usable = false; break }
+        const cw = advanceOf(it.codes[c])
+        if (cw === undefined || !Number.isFinite(cw)) { usable = false; break }
         charItem.push({ item: idx, charInItem: c })
         xAt.push(acc)
         acc += cw
