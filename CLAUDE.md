@@ -3252,6 +3252,19 @@ among them. All three variants read 69 of the 71 edits back, so what the wider
 rules cost was fidelity only: a refused run still draws, in Helvetica, which is
 a visible seam rather than a wrong glyph.
 
+### A refused trace is the one OCR outcome the user has to be told about
+The edit still lands - the run bakes either way - so nothing failed. What
+changes is the FIDELITY: that one line comes out in Helvetica while every other
+line on the page keeps the scan's own letterforms, and with no explanation that
+reads as the editor having got the font wrong. `traceRunIntoFace` returns
+`TraceResult { added, refused }` (the refusal is `lastCutReason()`), and
+`commitEdit` in `OcrTextLayer` puts it in the status bar.
+
+The alternative to refusing is tracing the wrong shapes, which renders the line
+as nonsense while extraction still reads it correctly - the failure the sliver
+note above describes. A visible seam that says why beats a silent one that
+doesn't.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

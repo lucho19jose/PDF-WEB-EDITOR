@@ -8,7 +8,7 @@ import { TesseractEngine } from '@/utils/ocr/engines/tesseractEngine'
 import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
 import { inkBounds, inkGaps, type InkCut } from '@/utils/ocr/inkMeasure'
-import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace } from '@/utils/ocr/scanFace'
+import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
 import { cutGlyphs, lastCutReason } from '@/utils/ocr/glyphCut'
 
 /**
@@ -206,20 +206,20 @@ function createOCR() {
    * a run that cannot be cut simply contributes no glyphs and the export
    * falls back to the base font for them.
    */
-  async function traceItem(item: OcrTextItem): Promise<number> {
+  async function traceItem(item: OcrTextItem): Promise<TraceResult> {
     const raster = rasters.get(item.pageIndex)
-    if (!raster || item.vertical) return 0
+    if (!raster || item.vertical) return { added: 0, refused: null }
     const k = 1 / raster.toPt
     const rect = { x: item.inkRect.x * k, y: item.inkRect.y * k, width: item.inkRect.width * k, height: item.inkRect.height * k }
     const symbols = item.symbols?.map(s => ({ x0: s.x * k, y0: s.y * k, x1: (s.x + s.width) * k, y1: (s.y + s.height) * k }))
     const face = scanFaceFor(item.pageIndex, styleKeyOf(item))
     try {
-      const added = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, symbols, item.text)
-      if (added) faceVersion.value++
-      return added
+      const res = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, symbols, item.text)
+      if (res.added) faceVersion.value++
+      return res
     } catch (err) {
       console.warn('[OCR] scan face tracing failed:', err)
-      return 0
+      return { added: 0, refused: null }
     }
   }
 

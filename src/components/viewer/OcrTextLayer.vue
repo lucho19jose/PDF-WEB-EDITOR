@@ -64,6 +64,7 @@
 import { ref, computed, nextTick, watch } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useOcrStore } from '@/stores/ocr'
+import { useEditorStore } from '@/stores/editor'
 import { useOCR } from '@/composables/useOCR'
 import { styleKeyOf } from '@/utils/ocr/scanFace'
 import { rgb01ToCss } from '@/utils/color'
@@ -78,6 +79,7 @@ const props = defineProps<{
 
 const docStore = useDocumentStore()
 const ocrStore = useOcrStore()
+const editorStore = useEditorStore()
 
 const scaleX = computed(() => props.pageWidth / props.pdfWidth)
 const scaleY = computed(() => props.pageHeight / props.pdfHeight)
@@ -355,7 +357,18 @@ function commitEdit() {
   // screen now, in the file at export — is drawn with the document's own
   // letterforms wherever it can be.
   const item = ocrStore.itemsFor(pageIndex.value).find(i => i.id === id)
-  if (item?.edited) void ocr.traceItem(item)
+  if (!item?.edited) return
+  void ocr.traceItem(item).then(res => {
+    // A refused cut is not a failure of the edit - the new text is on the page
+    // either way - but it IS a loss of fidelity the user can see and cannot
+    // otherwise explain: this one line comes out in Helvetica while the rest of
+    // the page keeps the scan's own letterforms. Saying so beats leaving them
+    // to wonder whether the editor is broken. (Tracing the WRONG shapes was the
+    // alternative, and it renders the line as nonsense - see the sliver note.)
+    if (res.refused) {
+      editorStore.setStatus(`Edited. The scan's own letterforms could not be traced for this line (${res.refused}), so it is drawn in a standard font.`)
+    }
+  })
 }
 
 function cancelEdit() {

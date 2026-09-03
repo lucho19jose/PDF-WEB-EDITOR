@@ -1,6 +1,6 @@
 import * as opentype from 'opentype.js'
 import { init as potraceInit, potrace } from 'esm-potrace-wasm'
-import { cutGlyphs, cellBitmap, expectedAdvance } from './glyphCut'
+import { cutGlyphs, cellBitmap, expectedAdvance, lastCutReason } from './glyphCut'
 import type { OcrBox } from './ocrEngine'
 
 /**
@@ -95,6 +95,9 @@ export function canDrawAll(face: ScanFace, text: string): boolean {
  * @param symbols per-glyph boxes, when the engine reported them
  * @returns how many glyphs were added (0 when the run could not be cut)
  */
+/** What a trace did, and why it did nothing when it did nothing. */
+export interface TraceResult { added: number; refused: string | null }
+
 export async function traceRunIntoFace(
   face: ScanFace,
   ctx: CanvasRenderingContext2D,
@@ -103,11 +106,15 @@ export async function traceRunIntoFace(
   symbols?: OcrBox[],
   /** What the user made of the run; characters they changed are not traced. */
   editedText?: string
-): Promise<number> {
+): Promise<TraceResult> {
   const wanted = [...text].filter(c => c !== ' ' && !face.glyphs.has(c))
-  if (!wanted.length) return 0
+  if (!wanted.length) return { added: 0, refused: null }
   const cut = cutGlyphs(ctx, inkRect, text, symbols)
-  if (!cut) return 0
+  // A refused cut is the one outcome the user has to be told about: the run
+  // still bakes, in a base-14 face, so the line comes out legible but in the
+  // wrong letterforms. Silence here is what made the misaligned-cut bug so
+  // hard to report - see the sliver note in CLAUDE.md.
+  if (!cut) return { added: 0, refused: lastCutReason() || 'the ink could not be cut into letters' }
   if (!potraceReady) potraceReady = potraceInit()
   await potraceReady
 
@@ -142,7 +149,7 @@ export async function traceRunIntoFace(
     added++
   }
   if (added) await rebuild(face)
-  return added
+  return { added, refused: null }
 }
 
 /**
