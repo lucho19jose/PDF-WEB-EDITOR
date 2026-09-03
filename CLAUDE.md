@@ -3208,10 +3208,14 @@ char_delta 0 → 59 and 0 → 24 on two paragraphs. Two experiments gained acros
 the corpora, one lost, and the loss leaves 59 characters of stale text on the
 page where the bug it fixes loses 2.
 
-A narrower test would be needed: the op must be foreign by FONT or by size (a
-superscript is set smaller, and in a different face here) rather than by text,
-since text alone cannot tell "not part of this line" from "decoded
-differently". Not implemented.
+A SIZE test was then tried — keep an op whose Tf size is two thirds of the
+run's or less — and it does not fire at all here: the mark is drawn in the SAME
+font at the SAME Tf size (FFMQYN+URWPalladioL-Bold), its smaller appearance
+coming from the matrix, so `textStateAtOp` reports no difference. Both cheap
+discriminators are therefore ruled out, measured. What is left is comparing the
+op's rendered size through its own CTM, or its baseline offset (a superscript
+sits above the run's baseline) — neither implemented, and the bug costs 2
+characters, so weigh that before spending more on it.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
