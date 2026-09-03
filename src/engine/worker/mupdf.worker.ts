@@ -5582,7 +5582,7 @@ function applyBlockReplacement(
     newContent = stripActualText(newContent)
     // Same lie, told from outside the block, on a tagged page. Returned rather
     // than applied — see the note in applyLineReplacement.
-    const tag = retagSpanActualText(stream, block.start, newText)
+    const tag = retagSpanActualText(stream, block.start, newText, block.end)
     const text = 'BT' + newContent + 'ET'
     const result = stream.substring(0, block.start) + text + stream.substring(block.end)
     // Only ONE block moved, and the tag sits below it, so no offset shifts.
@@ -6056,7 +6056,7 @@ function applyLineReplacement(
     // block sits in. Correct that too, or the page prints one thing and reads
     // as another. Keyed by the dictionary so a span wrapping several blocks is
     // retagged once — and by the PRIMARY, which is the block that still draws.
-    const tag = retagSpanActualText(stream, block.start, i === primaryIdx ? newText : '')
+    const tag = retagSpanActualText(stream, block.start, i === primaryIdx ? newText : '', block.end)
     if (tag && (i === primaryIdx || !retags.has(tag.start))) retags.set(tag.start, tag)
   }
 
@@ -6290,7 +6290,19 @@ function maskedOnce(stream: string): string {
 function retagSpanActualText(
   stream: string,
   blockStart: number,
-  text: string
+  text: string,
+  /**
+   * End of the BT block the text belongs to. The span must CONTAIN it: a
+   * marked-content section can close while the BT is still open — this
+   * receipt opens `/Artifact <<>> BDC` before the BT and then closes and
+   * reopens a section between every field, so the first section holds the
+   * block's start and exactly one `BT` (passing the count test below) while
+   * covering only its first few glyphs. Writing the whole block's words as
+   * that fragment's /ActualText made extraction read the page's text a second
+   * time out of the override: 721 characters became 973 for a ten-character
+   * edit, with the marker appearing twice.
+   */
+  blockEnd?: number
 ): { start: number; end: number; text: string } | null {
   const masked = maskedOnce(stream)
   const dict = enclosingMarkedContentDict(masked, blockStart)
@@ -6298,6 +6310,7 @@ function retagSpanActualText(
 
   const emc = matchingEmc(masked, dict.bdcEnd)
   if (emc < 0) return null
+  if (blockEnd !== undefined && emc < blockEnd) return null
   const inside = masked.slice(dict.bdcEnd, emc)
   if ((inside.match(/\bBT\b/g) ?? []).length !== 1) return null
   const body = stripActualText(stream.slice(dict.start + 2, dict.end - 2))
@@ -7898,7 +7911,7 @@ function applyPartialBlockReplacement(
         // a plain .replace silently no-ops when the extractor's spacing
         // disagrees with the stream's, and the span then keeps the old words.
         const spanText = ops.map(o => o === op ? looseReplace(o.decoded, targetNorm, newText) : o.decoded).join('')
-        const tag = retagSpanActualText(stream, block.start, spanText.trim())
+        const tag = retagSpanActualText(stream, block.start, spanText.trim(), block.end)
         return {
           stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end),
           substitutedFont: substFont,
@@ -8120,7 +8133,7 @@ function applyPartialBlockReplacement(
   // every untouched op's own.
   const spanText = ops.map((o, k) =>
     k === winI ? winText : (k > winI && k <= winJ ? '' : o.decoded)).join('')
-  const tag = retagSpanActualText(stream, block.start, spanText.trim())
+  const tag = retagSpanActualText(stream, block.start, spanText.trim(), block.end)
 
   return {
     stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end),

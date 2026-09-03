@@ -3009,6 +3009,24 @@ restore's, with the block-level size as the fallback when the op cannot be
 located. Measured: the edit touches ONE block instead of 21, round 3 gains 4
 experiments (466/404), baseline and round 2 unchanged, nothing lost.
 
+### A marked-content section can CLOSE while the BT is still open
+`retagSpanActualText` refuses a span holding more than one `BT`, which is what
+stops one line's words being written over three. The opposite shape was not
+guarded: a section that closes INSIDE the block. A utility bill opens
+`/Artifact <<>> BDC` before the BT and then closes and reopens a section
+between every field while the text object stays open, so the section holding
+the block's start contains exactly one `BT` — passing the count test — while
+covering only its first few glyphs. The whole block's text was written as that
+fragment's `/ActualText`, and since ActualText REPLACES the glyphs for every
+extractor, the page's text was then read a second time out of the override:
+721 characters became 973 for a ten-character edit, the marker appearing
+twice and a neighbouring line reading back as the entire invoice.
+
+The span must CONTAIN the block: `emc >= blockEnd`, passed at all four call
+sites. Measured on the reported receipt: the page now loses exactly the old
+field and gains exactly the new. Round 4 gains 4 experiments (294/…), the
+other three corpora byte-identical.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
