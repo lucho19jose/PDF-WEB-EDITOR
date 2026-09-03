@@ -84,7 +84,16 @@ function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; w
   return { x, y, w, h, ink, threshold, inverted }
 }
 
-/** Expected width of a character as a fraction of the em. */
+/**
+ * Expected width of a character as a fraction of the em.
+ *
+ * CJK punctuation is deliberately NOT given a narrower expectation. Its cell
+ * is a full em with the mark in one corner, so a third of an em looks like
+ * the honest number — measured, it moved one of this corpus's Chinese lines
+ * from traced to refused ("7 of 33 cells suspect") and fixed none, because
+ * the profile merges a comma into its neighbour's run as often as it reports
+ * it alone. The uniform 0.95 is what the corpus supports.
+ */
 export function expectedAdvance(ch: string): number {
   if (CJK.test(ch)) return 0.95
   if (/[iljtfrI.,;:'!|1]/.test(ch)) return 0.3
@@ -117,7 +126,7 @@ export function cutGlyphs(
   if (symbols && symbols.length === chars.length) {
     cells = symbols.map((s, i) => ({ char: chars[i], x0: Math.round(s.x0), x1: Math.round(s.x1) }))
   } else {
-    cells = cutByProfile(bin, chars, emPx)
+    cells = cutByProfile(bin, chars, emPx, cjk)
   }
   if (!cells) return null
 
@@ -125,7 +134,7 @@ export function cutGlyphs(
   return { cells, baselineY, emPx, threshold: bin.threshold, inverted: bin.inverted }
 }
 
-function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | null {
+function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): GlyphCell[] | null {
   const cols = new Uint16Array(bin.w)
   for (let yy = 0; yy < bin.h; yy++) for (let xx = 0; xx < bin.w; xx++) cols[xx] += bin.ink[yy * bin.w + xx]
   const minCol = 1
@@ -148,7 +157,16 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number): GlyphCell[] | nu
   // shared out, every second cell held the wrong letter. Tesseract's glyph
   // boxes are the only honest cut for such a line; without them, refuse.
   if (runs.length < target * 0.6) return refuse(`letters touch (${runs.length} runs for ${target} characters)`)
-  const budget = Math.max(1, Math.round(target * 0.35))
+  // An IDEOGRAPH is drawn as separated radicals: 报 is two, 遗 two or three,
+  // and the column profile reports each as its own run. A Chinese line
+  // therefore arrives with one and a half to two runs per character — 66 for
+  // 44 — and the Latin budget of a third refused every CJK line on the page,
+  // so a scanned Chinese memo could never be redrawn in its own face. Merging
+  // is the safe direction (it only ever joins ADJACENT pieces, smallest gap
+  // first) and a CJK cell is close to square, so a wrong merge shows up as a
+  // width outlier in the suspect check below. Two merges per character covers
+  // a three-part ideograph.
+  const budget = cjk ? Math.max(1, target * 2) : Math.max(1, Math.round(target * 0.35))
   let edits = 0
 
   // Too many pieces: an ideograph's radicals, a broken stroke, an accent

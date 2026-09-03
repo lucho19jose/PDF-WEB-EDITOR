@@ -2878,6 +2878,31 @@ and gains one.
 Sweeps after all three changes: baseline 262/232 (was 229), round 2 439/392
 (was 379 when the round was staged), zero lost on either.
 
+### An ideograph is SEVERAL ink runs, so the glyph cut needs a bigger budget
+`cutByProfile` merges adjacent ink runs until there is one per character and
+refuses when that takes more than a third of the character count. A Chinese
+line breaks that immediately: 报 is two radicals, 遗 two or three, and the
+column profile reports each as its own run — a scanned memo's lines arrived
+as 66 runs for 44 characters, 47 for 33, 72 for 43. Every Chinese line on the
+page was refused, so an edited line could never be redrawn in the scan's own
+face and always fell back to Noto. The budget is two merges per character for
+a CJK run (one for Latin's third), which covers a three-part ideograph;
+merging only ever joins ADJACENT pieces, smallest gap first, and a wrong
+merge still shows up as a width outlier in the suspect check below. Measured
+on the memo: the fragment refusals are gone and one more line traces.
+
+**CJK punctuation was NOT given a narrower expectation, though it looks
+right.** A "，" occupies a full em with the mark in one corner, so a third of
+an em is the honest ink width — and setting it moved a line that traced back
+to refused (7 of 33 cells suspect) while fixing none, because the profile
+merges a comma into its neighbour's run about as often as it reports it
+alone. Reverted; the uniform 0.95 is what the corpus supports.
+
+**Known limitation:** two of the memo's Chinese lines still refuse at the
+width fit ("widths do not fit the letters"), and one Latin line at the shape
+check. They fall back to Noto or Helvetica, which is a visible seam but never
+a wrong glyph.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
