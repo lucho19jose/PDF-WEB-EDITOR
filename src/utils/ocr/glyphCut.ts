@@ -226,6 +226,42 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
   // descender must descend, an ascender or a capital must rise — measured
   // against the run's own x-height and baseline.
   suspects += flagByShape(bin, cells)
+  // A cell a THIRD of what its letter needs is not a narrow glyph, it is a
+  // MISALIGNMENT - and one misaligned cell means every cell after it holds the
+  // wrong ink. A bilingual contract's ALL-CAPS title cut as
+  //   "M"[696-698] "E"[702-717] "J"[717-732] ... "M"[776-796]
+  // - the first M two pixels wide against twenty for the same letter later,
+  // because an extra ink run at the left edge (a table rule) took a cell.
+  // Only 6 of 39 cells were flagged, under the one-fifth bar, so the run was
+  // traced and every glyph the face learned came from the letter NEXT to it:
+  // the line rendered as "QRAI MIEJOR MNIIEIIC TAI DR IIIFORNAEDRUEROR" while
+  // still EXTRACTING as its correct text - which is what makes it so confusing
+  // to report, since copy and search say the document is fine while the page
+  // is unreadable.
+  //
+  // The shape check cannot see this on an all-caps line: every letter is a
+  // capital of the same height, so a one-letter shift keeps every shape
+  // plausible. Width against the letter's OWN expectation is the signal that
+  // survives, and `expectedAdvance` already gives i/l/. a third of an em, so a
+  // legitimately narrow glyph is not caught by it.
+  //
+  // At an END only. A shift happens when something extra at one EDGE of the box
+  // takes a cell: everything moves along by one and the cell at that edge is
+  // left a sliver. A sliver in the MIDDLE is a different thing - a broken
+  // letter, a thin glyph the profile clipped - and it costs one glyph, which
+  // the suspect flag already keeps out of the face. Measured on the 14-document
+  // OCR corpus, 71 edits: refusing on ANY sliver, or on any grossly wrong width
+  // either way, took tracing from 25 runs to 20 with 19 refusals; the end test
+  // alone keeps 24 with 7 refusals, the reported title among them. All three
+  // variants read back 69 of 71 edits, so the traces lost were pure fidelity.
+  const sliver = (i: number) => {
+    const c = cells[i]
+    const want = expectedAdvance(c.char) / totalE * totalW
+    return want > 2 && (c.x1 - c.x0) < want * 0.35
+  }
+  if (cells.length > 2 && (sliver(0) || sliver(cells.length - 1))) {
+    return refuse('the first or last cell is a sliver — the cut is misaligned')
+  }
   // A fifth: suspect cells are never traced anyway, so the bar is about
   // whether the REST can be trusted. Measured on 22 files, honest runs came
   // back with 2 of 18 or 2 of 15 suspect (a comma, an accent) and were being

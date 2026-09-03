@@ -3217,6 +3217,41 @@ op's rendered size through its own CTM, or its baseline offset (a superscript
 sits above the run's baseline) — neither implemented, and the bug costs 2
 characters, so weigh that before spending more on it.
 
+### A misaligned glyph cut leaves a SLIVER at one end, and that is what refuses it
+Editing one character of a scanned bilingual contract's title redrew the whole
+line as "QRAI MIEJOR MNIIEIIC TAI DR IIIFORNAEDRUEROR". The edit itself was
+right: extraction, copy and search all read "MEJORAMIENTO DE LA INFRAESTRUCTURA
+DE RED LAN" back, which is what makes this so hard to report - the document
+reads as correct and the page is unreadable.
+
+The damage was in the FACE, not the edit. `cutByProfile` cut the run's ink into
+one cell per character and an extra ink run at the left edge, a table rule, took
+the first cell: every cell after it held the letter to its left, so the traced
+face stored each glyph under its neighbour's name and every later line drawn in
+that face was scrambled too. The cut read
+`"M"[696-698] "E"[702-717] ... "M"[776-796]` - the same letter two pixels wide
+at the start and twenty later on.
+
+Neither existing guard could see it. `flagByShape` compares each cell against
+its letter's class, and on an ALL-CAPS line every letter is a capital of the
+same height, so a one-letter shift keeps every shape plausible: 6 of 39 cells
+flagged, under the one-fifth bar. Width against the letter's own
+`expectedAdvance` is the signal that survives, and it costs nothing on narrow
+glyphs because i, l and the full stop are already expected to be a third of an
+em.
+
+**Only at an END.** A shift is caused by something extra at one EDGE claiming a
+cell, so the sliver it leaves is the first cell or the last. A sliver in the
+MIDDLE is a broken letter or a thin glyph the profile clipped, it costs one
+glyph, and the suspect flag already keeps that glyph out of the face. Measured
+on the 14-document OCR corpus (71 edits): refusing on ANY sliver, or on any
+grossly wrong width in either direction, took tracing from 25 runs to 20 with 19
+refusals - the wide half of that test fired on nothing the narrow half missed.
+The end test alone keeps 24 traced runs with 7 refusals, the reported title
+among them. All three variants read 69 of the 71 edits back, so what the wider
+rules cost was fidelity only: a refused run still draws, in Helvetica, which is
+a visible seam rather than a wrong glyph.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
