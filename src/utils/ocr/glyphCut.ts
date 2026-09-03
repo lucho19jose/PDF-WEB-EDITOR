@@ -135,6 +135,11 @@ export function cutGlyphs(
 }
 
 function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): GlyphCell[] | null {
+  // Excluding fully-inked ROWS here (the rule `inkMeasure` applies on the axis
+  // a rule crosses) was tried and reverted: measured on the two documents that
+  // report "1 runs for N characters" — a letterhead's company name and a 73pt
+  // heading — neither box contains a rule and neither refusal changed. Whatever
+  // fuses those columns, it is not an underline.
   const cols = new Uint16Array(bin.w)
   for (let yy = 0; yy < bin.h; yy++) for (let xx = 0; xx < bin.w; xx++) cols[xx] += bin.ink[yy * bin.w + xx]
   const minCol = 1

@@ -40,3 +40,4 @@ tools/pdf-sweep/results-*.json
 public/_sweep/dl/
 dist.zip
 public/_sweep/r2/
+public/_sweep/ocr/
