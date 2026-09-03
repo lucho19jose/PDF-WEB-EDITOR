@@ -53,7 +53,9 @@ globalThis.fetch = async (url) => {
 }
 
 const { runPdf } = await import(pathToFileURL(ROOT + '/public/_sweep/driver.js').href)
-const manifest = JSON.parse(fs.readFileSync(ROOT + '/public/_sweep/manifest.json', 'utf8').replace(/^\uFEFF/, ''))
+// SWEEP_MANIFEST points at another round's manifest (entries' `staged` paths
+// are relative to public/_sweep, e.g. "r2/007.pdf").
+const manifest = JSON.parse(fs.readFileSync(process.env.SWEEP_MANIFEST || (ROOT + '/public/_sweep/manifest.json'), 'utf8').replace(/^\uFEFF/, ''))
 const results = []
 console.log = () => {}; console.warn = () => {}; console.error = () => {}
 for (const m of manifest) {

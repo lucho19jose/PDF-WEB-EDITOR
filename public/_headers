@@ -1,0 +1,17 @@
+# Netlify headers (Vite copies public/ into dist/). Apache reads .htaccess instead.
+#
+# Cross-origin isolation is REQUIRED: MuPDF and ONNX Runtime run in workers on
+# SharedArrayBuffer, which browsers only expose under these two headers.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+# The models, fonts and WASM are large and never change under the same name.
+/paddle/*
+  Cache-Control: public, max-age=31536000, immutable
+/fonts/*
+  Cache-Control: public, max-age=31536000, immutable
+/tessdata/*
+  Cache-Control: public, max-age=31536000, immutable
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable

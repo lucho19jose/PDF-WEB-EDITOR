@@ -661,6 +661,30 @@ function isTinyLyingSubset(pageIndex: number, stextFontName: string): boolean {
 const PAGE_RIGHT_MARGIN = 20
 
 /**
+ * How far replacement text may run from `x` before it has to wrap;
+ * `Infinity` means this text must NOT be wrapped at all.
+ *
+ * Normally the room to the right margin. A block already within three em of
+ * that margin is not prose whose line can break there — it is the last column
+ * of a table, right-aligned against the edge (" 0.00" 20pt from the margin on
+ * a bank statement, "40.00" 12pt from it on a SUNAT guide). There is no room
+ * to wrap INTO: a continuation line is one leading down, which on a table is
+ * exactly the next row, so the wrap wrote the tail across the row beneath and
+ * extraction read the two interleaved as "R 0K.0600". Both rows are then
+ * wrong and the edit reports success.
+ *
+ * Such a cell is drawn on ONE line instead. Text that outgrows it runs toward
+ * the paper's edge and can be clipped there — the already-documented
+ * justified-line limitation — but it damages only the row being edited, and
+ * a row the user did not touch is never overwritten. Real edits to these
+ * cells (an amount for an amount) fit comfortably either way.
+ */
+function wrapRoom(pageWidth: number, x: number, fontSize: number): number {
+  const toMargin = pageWidth - x - PAGE_RIGHT_MARGIN
+  return toMargin >= 3 * Math.max(fontSize, 1) ? toMargin : Number.POSITIVE_INFINITY
+}
+
+/**
  * Leading given to lines this engine emits, as a multiple of the font size.
  * Mirrored by `lineStep` in TextBlockOverlay — see the note at `tdStep`.
  */
@@ -2642,6 +2666,7 @@ function replaceTextInStream(
     // Try each in turn, with font lookups scoped to that source's resources.
     let lastError: string | null = null
     const searched: string[] = []
+    const perSourceDiag: string[] = []
     for (const src of getContentSources(pageIndex)) {
       searched.push(src.key)
       const outcome = withSource(src, () => {
@@ -2669,7 +2694,15 @@ function replaceTextInStream(
         )
       })
 
-      if (!outcome) continue
+      if (!outcome) {
+        // Per SOURCE, not just the last one. A Canva page draws its headline in
+        // the page stream and a button label two Form XObjects down; the shared
+        // `lastMatchDiagnostic` was overwritten by whichever source happened to
+        // be searched last, so the error described the button while the failure
+        // was in the headline.
+        if (lastMatchDiagnostic) perSourceDiag.push(`${src.key}: ${lastMatchDiagnostic}`)
+        continue
+      }
       if ('error' in outcome) { lastError = outcome.error; continue }
 
       // Longer text needs a wider window, or the tail is clipped away and lost.
@@ -2815,7 +2848,7 @@ function replaceTextInStream(
       success: false,
       error: lastError ||
         `Could not find matching text in content stream ` +
-        `[searched: ${searched.join(', ') || 'none'}] (${lastMatchDiagnostic || 'no diagnostic'})`
+        `[searched: ${searched.join(', ') || 'none'}] (${perSourceDiag.join(' || ') || lastMatchDiagnostic || 'no diagnostic'})`
     }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
@@ -3403,7 +3436,7 @@ function restyleInSource(
      * surgical Tf rewrite cannot produce a second line.
      */
     const pageWidth = getPageSize(pageIndex).width
-    const available = pageWidth - targetBlock.x - PAGE_RIGHT_MARGIN
+    const available = wrapRoom(pageWidth, targetBlock.x, targetBlock.fontSize)
     const overflows = sizeRatio !== null && sizeRatio > 1 &&
       targetBlock.width * sizeRatio > available && available > 0
     let drawnLines = 1
@@ -3794,11 +3827,17 @@ function getActiveClipsAtOffset(
   const depths: number[] = []
   const current: Clip[] = []
 
-  const re = /((-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re)\s+W\*?\s+n\b|((-?[\d.]+)\s+(-?[\d.]+)\s+m\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l\s+h?)\s*W\*?\s+n\b|(?:^|[\s\]>])([qQ])(?=[\s(<\[/%]|$)/g
+  // The path form takes an OPTIONAL fifth point: Acrobat/InDesign close the
+  // rectangle with an explicit `x0 y0 l` back to the start instead of `h`
+  // (`m l l l l W* n`). Requiring exactly three `l` missed every clip on such
+  // a page, so a moved block's lower lines crossed the unexpanded clip and
+  // vanished — a bilingual supplier form lost its whole Chinese title line to
+  // a 20pt drag, reported by the sweep as 16 characters gone from a MOVE.
+  const re = /((-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re)\s+W\*?\s+n\b|((-?[\d.]+)\s+(-?[\d.]+)\s+m\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l(?:\s+(-?[\d.]+)\s+(-?[\d.]+)\s+l)?(?:\s+h)?)\s*W\*?\s+n\b|(?:^|[\s\]>])([qQ])(?=[\s(<\[/%]|$)/g
   let m: RegExpExecArray | null
   while ((m = re.exec(masked)) !== null) {
-    if (m[15] === 'q') { depths.push(current.length); continue }
-    if (m[15] === 'Q') { current.length = depths.length > 0 ? depths.pop()! : 0; continue }
+    if (m[17] === 'q') { depths.push(current.length); continue }
+    if (m[17] === 'Q') { current.length = depths.length > 0 ? depths.pop()! : 0; continue }
     // Clips INTERSECT, they do not replace one another. Word nests the SAME
     // rectangle twice around a table cell, so widening only the innermost left
     // the outer one still cutting the text off.
@@ -3813,6 +3852,8 @@ function getActiveClipsAtOffset(
     const px = [+m[7], +m[9], +m[11], +m[13]]
     const py = [+m[8], +m[10], +m[12], +m[14]]
     const eq = (a: number, b: number) => Math.abs(a - b) < 0.01
+    // A fifth point must be the first one again — anything else is a pentagon.
+    if (m[15] !== undefined && !(eq(+m[15], px[0]) && eq(+m[16], py[0]))) continue
     const hvhv = eq(py[0], py[1]) && eq(px[1], px[2]) && eq(py[2], py[3]) && eq(px[3], px[0])
     const vhvh = eq(px[0], px[1]) && eq(py[1], py[2]) && eq(px[2], px[3]) && eq(py[3], py[0])
     if (!hvhv && !vhvh) continue
@@ -5062,7 +5103,9 @@ function replaceTextInContentStreamFontAware(
     a.order - b.order
   )
 
+  const tried: string[] = []
   for (const c of candidates) {
+    tried.push(`${c.partial ? 'P' : c.line ? 'L' : 'S'}${c.score.toFixed(2)}@${Number.isFinite(c.dist) ? c.dist.toFixed(0) : '?'}:${JSON.stringify(c.blocks.map(b => b.decodedText.slice(0, 12)).join('|'))}`)
     // A line group provably FAR from the click is never the line the user
     // meant: a sloppy fuzzy run 90pt away once beat nothing at all, edited the
     // other copy of a repeated label, and clipped a glyph off its neighbour.
@@ -5094,6 +5137,7 @@ function replaceTextInContentStreamFontAware(
       }
       return result
     }
+    tried[tried.length - 1] += '→null'
   }
 
   // Nothing matched. Report what was actually on the page so the next
@@ -5101,12 +5145,16 @@ function replaceTextInContentStreamFontAware(
   // Record WHY nothing matched. Surfacing the decoder's own view is what turns
   // "Could not find matching text" from a dead end into a diagnosis: mojibake
   // here means a font-encoding problem, sensible text means a matcher problem.
+  // The candidates that WERE tried (kind, score, distance, text) and refused
+  // are listed too — the difference between "nothing looked like it" and
+  // "something did, and the apply step declined" is the whole triage.
   lastMatchDiagnostic =
     `${allBlocks.length} blocks, ${lineGroups.size} lines, font ${targetFontRef ?? 'any'}; saw ` +
     allBlocks.slice(0, 3).map(b =>
       `[${b.fontRef}@${b.hasPos ? `${Math.round(b.xPos)},${Math.round(b.yPos)}` : 'nopos'}]` +
       JSON.stringify(b.decodedText.slice(0, 28))
-    ).join(' ')
+    ).join(' ') +
+    (tried.length ? `; tried ${tried.slice(0, 4).join(' ')}` : '; no candidates')
   return null
 }
 
@@ -5320,7 +5368,7 @@ function layoutReplacementLines(
   pageWidth: number,
   sizeRatio = 1
 ): string[] {
-  const available = pageWidth - targetBlock.x - PAGE_RIGHT_MARGIN
+  const available = wrapRoom(pageWidth, targetBlock.x, targetBlock.fontSize)
   if (!(available > 0)) return newText.split('\n')
 
   const face = pickSubstituteFont(null, targetBlock)
@@ -5370,8 +5418,8 @@ function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number,
   const m = wrapMeasure(targetBlock)
   if (!m) return null
   const { face, unit } = m
-  const roomFirst = pageWidth - PAGE_RIGHT_MARGIN - windowPageX
-  const roomRest = pageWidth - PAGE_RIGHT_MARGIN - targetBlock.x
+  const roomFirst = wrapRoom(pageWidth, windowPageX, targetBlock.fontSize)
+  const roomRest = wrapRoom(pageWidth, targetBlock.x, targetBlock.fontSize)
   if (!(roomRest > 0) || !(unit > 0)) return null
   if (measureEm(text, face) * unit <= Math.max(roomFirst, 0)) return null
   const words = text.split(/\s+/).filter(Boolean)
@@ -5382,7 +5430,25 @@ function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number,
     if (measureEm(cand, face) * unit > roomFirst) break
     first = cand
   }
-  const rest = words.slice(k).join(' ')
+  let rest = words.slice(k).join(' ')
+  // The first WORD alone is wider than the first line: break it by characters
+  // there, the way `wrapToWidth` breaks an over-wide word on any other line.
+  // Leaving the first line empty put a 73pt cover title ("CATÁLOGO" →
+  // "SWEEPMARK") one whole line LOWER than it stood, with a bare `() Tj`
+  // where the title had been — the sweep read it as the text having left
+  // its place.
+  if (!first && k < words.length) {
+    const word = words[k]
+    let chunk = ''
+    for (const ch of word) {
+      if (chunk && measureEm(chunk + ch, face) * unit > roomFirst) break
+      chunk += ch
+    }
+    if (chunk.length > 0 && chunk.length < word.length) {
+      first = chunk
+      rest = [word.slice(chunk.length), ...words.slice(k + 1)].join(' ')
+    }
+  }
   const lines = first ? [first] : ['']
   if (rest) lines.push(...wrapToWidth(rest, roomRest / unit, face))
   return lines.length > 1 ? lines : null
@@ -5577,12 +5643,22 @@ function applyLineReplacement(
     // decode carries '?' placeholders is exempt — unreadable is not the same
     // as foreign, and refusing on it broke fonts with incomplete CMaps.
     const tFold = foldForMatch(targetBlock.text).replace(/\s+/g, '')
+    // A FAKE-BOLD double draw states the target twice: Canva writes the same
+    // run a fraction of a point apart, so extraction reports "AUTO" as
+    // "AAUUTTOO" while each block still draws plain "AUTO". Compared against
+    // the doubled text every block reads as foreign, the guard refused, and
+    // the headline of every Canva poster was uneditable with the matcher
+    // having found the right blocks (score 1.5, distance 0) and thrown them
+    // away. The halved form is accepted alongside the raw one; `undouble`
+    // demands EVERY character be paired, so it cannot fire on ordinary text.
+    const tHalf = tFold ? (undouble(tFold) ?? '').replace(/\s+/g, '') : ''
+    const inTarget = (bf: string) => tFold.includes(bf) || (!!tHalf && tHalf.includes(bf))
     if (tFold) {
       for (const b of contributing) {
         if (b === primary) continue
         const bf = foldForMatch(b.decodedText).replace(/\s+/g, '')
         if (!bf || bf.includes('?')) continue
-        if (!tFold.includes(bf)) return null
+        if (!inTarget(bf)) return null
       }
       // The PRIMARY too, when the run has other members: it is REWRITTEN, so
       // glyphs of its own that the target never named are deleted just as
@@ -5592,7 +5668,7 @@ function applyLineReplacement(
       // primary IS the match the scorer accepted.
       if (contributing.length > 1) {
         const pf = foldForMatch(primary.decodedText).replace(/\s+/g, '')
-        if (pf && !pf.includes('?') && !tFold.includes(pf)) return null
+        if (pf && !pf.includes('?') && !inTarget(pf)) return null
       }
     }
   }

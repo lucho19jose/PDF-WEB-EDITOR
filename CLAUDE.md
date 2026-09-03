@@ -2792,6 +2792,52 @@ with `compare-sweeps.mjs`. Unlink the junctions with `cmd /c rmdir` BEFORE
 removing the worktree — `git worktree remove` fails on them, and `rm -rf`
 would walk into the real `node_modules`.
 
+### A clip may be closed with a fifth point, and a narrow right column never wraps
+Round 2 of the sweep (80 never-swept Downloads PDFs, 38 producer families)
+found three defects that no file in the original 52 exposed.
+
+- **A path clip can carry FIVE points.** `getActiveClipsAtOffset` matched
+  `m l l l h W* n`; Acrobat and InDesign close the rectangle with an explicit
+  `x0 y0 l` back to the start instead of `h`, so every clip on such a page was
+  invisible to the scanner and none was grown. Moving a title on a bilingual
+  supplier form pushed its Chinese line outside the unexpanded clip and it
+  vanished from the render AND from extraction — 16 characters gone from a
+  MOVE, which must never change a character. The fifth point is accepted only
+  when it really is the first one again.
+- **A cell against the right edge must not wrap.** `wrapRoom` returns
+  `Infinity` — meaning "do not wrap" — for a block within three em of the
+  right margin. Such a block is the last column of a table, and a
+  continuation line is one leading down, i.e. exactly the next row: the tail
+  was drawn across the row beneath and extraction read the two interleaved
+  ("R 0K.0600" on a bank statement, on a SUNAT guide the same). Two rows
+  wrong, and the edit reported success. Drawn on one line the overflow can be
+  clipped by the paper edge — the justified-line limitation already
+  documented — but only the edited row is ever affected. Real edits to these
+  cells fit either way.
+- **A first line too narrow for the first WORD breaks that word.**
+  `wrapWindowText` left the first line EMPTY and pushed the word down, so a
+  73pt cover title was redrawn one whole line lower with a bare `() Tj` where
+  it had been.
+
+### A doubled-draw target states its text twice; the blank guard must halve it
+Canva fakes bold by drawing the same run twice a fraction of a point apart, so
+extraction reports "AUTO" as "AAUUTTOO" while each block still draws plain
+"AUTO". The undouble matcher finds those blocks correctly (score 1.5, distance
+0) — and `applyLineReplacement`'s guard, which refuses to blank a block whose
+folded text does not appear in the target, compared "auto" against "aauuttoo",
+found it foreign, and threw the match away. Every headline on every Canva
+poster was uneditable while the matcher had the right answer in hand. The
+guard now accepts the halved form as well; `undouble` requires EVERY character
+to be paired, so it cannot fire on ordinary text.
+
+The failure was invisible in the error message, because `lastMatchDiagnostic`
+is shared and each content source overwrote it: the report described a button
+two Form XObjects down while the failure was in the page stream. Diagnostics
+are collected PER SOURCE now, and the candidates that were tried and refused
+are listed with their kind, score, distance and text — the difference between
+"nothing looked like it" and "something did, and the apply step declined" is
+the whole triage.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
