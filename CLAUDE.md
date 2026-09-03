@@ -3265,6 +3265,46 @@ as nonsense while extraction still reads it correctly - the failure the sliver
 note above describes. A visible seam that says why beats a silent one that
 doesn't.
 
+### The first SOURCE that answers wins - so a source must not answer badly
+An order form draws the same "800.00" in three cells. The page stream holds ONE
+of them; the other two are in a Form XObject. Editing any of the three rewrote
+the page stream's copy - the wrong cell for two of them - reported success, and
+truncated the replacement off the right edge of the paper. `char_delta` 5 on an
+edit that should have changed nothing but its own cell.
+
+Nothing was wrong with the block ranking: only one BT block on that source held
+the value at all, so it won by having no competition. `replaceTextInStream`'s
+source loop STOPS at the first source that returns an outcome, so the XObject
+holding the clicked cell was never searched. A source that answers badly
+therefore costs the answer entirely, and the only way through is for a source
+with no plausible match to decline.
+
+Two position bars do that, both inside `applyPartialBlockReplacement`:
+
+- **The op-window guard covers every target length now**, not only three
+  characters and under. A short target keeps the tight bar (it identifies
+  nothing on its own, so position is all there is); a longer one gets
+  `max(24pt, 3x the target's height)`, which is not a ranking term but a test
+  for a window that is plainly somewhere else - another row, another column.
+  The failing window measured 117pt from the click.
+- **The in-array chooser REJECTS as well as sorts.** Distance only ordered the
+  candidate TJ arrays; nothing dropped one, so once the op window was refused
+  the array path applied the same wrong cell. `arrayTooFar` is one-sided in x
+  on purpose: an array is wide and its ops are placed from its start, so one
+  beginning to the LEFT of the target may well draw it further along, while one
+  beginning to the RIGHT of where the target ENDS cannot. Vertically there is
+  no such asymmetry - another baseline is another line.
+
+Measured over three corpora, 1279 experiments (main 262, r3 466, r6 551): **0
+gained, 0 lost, 3 changed**, and all three changed are the bug - `char_delta`
+5 to 0 and 3 to 0 where a wrong cell was being rewritten. Each of the three
+"800.00" cells now edits its own.
+
+**Still not a sweep success**, and honestly so: the synthetic replacement
+("SWEEPMARK47") is far wider than a numeric cell 90pt from the right edge, so it
+runs off the page - the justified-line limitation already recorded above. What
+changed is that the edit no longer damages a cell the user never named.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

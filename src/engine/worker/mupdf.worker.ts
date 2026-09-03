@@ -7928,9 +7928,30 @@ function applyPartialBlockReplacement(
    * three characters or fewer — below that length the text carries almost no
    * identification, and above it the op scan has a corpus behind it.
    */
-  if (best && targetLocal && targetNorm.length <= 3) {
+  if (best && targetLocal) {
     const gap = runGapToTarget(block, ops, best.i, best.j, pageIndex, targetLocal)
-    if (gap !== null && gap > Math.max(6, targetBlock.height || 0)) best = null
+    // A SHORT target is held to the tight bar above: it identifies nothing on
+    // its own, so position is all there is. A longer one gets a generous one,
+    // because it is only meant to catch a window that is plainly somewhere
+    // else - a different row, a different column of the same table.
+    //
+    // An order form draws the same "800.00" in three cells; the page stream
+    // holds only ONE of them and the other two live in a Form XObject. The op
+    // scan matched the page stream's copy at a gap of 117pt from the click,
+    // nothing outranked it because nothing else in that source matched at all,
+    // and the source loop STOPS at the first source that answers - so the
+    // Form XObject holding the clicked cell was never searched. Editing any of
+    // the three rewrote the same wrong one, reported success, and truncated
+    // the replacement off the right edge of the page for good measure.
+    //
+    // Refusing here is what lets the loop go on to the next source. The bar is
+    // the target's own height times three, floored at 24pt: a correct window
+    // sits ON the text, and the slack only has to cover a baseline sitting
+    // below the box and a run measured from its first op.
+    const bar = targetNorm.length <= 3
+      ? Math.max(6, targetBlock.height || 0)
+      : Math.max(24, (targetBlock.height || 0) * 3)
+    if (gap !== null && gap > bar) best = null
   }
 
   /**
@@ -8003,6 +8024,33 @@ function applyPartialBlockReplacement(
       return blockTfSize
     }
 
+    /**
+     * An array that starts past the target's right edge, or on another line, is
+     * not the array the click meant.
+     *
+     * Distance only SORTED these; nothing rejected one, so where a source held
+     * a single far-away copy of a repeated value it won by having no
+     * competition. An order form draws "800.00" in three cells, the page
+     * stream holds one of them and a Form XObject the other two: every one of
+     * the three rewrote the page stream's copy, 117pt from the click, and
+     * reported success. Refusing here is what lets the source loop go on to
+     * the XObject that holds the clicked cell.
+     *
+     * Deliberately one-sided in x. An array is wide and its ops are placed
+     * from its START, so one beginning to the LEFT of the target may well draw
+     * it further along; one beginning to the RIGHT of where the target ends
+     * cannot. Vertically there is no such asymmetry - a different baseline is
+     * a different line.
+     */
+    const arrayTooFar = (o: ShowOpInfo): boolean => {
+      if (!targetLocal) return false
+      const hi = Math.max(targetLocal.x, targetLocal.xEnd)
+      const xGap = o.x > hi ? o.x - hi : 0
+      const yGap = o.y < targetLocal.yLo ? targetLocal.yLo - o.y
+        : (o.y > targetLocal.yHi ? o.y - targetLocal.yHi : 0)
+      return xGap + yGap * 3 > Math.max(24, (targetBlock.height || 0) * 3)
+    }
+
     // Candidate arrays containing the target, nearest clicked position first
     const candidates = ops
       // Space-FREE on both sides: the gap between two cells is a KERN, so the
@@ -8010,7 +8058,8 @@ function applyPartialBlockReplacement(
       // and extraction can also invent a space inside a run this engine
       // re-encoded, which a merely collapsed comparison still trips over.
       .filter(o => o.kind === 'TJ' &&
-        o.decoded.replace(/\s+/g, '').includes(targetNorm.replace(/\s+/g, '')))
+        o.decoded.replace(/\s+/g, '').includes(targetNorm.replace(/\s+/g, '')) &&
+        !arrayTooFar(o))
       .sort((a, b) => {
         if (!targetLocal) return 0
         const da = Math.abs(a.x - targetLocal.x) + Math.abs(a.y - targetLocal.y) * 4

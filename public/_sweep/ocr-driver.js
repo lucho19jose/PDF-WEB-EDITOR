@@ -103,6 +103,58 @@ async function inkFraction(pageNo, rectPt) {
   return dark / (w * h)
 }
 
+/**
+ * Recognise the BAKED page again and compare each edited run's ink against the
+ * text the user typed. Two runs' texts are compared folded and space-free; a
+ * traced face that learned the wrong shapes scores near zero while the
+ * extracted text is a perfect match, which is exactly the gap being measured.
+ */
+async function rereadEdits(pageIndex, edits) {
+  const P = provides()
+  const ocr = P.ocr || window.__ocrLayer?.ocr
+  if (!ocr) return { error: 'no ocr composable' }
+  const canvas = await window.__pdfViewer.renderPageToCanvas(pageIndex + 1, 220 / 72)
+  if (!canvas) return { error: 'no canvas' }
+  const size = await window.__pdfEngine.getPageSize(pageIndex).catch(() => ({ width: 612, height: 792 }))
+  const res = await withTimeout(
+    ocr.recognizePage(canvas, pageIndex, size.width, size.height, undefined, false),
+    240000, 'reread')
+  if (!res) return { error: 'no result' }
+  const fold = (t) => (t || '').toLowerCase().replace(/\s+/g, '')
+  const out = []
+  for (const e of edits) {
+    if (!e.text || !e.rect) continue
+    const want = fold(e.text)
+    let best = null
+    for (const it of res.items) {
+      const r = it.rect
+      const ox = Math.min(r.x + r.width, e.rect.x + e.rect.width) - Math.max(r.x, e.rect.x)
+      const oy = Math.min(r.y + r.height, e.rect.y + e.rect.height) - Math.max(r.y, e.rect.y)
+      if (ox <= 0 || oy <= 0) continue
+      const area = ox * oy
+      if (!best || area > best.area) best = { area, text: it.text }
+    }
+    const got = fold(best?.text)
+    out.push({ want: e.text.slice(0, 50), got: (best?.text || '').slice(0, 50), sim: got ? similarity(want, got) : 0, traced: !!(e.font && /ScanFace/.test(e.font)) })
+  }
+  return { runs: res.items.length, edits: out }
+}
+
+/** Longest common subsequence over length — 1 is identical, 0 is unrelated. */
+function similarity(a, b) {
+  if (!a || !b) return 0
+  const prev = new Array(b.length + 1).fill(0)
+  for (let i = 1; i <= a.length; i++) {
+    let diag = 0
+    for (let j = 1; j <= b.length; j++) {
+      const t = prev[j]
+      prev[j] = a[i - 1] === b[j - 1] ? diag + 1 : Math.max(prev[j], prev[j - 1])
+      diag = t
+    }
+  }
+  return Math.round((prev[b.length] / Math.max(a.length, b.length)) * 100) / 100
+}
+
 export async function runPdf(entry, opts = {}) {
   const maxPages = opts.maxPages ?? 3
   const maxRuns = opts.maxRuns ?? 3
@@ -190,6 +242,15 @@ export async function runPdf(entry, opts = {}) {
           e.font = drawn?.fontName || null
           try { e.ink = e.rect ? await inkFraction(p, e.rect) : null } catch (_) { e.ink = null }
         }
+        // What the page SHOWS, not what it says. A scan face traced from a
+        // misaligned glyph cut draws every letter as its neighbour, so the line
+        // renders as nonsense while extraction still reads it back perfectly —
+        // the failure a user reports as "I edited one character and it broke"
+        // and that no text-level assertion here can see. Recognising the baked
+        // page again is the only reading of the ink there is.
+        try {
+          page.reread = await rereadEdits(pageIndex, page.edits)
+        } catch (err) { page.reread = { error: String(err?.message || err) } }
       } catch (err) {
         page.error = String(err?.message || err)
       }
