@@ -3208,6 +3208,53 @@ function transformInSource(
     }
 
     src.write(streamBytes)
+
+    // Text moved inside a Form XObject is bounded by that form's /BBox, and by
+    // every ancestor's box and the clips around each `Do`. The replace path
+    // already walks that chain; the move path did not, so a drag inside a
+    // nested form simply deleted the text (measured on an iLovePDF admission
+    // form: "Académicas" moved 20pt and was gone, char_delta 10 on an
+    // operation that must change no characters at all).
+    if (src.formDict) {
+      const d = deltaInSourceSpace(src, dx, dy)
+      growFormBBoxByDelta(src.formDict, d.ddx, d.ddy)
+    }
+    {
+      let child: any = src
+      const seen = new Set([src.key])
+      while (child.parentKey !== undefined && child.doOffset !== undefined) {
+        const parent: any = getFormNode(pageIndex, child.parentKey)
+        if (!parent || seen.has(parent.key)) break
+        seen.add(parent.key)
+        const pclips = getActiveClipsAtOffset(parent.stream, child.doOffset)
+          .sort((a, b) => b.index - a.index)
+        if (pclips.length) {
+          let pstream = parent.stream
+          let changed = false
+          withSource(parent, () => {
+            for (const clip of pclips) {
+              const widened = expandClipForTransform(parent.stream, clip, dx, dy, sx, sy, anchorX, anchorY)
+              if (widened) {
+                pstream = pstream.slice(0, clip.index) + widened + pstream.slice(clip.index + clip.length)
+                changed = true
+              }
+            }
+          })
+          if (changed) {
+            const pbytes = new Uint8Array(pstream.length)
+            for (let i = 0; i < pstream.length; i++) pbytes[i] = pstream.charCodeAt(i) & 0xFF
+            parent.write(pbytes)
+            clipAdjusted = true
+          }
+        }
+        if (parent.formDict) {
+          const pd = deltaInSourceSpace(parent, dx, dy)
+          growFormBBoxByDelta(parent.formDict, pd.ddx, pd.ddy)
+        }
+        child = parent
+      }
+    }
+
     invalidateContentSources(pageIndex)
     return {
       success: true,
@@ -3986,6 +4033,53 @@ function widenClipForText(
  * Hiding content is the failure being fixed here, so that is the safe direction
  * to err in.
  */
+/**
+ * Grow a Form XObject's /BBox so text MOVED inside it is still drawn.
+ *
+ * A form is clipped to its own box even with no `re W n` in sight, and the
+ * move path never touched it: dragging a heading inside an iLovePDF form
+ * pushed it past the edge of the box and it vanished from the render AND from
+ * extraction, with the move reporting success and `clipAdjusted: false`. A
+ * move must never change a character, and this one deleted the word.
+ *
+ * The box only ever GROWS, and only in the direction of travel, so it can
+ * reveal more of the form's own content and never hide anything.
+ */
+function growFormBBoxByDelta(formDict: any, ddx: number, ddy: number): void {
+  if (!pdfDoc) return
+  if (!(Math.abs(ddx) > 0.01 || Math.abs(ddy) > 0.01)) return
+  try {
+    const bbox = formDict.get('BBox')
+    if (!bbox || String(bbox) === 'null') return
+    const arr = bbox.resolve ? bbox.resolve() : bbox
+    if (arr.length !== 4) return
+    const v = [0, 1, 2, 3].map(i => Number(String(arr.get(i))))
+    if (v.some(n => !Number.isFinite(n))) return
+    const x0 = Math.min(v[0], v[2]), x1 = Math.max(v[0], v[2])
+    const y0 = Math.min(v[1], v[3]), y1 = Math.max(v[1], v[3])
+    const nx0 = x0 + Math.min(0, ddx), nx1 = x1 + Math.max(0, ddx)
+    const ny0 = y0 + Math.min(0, ddy), ny1 = y1 + Math.max(0, ddy)
+    const out = pdfDoc.newArray()
+    out.push(pdfDoc.newReal(nx0))
+    out.push(pdfDoc.newReal(ny0))
+    out.push(pdfDoc.newReal(nx1))
+    out.push(pdfDoc.newReal(ny1))
+    formDict.put('BBox', out)
+  } catch (_) { /* leave the box alone rather than corrupt it */ }
+}
+
+/** A page-space vector expressed in a source's own coordinates. */
+function deltaInSourceSpace(src: { invokeCtm?: Mat6 }, dx: number, dy: number): { ddx: number; ddy: number } {
+  const m = src.invokeCtm
+  if (!m) return { ddx: dx, ddy: dy }
+  const det = m[0] * m[3] - m[1] * m[2]
+  if (!(Math.abs(det) > 1e-9)) return { ddx: dx, ddy: dy }
+  return {
+    ddx: (dx * m[3] - dy * m[2]) / det,
+    ddy: (dy * m[0] - dx * m[1]) / det
+  }
+}
+
 function expandClipForTransform(
   stream: string,
   clip: { index: number; length: number; rect: [number, number, number, number] },

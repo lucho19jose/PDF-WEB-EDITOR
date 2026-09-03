@@ -2903,6 +2903,27 @@ width fit ("widths do not fit the letters"), and one Latin line at the shape
 check. They fall back to Noto or Helvetica, which is a visible seam but never
 a wrong glyph.
 
+### A move inside a Form XObject must grow that form's /BBox — and its ancestors'
+A form is clipped to its own /BBox even with no `re W n` in sight. The REPLACE
+path has walked the ancestor chain for a long time, widening each box and the
+clips around every `Do`; the MOVE path did neither. Dragging a heading inside
+an iLovePDF admission form therefore pushed it past the edge of the box, where
+it vanished from the render AND from every extractor, while the operation
+reported success with `clipAdjusted: false` — measured, "Académicas" moved
+20pt and was gone, char_delta 10 on an operation that must change no
+characters at all.
+
+`growFormBBoxByDelta` extends the box ONLY in the direction of travel, and
+only ever outward, so it can reveal more of the form's own content and never
+hide anything. The delta is mapped into each source's own coordinates through
+the inverse of its `invokeCtm` (`deltaInSourceSpace`), because a form's box
+lives in the form's space, not the page's. The ancestor walk mirrors the
+replace path's, expanding the clips in force at each nested `Do` with
+`expandClipForTransform`.
+
+Measured across three corpora: baseline 262/235 (was 232), round 2 439/392
+unchanged, round 3 466/401 (was 398), zero lost anywhere.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
