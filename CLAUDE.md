@@ -3489,18 +3489,106 @@ now "a fifth or more": with one fewer suspect the RJ notice's address line
 (10 of 50) was admitted and drew as half-height capitals; refused, it falls
 back as it did at HEAD.
 
-**Known limitations.** (1) Two lines that TOUCH on the scan - a bold caps
-line whose baseline meets the cap tops of the line beneath (the RJ notice's
-"EMPRESA MINERA…" over "AV. REPUBLICA…") - share a box: no empty row
-separates them, so the stray-band strip cannot cut there, the lower line's
-box starts 1.3pt inside the upper one (was 3pt at HEAD) and the bake's patch
-shaves the bottom of the line above. Separating them needs a column-aware
-cut, not a row one. (2) A detector box that spans two visual lines
-(014.pdf's "N° Const / Detracción") is sized to both; `refineLines` cuts only
-on horizontal gaps. (3) One 4-letter run ("Zone", 011.pdf page 3) went from
+**Known limitation:** one 4-letter run ("Zone", 011.pdf page 3) went from
 traced at 1.0 to refused at 0.2 in the sweep, with its box growing from 9 to
 13.4pt; the page could not be re-inspected because pdf.js does not return a
 render of that 79-page scan's page 3 within 90 s outside the sweep.
+
+### A neighbour's letters behind a gap are dense; a cut border's edge column is one pixel
+Second round on the same corpus, four measurement defects and one new cut:
+
+- **The bold line above the RJ notice's address ends four rows inside the
+  address's box** (200, 161, 112, 41 inked columns of 733), then three empty
+  rows, then the address. The stray-band strip saw the gap and refused the
+  band for being dense — it was written for crumbs. Density is exactly what
+  tells a neighbour's letters (27% of the width in a row) from an accent or
+  an "i" dot (2%): a short band (a quarter of the body at most) that is dense
+  (a row over 15% of the width), on a box at least four ems wide, leaving a
+  body half an em tall, is stripped. The address's box now starts 1.3pt
+  BELOW the line above instead of inside it, its patch no longer shaves that
+  line, and its em is no longer taken from a box four rows too tall.
+- **Punctuation descends a tenth of an em, a "g" a quarter.** `DESCENDERS`
+  put commas and semicolons with the letters, so an all-caps address with a
+  comma in it ("262,08 (OCTAVO PISO)") was read as 0.95 of an em tall and
+  sized 7.6pt beside a 10.3pt line in the same face. `boxPerEm` gives a
+  punctuation-only line 0.85; the glyph cut's em uses the same three ratios.
+- **A rule is THIN.** The span bar (two ems, from the text's expected
+  advances) is small on a short bold word: "Detracción" at 19px per em has
+  60-column spans in every row of its x-height band, and cleared row by row
+  as "rules" the box had no ink left to measure — `inkBounds` returned the
+  detector's box untouched, 15.1pt for a 6pt word. `clearRuleSpans` now
+  measures a span's thickness (rows carrying ink over 70% of its columns) and
+  keeps anything thicker than a quarter of the em; spans are judged on the
+  original bitmap and blanked afterwards, or one row's clearing thins the
+  band the next row is measured against.
+- **A row with one pixel is not a glyph row.** The same box's left border is
+  three columns wide and only two of them are inked down 80% of the box; the
+  third left one pixel per row, and `trimProfile`'s floor of one pixel kept
+  nine empty rows above the word. The floor is two.
+- **Tesseract's glyph boxes as a second cut.** Half the corpus's refusals are
+  "letters touch": PaddleOCR gives one box per line and the column profile
+  cannot separate letters that share ink. When the profile cut refuses a run
+  without glyph boxes, `traceItem` crops the run (0.6 of its height of margin)
+  and reads it once more with Tesseract for its symbol boxes ALONE — its
+  reading must have the same non-space count and agree on four letters in
+  five, or the boxes describe another line — and cuts again on those. Engine
+  boxes go through `vetCells`, the same width, shape and sliver checks a
+  profile cut gets; the Tesseract-engine path was tracing its boxes unvetted
+  before this.
+
+Chasing the first run the fallback admitted — the 35pt underlined
+"MINERA SHOUXIN PERU S.A." of a CamScanner PDF — found four more things, each
+visible only in the traced OUTLINES (draw `face.glyphs.get(ch).path` on a
+canvas; the baked render and the re-read both looked plausible):
+
+- **A tilted rule is a CHAIN of short spans.** The underline crossed the box
+  diagonally, 120 columns per row where the bar was 270, so no row on its own
+  was a rule; it stayed, the baseline was fitted through it and every glyph
+  hung above its own baseline with a piece of the underline for a foot.
+  `clearRuleSpans` now takes every thin span of a third of the bar as a
+  candidate, joins candidates in adjacent rows that overlap in x, and judges
+  the chain's extent. Lowering the candidate length to an eighth (for a rule
+  at 28 columns per row) chained the tops of the letters it crossed into it
+  and shaved them — reverted; that rule stays, see the height guard.
+- **Rule thickness needs 90% overlap, not 70%.** The bottoms of a heavy caps
+  line sitting on its underline cover two thirds of the underline's columns
+  and, counted as part of it, made the rule "thick".
+- **A cell's bottom needs a few pixels, not one.** `cellExtent` counts a row
+  only with two pixels and a sixth of the cell's densest row; the fringe of
+  an underline put a pixel under most letters and each cell ended in it.
+- **Nothing below the baseline belongs to a letter that does not descend.**
+  `cellBitmap` cuts a non-descending character's bitmap at the fitted
+  baseline; a descender keeps what hangs below. And the letters must FILL
+  their box: when the second-tallest cell is under 55% of the box's height
+  the box holds something else (a rule through its top) and the em from it
+  is inflated — the run is refused rather than traced at half size beside a
+  full-size fallback glyph.
+
+`stripEdgeCrumbs` (specks under 3% of a cell's ink, thin pieces hugging a
+cell's side) and a one-to-three-column erosion where two cells touch also
+went in; neither was what this line needed, both are cheap and safe.
+
+**The Tesseract fallback is gated hard, and the sweep is why.** Admitted at
+the profile cut's bar it traced a 6-letter "MINERA" as nonsense (re-read
+similarity 0 against 0.83 in Helvetica) and a 4.7pt "Escaneado con
+CamScanner" watermark at 0.67, for one good line; the corpus average went
+DOWN, 0.899 to 0.880. Engine boxes are now accepted only with NO suspect cell
+(one box straddling a join means the engine misread the segmentation), for
+runs of eight characters or more with 20px or more of ink, from a line
+Tesseract read at 85% or better. Measured after the first two gates: 71/71
+read back, 28 traced, 0.892; the watermark was the one fallback trace left,
+hence the height gate.
+
+Round by round on the 14-document corpus (71 edits): HEAD 69 found / 24
+traced / 0.873 → round 1 (rule spans, 1:1 raster) 70 / 27 / 0.879 → round 2
+(neighbour bands, em ratios, thickness, one-pixel floor) 70 / 27 / 0.899 (with
+one transient page) → round 3 (chains, cell extents, loose fallback) 71 / 30
+/ 0.880 → round 4 (gated fallback) 71 / 28 / 0.892 → round 5 (fallback
+height gate) 71 / 27 / 0.896. In round 5 every row under 0.6 is a base-font
+fallback except "15-09-2021" at 0.27, whose dashes the re-read miscounts; the
+others are the known ones — the "EL EGO" 170pt cover title (2 of 5 cells
+suspect), "Zone" on the 79-page calibration scan, "distance", "Detracción".
+No traced row reads back under 0.85 apart from that date.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates

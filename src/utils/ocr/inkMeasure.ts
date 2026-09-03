@@ -19,6 +19,8 @@ interface Profile {
   rows: Uint16Array
   /** 1 where a column is a vertical rule (inked down most of the box). */
   ruleCol: Uint8Array
+  /** The binarised box, rules already cleared — for tests that need more than the two profiles. */
+  ink: Uint8Array
   x: number
   y: number
   width: number
@@ -49,8 +51,35 @@ interface Profile {
  * row would cut every other glyph on it in two. A one-pixel break does not
  * end a span; a scanner drops pixels off a thin line as readily as off a stem.
  */
-export function clearRuleSpans(ink: Uint8Array, w: number, h: number, minSpan: number): number {
+export function clearRuleSpans(ink: Uint8Array, w: number, h: number, minSpan: number, maxThick = 4): number {
   let cleared = 0
+  // How many rows, counting this one, carry ink over most of the span's
+  // columns. A rule is THIN - a hairline is one row at 220 DPI, a 1pt border
+  // three, and a skewed one drifts a column or two per row, which the 70%
+  // overlap absorbs. A word whose bold letters touch is not: "Detracción" at
+  // 19px per em put a 60-column span in every row of its x-height band, nine
+  // rows deep, and read as a rule it was blanked row by row until the box had
+  // no ink left to measure. Thickness is what separates them.
+  const thickness = (yy: number, start: number, end: number): number => {
+    const cols = end - start + 1
+    // Over 90% of the span's columns, not 70%: the bottoms of a heavy caps line
+    // sitting ON its underline cover two thirds of the underline's columns,
+    // and counted as part of it they made the rule "thick" and kept it.
+    const inked = (r: number) => { let n = 0; for (let xx = start; xx <= end; xx++) n += ink[r * w + xx]; return n >= cols * 0.9 }
+    let t = 1
+    for (let r = yy - 1; r >= 0 && t <= maxThick && inked(r); r--) t++
+    for (let r = yy + 1; r < h && t <= maxThick && inked(r); r++) t++
+    return t
+  }
+  // Every thin span of at least a third of the bar is a CANDIDATE, and
+  // candidates in neighbouring rows whose columns overlap are one thing: a
+  // tilted rule crosses a box diagonally, and a 35pt line's underline put a
+  // 120-column piece in each of six rows where the bar was 270 - no row on
+  // its own was a rule, the underline stayed, the baseline was fitted through
+  // it and the glyphs were traced floating above a bar. What is judged is
+  // the CHAIN's extent, min x0 to max x1. A glyph's bottom bar ("E", "L") is
+  // a few rows of the same 0.6em span - a chain no wider than the bar itself.
+  const spans: { row: number; start: number; end: number }[] = []
   for (let yy = 0; yy < h; yy++) {
     const row = yy * w
     let start = -1, lastOn = -1
@@ -60,15 +89,49 @@ export function clearRuleSpans(ink: Uint8Array, w: number, h: number, minSpan: n
       if (start < 0) continue
       if (xx - lastOn <= 1 && xx < w) continue
       const len = lastOn + 1 - start
-      // A span cut off by the box's own edge is only PART of whatever it is,
-      // so the bar is lowered for it: a rule leaving the box through its side
-      // showed 46 columns of a 200-column fragment, and a glyph touching the
-      // edge is still no wider than a glyph (an ideograph about one em, the
-      // bar here is 1.2 of the hinted em).
-      const bar = (start === 0 || lastOn === w - 1) ? minSpan * 0.6 : minSpan
-      if (len >= bar) { ink.fill(0, row + start, row + lastOn + 1); cleared += len }
+      // A third of the bar. An eighth was tried, for a rule tilted enough to
+      // leave 28 columns per row: it chained the tops of the letters it
+      // crossed into the rule and shaved them off. That rule stays; a box it
+      // crosses is refused by the height guard in the glyph cut instead.
+      if (len >= minSpan * 0.3 && thickness(yy, start, lastOn) <= maxThick) spans.push({ row: yy, start, end: lastOn })
       start = -1
     }
+  }
+  if (!spans.length) return 0
+  // Union-find over spans in adjacent rows that overlap in x (two columns of
+  // slack for a rule that steps as it tilts).
+  const parent = spans.map((_, i) => i)
+  const find = (i: number): number => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i] } return i }
+  spans.sort((a, b) => a.row - b.row || a.start - b.start)
+  let rowStart = 0
+  for (let i = 0; i < spans.length; i++) {
+    while (spans[rowStart].row < spans[i].row - 1) rowStart++
+    for (let j = rowStart; j < i; j++) {
+      if (spans[j].row !== spans[i].row - 1) continue
+      if (spans[j].end + 2 >= spans[i].start && spans[i].end + 2 >= spans[j].start) {
+        const a = find(i), b = find(j)
+        if (a !== b) parent[a] = b
+      }
+    }
+  }
+  const chains = new Map<number, { x0: number; x1: number; members: number[] }>()
+  spans.forEach((s, i) => {
+    const r = find(i)
+    const c = chains.get(r) ?? { x0: s.start, x1: s.end, members: [] }
+    c.x0 = Math.min(c.x0, s.start); c.x1 = Math.max(c.x1, s.end); c.members.push(i)
+    chains.set(r, c)
+  })
+  for (const c of chains.values()) {
+    // A chain cut off by the box's own edge is only PART of whatever it is,
+    // so the bar is lowered for it: a rule leaving the box through its side
+    // showed 46 columns of a 200-column fragment, and a glyph touching the
+    // edge is still no wider than a glyph (an ideograph about one em, the
+    // bar here is 1.2 of the hinted em).
+    const bar = (c.x0 === 0 || c.x1 === w - 1) ? minSpan * 0.6 : minSpan
+    if (c.x1 - c.x0 + 1 < bar) continue
+    // Blanked only now, after every row has been judged, or clearing one row
+    // would thin the band the next row's thickness is measured against.
+    for (const i of c.members) { const s = spans[i]; ink.fill(0, s.row * w + s.start, s.row * w + s.end + 1); cleared += s.end - s.start + 1 }
   }
   return cleared
 }
@@ -103,7 +166,9 @@ function profile(ctx: CanvasRenderingContext2D, rect: InkRect, ruleSpan?: number
   // A rule that is only PARTLY inside the box — see `clearRuleSpans`. The
   // detector's box is padded, so on its own height the bar can only be set
   // generously; `inkBounds` comes back with a bar from the TIGHT height.
-  clearRuleSpans(ink, w, h, ruleSpan ?? h * 1.5)
+  // A rule's thickness: a quarter of the em when the em is known (the hint is
+  // two ems), else a tenth of the box, never under four rows.
+  clearRuleSpans(ink, w, h, ruleSpan ?? h * 1.5, Math.max(4, Math.round(ruleSpan ? ruleSpan * 0.125 : h * 0.12)))
   const rawCols = new Uint16Array(w)
   const rawRows = new Uint16Array(h)
   for (let yy = 0; yy < h; yy++) {
@@ -131,7 +196,7 @@ function profile(ctx: CanvasRenderingContext2D, rect: InkRect, ruleSpan?: number
       rows[yy]++
     }
   }
-  return { cols, rows, ruleCol, x, y, width: w, height: h }
+  return { cols, rows, ruleCol, ink, x, y, width: w, height: h }
 }
 
 /**
@@ -153,7 +218,7 @@ export function inkBounds(ctx: CanvasRenderingContext2D, rect: InkRect, emHint?:
   const hinted = emHint && emHint > 2 ? emHint * 2 : undefined
   const p = profile(ctx, rect, hinted)
   if (!p) return rect
-  let box = trimProfile(p)
+  let box = trimProfile(p, emHint)
   if (!box) return rect
   // Second pass with the rule bar set from the TIGHT height. The first pass
   // could only measure spans against the detector's padded box, and a thick
@@ -165,15 +230,19 @@ export function inkBounds(ctx: CanvasRenderingContext2D, rect: InkRect, emHint?:
   const tight = box.bottom - box.top + 1
   if (tight * 2 < (hinted ?? p.height * 1.5)) {
     const p2 = profile(ctx, rect, tight * 2)
-    const box2 = p2 && trimProfile(p2)
+    const box2 = p2 && trimProfile(p2, emHint)
     if (p2 && box2) return { x: p2.x + box2.left, y: p2.y + box2.top, width: box2.right - box2.left + 1, height: box2.bottom - box2.top + 1 }
   }
   return { x: p.x + box.left, y: p.y + box.top, width: box.right - box.left + 1, height: box.bottom - box.top + 1 }
 }
 
 /** The tight ink extent of a profile, or null when it holds nothing worth boxing. */
-function trimProfile(p: Profile): { top: number; bottom: number; left: number; right: number } | null {
-  const minRow = Math.max(1, Math.round(p.width * 0.01))
+function trimProfile(p: Profile, emHint?: number): { top: number; bottom: number; left: number; right: number } | null {
+  // Never one pixel: the edge column of a three-pixel cell border is inked
+  // down 77% of the box, under the rule test's 80%, and its one pixel per row
+  // held a box nine empty rows above its word ("Detracción", 15.1pt for a
+  // 6pt word). A glyph row has at least a stem's worth.
+  const minRow = Math.max(2, Math.round(p.width * 0.01))
   const minCol = Math.max(1, Math.round(p.height * 0.05))
   let top = 0, bottom = p.height - 1
   while (top < bottom && p.rows[top] < minRow) top++
@@ -206,13 +275,46 @@ function trimProfile(p: Profile): { top: number; bottom: number; left: number; r
   const stray = totalInk * 0.015
   const gapRows = 3
   const bandRows = Math.max(2, Math.round((bottom - top + 1) * 0.3))
+  //
+  // A band behind such a gap that is NOT sparse is a neighbouring line's
+  // letters: the bold caps line above the RJ notice's address ends four rows
+  // inside the address's box (200, 161, 112, 41 inked columns of 733), then
+  // three empty rows, then the address. Sparse it is not — 27% of the width
+  // in its densest row, against the 2% an accent or an "i" dot puts on a
+  // line — so density tells the two apart. Such a band is stripped when it
+  // is short beside the body (a quarter of it at most), dense (a row inked
+  // over 15% of the width), on a box wide enough to be a line (four ems),
+  // and what remains is at least half an em tall. Without it the address's
+  // patch painted over the bottom of the line above, and its em, taken from
+  // a box four rows too tall, drew the traced glyphs at 85% of their size.
+  const emPx = emHint && emHint > 2 ? emHint : 0
   const strayBand = (from: number, limit: number, step: 1 | -1): number => {
-    let yy = from, ink = 0
+    let yy = from, ink = 0, densest = 0
     while (Math.abs(yy - from) < bandRows && yy !== limit) {
       ink += p.rows[yy]
+      if (p.rows[yy] > densest) densest = p.rows[yy]
       let gap = 0
       while (yy + step * (1 + gap) !== limit + step && p.rows[yy + step * (1 + gap)] < minRow) gap++
-      if (gap >= gapRows) return ink <= stray ? yy + step * (1 + gap) : from
+      if (gap >= gapRows) {
+        const next = yy + step * (1 + gap)
+        if (ink <= stray) return next
+        const bandH = Math.abs(yy - from) + 1
+        const bodyH = Math.abs(limit - next) + 1
+        const neighbour = emPx > 0 && p.width >= emPx * 4 && densest >= p.width * 0.15 &&
+          bandH <= bodyH * 0.25 && bodyH >= emPx * 0.5
+        if (neighbour) return next
+        // A blob in one CORNER: the black edge of a scanned page reaching into
+        // the top-left of a title's box, tall and dense but confined to a
+        // few columns. Text runs the width of its box; ink whose columns span
+        // under an eighth of it is not text. Half an em of body must remain.
+        let cx0 = p.width, cx1 = -1
+        for (let r = Math.min(from, yy); r <= Math.max(from, yy); r++) {
+          for (let xx = 0; xx < p.width; xx++) if (p.ink[r * p.width + xx] && !p.ruleCol[xx]) { if (xx < cx0) cx0 = xx; if (xx > cx1) cx1 = xx }
+        }
+        const corner = cx1 >= cx0 && (cx1 - cx0 + 1) <= p.width * 0.125 && p.width >= 8 * (cx1 - cx0 + 1) &&
+          (emPx <= 0 || bodyH >= emPx * 0.5)
+        return corner ? next : from
+      }
       yy += step * (1 + gap)
     }
     return from

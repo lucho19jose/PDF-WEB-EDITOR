@@ -71,6 +71,23 @@ const GLYPH_BOX_PER_EM_NO_DESCENDER = 0.76
 const DESCENDERS = /[gjpqyQ,;]/
 
 /**
+ * How much of an em the tallest glyph box is, for `text`.
+ *
+ * A comma or a parenthesis hangs a tenth of an em below the baseline where a
+ * "g" or a "p" hangs a quarter, so a line whose only descenders are
+ * punctuation - an all-caps address, "262,08 (OCTAVO PISO)" - is about 0.85
+ * of an em tall, not 0.95. Reading it as 0.95 set the RJ notice's address at
+ * 7.6pt beside a 10.3pt line drawn in the same face.
+ */
+const LETTER_DESCENDERS = /[gjpqyQ]/
+const PUNCT_DESCENDERS = /[,;()\[\]{}]/
+export function boxPerEm(text: string): number {
+  if (LETTER_DESCENDERS.test(text)) return GLYPH_BOX_PER_EM
+  if (PUNCT_DESCENDERS.test(text)) return 0.85
+  return GLYPH_BOX_PER_EM_NO_DESCENDER
+}
+
+/**
  * The same fraction for a monospaced face.
  *
  * Courier's ascenders reach 0.63 of the em where Helvetica's reach 0.72, so the
@@ -216,11 +233,94 @@ function createOCR() {
     try {
       const res = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, symbols, item.text)
       if (res.added) faceVersion.value++
-      return res
+      // A PaddleOCR run carries ONE box as its "symbols" (its own line box,
+      // from `refineLines`); only a box per character is a glyph cut.
+      const perGlyph = !!symbols && symbols.length === [...item.originalText].filter(c => c !== ' ').length
+      if (res.added || !res.refused || perGlyph) return res
+      // The profile cut refused — letters that touch, too many fragments, a
+      // misaligned end. PaddleOCR reports no glyph boxes, and the column
+      // profile is the only cut there was; Tesseract does report them, and
+      // segments touching letters with its recogniser rather than by ink.
+      // Half the corpus's refusals are "letters touch", so the run is cropped
+      // and read once more, by Tesseract, for its boxes alone. Its READING has
+      // to agree with the run's text (same count, four letters in five the
+      // same) or the boxes describe some other line; and the cells it gives
+      // are vetted exactly as a profile cut is.
+      const boxes = await glyphBoxesFromTesseract(raster.ctx, rect, item.originalText).catch(() => null)
+      if (!boxes) return res
+      const again = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, boxes, item.text)
+      if (again.added) { faceVersion.value++; return again }
+      return { added: 0, refused: `${res.refused}; on Tesseract's glyph boxes: ${again.refused || 'nothing to add'}` }
     } catch (err) {
       console.warn('[OCR] scan face tracing failed:', err)
       return { added: 0, refused: null }
     }
+  }
+
+  /**
+   * Tesseract's per-glyph boxes for the run at `rect` (raster pixels), in
+   * raster coordinates and reading order — or null when its reading does not
+   * match `text` closely enough to trust the boxes.
+   */
+  async function glyphBoxesFromTesseract(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; width: number; height: number }, text: string): Promise<OcrBox[] | null> {
+    const chars = [...text].filter(c => c !== ' ')
+    // Eight characters at least: on the corpus the fallback's wrong traces were
+    // the short runs ("MINERA", "EL EGO"), where a count that matches and four
+    // letters in five agreeing is little evidence that the boxes are the run's.
+    if (chars.length < 8) return null
+    // And a run tall enough to trace at all: a 4.7pt "Escaneado con
+    // CamScanner" watermark (14px of ink) passed every other gate and traced
+    // at 0.67 similarity — glyphs seven pixels tall are not letterforms.
+    if (rect.height < 20) return null
+    // Room around the run: the recogniser wants margin, and a crop cut at the
+    // ink loses the descenders' tails and the accents.
+    const pad = Math.max(6, Math.round(rect.height * 0.6))
+    const x = Math.max(0, Math.floor(rect.x) - pad), y = Math.max(0, Math.floor(rect.y) - pad)
+    const w = Math.min(ctx.canvas.width - x, Math.ceil(rect.width) + pad * 2)
+    const h = Math.min(ctx.canvas.height - y, Math.ceil(rect.height) + pad * 2)
+    if (w < 4 || h < 4) return null
+    const crop = document.createElement('canvas')
+    crop.width = w; crop.height = h
+    const cctx = crop.getContext('2d')
+    if (!cctx) return null
+    cctx.drawImage(ctx.canvas, x, y, w, h, 0, 0, w, h)
+    const rec = await engineFor('tesseract').recognize(crop, { lang: OCR_DEFAULT_LANG })
+    // The line that overlaps the run most; a crop this tight rarely holds two.
+    const cy = rect.y - y + rect.height / 2
+    let best: OcrLine | null = null, bestScore = 0
+    for (const line of rec.lines) {
+      const oy = Math.min(line.box.y1, cy + rect.height / 2) - Math.max(line.box.y0, cy - rect.height / 2)
+      if (oy > bestScore) { bestScore = oy; best = line }
+    }
+    // A confident reading only: a 4.7pt "Escaneado con CamScanner" watermark
+    // read at low confidence traced at 0.67 similarity.
+    if (!best || best.confidence < 85) return null
+    const got: string[] = [], boxes: OcrBox[] = []
+    for (const word of best.words ?? []) {
+      const wc = [...(word.text ?? '')].filter(c => c !== ' ')
+      const syms = word.symbols ?? []
+      if (wc.length !== syms.length) return null
+      got.push(...wc)
+      for (const s of syms) boxes.push({ x0: s.x0 + x, y0: s.y0 + y, x1: s.x1 + x, y1: s.y1 + y })
+    }
+    if (got.length !== chars.length) return null
+    const fold = (c: string) => c.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
+    let same = 0
+    for (let i = 0; i < chars.length; i++) if (fold(got[i]) === fold(chars[i])) same++
+    if (same < chars.length * 0.8) return null
+    // Where two letters touch, Tesseract's box for the first often runs on
+    // over the second ("R" 131–196 beside "A" 170–196 on a heavy 35pt line)
+    // while the second's own box is right. A box is clipped at the next one's
+    // start; the vetting then judges what is left. Boxes must be in reading
+    // order for that, and a box emptied by the clip means the pair was one
+    // blob to the engine too - give up rather than guess. The boxes stay in
+    // the engine's order, which is the order of `got`: sorting would break
+    // the pairing with the characters.
+    for (let i = 0; i + 1 < boxes.length; i++) {
+      if (boxes[i].x1 > boxes[i + 1].x0) boxes[i] = { ...boxes[i], x1: boxes[i + 1].x0 }
+      if (boxes[i].x1 - boxes[i].x0 < 2) return null
+    }
+    return boxes
   }
 
   /** How an item's ink would be cut into glyph cells — for tests and the harness. */
@@ -379,7 +479,7 @@ function createOCR() {
     let at = 0
     while (at < 2 && heights.length - at >= 4 && heights[at] > heights[at + 1] * 1.25) at++
     const capPx = heights[at] ?? 0
-    const perEm = DESCENDERS.test(text) ? GLYPH_BOX_PER_EM : GLYPH_BOX_PER_EM_NO_DESCENDER
+    const perEm = boxPerEm(text)
     return capPx > 1 ? capPx / perEm : fallbackHeight * 1.05
   }
 
@@ -496,7 +596,7 @@ function createOCR() {
       const emGuess = rect.width / Math.max(1, [...line.text].filter(c => c !== ' ').reduce((s, c) => s + expectedAdvance(c), 0))
       const ink = inkBounds(ctx, rect, emGuess)
       const cjk = isMostlyCjk(line.text)
-      const emPx = ink.height / (cjk ? GLYPH_BOX_PER_EM_CJK : (DESCENDERS.test(line.text) ? GLYPH_BOX_PER_EM : GLYPH_BOX_PER_EM_NO_DESCENDER))
+      const emPx = ink.height / (cjk ? GLYPH_BOX_PER_EM_CJK : boxPerEm(line.text))
       // Only an UNMISTAKABLE gap cuts (two and a half ems — the same bar
       // `splitRuns` sets): justified prose opens word gaps past an em, and a
       // 1.2 em bar cut "En caso de incumplimiento…" in two and the re-read
