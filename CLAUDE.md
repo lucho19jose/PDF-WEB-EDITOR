@@ -3101,6 +3101,35 @@ has neither a governing Tm nor a line-leading run, so the last-resort pass
 never admits the block and `findTargetSegment` is never reached. Admitting a
 block on a segment hit would be the next step and is not implemented.
 
+### A segment hit ADMITS a block for moving — and must sit on the clicked ROW
+The move matcher's last-resort pass admitted a block only when
+`findGoverningTm` or a line-leading run could be found. A Ghostscript
+timesheet draws a whole row as one TJ array inside a block that shares its Tm
+with every other row, so a mid-line cell like "16:00" has neither: the block
+was never admitted, `findTargetSegment` was never reached, and dragging a cell
+reported "could not find matching text" while EDITING the same cell worked.
+A segment hit is now a third way in.
+
+**On its own that change moved the WRONG ROW, and the sweep's totals hid it.**
+It scored +1 with nothing lost — but four experiments went from refusing
+(`blocks_touched` 0) to moving (`blocks_touched` 1) while still failing, and
+those are the ones that mattered: asked to move the second row's "16:00" the
+engine moved the FIRST row's, 17pt away, silently and reporting success.
+`findTargetSegment` chooses its occurrence on `clickedRel` — HORIZONTAL
+position only — and a timesheet repeats the same value in the same column down
+every row, so x cannot tell the rows apart. Ops more than 6pt (in page units,
+through `unitScale`) off the target's local y span are now skipped;
+`scanShowOps` already tracks `op.y` in the block's own space.
+
+The comment first written here claimed the segment search "carries its own
+position check, so admitting on it cannot pick a copy the click did not mean".
+That was false as implemented. A confident justification in a comment is how a
+wrong assumption becomes permanent — check the claim before writing it.
+
+Measured, both changes together: baseline 262/237 and round 2 439/394
+unchanged, round 3 466/412 (+4), round 4 462/416 (+4), zero lost. Both cells
+of the reported timesheet now move their OWN row by exactly the delta asked.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

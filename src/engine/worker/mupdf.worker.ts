@@ -4856,7 +4856,17 @@ function findBtBlocksByPosition(
         if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) continue
         const d = Math.min(distOf(block), govDist(block), runDist(block))
         if (!(d <= onTarget * 2)) continue
-        if (!findGoverningTm(block, targetBlock.text, pageIndex) && !lineRun(block)) continue
+        // A run INSIDE a TJ array is a third way in. A Ghostscript timesheet
+        // draws a whole row as one array inside a block that shares its Tm
+        // with every other row, so a mid-line cell like "16:00" has neither a
+        // governing Tm nor a line-leading run: the block was never admitted,
+        // `findTargetSegment` was never reached, and dragging a cell reported
+        // "could not find matching text" while editing the same cell worked.
+        // The segment search is the same one the move then uses to shift it,
+        // and it carries its own position check, so admitting on it cannot
+        // pick a copy the click did not mean.
+        if (!findGoverningTm(block, targetBlock.text, pageIndex) && !lineRun(block) &&
+            !findTargetSegment(block, targetBlock, pageIndex, stream, pageHeight)) continue
         candidates.push({ blocks: [block], score: 1, dist: d, order: candidates.length })
       }
       if (candidates.length > 0 || !targetFontRef) break
@@ -7497,6 +7507,17 @@ function findTargetSegment(
     const op = ops[i]
     if (op.kind !== 'TJ') continue
     if (!op.decoded.includes(targetNorm)) continue
+    // The op must sit on the clicked ROW. The occurrence chooser below
+    // compares horizontal position only, which cannot tell one row of a table
+    // from another: a Ghostscript timesheet repeats "16:00" in the same
+    // column down every row, and asked to move the second row's cell the
+    // search took the first row's — the wrong line moved, silently. `op.y` is
+    // tracked in the block's own space by `scanShowOps`, the same space
+    // `blockLocalPoint` reports the target's span in.
+    if (local) {
+      const yGap = op.y < local.yLo ? local.yLo - op.y : (op.y > local.yHi ? op.y - local.yHi : 0)
+      if (yGap * (local.unitScale || 1) > 6) continue
+    }
 
     const fr = op.fontRef && op.fontRef !== block.fontRef
       ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
