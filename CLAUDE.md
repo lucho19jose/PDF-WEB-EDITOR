@@ -3367,6 +3367,22 @@ swallows the 28pt tagline beneath it, so patching the logo also paints over
 "--Empresas y Gobierno". Splitting a patch around the runs it overlaps is not
 implemented.
 
+### Known limitation: a faint crossbar is lost at 220 DPI, so a traced "t" reads as "l"
+Two unrelated forms both bake "Cta. Cte" as "Cla. Cle" in the scan face. The
+cut is right - the "t" cell holds the stem - but at 220 DPI this blurred bold
+face's crossbar is a ONE-pixel bump on either side of an 8px stem (measured on
+the binarised cell, at the biased threshold and at the midpoint alike), and an
+outline tracer smooths a bump that size away. Not a threshold problem: an
+adaptive threshold (midpoint when the 0.42 cut discards over 30% of the ink)
+was tried and did not fire, because a bar is a negligible fraction of a box's
+pixels; reverted unmeasured. The "e" bar and "B" bars survive at both
+thresholds. Fixing it means tracing from a raster at 2x the OCR resolution,
+which the page rasters are not; not implemented.
+
+The 110-document ink re-read (67 scanned-page edits, average similarity 0.94)
+found no other class: the remaining sub-0.5 cases were the re-read matching a
+neighbouring run, a miscount of "=" signs, and this one.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
