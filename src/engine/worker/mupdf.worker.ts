@@ -7819,9 +7819,29 @@ function applyPartialBlockReplacement(
     // 12: this size is written back out with the restore, so guessing it
     // re-sizes the inherited font for everything drawn after the array.
     const inheritedSize2 = parseFloat(block.inheritedTf?.match(/([\d.]+)\s+Tf\s*$/)?.[1] ?? '')
-    const tfSize = tfMatch
+    const blockTfSize = tfMatch
       ? parseFloat(tfMatch[1])
       : (Number.isFinite(inheritedSize2) ? inheritedSize2 : 12)
+    /**
+     * The size in force AT THE OP, not the block's FIRST Tf.
+     *
+     * Ghostscript draws a whole timesheet from one BT that switches font and
+     * size per cell (`/R7 6.42`, `/R13 4.98`, `/R9 5.7` …). The restore this
+     * path emits after the substitute — `/R9 <size> Tf` — was written with
+     * the block's first size, so editing a 5.7pt cell restored /R9 at 3.54
+     * and EVERY run after it rendered at 62% and crept left: 21 blocks moved
+     * for a five-character edit, while char_delta stayed 0 and the edit
+     * reported success. `textStateAtOp` is the same reader the op-window path
+     * already uses for exactly this reason.
+     */
+    const sizeAtOp = (op: ShowOpInfo): number => {
+      const i = ops.indexOf(op)
+      if (i >= 0) {
+        const st = textStateAtOp(block, ops, i, pageIndex)
+        if (st && st.tfSize > 0) return st.tfSize
+      }
+      return blockTfSize
+    }
 
     // Candidate arrays containing the target, nearest clicked position first
     const candidates = ops
@@ -7855,10 +7875,11 @@ function applyPartialBlockReplacement(
         // The cell's subsetted font lacks the replacement's glyphs. Split the
         // array and draw just this run in the substitute face.
         const newLit = { literal: substLiteral(plan), codes: [] as number[] }
-        newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, tfSize, {
+        const opSize = sizeAtOp(op)
+        newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, opSize, {
           fontRef: plan.fontRef,
           origFontRef: op.fontRef ?? block.fontRef,
-          sizeStr: fmtNum(tfSize),
+          sizeStr: fmtNum(opSize),
           newWidthKu: Math.round(measureEm(newText, plan.fontName) * 1000)
         })
         if (newRaw) substFont = plan.fontName
@@ -7866,7 +7887,7 @@ function applyPartialBlockReplacement(
         const newLit = plan.kind === 'keep-hex'
           ? { literal: `<${plan.hexLines[0]}>`, codes: hexToCodes(plan.hexLines[0], fr.encoding ? (fr.encoding.codeBytes === 1 ? 1 : 2) : 1) }
           : { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [...plan.byteLines[0]].map(c => c.charCodeAt(0)) }
-        newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, tfSize)
+        newRaw = replaceInsideTjArray(op, targetNorm, newLit, fr.encoding, fr.simpleInfo, targetLocal?.x ?? null, sizeAtOp(op))
       }
 
       if (newRaw) {

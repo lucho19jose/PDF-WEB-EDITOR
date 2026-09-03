@@ -2991,6 +2991,24 @@ SAME operator, collapsing the span to one character so no op can fall outside
 it. Measured after the fix: baseline 262/235, round 2 439/392, round 3
 466/401 — the same totals as before the guard, with the four-block drag gone.
 
+### The size restored after an in-array substitution is the size AT THE OP
+Ghostscript draws a whole timesheet from one BT that switches font AND size
+per cell — `/R7 6.42`, `/R13 4.98`, `/R9 5.7`. `replaceInsideTjArray`'s
+substitution branch splits the array and writes the original font back after
+the new run (`/R9 <size> Tf`), and that size was taken from the block's FIRST
+`Tf`. Editing a 5.7pt cell therefore restored /R9 at 3.54, and every run after
+it rendered at 62% and crept progressively left: measured, 21 blocks moved for
+a five-character edit, with `char_delta` 0 and the edit reporting success — the
+page visibly wrecked below the edit while every text-preservation check passed.
+
+`textStateAtOp` is the reader for this and the op-window path already used it
+for exactly this reason ("Sizes come from `textStateAtOp` at the window, not
+from whatever Tf happens to appear first in the content"); the in-array path
+simply never did. `sizeAtOp` now supplies both the substitute's size and the
+restore's, with the block-level size as the fallback when the op cannot be
+located. Measured: the edit touches ONE block instead of 21, round 3 gains 4
+experiments (466/404), baseline and round 2 unchanged, nothing lost.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
