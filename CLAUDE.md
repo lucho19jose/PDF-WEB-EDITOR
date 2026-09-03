@@ -3130,6 +3130,27 @@ Measured, both changes together: baseline 262/237 and round 2 439/394
 unchanged, round 3 466/412 (+4), round 4 462/416 (+4), zero lost. Both cells
 of the reported timesheet now move their OWN row by exactly the delta asked.
 
+### The pen advances across a show op, and that position is tracked
+`scanShowOps` used to derive every op's position from Tm/Td/TD/T* alone, so
+consecutive show ops with no positioning operator between them all reported
+the SAME x. That is exact for a generator's own output and wrong for the shape
+this engine writes: an in-array substitution splits a row into
+`(new) Tj … [rest] TJ` with nothing positional in between.
+
+`pen` accumulates each op's own advance (`showOpAdvance`, which now reads a CID
+font's /W as well as a simple font's /Widths) and is kept SEPARATE from `ux`,
+the line matrix's translation — a Td or T* moves the line matrix and restarts
+the pen, so folding the two together would make every later Td relative to the
+wrong origin. When a width cannot be had the pen stops advancing rather than
+guessing, and later ops then report the last known position exactly as they did
+before.
+
+Measured on all five corpora: 262/237, 439/394, 466/413 (+1), 462/416,
+446/410 (+1) — two gained, none lost.
+
+**It did not fix the case that prompted it**, which is worth knowing before
+anyone tries again:
+
 ### KNOWN, REPRODUCIBLE: a second substitution lands on the first one's run
 `scanShowOps` tracks the pen from Tm/Td/TD/T* only — never from the glyphs
 actually drawn. That is exact for every generator's own output, where cells are
@@ -3155,7 +3176,13 @@ the FIRST edit's pen position, on top of it, instead of at the cell it was given
 the same column after it is not. The user-visible report would be "I change one
 amount, then the next one disappears".
 
-**The fix is pen tracking, and it is not a small change.** `scanShowOps` would
+**Pen tracking was implemented and did NOT fix this.** The cause is one level
+deeper: on this page the engine's own decode yields no readable characters at
+all (`debugBtBlocks` finds zero blocks containing "120.00" while extraction
+reports it), so the match is made on '?' wildcards and no amount of positional
+accuracy can pick the right one of many identical wildcard runs. This is the
+"decode must agree with EXTRACTION" class, not a position bug. The remaining
+half-measure still stands: `scanShowOps` would
 have to advance x by each show op's own width (`showOpAdvance` already computes
 one for the kern compensation) and mark the position UNKNOWN when a width cannot
 be had, rather than silently reporting the last Tm for every op. That moves

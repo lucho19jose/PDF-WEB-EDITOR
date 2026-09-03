@@ -6715,7 +6715,10 @@ function scanShowOps(
     `((?:-?[\\d.]+\\s+-?[\\d.]+\\s+)?(?:${STR_LIT_SRC}|${HEX_LIT_SRC})\\s*")` + '|' +
     `((?:${STR_LIT_SRC}|${HEX_LIT_SRC})\\s*(?:Tj|'))` + '|' +
     // font switches (tracked, not collected)
-    `\\/([^\\s<>\\[\\]()/%]+)\\s+[\\d.-]+\\s+Tf`,
+    `\\/([^\\s<>\\[\\]()/%]+)\\s+([\\d.-]+)\\s+Tf` + '|' +
+    // spacing, needed to advance the pen across a show op
+    `(-?[\\d.]+)\\s+Tc(?![A-Za-z0-9])` + '|' +
+    `(-?[\\d.]+)\\s+Tw(?![A-Za-z0-9])`,
     'g'
   )
 
@@ -6735,6 +6738,25 @@ function scanShowOps(
   let ux = 0, uy = 0                 // accumulated line-space Td offsets
   let leading = 0
   let curFont: string | null = null
+  /**
+   * Pen advance since the last POSITIONING operator, in unscaled text space —
+   * kept apart from `ux`, which is the line matrix's own translation. A Td or
+   * T* moves the LINE matrix and restarts the pen, so folding the two together
+   * would make every later Td relative to the wrong origin.
+   *
+   * Without this every show op with no Td between it and the previous one
+   * reported the SAME x. That is exact for a generator's own output, and wrong
+   * for the shape this engine writes: an in-array substitution splits a row
+   * into `(new) Tj … [rest] TJ` with no positioning operator between the
+   * pieces, so a SECOND edit could not tell them apart and landed on top of
+   * the first (measured on a Ghostscript invoice: two amounts in one column,
+   * the second written over the first and its own cell untouched).
+   */
+  let pen = 0
+  let penKnown = true
+  let tfSize = 0
+  let tc = 0
+  let tw = 0
   let m: RegExpExecArray | null
   while ((m = re.exec(content)) !== null) {
     if (m[1] !== undefined) { // Tm — matrix AND translation
@@ -6742,17 +6764,22 @@ function scanShowOps(
       mc = parseFloat(m[3]); md = parseFloat(m[4])
       ex = parseFloat(m[5]); ey = parseFloat(m[6])
       ux = 0; uy = 0
+      pen = 0; penKnown = true
       continue
     }
     if (m[7] !== undefined) { // Td / TD
       ux += parseFloat(m[7]); uy += parseFloat(m[8])
       if (m[9] === 'TD') leading = -parseFloat(m[8])
+      pen = 0; penKnown = true
       continue
     }
     if (m[10] !== undefined) { leading = parseFloat(m[10]); continue } // TL
-    if (m[0] === 'T*') { uy -= leading; continue }
+    if (m[0] === 'T*') { uy -= leading; pen = 0; penKnown = true; continue }
+    if (m[16] !== undefined) { tc = parseFloat(m[16]); continue } // Tc
+    if (m[17] !== undefined) { tw = parseFloat(m[17]); continue } // Tw
     if (m[14] !== undefined) { // Tf
       curFont = m[14]
+      tfSize = parseFloat(m[15] ?? '') || tfSize
       if (resolveFont) {
         const next = resolveFont(m[14])
         encoding = next.encoding
@@ -6766,18 +6793,28 @@ function scanShowOps(
       m[11] !== undefined ? 'TJ'
       : m[12] !== undefined ? 'dquote'
       : raw.trimEnd().endsWith("'") ? 'quote' : 'Tj'
-    if (kind === 'quote' || kind === 'dquote') { uy -= leading } // implicit T*
-    ops.push({
+    if (kind === 'quote' || kind === 'dquote') { uy -= leading; pen = 0; penKnown = true } // implicit T*
+    const lx = ux + (penKnown ? pen : 0)
+    const op: ShowOpInfo = {
       start: m.index,
       end: m.index + raw.length,
       raw,
       decoded: decodeBtBlockText(raw, encoding, simpleInfo),
       kind,
       isHex: /<[0-9A-Fa-f\s]*[0-9A-Fa-f]/.test(raw),
-      x: ex + ma * ux + mc * uy,
-      y: ey + mb * ux + md * uy,
+      x: ex + ma * lx + mc * uy,
+      y: ey + mb * lx + md * uy,
       fontRef: curFont
-    })
+    }
+    ops.push(op)
+    // Advance the pen by what this op actually draws. When the width cannot be
+    // had, stop advancing rather than guess: later ops then report the last
+    // known position, exactly as they did before this tracking existed.
+    if (penKnown) {
+      const adv = showOpAdvance(op, encoding, simpleInfo ?? null, tfSize, tc, tw)
+      if (adv === null) penKnown = false
+      else pen += adv
+    }
   }
   return ops
 }
@@ -7215,9 +7252,16 @@ function showOpAdvance(
   tc: number,
   tw: number
 ): number | null {
-  const widths = simpleInfo?.widths
-  if (!widths || !(tfSize > 0)) return null
-  const fc = simpleInfo!.firstChar
+  // Whichever width table the font has: /Widths for a simple font, the
+  // descendant /W for an Identity CID font. Without the CID branch the pen
+  // could not be advanced across a Ghostscript or Print-to-PDF row at all.
+  const advanceOf: ((code: number) => number | undefined) | null =
+    simpleInfo?.isType0 && simpleInfo.cidWidths
+      ? (code: number) => simpleInfo.cidWidths!.get(code) ?? simpleInfo.cidDefaultWidth ?? 1000
+      : simpleInfo?.widths
+        ? (code: number) => simpleInfo.widths![code - simpleInfo.firstChar]
+        : null
+  if (!advanceOf || !(tfSize > 0)) return null
   // A bare Tj is measured as a one-item array — parseTjItems only looks for
   // literals and numbers between the brackets, and `Tj` is neither.
   const items = parseTjItems(op.kind === 'TJ' ? op.raw : `[${op.raw}]`, encoding, simpleInfo)
@@ -7229,8 +7273,8 @@ function showOpAdvance(
   for (const it of items) {
     if (!it.isLiteral) { sum -= (it.value ?? 0) / 1000 * tfSize; continue }
     for (const code of it.codes) {
-      const cw = widths[code - fc]
-      if (cw === undefined) return null
+      const cw = advanceOf(code)
+      if (cw === undefined || !Number.isFinite(cw)) return null
       sum += cw / 1000 * tfSize + tc + (code === 32 ? tw : 0)
     }
   }
