@@ -3305,6 +3305,39 @@ gained, 0 lost, 3 changed**, and all three changed are the bug - `char_delta`
 runs off the page - the justified-line limitation already recorded above. What
 changed is that the edit no longer damages a cell the user never named.
 
+### The patch and the text must be placed in the SAME space
+Editing a scanned line paints over the original ink (`fillRect`) and draws the
+replacement on top (`addTextToPage`). `addTextToPage` has always mapped its text
+matrix through the inverse of `pageRotationCtm`; the patch never did. On a
+calibration certificate stored landscape and displayed portrait (/Rotate 90) the
+text therefore landed correctly and the patch came out as a thin bar in a corner
+of the page - so appending ONE character to "Within specifications (i)" left the
+original line printed through the replacement, an unreadable doubled line whose
+extracted text still read back perfectly. That combination - the page wrong, the
+text right - is the signature of this whole family of bugs and the reason they
+are so hard to report.
+
+`fillRect` now composes both corrections: the /Rotate inverse, then the
+inverse of the CTM the stream leaves in force (the pre-existing one, for the
+unbracketed `0.36 0 0 0.36 0 0 cm` a scan's image is drawn under). A page with
+no /Rotate produces exactly the matrix it produced before, so unrotated
+documents are untouched.
+
+**A baked replacement is also fitted to the run BESIDE it**, not only to the
+paper. `fitSize` capped the size against the page edge; a base-14 face is wider
+than most scanned ones, so a one-character append to a table cell drew straight
+across the next cell on the same row and the two read back as one interleaved
+run of nonsense. `nextRunRight` gives the nearer bound. It is deliberately
+narrow: only a run whose left edge is past the MIDDLE of this one counts (the
+detector's boxes touch and overlap a little) and only one sharing the line.
+
+Measured with the OCR corpus' new ink re-read - the baked page is recognised
+AGAIN and each edited run's ink compared with what was typed, because no
+text-level assertion can see this class at all. Of the ten worst runs, the two
+this fixes went from 0.23 and 0.00 similarity to 0.70 and clean; average over
+34 edits 0.79; the seven still under 0.5 are separate leads on three other
+documents.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

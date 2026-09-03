@@ -9943,18 +9943,32 @@ function fillRect(
     const r = color[0] ?? 1, g = color[1] ?? 1, b = color[2] ?? 1
     const existing = readContentStream(pageIndex)
 
-    // The patch is APPENDED, so it is drawn under whatever CTM the stream
-    // leaves in force at its end. A scanned letter opens with an unbracketed
-    // `0.36 0 0 0.36 0 0 cm` for its image and never restores it, so a patch
-    // written in page units landed at a third of its size in the corner while
-    // the replacement text — which already undoes the end CTM — sat over the
-    // old ink. Same compensation as `addTextToPage`.
+    /**
+     * The rectangle arrives in the VISIBLE space - the one `getBounds()`
+     * reports and the user clicked in - and the stream draws in the raw one.
+     * Two corrections, and BOTH have to be here or the patch lands somewhere
+     * else on the page while the replacement text lands correctly, so the old
+     * ink goes on showing underneath it. That reads as a garbled edit even
+     * though the text itself is right: on a /Rotate 90 calibration certificate
+     * a one-character append left "Within specifications (i)" printed through
+     * "Within specifications (i) X", and the patch itself came out as a thin
+     * bar in a corner of the page.
+     *
+     * - **The page's /Rotate.** `addTextToPage` has always mapped its text
+     *   matrix through the inverse of `pageRotationCtm`; the patch never did.
+     * - **The CTM the stream leaves in force.** A scanned letter opens with an
+     *   unbracketed `0.36 0 0 0.36 0 0 cm` for its image and never restores
+     *   it, so a rect written in page units draws at a third of its size.
+     */
+    let correction: Mat6 | null = null
+    const pageRot = pageRotationCtm(pageIndex)
+    if (pageRot) correction = matInvert(pageRot)
     const endCtm = getCtmAtOffset(existing, existing.length)
-    let undo = ''
     if (endCtm.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
       const inv = matInvert(endCtm)
-      if (inv) undo = `${inv.map(v => fmtNum(v)).join(' ')} cm `
+      if (inv) correction = correction ? matConcat(correction, inv) : inv
     }
+    const undo = correction ? `${correction.map(v => fmtNum(v)).join(' ')} cm ` : ''
     // q/Q so the fill colour does not leak into whatever is drawn next.
     const op = `
 q ${undo}${fmtNum(r)} ${fmtNum(g)} ${fmtNum(b)} rg ` +

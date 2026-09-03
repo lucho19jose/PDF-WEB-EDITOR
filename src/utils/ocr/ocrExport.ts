@@ -125,14 +125,50 @@ function plainColor(c: readonly number[] | undefined): [number, number, number] 
  * page, less a small margin; the size comes down just enough, never below
  * half the original.
  */
-function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined): number {
+function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined, all: OcrTextItem[]): number {
   const size = item.fontSize
-  if (!pageWidth || item.vertical) return size
+  if (item.vertical) return size
   const margin = 12
-  const room = Math.max(20, pageWidth - margin - item.rect.x)
+  let room = pageWidth ? Math.max(20, pageWidth - margin - item.rect.x) : Infinity
+  const near = nextRunRight(item, all)
+  if (near !== null) room = Math.min(room, Math.max(20, near - item.rect.x))
+  if (!Number.isFinite(room)) return size
   const width = approxWidth(text, size, item.fontFamily)
   if (width <= room) return size
   return Math.max(size * 0.5, Math.round(size * (room / width) * 10) / 10)
+}
+
+/**
+ * The left edge of the next run along this line, or null when there is none.
+ *
+ * The paper is not the only thing a replacement can run into. A bilingual
+ * inspection sheet puts "Within specifications (i)" and
+ * "Within specifications* (ii) Outside specifications" side by side on one
+ * row; appending a single character to the first drew it in Helvetica, which
+ * is wider than the scan's face, straight across the second — and the page
+ * then reads as one interleaved run of nonsense, exactly the shape of a
+ * garbled edit even though the text itself is right. This is the same
+ * accommodation `fitSize` already makes for the page edge, applied to the
+ * nearer obstacle.
+ *
+ * Only a run that is CLEARLY to the right counts (its left edge past the
+ * middle of this one) and only one sharing the line: detector boxes touch and
+ * overlap a little, and a neighbour that starts inside this run's own box
+ * cannot be what bounds it. A removed or edited neighbour still occupies the
+ * row - the edit redraws it in place.
+ */
+function nextRunRight(item: OcrTextItem, all: OcrTextItem[]): number | null {
+  const midY = item.rect.y + item.rect.height / 2
+  const floor = item.rect.x + item.rect.width * 0.5
+  let best: number | null = null
+  for (const o of all) {
+    if (o === item || o.vertical) continue
+    if (midY < o.rect.y || midY > o.rect.y + o.rect.height) continue
+    if (o.rect.x < floor) continue
+    if (best === null || o.rect.x < best) best = o.rect.x
+  }
+  // A hair of clearance, so the two runs do not touch.
+  return best === null ? null : best - 2
 }
 
 export function planOcrExport(items: OcrTextItem[], faceIdFor?: (item: OcrTextItem) => string | undefined, pageWidth?: number): OcrExportPlan {
@@ -183,7 +219,7 @@ export function planOcrExport(items: OcrTextItem[], faceIdFor?: (item: OcrTextIt
       text: String(item.text),
       x: Number(x),
       y: Number(baselineY),
-      fontSize: Number(fitSize(item, item.text, pageWidth)),
+      fontSize: Number(fitSize(item, item.text, pageWidth, items)),
       fontName,
       color: plainColor(item.color),
       rotation: 0,
