@@ -3130,6 +3130,40 @@ Measured, both changes together: baseline 262/237 and round 2 439/394
 unchanged, round 3 466/412 (+4), round 4 462/416 (+4), zero lost. Both cells
 of the reported timesheet now move their OWN row by exactly the delta asked.
 
+### KNOWN, REPRODUCIBLE: a second substitution lands on the first one's run
+`scanShowOps` tracks the pen from Tm/Td/TD/T* only — never from the glyphs
+actually drawn. That is exact for every generator's own output, where cells are
+separated by kerns INSIDE one array or by an explicit Td, and it is wrong for
+the shape THIS ENGINE writes: an in-array substitution splits the array into
+`[] TJ /Fsub s Tf (new) Tj /Forig s Tf [rest] TJ`, and the ops on either side of
+the split carry no positioning operator between them. Every one of them then
+reports the SAME x/y — the Tm's — so the next edit cannot tell them apart.
+
+Measured on a Ghostscript invoice (`r5/011.pdf`, one "120.00" per row):
+
+    #62  "710.00"  -> partial_block, marker lands at (500, 186)   correct
+    #117 "120.00"  -> partial_block, reports success, char_delta 5
+                      the marker is NOWHERE on the page
+
+The saved stream shows why:
+
+    [] TJ /F1 8.04 Tf (SWEEPMARK62) Tj /R11 8.04 Tf /F1 8.04 Tf [(SWEEPMARK117)] TJ
+
+and pdf.js reads "SWEEPMARK62SWEEPMARK" at (500, 597): the SECOND edit wrote at
+the FIRST edit's pen position, on top of it, instead of at the cell it was given
+(page y 348). Editing one cell alone is always correct; editing a second cell in
+the same column after it is not. The user-visible report would be "I change one
+amount, then the next one disappears".
+
+**The fix is pen tracking, and it is not a small change.** `scanShowOps` would
+have to advance x by each show op's own width (`showOpAdvance` already computes
+one for the kern compensation) and mark the position UNKNOWN when a width cannot
+be had, rather than silently reporting the last Tm for every op. That moves
+every position-based decision in the matchers, so it needs the full five-corpus
+measurement, not a spot check. Refusing when several candidates share one
+position would be the cheaper half-measure: it turns a silent wrong edit into an
+honest failure, which is the trade this codebase already prefers elsewhere.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
