@@ -2838,6 +2838,39 @@ are listed with their kind, score, distance and text — the difference between
 "nothing looked like it" and "something did, and the apply step declined" is
 the whole triage.
 
+### A visual line is constant PAGE y, never constant text-space y
+`findBtBlocksByPosition` grouped blocks into lines by `yPos`, the origin
+inside whatever `cm` is in force. A generator that wraps each region of the
+page in its own transform reuses the same text-space y everywhere: on a Qt
+service report the header title, the company name, the site URL and the page
+number all sit at y = -17, so ONE group held nine unrelated runs, its join was
+garbage, and no line ever matched. The heading is drawn as two blocks
+("Reporte de Servicio Técnico " + "— N° 146711 - 1"); with no line match each
+was moved on its own and a drag tore the title in half. Blocks are now
+clustered by PAGE-space y (origin through `getFullCtmAtOffset`, flipped),
+by PROXIMITY rather than onto a grid — a baseline exactly on a grid boundary
+lands either side of it by floating-point noise — and `byX` sorts in page
+space too. `LINE_CLUSTER_PT` is 3, half a line of body text.
+
+This is what the 23 "moved but did not land" failures of round 2 had in
+common across Qt, dompdf, tex, crystal, pdf24 and miktex.
+
+**A blank block on the run travels with it, but only when the target says so.**
+Word and iLovePDF draw a run's trailing space as its own BT, and every pass
+that matches on TEXT keeps only the blocks whose text matches — so the space
+stayed behind while its words moved 20pt away, stranding a glyph that later
+readbacks report as a phantom space inside the words. Blanks are attached to
+the WINNING candidate (an exact single-block match outranks the line group
+carrying the same space, so doing it per candidate never reached the winner)
+— and ONLY when `targetBlock.text` is not equal to its own trim. Extraction
+merges a trailing space into the block it belongs to, so "BANCO DE CRÉDITO "
+ends in one and its blank is part of the run, while "Sonido" does not and the
+blank near it belongs to another cell: carrying that one appended a space to
+a run the user never touched, which cost four experiments before the gate.
+
+Sweeps after both changes: baseline 262/232 (was 229), round 2 439/391 (was
+379 when the round was staged), zero lost on either.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

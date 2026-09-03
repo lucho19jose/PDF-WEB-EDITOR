@@ -657,6 +657,14 @@ function isTinyLyingSubset(pageIndex: number, stextFontName: string): boolean {
  * MuPDF groups all text on the same line into one block, but for
  * move/resize we need finer granularity (like Adobe Acrobat).
  */
+/**
+ * How close two baselines must be, in page points, to be read as one visual
+ * line. Half a line of ordinary body text — wide enough for the baseline
+ * jitter a scaled transform introduces, narrow enough never to fuse two rows
+ * of a table.
+ */
+const LINE_CLUSTER_PT = 3
+
 /** Room kept between wrapped text and the right edge of the page, in points. */
 const PAGE_RIGHT_MARGIN = 20
 
@@ -4354,11 +4362,45 @@ function findBtBlocksByPosition(
   // more often, but it is not always: on one file in the corpus the stream order
   // was the one that matched, and moving to x order alone turned a working drag
   // into "could not find matching text". Trying both can only ever add a match.
+  //
+  // Grouped in PAGE space, not in the blocks' own text space. `yPos` is the
+  // origin inside whatever `cm` is in force, and a generator that wraps each
+  // region in its own transform reuses the same text-space y everywhere: on a
+  // Qt service report the header line, the company name, the site URL and the
+  // page number all sit at y=-17, so ONE group held nine unrelated runs, its
+  // join was garbage, and no line ever matched. The two halves of the title
+  // ("Reporte de Servicio Técnico " + "— N° 146711 - 1") were then moved
+  // one at a time and the drag tore the heading in half.
+  const pagePos = new Map<number, { x: number; y: number }>()
+  const posOf = (b: BtInfo) => {
+    let p = pagePos.get(b.start)
+    if (!p) {
+      if (pageHeight === undefined) p = { x: b.xPos, y: b.yPos }
+      else {
+        const ctm = getFullCtmAtOffset(stream, b.start)
+        const ux = b.xPos * ctm[0] + b.yPos * ctm[2] + ctm[4]
+        const uy = b.xPos * ctm[1] + b.yPos * ctm[3] + ctm[5]
+        p = { x: ux, y: pageHeight - uy }
+      }
+      pagePos.set(b.start, p)
+    }
+    return p
+  }
+  // Clustered by proximity rather than rounded onto a grid: a baseline sitting
+  // exactly on a grid boundary lands on either side of it by floating-point
+  // noise, which is how a one-letter block once got stranded out of its line.
   const lineGroups = new Map<number, BtInfo[]>()
-  for (const block of allBlocks) {
-    const yKey = Math.round(block.yPos * 2) / 2
-    if (!lineGroups.has(yKey)) lineGroups.set(yKey, [])
-    lineGroups.get(yKey)!.push(block)
+  {
+    const byY = [...allBlocks].sort((a, b) => posOf(a).y - posOf(b).y)
+    let key = 0
+    let prev: number | null = null
+    for (const block of byY) {
+      const y = posOf(block).y
+      if (prev === null || Math.abs(y - prev) > LINE_CLUSTER_PT) key++
+      prev = y
+      if (!lineGroups.has(key)) lineGroups.set(key, [])
+      lineGroups.get(key)!.push(block)
+    }
   }
 
   const joinOf = (blocks: BtInfo[]) =>
@@ -4376,7 +4418,7 @@ function findBtBlocksByPosition(
   // with the moved run. A loud "could not find" is the correct outcome there.
 
   for (const [, lineBlocks] of lineGroups) {
-    const byX = [...lineBlocks].sort((a, b) => a.xPos - b.xPos)
+    const byX = [...lineBlocks].sort((a, b) => posOf(a).x - posOf(b).x)
     const alongStream = joinOf(lineBlocks)
     const acrossPage = joinOf(byX)
     const orders = acrossPage === alongStream ? [acrossPage] : [acrossPage, alongStream]
@@ -4540,7 +4582,35 @@ function findBtBlocksByPosition(
     b.blocks.length - a.blocks.length || // prefer the fuller line match on a tie
     a.order - b.order
   )
-  return candidates[0].blocks
+
+  // A blank block sitting ON the winning run travels WITH it. Word and
+  // iLovePDF draw a run's trailing space as its own BT, and every pass that
+  // matches on TEXT keeps only the blocks whose text matches — so the space
+  // stayed at the old position while its words moved 20pt away. It carries no
+  // ink, so taking it along can damage nothing; leaving it behind strands a
+  // glyph that later readbacks report as a phantom space inside the words
+  // (the same hazard `narrowLineAndRetry` keeps its space blocks for).
+  // Attached to the WINNER rather than to each candidate: an exact
+  // single-block match outranks the line group carrying the same space, so
+  // doing it per candidate never reached the one that wins.
+  const won = candidates[0].blocks
+  // Only when the TARGET itself carries that space. Extraction merges a
+  // trailing space into the block it belongs to, so "BANCO DE CRÉDITO " ends
+  // in one and its space block is part of the run; "Sonido" does not, and the
+  // blank sitting near it belongs to some other cell — dragging that one along
+  // appended a space to a run the user never touched. The target's own text is
+  // the evidence for which case this is.
+  if (targetBlock.text === targetBlock.text.trim()) return won
+  const wonY = won.map(b => posOf(b).y)
+  const [bx0, , bx1] = targetBlock.bbox
+  const xLo = Math.min(bx0, bx1), xHi = Math.max(bx0, bx1)
+  const blanks = allBlocks.filter(b => {
+    if (won.includes(b) || b.decodedText.trim()) return false
+    const p = posOf(b)
+    if (p.x < xLo - 1 || p.x > xHi + 1) return false
+    return wonY.some(y => Math.abs(p.y - y) <= LINE_CLUSTER_PT)
+  })
+  return blanks.length ? [...won, ...blanks] : won
 }
 
 interface BtInfo {
