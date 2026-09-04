@@ -320,6 +320,11 @@ async function runOcrNow(pageIndex: number, lang: string) {
  */
 async function bakeOcrEdits(): Promise<number> {
   if (!ocrStore.hasEdits) return 0
+  // The trace an edit started may still be running (a save a second after the
+  // edit): consulting the faces before it finishes bakes the run in Helvetica.
+  const settled = ocr.settleTraces()
+  const slow = setTimeout(() => editorStore.setStatus("Finishing the scan's letterforms..."), 800)
+  try { await settled } finally { clearTimeout(slow) }
   let written = 0
 
   for (const [pageIndex, page] of ocrStore.pages) {
@@ -653,6 +658,10 @@ let printCleanup: (() => void) | null = null
 async function printFile() {
   if (!docStore.loaded) return
   await flushOpenEditor()
+  // Printing goes through the engine bytes, and a scanned page's OCR edits are
+  // only a preview until they are baked — without this the print lacked them
+  // while the save had them.
+  await bakeOcrEdits()
 
   editorStore.setStatus('Preparing document for printing...')
   let blob: Blob

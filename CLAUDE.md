@@ -3612,8 +3612,14 @@ production MUST provide, all of which `public/.htaccess` does for Apache:
   models and an 8 MB font that never change under the same name; the app
   also stores the models in the Cache Storage API after the first load.
 - Nothing is fetched from a CDN: ORT's WASM is a Vite asset, models and
-  fonts are under `public/`. The only network calls are the ones the user
-  opts into (Mistral OCR).
+  fonts are under `public/`, and tesseract.js's worker and WASM cores are
+  under `public/tesseract/` (`workerPath`/`corePath` in `tesseractEngine.ts`
+  — until 2026-09-03 they came from cdn.jsdelivr.net by the library's
+  defaults, which this note wrongly denied). `corePath` is a directory and
+  the three `tesseract-core*-lstm.wasm.js` names must stay as shipped: the
+  worker picks one by WASM feature detection. Serve `*.wasm.js` as
+  JavaScript. The only network calls are the ones the user opts into
+  (Mistral OCR).
 
 ## Vite Config Notes
 - COEP/COOP headers needed for SharedArrayBuffer (WASM)

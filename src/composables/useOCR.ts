@@ -223,7 +223,24 @@ function createOCR() {
    * a run that cannot be cut simply contributes no glyphs and the export
    * falls back to the base font for them.
    */
-  async function traceItem(item: OcrTextItem): Promise<TraceResult> {
+  /**
+   * Every trace still running. `commitEdit` fires `traceItem` and forgets it,
+   * and a save that landed a second later consulted the faces before the trace
+   * had added a glyph — the run baked in Helvetica although its own letterforms
+   * were a moment away. `bakeOcrEdits` awaits `settleTraces()` first.
+   */
+  const pendingTraces = new Set<Promise<unknown>>()
+  async function settleTraces(): Promise<void> {
+    while (pendingTraces.size) await Promise.allSettled([...pendingTraces])
+  }
+  function traceItem(item: OcrTextItem): Promise<TraceResult> {
+    const p = traceItemNow(item)
+    pendingTraces.add(p)
+    p.finally(() => pendingTraces.delete(p)).catch(() => {})
+    return p
+  }
+
+  async function traceItemNow(item: OcrTextItem): Promise<TraceResult> {
     const raster = rasters.get(item.pageIndex)
     if (!raster || item.vertical) return { added: 0, refused: null }
     const k = 1 / raster.toPt
@@ -988,6 +1005,10 @@ function createOCR() {
       for (const it of items) confSum += it.confidence
 
       keepRaster(pageIndex, { canvas: target, ctx: tctx, toPt })
+      // Warm the recogniser the glyph-box fallback will ask for, so the first
+      // edit on a fresh browser does not pay its ~20 s worker start. Not
+      // awaited, and a failure is the fallback's to report when it is needed.
+      if (engineId !== 'tesseract') void engineFor('tesseract').ready({ lang }).catch(() => {})
 
       return {
         pageIndex,
@@ -1153,5 +1174,5 @@ function createOCR() {
     engines.clear()
   }
 
-  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, cutFor, faceOf, facesOf, reset, destroy }
+  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, cutFor, faceOf, facesOf, reset, destroy }
 }

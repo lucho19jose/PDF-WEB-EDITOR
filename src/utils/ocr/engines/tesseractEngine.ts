@@ -28,7 +28,15 @@ export class TesseractEngine implements OcrEngine {
       this.worker = null
     }
     opts.onProgress?.('Loading the recogniser...', 0)
+    // The worker script and the WASM core are served from `public/tesseract/`,
+    // not tesseract.js's default CDN (cdn.jsdelivr.net): the app promises to
+    // fetch nothing from a CDN, and the glyph-box fallback now calls this
+    // engine at edit time, where a network round trip is felt. `corePath` is a
+    // DIRECTORY on purpose — the worker appends one of six file names by WASM
+    // feature detection, so the names under it must stay exactly as shipped.
     const w = await createWorker(opts.lang, 1, {
+      workerPath: '/tesseract/worker.min.js',
+      corePath: '/tesseract',
       langPath: '/tessdata',
       gzip: true,
       logger: (m: any) => {
