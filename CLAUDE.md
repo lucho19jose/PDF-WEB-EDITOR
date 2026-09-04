@@ -3845,6 +3845,40 @@ at 96% against 60 at 98%, Paddle's own noise); corpus after the switch: main
 33 of 33, 0.950 — two rows on the OT-GA order's page 4 dropped, both 6pt
 table cells whose Helvetica redraw overruns the cell (see below).
 
+### A split with no valley is the middle of a glyph, and a table's rows can be a line apart
+Three defects on the OT-GA order's page 4 (a 4.5pt table set at 5.2pt leading,
+grey ink), each visible only in the baked pixels:
+
+- **The row above came along in the box.** `trimProfile` stripped a dense
+  band behind a clear gap only when it was under a quarter of the body's
+  height; here the bottom HALF of "ELABORACION" sat in "MODALIDAD"'s box —
+  five rows against a ten-row body — so the box read 5.9pt for 3.3pt of
+  letters, the em 7.8pt for 4.6, and the redraw painted over the row above
+  and ran into the next cell. A dense band behind a gap is a neighbouring
+  line up to 0.8 of the body's height; accents and dots never reach the 15%
+  density that makes a band dense, so they stay.
+- **A split through a glyph.** Two letters that touch meet at a VALLEY, a
+  column with a few grazing pixels. On "50.00" the faint full stop fell
+  below the threshold, the width fit gave the fused "50" three letters, and
+  the "." cell — the right half of the "0" — went into the face as the full
+  stop and the left half as the "0" ("$695.13 X" baked as "S69!:· X").
+  `cutByProfile` marks both sides of a split whose column carries half the
+  run's typical ink or more.
+- **The ratio test counted only its own flags.** The cutter's marks did not
+  reach it, so "$695.13" traced at three of seven suspect. `vetCells` now
+  counts every suspect cell before the bar.
+- **Sixteen pixels of em is the floor.** A 5pt line at 220 DPI has one-pixel
+  stems and loses its punctuation to the threshold; whatever raster reaches
+  the cut, an em under 16 pixels refuses ("too small to trace").
+
+Measured: "MODALIDAD" boxes at 3.3pt and its replacement sits inside the
+cell; "$695.13" refuses on both rasters and bakes in Helvetica-Bold with the
+status line saying why. Corpus: main 72 of 74, 0.915, 44 cuts accepted
+(one fewer: a run the valley test now refuses); second corpus 33 of 33,
+0.968 (was 0.950). The "MODALIDAD" row itself scores 0 in the sweep because
+the re-read cannot detect 4.3pt Helvetica at 220 DPI — the crop shows it
+drawn in its cell; the metric, not the page, is at its floor there.
+
 ### A scan signed through a stamping service still has "text" — judge it by COVERAGE
 `judgeScanned` counted characters: over 12 and the page was a text page. An
 Intellisign-signed scan carries the service's ID strip — one 8pt line at the

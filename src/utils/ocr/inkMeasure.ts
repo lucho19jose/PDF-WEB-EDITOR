@@ -351,8 +351,16 @@ function trimProfile(p: Profile, emHint?: number): { top: number; bottom: number
         if (ink <= stray) return next
         const bandH = Math.abs(yy - from) + 1
         const bodyH = Math.abs(limit - next) + 1
+        // A dense band behind a clear gap is the neighbouring line whatever
+        // its height, up to most of the body's: a 4.5pt table set at 5.2pt
+        // leading (the OT-GA order) put the bottom HALF of "ELABORACION" in
+        // "MODALIDAD"'s box — five rows against a ten-row body, twice the
+        // quarter the rule allowed — so the box read 5.9pt for 3.3pt of
+        // letters, the em came out 7.8pt for 4.6, and the redraw painted
+        // over the row above. The gap is what separates lines; accents and
+        // dots never reach 15% of the width, so density still keeps them.
         const neighbour = emPx > 0 && p.width >= emPx * 4 && densest >= p.width * 0.15 &&
-          bandH <= bodyH * 0.25 && bodyH >= emPx * 0.5
+          bandH < bodyH * 0.8 && bodyH >= emPx * 0.5
         if (neighbour) return next
         // A blob in one CORNER: the black edge of a scanned page reaching into
         // the top-left of a title's box, tall and dense but confined to a

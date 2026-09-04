@@ -177,6 +177,11 @@ export function cutGlyphs(
   // The same ratios `boxPerEm` in useOCR uses: a letter descender makes the
   // box 0.95 of an em, punctuation alone (a comma, a parenthesis) 0.85.
   const emPx = bin.h / (cjk ? 0.92 : chars.some(c => /[gjpqyQ]/.test(c)) ? 0.95 : chars.some(c => DESCENDER_CHARS.test(c)) ? 0.85 : 0.76)
+  // Sixteen pixels of em is a 5pt line at 220 DPI: its stems are one pixel,
+  // its punctuation falls below the threshold, and an outline traced from
+  // that is a blob. The tracer tries the 440 DPI raster first, where the same
+  // line is 32 pixels; this is the floor for whatever raster reaches here.
+  if (emPx < 16) return refuse('too small to trace')
 
   let cells: GlyphCell[] | null = null
   if (symbols && symbols.length === chars.length) {
@@ -321,6 +326,7 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
     groups = aligned.groups
   }
   const cells: GlyphCell[] = []
+  let carrySuspect = false
   for (let i = 0; i < merged.length; i++) {
     const r = merged[i]
     const held = groups[i]
@@ -336,7 +342,24 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
       // join between two letters is a column with little ink; look for it
       // within a fifth of an em either side.
       const x1 = k === held.length - 1 ? r.x1 : splitAt(cols, x + w, x, r.x1, emPx)
-      cells.push({ char: c, x0: bin.x + Math.round(x), x1: bin.x + Math.round(x1) })
+      const cell: GlyphCell = { char: c, x0: bin.x + Math.round(x), x1: bin.x + Math.round(x1) }
+      // Two letters that touch meet at a VALLEY — a column with a few pixels
+      // where their strokes graze. A split column carrying as much ink as the
+      // run's typical column is not a join, it is the middle of a glyph: on a
+      // 5pt grey "50.00" the faint full stop fell below the threshold, the
+      // fit gave the fused "50" three letters, and the third cell — the
+      // right half of the "0" — was traced as the face's full stop, with the
+      // left half as its "0". Both sides of such a split are suspect.
+      if (carrySuspect) { cell.suspect = true; carrySuspect = false }
+      if (k < held.length - 1) {
+        const col = Math.min(bin.w - 1, Math.max(0, Math.round(x1)))
+        const runCols: number[] = []
+        for (let xx = Math.ceil(r.x0); xx < Math.floor(r.x1); xx++) if (cols[xx] > 0) runCols.push(cols[xx])
+        runCols.sort((a, b) => a - b)
+        const typical = runCols.length ? runCols[Math.floor(runCols.length / 2)] : 0
+        if (typical > 0 && cols[col] >= typical * 0.5) { cell.suspect = true; carrySuspect = true }
+      }
+      cells.push(cell)
       x = x1
     })
   }
@@ -464,6 +487,10 @@ function vetCells(bin: Bin, cells: GlyphCell[], chars: string[]): GlyphCell[] | 
   // as a jumble of half-height capitals: its box takes in the bottom rows of
   // the bold line touching it above, so the em is inflated and every cell
   // carries a sliver of the neighbour. At the bar is not under it.
+  // Every suspect cell, whoever flagged it — the cutter marks the two sides of
+  // a split with no valley before the cells ever reach here, and a count kept
+  // only by the tests above let "$695.13" through at three of seven.
+  suspects = cells.filter(c => c.suspect).length
   if (suspects >= cells.length * 0.2) return refuse(`${suspects} of ${cells.length} cells suspect`)
   // The letters must FILL their box. A Latin line's glyph rows are at least
   // three quarters of a tight box; a box holding a rule that crosses it, or a
