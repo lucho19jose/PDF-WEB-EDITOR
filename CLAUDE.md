@@ -3675,6 +3675,71 @@ page's joined text can interleave; the page itself is right. Known: a wide
 cell from a touching pair gives its traced glyph a wide advance ("AN A" on the
 35pt title) — the gap is measured per run, not per glyph.
 
+### Which ink runs make a letter is a question of WIDTH, not of gap
+The glyph cut had too many ink runs for the title "CONTRATO DE PRESTACIÓN DE
+SOLUCIÓN INTEGRAL" (a bold underlined scan: a broken T, a broken S) and merged
+the pair with the smallest gap until the count matched. The tightest gap on
+the line was the 3px between an intact "R" and an intact "A", not the 5px
+inside the broken S — so RA took one cell and every cell after it held the
+letter next door at a plausible width and, on a line of capitals, a plausible
+shape. Seven cells flagged of 38, under the one-fifth bar; the face learned
+"A" from a T, "D" from an E, "E" from a P, and the line rendered as
+"CONTETTO EP REPSTTĆIÓNNN EP SOLUCIÓN INTPGETL" while extracting perfectly.
+At 220 DPI the same cut happened to flag nine and was refused; at the 440 DPI
+tracing raster it passed — which is why the finer raster made this WORSE.
+
+`alignRunsToChars` replaces the gap merge for Latin runs: one least-squares
+alignment over widths in which a run may take several letters (they touch)
+and up to three adjacent runs may make one letter (it is broken), each merge
+costing a little. R+A is 1.4 em against a want of 0.65, so the fit refuses
+to join them whatever their gap. Ideographs keep the gap merge — their
+radicals are separate runs by design and the corpus's Chinese lines trace
+with it. Two guards were added alongside:
+
+- **A fused cell and a sliver bracket a shift.** In `vetCells`, a cell over
+  1.6× its letter's width paired with a sliver elsewhere on the run marks
+  every cell BETWEEN them suspect, whichever order they come in. The two ends
+  were each flagged already; the cells between are what the face learns wrong.
+- **`debugCuts(item)`** on the OCR composable reports the cut on every
+  raster — 220, 440 and Tesseract's boxes — with the raw ink runs
+  (`lastCutDebug`), for the harness. The trace uses the 440 cut when it
+  passes, so `cutFor` (220 only) cannot show what was traced.
+
+**A merge must be between NEAR pieces.** Left free, the fit joined a 3px
+speck 17px (a third of an em) from the next run and called the pair the
+"M" of a logo — the run was the mark beside the word — then traced the
+logo's shapes as letters (007.pdf "MINERA", re-read similarity 0.2 against
+0.83 in Helvetica). No merge across more than 0.15 em; the speck then has to
+be a letter on its own, is a sliver at the run's start, and the cut is
+refused as misaligned, which is what it is.
+
+Measured on the title: both rasters now cut 38 cells with 2 suspect (the two
+accented Ó), the traced face reads C O N T R A D E P S I L U G correctly.
+Corpus (now 15 documents — the INTEGRATEL order joined it — 26 scanned
+pages, 74 edits): 71 read back, average re-read similarity 0.911. Over the
+original 71 edits: 68 read back, 0.908, against 70 and 0.918 before. Every
+row was inspected: the two newly not-found rows are "Test Parameters…" on
+011/012, whose ink re-reads at 1.0 (the extraction-order limitation of the
+invisible head/tail, moved by a slightly different cut); "ENEMIGO" 1.0 → 0.86
+twice is the re-read dropping the last letter of a Helvetica-Bold whole-run
+redraw on a navy cover (the bake was inspected and is right, as is the traced
+"EL GO" beside it); "15-09-2021" 0.73 → 0.91 and "COMPROBANTE" 0.42 → 0.92
+are gains. No traced run reads back wrong.
+
+### A scan signed through a stamping service still has "text" — judge it by COVERAGE
+`judgeScanned` counted characters: over 12 and the page was a text page. An
+Intellisign-signed scan carries the service's ID strip — one 8pt line at the
+foot of the page, drawn once per signing pass, 34 copies — so the scanned
+contract page had 1768 characters of "text", the edit tool listed 34
+unreachable blocks (their shuffle extracts as `IIIIIIInInnInnIInnn…`), and
+recognising it took the OCR button and a confirmation. `textLayerOf` in
+`EditorLayout` measures how much of the paper the text blocks cover, as a
+UNION over a 64×64 grid so the 34 stacked copies count once; under 2% is a
+stamp, a footer or a page number whatever its character count, and both
+`isScanLikePage` and the OCR button take the verdict. Measured on the order:
+pages 1–2 (real text, 2500+ characters) stay text pages, pages 3–5 (the
+scanned contract) are scans.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

@@ -9,7 +9,7 @@ import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
 import { inkBounds, inkGaps, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
-import { cutGlyphs, lastCutReason, expectedAdvance } from '@/utils/ocr/glyphCut'
+import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance } from '@/utils/ocr/glyphCut'
 import { toSpanCut, type SpanCut } from '@/utils/ocr/partialRedraw'
 
 /**
@@ -37,6 +37,8 @@ const PDF_DPI = 72
  * still a page nobody can edit.
  */
 const SCANNED_TEXT_THRESHOLD = 12
+/** Text covering less of the paper than this is a stamp or a footer, not a text page. */
+const SCANNED_TEXT_COVERAGE = 0.02
 
 /**
  * The tallest symbol box of a line WITH descenders, as a fraction of the em.
@@ -430,6 +432,35 @@ function createOCR() {
       : { cells: [], emPx: 0, baselineY: 0, toPt: raster.toPt, reason: lastCutReason() }
   }
 
+  /**
+   * Every cut `traceItemNow` could make for an item, side by side — the OCR
+   * raster, the tracing raster and Tesseract's glyph boxes — for the harness.
+   * Says which one the trace would have used.
+   */
+  async function debugCuts(item: OcrTextItem) {
+    const base = rasters.get(item.pageIndex)
+    if (!base) return null
+    const describe = (raster: { ctx: CanvasRenderingContext2D; toPt: number }, boxes?: OcrBox[]) => {
+      const k = 1 / raster.toPt
+      const rect = { x: item.inkRect.x * k, y: item.inkRect.y * k, width: item.inkRect.width * k, height: item.inkRect.height * k }
+      const cut = cutGlyphs(raster.ctx, rect, item.originalText, boxes)
+      return cut
+        ? { toPt: raster.toPt, emPx: cut.emPx, emPt: cut.emPx * raster.toPt, cells: cut.cells.map(c => `${c.char}[${Math.round(c.x0)}-${Math.round(c.x1)}${c.suspect ? '!' : ''}]`).join(' '), debug: lastCutDebug() }
+        : { toPt: raster.toPt, reason: lastCutReason(), debug: lastCutDebug() }
+    }
+    const hi = await traceRasterFor(item.pageIndex, base)
+    const out: Record<string, unknown> = { base: describe(base) }
+    if (hi) out.hi = describe(hi)
+    const raster = hi && !('reason' in (out.hi as { reason?: string })) ? hi : base
+    out.used = raster === hi ? 'hi' : 'base'
+    const k = 1 / raster.toPt
+    const rect = { x: item.inkRect.x * k, y: item.inkRect.y * k, width: item.inkRect.width * k, height: item.inkRect.height * k }
+    const boxes = await glyphBoxesFromTesseract(raster.ctx, rect, item.originalText, item.inkRect.height).catch(() => null)
+    out.tesseractBoxes = boxes ? boxes.map(b => `${Math.round(b.x0)}-${Math.round(b.x1)}`).join(' ') : null
+    if (boxes) out.tesseract = describe(raster, boxes)
+    return out
+  }
+
   /** The page's scan face for a run's style, if any glyph has been traced for it. */
   function faceOf(pageIndex: number, styleKey: string): ScanFace | null {
     const f = scanFaceFor(pageIndex, styleKey)
@@ -458,7 +489,21 @@ function createOCR() {
    * The verdict carries its reason so the UI can explain itself instead of
    * silently deciding for the user.
    */
-  function judgeScanned(extractedChars: number): ScannedVerdict {
+  function judgeScanned(extractedChars: number, textCoverage?: number): ScannedVerdict {
+    // A signing service stamps a scanned contract with its ID strip — a line
+    // of 8pt text at the foot of every page, once per signing pass, so 34
+    // copies of "Intellisign ID: …" put 1768 characters on a page that is
+    // otherwise a photograph. Counted, they made the page a "text page" and
+    // the edit tool showed 34 unreachable blocks instead of recognising it.
+    // Text that covers under 2% of the paper is a stamp, a page number or a
+    // footer, whatever its character count.
+    if (extractedChars > SCANNED_TEXT_THRESHOLD && textCoverage !== undefined && textCoverage < SCANNED_TEXT_COVERAGE) {
+      return {
+        scanned: true,
+        extractedChars,
+        reason: `the page's ${extractedChars} characters of text cover only ${(textCoverage * 100).toFixed(1)}% of the paper — a stamp or footer over an image`
+      }
+    }
     if (extractedChars > SCANNED_TEXT_THRESHOLD) {
       return {
         scanned: false,
@@ -1253,5 +1298,5 @@ function createOCR() {
     engines.clear()
   }
 
-  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, spanCutFor, forgetSpanCut, setPageRenderer, forgetTraceRaster, cutFor, faceOf, facesOf, reset, destroy }
+  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, spanCutFor, forgetSpanCut, setPageRenderer, forgetTraceRaster, cutFor, debugCuts, faceOf, facesOf, reset, destroy }
 }

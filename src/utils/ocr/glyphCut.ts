@@ -57,6 +57,10 @@ let refusedBecause = ''
 export function lastCutReason(): string { return refusedBecause }
 function refuse(why: string): null { refusedBecause = why; return null }
 
+/** What the last profile cut saw, refused or not — for the harness. */
+const cutDebug: { runs: string; cells: string } = { runs: '', cells: '' }
+export function lastCutDebug() { return { ...cutDebug } }
+
 const DESCENDER_CHARS = /[gjpqyQ,;()\[\]{}]/
 const CJK = /[\p{Script=Han}　-〿＀-￯]/u
 
@@ -232,9 +236,27 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
   const budget = cjk ? Math.max(1, target * 2) : Math.max(1, Math.round(target * 0.35))
   let edits = 0
 
+  cutDebug.runs = runs.map(r => `${r.x0}-${r.x1}`).join(' ')
+  cutDebug.cells = ''
+
   // Too many pieces: an ideograph's radicals, a broken stroke, an accent
   // above its letter. Merge the pair with the smallest gap first.
-  while (runs.length > target) {
+  //
+  // CJK ONLY. For Latin text the smallest gap is the wrong signal, and it
+  // scrambled a face: a bold underlined title had a broken T (two runs 2px
+  // apart) and a broken S (5px), which put the count over the target, and the
+  // merge closed the tightest gaps first — the 3px between an intact "R" and
+  // an intact "A" before the 5px inside the S. The fused RA took one cell and
+  // every cell after it held the letter next door, at a plausible width and
+  // shape, until the S's sliver absorbed the shift eight cells on: the face
+  // learned "A" from a T, "D" from an E, "E" from a P, and "CONTRATO DE
+  // PRESTACIÓN" rendered as "CONTETTO EP REPSTTĆIÓNNN". Which pieces belong
+  // together is a question of WIDTH — R+A is 1.4 em, no capital is — so
+  // Latin runs go through `alignRunsToChars`, which decides merges and splits
+  // together by how well the widths fit the letters. Ideographs keep the gap
+  // merge: their radicals are two or three runs apart by design, and the
+  // corpus's Chinese lines trace with it.
+  while (cjk && runs.length > target) {
     let best = -1, bestGap = Infinity
     for (let i = 1; i < runs.length; i++) {
       const gap = runs[i].x0 - runs[i - 1].x1
@@ -250,11 +272,20 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
   // to runs in order, each run taking one or more, minimising how far each
   // run's width is from the expected advances of the letters it holds; a run
   // that took several is then divided among them by those advances.
-  const groups = assignByWidth(runs, chars, emPx)
-  if (!groups) return refuse('widths do not fit the letters')
+  let merged = runs
+  let groups: string[][] | null
+  if (cjk) {
+    groups = assignByWidth(runs, chars, emPx)
+    if (!groups) return refuse('widths do not fit the letters')
+  } else {
+    const aligned = alignRunsToChars(runs, chars, emPx, budget)
+    if (!aligned) return null
+    merged = aligned.runs
+    groups = aligned.groups
+  }
   const cells: GlyphCell[] = []
-  for (let i = 0; i < runs.length; i++) {
-    const r = runs[i]
+  for (let i = 0; i < merged.length; i++) {
+    const r = merged[i]
     const held = groups[i]
     const sum = held.reduce((s, c) => s + expectedAdvance(c), 0) || 1
     let x = r.x0
@@ -299,6 +330,33 @@ function vetCells(bin: Bin, cells: GlyphCell[], chars: string[]): GlyphCell[] | 
     const thinChar = /[iljtfrI.,;:'!|1]/.test(c.char)
     const off = thinChar ? Math.max(0, got - want) : Math.abs(got - want)
     if (off > Math.max(3, want * 0.4) || got < 2) { c.suspect = true; suspects++ }
+  }
+  cutDebug.cells = cells.map(c => `${c.char}[${c.x0 - bin.x}-${c.x1 - bin.x}${c.suspect ? '!' : ''}]`).join(' ')
+  // A cell holding TWO letters and a sliver somewhere else on the run are the
+  // two ends of one misalignment: between them every cell holds the ink of
+  // the letter next door, at a plausible width and (on a line of capitals) a
+  // plausible shape, so neither test above can see it. The fused cell and the
+  // sliver are each flagged on their own; the cells BETWEEN them are what the
+  // face would learn wrong, and on the title that taught it "A" from a T there
+  // were eight of them against seven flags — under the bar. Marked suspect,
+  // whichever order the two come in.
+  {
+    const wantOf = (c: GlyphCell) => expectedAdvance(c.char) / totalE * totalW
+    const thinChar = (c: GlyphCell) => /[iljtfrI.,;:'!|1]/.test(c.char)
+    const wide = cells.map(c => !thinChar(c) && (c.x1 - c.x0) > wantOf(c) * 1.6 && (c.x1 - c.x0) - wantOf(c) > 3)
+    const sliver = cells.map(c => !thinChar(c) && wantOf(c) > 2 && (c.x1 - c.x0) < wantOf(c) * 0.35)
+    for (let s = 0; s < cells.length; s++) {
+      if (!sliver[s]) continue
+      let f = -1
+      for (let d = 1; d < cells.length && f < 0; d++) {
+        if (s - d >= 0 && wide[s - d]) f = s - d
+        else if (s + d < cells.length && wide[s + d]) f = s + d
+      }
+      if (f < 0) continue
+      for (let i = Math.min(f, s) + 1; i < Math.max(f, s); i++) {
+        if (!cells[i].suspect) { cells[i].suspect = true; suspects++ }
+      }
+    }
   }
   // And each cell's SHAPE against its letter: a cell shifted by one letter
   // keeps a plausible width, which is how "República" came back reading
@@ -516,6 +574,83 @@ function assignByWidth(runs: { x0: number; x1: number }[], chars: string[], emPx
     j = k
   }
   return groups
+}
+
+/**
+ * Align ink runs to characters when there may be MORE runs than letters as
+ * well as fewer: a run may hold several letters (they touch) and several
+ * adjacent runs may make one letter (it is broken, or accented off to one
+ * side). Both are decided at once, by least squares over widths, so a tight
+ * pair of intact letters is never joined just because its gap is small — the
+ * fused pair would be 1.4 em against a want of 0.65, and the fit says no.
+ *
+ * Up to three runs make one letter (a broken bold capital rarely comes in
+ * more), each merge costing a little so it has to buy real fit. Refused when
+ * the merges exceed the fragment budget, or when the best alignment still
+ * leaves the widths far from the letters.
+ */
+function alignRunsToChars(
+  runs: { x0: number; x1: number }[],
+  chars: string[],
+  emPx: number,
+  budget: number
+): { runs: { x0: number; x1: number }[]; groups: string[][] } | null {
+  const R = runs.length, N = chars.length
+  if (R === 0 || N === 0) return refuse('no ink runs')
+  const MAX_MERGE = 3
+  const MERGE_PENALTY = 0.01
+  const widths = runs.map(r => (r.x1 - r.x0) / emPx)
+  const adv = chars.map(expectedAdvance)
+  const scale = widths.reduce((s, w) => s + w, 0) / Math.max(adv.reduce((s, a) => s + a, 0), 1e-6)
+  const prefix = [0]
+  for (const a of adv) prefix.push(prefix[prefix.length - 1] + a * scale)
+  const INF = Number.POSITIVE_INFINITY
+  const best: number[][] = Array.from({ length: R + 1 }, () => new Array(N + 1).fill(INF))
+  const fromI: number[][] = Array.from({ length: R + 1 }, () => new Array(N + 1).fill(-1))
+  const fromJ: number[][] = Array.from({ length: R + 1 }, () => new Array(N + 1).fill(-1))
+  best[0][0] = 0
+  for (let i = 1; i <= R; i++) {
+    for (let j = 1; j <= N; j++) {
+      // One run, one or more letters.
+      for (let k = 0; k < j; k++) {
+        const prev = best[i - 1][k]
+        if (prev === INF) continue
+        const d = widths[i - 1] - (prefix[j] - prefix[k])
+        const cost = prev + d * d
+        if (cost < best[i][j]) { best[i][j] = cost; fromI[i][j] = i - 1; fromJ[i][j] = k }
+      }
+      // Several runs, one letter — pieces of a BROKEN letter, which sit a few
+      // pixels apart. A speck a third of an em away from the next run is not a
+      // piece of it: joined, the pair reads as one wide cell and the fit
+      // happily calls it the "M" of a logo (the run was the mark itself) and
+      // traces the logo's shapes as letters. No merge across more than 0.15 em.
+      for (let m = 2; m <= MAX_MERGE; m++) {
+        const h = i - m
+        if (h < 0) break
+        if ((runs[h + m - 1].x0 - runs[h + m - 2].x1) / emPx > 0.15) break
+        const prev = best[h][j - 1]
+        if (prev === INF) continue
+        const span = (runs[i - 1].x1 - runs[h].x0) / emPx
+        const d = span - (prefix[j] - prefix[j - 1])
+        const cost = prev + d * d + MERGE_PENALTY * (m - 1)
+        if (cost < best[i][j]) { best[i][j] = cost; fromI[i][j] = h; fromJ[i][j] = j - 1 }
+      }
+    }
+  }
+  if (best[R][N] === INF) return refuse(`too many fragments (${R} runs for ${N} characters)`)
+  const outRuns: { x0: number; x1: number }[] = []
+  const groups: string[][] = []
+  let merges = 0
+  for (let i = R, j = N; i > 0; ) {
+    const pi = fromI[i][j], pj = fromJ[i][j]
+    outRuns.unshift({ x0: runs[pi].x0, x1: runs[i - 1].x1 })
+    groups.unshift(chars.slice(pj, j))
+    merges += i - pi - 1
+    i = pi; j = pj
+  }
+  if (merges > budget) return refuse(`too many fragments (${R} runs for ${N} characters)`)
+  if (Math.sqrt(best[R][N] / outRuns.length) > 0.34) return refuse('widths do not fit the letters')
+  return { runs: outRuns, groups }
 }
 
 /**

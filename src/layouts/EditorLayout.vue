@@ -165,13 +165,8 @@ async function runOcrOnPage(lang = OCR_DEFAULT_LANG) {
   const pageIndex = docStore.currentPage - 1
 
   // Say plainly when the page does not need this.
-  let chars = 0
-  try {
-    const blocks = await pdfEngine.getTextBlocks(pageIndex)
-    chars = blocks.reduce((n, b) => n + b.text.trim().length, 0)
-  } catch (_) { /* unreadable text layer counts as none */ }
-
-  const verdict = ocr.judgeScanned(chars)
+  const layer = await textLayerOf(pageIndex)
+  const verdict = ocr.judgeScanned(layer.chars, layer.coverage)
   if (!verdict.scanned) {
     $q.dialog({
       title: 'This page already has text',
@@ -192,14 +187,42 @@ async function runOcrOnPage(lang = OCR_DEFAULT_LANG) {
  * The verdict is cached per page; it cannot change until the document does,
  * and the store's `clear()` on a new file drops the cache with the results.
  */
+/**
+ * The page's own text layer: how many characters, and how much of the paper
+ * they cover. Coverage is the share of a coarse grid the text blocks touch —
+ * a union, so a stamp drawn 34 times over itself counts once — because the
+ * character count alone cannot tell a text page from a scan carrying a
+ * signing service's ID strip (see `judgeScanned`). An unreadable layer
+ * counts as none.
+ */
+async function textLayerOf(pageIndex: number): Promise<{ chars: number; coverage: number }> {
+  try {
+    const blocks = await pdfEngine.getTextBlocks(pageIndex)
+    const chars = blocks.reduce((n, b) => n + b.text.trim().length, 0)
+    const size = await pdfEngine.getPageSize(pageIndex)
+    const G = 64
+    const grid = new Uint8Array(G * G)
+    for (const b of blocks) {
+      if (!b.text.trim()) continue
+      const x0 = Math.max(0, Math.floor(Math.min(b.bbox[0], b.bbox[2]) / size.width * G))
+      const x1 = Math.min(G - 1, Math.floor(Math.max(b.bbox[0], b.bbox[2]) / size.width * G))
+      const y0 = Math.max(0, Math.floor(Math.min(b.bbox[1], b.bbox[3]) / size.height * G))
+      const y1 = Math.min(G - 1, Math.floor(Math.max(b.bbox[1], b.bbox[3]) / size.height * G))
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) grid[y * G + x] = 1
+    }
+    let touched = 0
+    for (const v of grid) touched += v
+    return { chars, coverage: touched / (G * G) }
+  } catch (_) { return { chars: 0, coverage: 0 } }
+}
+
 async function isScanLikePage(pageIndex: number): Promise<boolean> {
   const cached = ocrStore.scanVerdicts.get(pageIndex)
   if (cached !== undefined) return cached
   let verdict = false
   try {
-    const blocks = await pdfEngine.getTextBlocks(pageIndex)
-    const chars = blocks.reduce((n, b) => n + b.text.trim().length, 0)
-    if (ocr.judgeScanned(chars).scanned) {
+    const layer = await textLayerOf(pageIndex)
+    if (ocr.judgeScanned(layer.chars, layer.coverage).scanned) {
       const size = await pdfEngine.getPageSize(pageIndex)
       const paper = Math.max(1, size.width * size.height)
       // Summed, not "any one image": the supplier survey is one scan TILED
