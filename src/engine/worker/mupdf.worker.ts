@@ -108,6 +108,13 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      case 'addTextRun': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        await ensureCjkFontFor(req.data.parts.map(p => p.text).join(''))
+        respond({ id: req.id, type: 'success', data: addTextRunToPage(req.data.pageIndex, req.data.parts, req.data.rotation ?? 0) })
+        break
+      }
+
       case 'measureRuns': {
         if (!mupdf) throw new Error('MuPDF not initialized')
         respond({ id: req.id, type: 'success', data: { widths: req.data.runs.map(r => measureRunWidth(r.text, r.fontSize, r.fontName, r.faceId)) } })
@@ -388,6 +395,34 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
           { id: req.id, type: 'success', data: { bytes: savedBytes.buffer } },
           [savedBytes.buffer] as any
         )
+        break
+      }
+
+      case 'renderPixmap': {
+        if (!pdfDoc || !mupdf) throw new Error('No document loaded')
+        // pdf.js took over 90 seconds on one page of a 79-page fax-encoded
+        // calibration scan (CCITT and JPEG images through iLovePDF/PDF24) and
+        // the OCR raster with it, so recognising that page never finished
+        // outside the sweep. MuPDF draws the same page in 32 ms. /Rotate is
+        // applied, as pdf.js's viewport applies it, so the raster is the
+        // visible page and every box measured on it lands where it should.
+        const page = pdfDoc.loadPage(req.data.pageIndex)
+        try {
+          const s = req.data.scale
+          const pix = page.toPixmap(mupdf.Matrix.scale(s, s), mupdf.ColorSpace.DeviceRGB, false, true)
+          const w = pix.getWidth(), h = pix.getHeight()
+          const n = pix.getNumberOfComponents()
+          const src = pix.getPixels()
+          const rgba = new Uint8ClampedArray(w * h * 4)
+          for (let i = 0, j = 0; i < w * h; i++, j += n) {
+            rgba[i * 4] = src[j]; rgba[i * 4 + 1] = src[j + 1]; rgba[i * 4 + 2] = src[j + 2]; rgba[i * 4 + 3] = 255
+          }
+          pix.destroy()
+          self.postMessage(
+            { id: req.id, type: 'success', data: { width: w, height: h, rgba: rgba.buffer } },
+            [rgba.buffer] as any
+          )
+        } finally { page.destroy() }
         break
       }
 
@@ -2359,11 +2394,149 @@ function measureRunWidth(text: string, fontSize: number, fontName: string, faceI
       continue
     }
     const winAnsi = encodeWinAnsiText(seg.text)
-    if ('missing' in winAnsi) { em += [...seg.text].length * 1.0; exact = false; continue }
+    if ('missing' in winAnsi) {
+      // The whole segment goes to the CJK face, Latin letters included, and
+      // there an ideograph is an em but a Latin letter is about half of one.
+      // Counting every character as an em made "(承包商 Prove" 11 ems where
+      // it draws as 7, and the invisible run fitted to that estimate came out
+      // at 55% of its ink and ended 20pt short of the letters it stood for.
+      // With the face loaded, its own advances — the run is drawn from them.
+      for (const ch of seg.text) {
+        if (cjkFont) {
+          try { em += cjkFont.charToGlyph(ch).advanceWidth / cjkFont.unitsPerEm; continue } catch (_) { /* fall through */ }
+        }
+        em += ch === ' ' ? 0.3 : hasCjk(ch) ? 1.0 : 0.55
+        exact = false
+      }
+      continue
+    }
     if (!measureFace(fontName)) exact = false
     em += measureEm(seg.text, fontName)
   }
   return { width: em * fontSize, exact }
+}
+
+/**
+ * The show operators for one run — one `Tf` + `Tj` per SEGMENT, the run cut
+ * into stretches the scan face can draw and stretches it cannot (WinAnsi in
+ * the base-14 face, or a subset of the CJK face). Shared by `addTextToPage`
+ * and `addTextRunToPage`.
+ */
+function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: string, faceId?: string): { ops: string } | { error: string } {
+  const face = faceId ? scanFaces.get(faceId) : null
+  const segments = segmentRun(text, face)
+  const ops: string[] = []
+  for (const seg of segments) {
+    if (seg.traced && face) {
+      const run = registerEmbeddedRun(pageObj, face, seg.text, 'FSCN')
+      if (run) { ops.push(`/${run.refName} ${fontSize} Tf <${run.hex}> Tj`); continue }
+    }
+    const winAnsi = encodeWinAnsiText(seg.text)
+    if ('missing' in winAnsi) {
+      const cjk = hasCjk(seg.text) ? registerCjkRun(pageObj, seg.text) : null
+      if (!cjk) {
+        const why = hasCjk(seg.text) && !cjkFont
+          ? ' (the CJK font could not be loaded)'
+          : ''
+        return { error: `Characters not supported by ${fontName}: ${winAnsi.missing.join(', ')}${why}` }
+      }
+      ops.push(`/${cjk.refName} ${fontSize} Tf <${cjk.hex}> Tj`)
+    } else {
+      ops.push(`/${ensureStandardFont(pageObj, fontName)} ${fontSize} Tf (${escapePdfString(winAnsi.bytes)}) Tj`)
+    }
+  }
+  return { ops: ops.join('\n') }
+}
+
+/**
+ * The text matrix for a run whose baseline starts at `x y` (bottom-left page
+ * space), corrected the way `addTextToPage` corrects its own: through the
+ * inverse of /Rotate, and through the inverse of the CTM the stream leaves in
+ * force at its end (the block is appended there).
+ */
+function appendedTextMatrix(pageIndex: number, existingStream: string, x: number, y: number, rotation: number): Mat6 {
+  const rad = (rotation * Math.PI) / 180
+  const upright = Math.abs(rotation) < 0.01
+  const ca = upright ? 1 : Math.cos(rad)
+  const sa = upright ? 0 : Math.sin(rad)
+  let tm: Mat6 = [ca, sa, -sa, ca, x, y]
+  const pageRot = pageRotationCtm(pageIndex)
+  if (pageRot) {
+    const inv = matInvert(pageRot)
+    if (inv) tm = matConcat(tm, inv)
+  }
+  const endCtm = getCtmAtOffset(existingStream, existingStream.length)
+  if (endCtm.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
+    const endInv = matInvert(endCtm)
+    if (endInv) tm = matConcat(tm, endInv)
+  }
+  return tm
+}
+
+/**
+ * Several runs in ONE text object, each at its own pen, visible or not.
+ *
+ * A partially redrawn scanned line is three runs — the words the scan keeps
+ * drawing (invisible, render mode 3), the stretch that changed (drawn), the
+ * words after it (invisible again). Appended as three text objects, MuPDF's
+ * extraction listed the visible stretch BEFORE its own line's head, so the
+ * line no longer copied, searched or read back in order. Inside one BT the
+ * characters are in reading order whatever their render mode; `Tr` and the
+ * colour are set per part and the whole object is bracketed in q/Q so
+ * neither outlives it.
+ */
+function addTextRunToPage(
+  pageIndex: number,
+  parts: { x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; faceId?: string; invisible?: boolean; fitWidth?: number }[],
+  rotation = 0
+): { success: boolean; error?: string } {
+  if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
+  if (!parts.length) return { success: true }
+  try {
+    const page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+    const existingStream = readContentStream(pageIndex)
+    const fmt = (n: number) => (Math.abs(n) < 1e-6 ? '0' : n.toFixed(4))
+    const chunks: string[] = []
+    for (const part of parts) {
+      if (!part.text) continue
+      const built = buildShowOps(pageObj, part.text, part.fontSize, part.fontName, part.faceId)
+      if ('error' in built) { page.destroy(); return { success: false, error: built.error } }
+      const tm = appendedTextMatrix(pageIndex, existingStream, part.x, part.y, rotation)
+      const r = part.color?.[0] ?? 0, g = part.color?.[1] ?? 0, b = part.color?.[2] ?? 0
+      // An invisible run stands for the scan's own words, whose letters are
+      // not Helvetica's width: set at its natural advance it ended short of
+      // the ink (or ran past it), and extraction read the difference as a
+      // space or a collision. `Tz` scales the advance to the ink's span.
+      let tz = 100
+      if (part.fitWidth && part.fitWidth > 0) {
+        const natural = measureRunWidth(part.text, part.fontSize, part.fontName, part.faceId).width
+        if (natural > 0) tz = Math.min(200, Math.max(50, (part.fitWidth / natural) * 100))
+      }
+      chunks.push(
+        `${part.invisible ? 3 : 0} Tr\n${tz.toFixed(2)} Tz\n${part.invisible ? '' : `${r} ${g} ${b} rg\n`}` +
+        `${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${built.ops}`
+      )
+    }
+    if (!chunks.length) { page.destroy(); return { success: true } }
+    const newBlock = `\nq\nBT\n${chunks.join('\n')}\nET\nQ\n`
+    const combined = existingStream + newBlock
+    const streamBytes = new Uint8Array(combined.length)
+    for (let i = 0; i < combined.length; i++) streamBytes[i] = combined.charCodeAt(i) & 0xFF
+    const contents = pageObj.get('Contents')
+    const isStream = !!contents && String(contents) !== 'null' &&
+      typeof contents.isStream === 'function' && contents.isStream()
+    if (isStream) {
+      contents.writeStream(streamBytes)
+    } else {
+      const newStreamObj = pdfDoc.addStream(streamBytes, {})
+      pageObj.put('Contents', newStreamObj)
+    }
+    page.destroy()
+    return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) }
+  }
 }
 
 function addTextToPage(
@@ -2396,30 +2569,9 @@ function addTextToPage(
     // WinAnsi in the base-14 face where it can — serializing raw Unicode with
     // "& 0xFF" would silently mangle €, smart quotes, dashes… — and to a
     // subset of the shipped CJK face for text WinAnsi cannot hold.
-    const face = faceId ? scanFaces.get(faceId) : null
-    const segments = segmentRun(text, face)
-    const ops: string[] = []
-    for (const seg of segments) {
-      if (seg.traced && face) {
-        const run = registerEmbeddedRun(pageObj, face, seg.text, 'FSCN')
-        if (run) { ops.push(`/${run.refName} ${fontSize} Tf <${run.hex}> Tj`); continue }
-      }
-      const winAnsi = encodeWinAnsiText(seg.text)
-      if ('missing' in winAnsi) {
-        const cjk = hasCjk(seg.text) ? registerCjkRun(pageObj, seg.text) : null
-        if (!cjk) {
-          page.destroy()
-          const why = hasCjk(seg.text) && !cjkFont
-            ? ' (the CJK font could not be loaded)'
-            : ''
-          return { success: false, error: `Characters not supported by ${fontName}: ${winAnsi.missing.join(', ')}${why}` }
-        }
-        ops.push(`/${cjk.refName} ${fontSize} Tf <${cjk.hex}> Tj`)
-      } else {
-        ops.push(`/${ensureStandardFont(pageObj, fontName)} ${fontSize} Tf (${escapePdfString(winAnsi.bytes)}) Tj`)
-      }
-    }
-    const showOps = ops.join('\n')
+    const built = buildShowOps(pageObj, text, fontSize, fontName, faceId)
+    if ('error' in built) { page.destroy(); return { success: false, error: built.error } }
+    const showOps = built.ops
 
     // 2. Read existing content stream
     const existingStream = readContentStream(pageIndex)

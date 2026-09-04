@@ -1,6 +1,20 @@
 import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, ImageOrient, ImageAlign } from '../types'
 
 // Messages from main thread -> worker
+/** One run of an `addTextRun` text object: its own pen (bottom-left origin baseline), size, face and visibility. */
+export interface TextRunPart {
+  x: number
+  y: number
+  text: string
+  fontSize: number
+  fontName: string
+  color?: [number, number, number]
+  faceId?: string
+  invisible?: boolean
+  /** Stretch the run horizontally (`Tz`) so its advance equals this many points — an invisible run set over the scan's own ink. */
+  fitWidth?: number
+}
+
 export type WorkerRequest =
   | { id: number; type: 'init' }
   | { id: number; type: 'loadDocument'; data: { bytes: ArrayBuffer } }
@@ -11,6 +25,8 @@ export type WorkerRequest =
   | { id: number; type: 'writeContentStream'; data: { pageIndex: number; streamBytes: ArrayBuffer } }
   | { id: number; type: 'replaceText'; data: { pageIndex: number; blockId: string; newText: string } }
   | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number; faceId?: string; invisible?: boolean } }
+  /** Several runs in ONE text object — the invisible head, the visible stretch and the invisible tail of a partial redraw — so extraction reads them as one line. */
+  | { id: number; type: 'addTextRun'; data: { pageIndex: number; rotation?: number; parts: TextRunPart[] } }
   /** A traced scan face (OpenType bytes) the worker keeps by id for `addText` runs that name it. */
   | { id: number; type: 'registerFace'; data: { faceId: string; bytes: ArrayBuffer } }
   /** The exact pen advance `addText` would give each run, in points — measured with the fonts that will draw it. */
@@ -55,6 +71,8 @@ export type WorkerRequest =
   | { id: number; type: 'searchPage'; data: { pageIndex: number; needle: string; maxHits?: number } }
   | { id: number; type: 'searchDocument'; data: { needle: string; maxHitsPerPage?: number } }
   | { id: number; type: 'saveDocument' }
+  /** Render a page through MuPDF at `scale` (1 = 72 DPI), /Rotate applied, as RGBA — for OCR rasters, where pdf.js takes minutes on some fax-encoded scans. */
+  | { id: number; type: 'renderPixmap'; data: { pageIndex: number; scale: number } }
   | { id: number; type: 'destroy' }
 
 // Messages from worker -> main thread

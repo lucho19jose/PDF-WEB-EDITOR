@@ -49,6 +49,15 @@ export interface TextOp {
    * not change and puts their words back into the page this way.
    */
   invisible?: boolean
+  /**
+   * Ops sharing a group are ONE line — the invisible head, the visible stretch
+   * and the invisible tail of a partial redraw — and the bake writes them as
+   * one text object. As three, MuPDF listed the visible stretch before its
+   * own line's head, so the line no longer copied or searched in order.
+   */
+  group?: string
+  /** For an invisible run: the width of the ink it stands for, so the engine can scale its advance to match. */
+  fitWidth?: number
 }
 
 /** The scan's own pixels moved: read at `srcRect`, drawn at `dstRect` (same size), page points, top-left origin. */

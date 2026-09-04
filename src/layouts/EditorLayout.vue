@@ -279,7 +279,10 @@ async function runOcrNow(pageIndex: number, lang: string) {
   // canvas will not do: in continuous scroll the first `canvas.pdf-canvas` in
   // the document is page 1's whatever page is current, and page 2's OCR came
   // back reading page 1.
-  const canvas = await pdfViewer.renderPageToCanvas(pageIndex + 1, OCR_RENDER_SCALE).catch(() => null)
+  // MuPDF first: pdf.js took over 90 s on one page of a fax-encoded scan
+  // (CCITT images through iLovePDF/PDF24) where MuPDF takes 32 ms, and the
+  // button appeared to do nothing. pdf.js stays as the fallback.
+  const canvas = await renderForOcr(pageIndex, OCR_RENDER_SCALE)
   if (!canvas) { editorStore.setStatus('The page could not be rendered for recognition'); return }
 
   // Progress in the status bar: a page of Chinese and Spanish takes long
@@ -392,7 +395,7 @@ async function bakeOcrEdits(): Promise<number> {
     // pre-bake document until `syncAfterEdit`, whatever the OCR raster LRU has.
     const crops: (ArrayBuffer | null)[] = []
     if (plan.images.length) {
-      const canvas = await pdfViewer.renderPageToCanvas(pageIndex + 1, 300 / 72).catch(() => null)
+      const canvas = await renderForOcr(pageIndex, 300 / 72)
       const k = canvas ? canvas.width / page.pageWidth : 0
       for (const img of plan.images) {
         const [x0, y0, x1, y1] = img.srcRect
@@ -411,10 +414,25 @@ async function bakeOcrEdits(): Promise<number> {
         const png = crops[i]
         if (png) await pdfEngine.drawImageInContent(pageIndex, img.dstRect, png, false)
       }
-      for (const t of plan.texts) {
+      // Ops of one GROUP — a partial redraw's invisible head, visible stretch
+      // and invisible tail — go into one text object, or MuPDF lists the
+      // stretch before its own head and the line stops copying in order.
+      for (let i = 0; i < plan.texts.length; ) {
+        const t = plan.texts[i]
+        let j = i + 1
+        while (t.group && j < plan.texts.length && plan.texts[j].group === t.group) j++
+        const run = plan.texts.slice(i, j)
         // addText takes a bottom-left origin baseline; OCR works top-left.
-        await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible)
-        if (!t.invisible) written++
+        if (run.length > 1) {
+          await pdfEngine.addTextRun(pageIndex, run.map(o => ({
+            x: o.x, y: page.pageHeight - o.y, text: o.text, fontSize: o.fontSize, fontName: o.fontName,
+            color: o.color, faceId: o.faceId, invisible: o.invisible, fitWidth: o.fitWidth
+          })), t.rotation)
+        } else {
+          await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible)
+        }
+        for (const o of run) if (!o.invisible) written++
+        i = j
       }
     })
   }
@@ -1117,7 +1135,14 @@ async function handleDrop(e: DragEvent) {
 provide('runOcrOnPage', runOcrOnPage)
 // The recogniser has no viewer of its own; lend it ours so it can render a
 // page again at tracing resolution (see `traceRasterFor`).
-ocr.setPageRenderer((pageIndex, scale) => pdfViewer.renderPageToCanvas(pageIndex + 1, scale))
+ocr.setPageRenderer((pageIndex, scale) => renderForOcr(pageIndex, scale))
+
+/** The page as a raster for recognition: MuPDF, and pdf.js when MuPDF cannot. */
+async function renderForOcr(pageIndex: number, scale: number): Promise<HTMLCanvasElement | null> {
+  const viaMupdf = await pdfEngine.renderPageBitmap(pageIndex, scale).catch(() => null)
+  if (viaMupdf) return viaMupdf
+  return pdfViewer.renderPageToCanvas(pageIndex + 1, scale).catch(() => null)
+}
 provide('bakeOcrEdits', bakeOcrEdits)
 // For the sweep drivers (public/_sweep/*.js): a production build strips the
 // Vue internals they used to walk to these, so they are put on window like

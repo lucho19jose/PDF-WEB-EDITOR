@@ -1,5 +1,5 @@
 import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult, ImageOrient, ImageAlign } from './types'
-import type { WorkerResponse } from './worker/worker-protocol'
+import type { WorkerResponse, TextRunPart } from './worker/worker-protocol'
 
 /**
  * MuPDF Engine Bridge
@@ -200,6 +200,15 @@ export class MuPDFBridge {
     invisible?: boolean
   ): Promise<{ success: boolean; error?: string }> {
     return this.send('addText', { pageIndex, x, y, text, fontSize, fontName, color, rotation, faceId, invisible })
+  }
+
+  /**
+   * Several runs as ONE text object, each at its own pen — the invisible head,
+   * the visible stretch and the invisible tail of a partially redrawn line, so
+   * extraction reads them in order as one line.
+   */
+  async addTextRun(pageIndex: number, parts: TextRunPart[], rotation?: number): Promise<{ success: boolean; error?: string }> {
+    return this.send('addTextRun', { pageIndex, parts, rotation })
   }
 
   /** Hand the worker a traced scan face to embed for runs that name it. */
@@ -418,6 +427,11 @@ export class MuPDFBridge {
   async saveDocument(): Promise<ArrayBuffer> {
     const result = await this.send('saveDocument')
     return result.bytes
+  }
+
+  /** The page rendered by MuPDF at `scale` (1 = 72 DPI), /Rotate applied, as RGBA pixels. */
+  async renderPixmap(pageIndex: number, scale: number): Promise<{ width: number; height: number; rgba: ArrayBuffer }> {
+    return this.send('renderPixmap', { pageIndex, scale })
   }
 
   /**

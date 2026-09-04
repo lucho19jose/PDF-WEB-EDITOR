@@ -94,17 +94,24 @@ export function toSpanCut(cut: GlyphCutResult, toPt: number, originalText: strin
   const chars = [...originalText]
   let cellIndex = -1
   let pendingSpace = false
-  let prev: { x1: number; suspect: boolean } | null = null
+  let prev: { x1: number; suspect: boolean; cjk: boolean } | null = null
+  // An ideograph sits in a full em with air on both sides, so the gap between
+  // two of them is several times a Latin letter gap. On "(承包商 Proveedor)"
+  // three such gaps pulled the median letter gap to 4pt at 9pt, and a tail
+  // shifted by that gap left a space inside "Provedor". Letter gaps are
+  // measured between Latin neighbours only.
+  const CJK_CHAR = /[　-鿿豈-﫿＀-￯]/
   for (const ch of chars) {
     if (ch === ' ') { pendingSpace = true; continue }
     cellIndex++
     const cell = cells[cellIndex]
     if (!cell) break
+    const cjk = CJK_CHAR.test(ch)
     if (prev && !prev.suspect && !cell.suspect) {
       const gap = cell.x0 - prev.x1
-      if (gap >= 0) (pendingSpace ? wordGaps : letterGaps).push(gap)
+      if (gap >= 0 && (pendingSpace || (!cjk && !prev.cjk))) (pendingSpace ? wordGaps : letterGaps).push(gap)
     }
-    prev = cell
+    prev = { x1: cell.x1, suspect: cell.suspect, cjk }
     pendingSpace = false
   }
   const emPt = cut.emPx * toPt
@@ -237,17 +244,22 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const edited = nonSpace(item.text)
   const headText = prefix > 0 ? t.slice(0, positions[prefix - 1] + 1).join('').trim() : ''
   const tailText = suffix > 0 ? t.slice(positions[edited.length - suffix]).join('').trim() : ''
-  const invisible = (text: string, x: number): TextOp[] => text ? [{
-    text, x, y: cut.baseline.yAtCentre + cut.baseline.slope * (x - cut.baseline.centreX), fontSize: sizePt,
-    fontName: ctx.fontName, color: ctx.color, rotation: 0, invisible: true
+  // On the STRETCH's baseline, not each at its own point of the fitted line:
+  // a scan tilted by 0.7° puts the head's baseline 0.8pt from the stretch's
+  // sixty points away, and the extractor reads a step that size as two lines
+  // — "X" listed before "Las partes que". The invisible words have no ink to
+  // sit anywhere, so one shared height costs nothing and keeps the line one.
+  const invisible = (text: string, x: number, fitWidth: number): TextOp[] => text ? [{
+    text, x, y: baselineY, fontSize: sizePt,
+    fontName: ctx.fontName, color: ctx.color, rotation: 0, invisible: true, group: item.id, fitWidth
   }] : []
   const textOp = (tailShift = 0): TextOp[] => [
-    ...invisible(headText, cells[0].x0 - bearing),
+    ...invisible(headText, cells[0].x0 - bearing, headEnd - cells[0].x0 + bearing),
     ...(st.text.length ? [{
       text: st.text, x: penX, y: baselineY, fontSize: sizePt,
-      fontName: ctx.fontName, color: ctx.color, rotation: 0, faceId: ctx.faceId
+      fontName: ctx.fontName, color: ctx.color, rotation: 0, faceId: ctx.faceId, group: item.id
     } as TextOp] : []),
-    ...(tailStart !== null ? invisible(tailText, tailStart + tailShift - bearing) : [])
+    ...(tailStart !== null ? invisible(tailText, tailStart + tailShift - bearing, inkRight - tailStart + bearing) : [])
   ]
 
   if (tailStart === null) {

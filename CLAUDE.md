@@ -3789,6 +3789,62 @@ the change the tail may open by a letter gap and a hair; past that it is
 shifted onto the vacated ink. Measured: "presnte" and "Rgistro" bake closed
 up (partial+shift) and extract as typed.
 
+### A partially redrawn line is ONE text object, on ONE baseline, at the ink's WIDTH
+The partial redraw put a line back as three text objects — invisible head,
+visible stretch, invisible tail — and MuPDF listed the visible "X" BEFORE the
+line it belonged to, so an edited line no longer copied, searched or read back
+in order ("Test Parameters", "Las partes que X", the sweep's `found` misses).
+Three things, each measured on the CLARO order's "Las partes que" row:
+
+- **One text object.** `addTextRun` (worker `addTextRunToPage`, bridge,
+  `usePDFEngine`) writes every part of a `TextOp.group` inside one BT, `Tr`
+  and colour set per part and the whole bracketed in q/Q. Inside one BT the
+  characters are in reading order whatever their render mode.
+- **One baseline.** Each part sat on the fitted baseline at its own x, and on
+  a scan tilted 0.7° that put the head 0.8pt from the stretch sixty points
+  away — `splitBlocksAtGaps` reads a step that size (over 8% of the size) as
+  a new line, sorted by y, so the "X" came first even inside one BT. The
+  invisible parts take the stretch's baseline: they have no ink to sit
+  anywhere.
+- **The ink's width.** An invisible run is set in Helvetica (or the CJK face,
+  Latin letters included), whose advances are not the scan's: set naturally
+  it ended 20pt short of the letters it stood for and extraction read the
+  difference as a space ("Prove dor"). `TextRunPart.fitWidth` scales the
+  advance with `Tz` to the span of ink the part stands for. The width it is
+  scaled FROM has to be exact: `measureRunWidth` counted every character of
+  a CJK-fallback segment as an em (11 ems for "(承包商 Prove", drawn as 7)
+  and now reads the loaded face's own advances.
+
+And the letter gap that places a shifted tail is measured between LATIN
+neighbours only: the three ideographs on that row pulled the median to 4pt
+at 9pt and a tail shifted by it left a space inside "Provedor".
+
+Measured: the row extracts as one block, "Las partes que X (承包商
+Provedor): AMÉRICA MÓVIL", spaces where the page has them and nowhere else.
+Corpus: main 72 of 74 read back (was 71; "CUMPLIÓ" now in order), 0.915;
+the second corpus (ten recent Downloads scans: the CLARO and LIDERA orders,
+a work order, the fixed-asset reports, a quotation — `public/_sweep/ocr2`,
+gitignored) 33 of 33 read back (was 30), 0.995.
+
+### The OCR raster comes from MuPDF, not pdf.js
+pdf.js took over 90 seconds — measured, it never finished — to render one page
+of a 79-page calibration scan (CCITT fax and JPEG images through
+iLovePDF/PDF24, /Rotate 270) at 220 DPI, and with it the OCR button did
+nothing on that page; in node, MuPDF draws the same page in 32 ms.
+`renderPixmap` (worker → `MuPDFBridge.renderPixmap` → `pdfEngine.renderPageBitmap`)
+renders a page through `Page.toPixmap` with /Rotate applied, as pdf.js's
+viewport applies it, and hands the RGBA back transferred. `renderForOcr` in
+`EditorLayout` uses it for the recognition raster, the 440 DPI tracing raster
+and the bake's 300 DPI tail crops, with pdf.js as the fallback when MuPDF
+cannot. pdf.js stays the viewer. Measured in the browser on that page: the
+raster in 59 ms, recognition in 13 s, and a first-word replacement
+("Test" → "tseT") bakes and extracts as one line. The two rasters are
+indistinguishable at the pixel level on a Word-scan page (recognition 62 runs
+at 96% against 60 at 98%, Paddle's own noise); corpus after the switch: main
+72 of 74 read back, 0.917, 45 of 74 cuts accepted (was 38); second corpus
+33 of 33, 0.950 — two rows on the OT-GA order's page 4 dropped, both 6pt
+table cells whose Helvetica redraw overruns the cell (see below).
+
 ### A scan signed through a stamping service still has "text" — judge it by COVERAGE
 `judgeScanned` counted characters: over 12 and the page was a text page. An
 Intellisign-signed scan carries the service's ID strip — one 8pt line at the

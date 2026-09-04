@@ -1,5 +1,6 @@
 import { ref, readonly } from 'vue'
 import { getMuPDFBridge } from '@/engine/bridge'
+import type { TextRunPart } from '@/engine/worker/worker-protocol'
 import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, ContentImageInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult, ImageOrient, ImageAlign } from '@/engine/types'
 
 /**
@@ -161,6 +162,45 @@ export function usePDFEngine() {
   ): Promise<boolean> {
     try {
       const result = await bridge.addText(pageIndex, x, y, text, fontSize, fontName, color, rotation, faceId, invisible)
+      if (result.success) {
+        pageTextCache.delete(pageIndex)
+      } else {
+        error.value = result.error || 'Unknown error adding text'
+      }
+      return result.success
+    } catch (err: any) {
+      error.value = `Failed to add text: ${err.message}`
+      throw err
+    }
+  }
+
+  /**
+   * A page rendered by MuPDF onto a fresh canvas, at `scale` (1 = 72 DPI),
+   * /Rotate applied — the raster OCR reads. pdf.js is the viewer, but on some
+   * fax-encoded scans it takes minutes for one page where MuPDF takes
+   * milliseconds, and recognition never got its raster.
+   */
+  async function renderPageBitmap(pageIndex: number, scale: number): Promise<HTMLCanvasElement | null> {
+    try {
+      const px = await bridge.renderPixmap(pageIndex, scale)
+      if (!px || !px.width || !px.height) return null
+      const canvas = document.createElement('canvas')
+      canvas.width = px.width
+      canvas.height = px.height
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })
+      if (!ctx) return null
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(px.rgba), px.width, px.height), 0, 0)
+      return canvas
+    } catch (err: any) {
+      console.warn('[Engine] renderPageBitmap failed:', err?.message || err)
+      return null
+    }
+  }
+
+  /** Several runs in one text object — see `MuPDFBridge.addTextRun`. */
+  async function addTextRun(pageIndex: number, parts: TextRunPart[], rotation?: number): Promise<boolean> {
+    try {
+      const result = await bridge.addTextRun(pageIndex, parts, rotation)
       if (result.success) {
         pageTextCache.delete(pageIndex)
       } else {
@@ -484,7 +524,7 @@ export function usePDFEngine() {
     debugBtBlocks,
     readContentStream,
     replaceText,
-    addText, registerFace, measureRuns,
+    addText, addTextRun, registerFace, measureRuns, renderPageBitmap,
     transformTextBlock,
     transformTextBlocks,
     restyleTextBlocks,
