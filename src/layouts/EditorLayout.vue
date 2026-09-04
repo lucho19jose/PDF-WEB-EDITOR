@@ -87,7 +87,10 @@ import { styleKeyOf } from '@/utils/ocr/scanFace'
 const OCR_RENDER_SCALE = 220 / 72
 /** The user said yes to sending a page image to the cloud, this session. */
 let cloudConsentGiven = false
-import { planOcrExport } from '@/utils/ocr/ocrExport'
+import { planOcrExport, base14 } from '@/utils/ocr/ocrExport'
+import { stretchOf, sizeOf } from '@/utils/ocr/partialRedraw'
+import { cropToPng } from '@/utils/ocr/pixelCrop'
+import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
 import { getMuPDFBridge } from '@/engine/bridge'
@@ -326,6 +329,8 @@ async function bakeOcrEdits(): Promise<number> {
   const slow = setTimeout(() => editorStore.setStatus("Finishing the scan's letterforms..."), 800)
   try { await settled } finally { clearTimeout(slow) }
   let written = 0
+  /** Per page, per edited item: how it was drawn — for the sweep (`window.__ocrBakeReport`). */
+  const modes: Record<number, Record<string, string>> = {}
 
   for (const [pageIndex, page] of ocrStore.pages) {
     // The page's traced scan faces — one per style — embedded once per bake
@@ -336,11 +341,41 @@ async function bakeOcrEdits(): Promise<number> {
       const ok = await pdfEngine.registerFace(face.familyName, face.bytes.slice(0)).catch(() => false)
       if (ok) registered.add(face.familyName)
     }
-    const plan = planOcrExport(page.items, item => {
+    const faceIdFor = (item: OcrTextItem) => {
       const face = ocr.faceOf(pageIndex, styleKeyOf(item))
       return face && registered.has(face.familyName) ? face.familyName : undefined
-    }, page.pageWidth)
-    if (plan.patches.length === 0 && plan.texts.length === 0) continue
+    }
+    // Only the CHANGED stretch of a run is redrawn when its letters' positions
+    // are known (the glyph cut made at commit time) and the engine can say
+    // exactly how wide the new stretch will be with the fonts that will draw
+    // it; the untouched words keep the scan's own pixels. The widths are
+    // measured in one batched call per page.
+    const candidates = page.items.filter(i => i.edited && !i.removed && !i.vertical && !i.baked && ocr.spanCutFor(i))
+    const measured = await pdfEngine.measureRuns(candidates.map(item => {
+      const cut = ocr.spanCutFor(item)!
+      return { text: stretchOf(item)?.text ?? '', fontSize: sizeOf(item, cut), fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item) }
+    }))
+    const partialCtx = new Map(candidates.map((item, i) => [item.id, {
+      cut: ocr.spanCutFor(item)!,
+      stretchWidthPt: measured[i]?.exact ? measured[i].width : null,
+      allowShift: true
+    }]))
+    const plan = planOcrExport(page.items, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null)
+    modes[pageIndex] = plan.modes
+    if (plan.patches.length === 0 && plan.texts.length === 0 && plan.images.length === 0) continue
+
+    // The scan's pixels for any tail that moves, read from a fresh render of
+    // the page BEFORE anything is drawn on it: PDF.js still holds the
+    // pre-bake document until `syncAfterEdit`, whatever the OCR raster LRU has.
+    const crops: (ArrayBuffer | null)[] = []
+    if (plan.images.length) {
+      const canvas = await pdfViewer.renderPageToCanvas(pageIndex + 1, 300 / 72).catch(() => null)
+      const k = canvas ? canvas.width / page.pageWidth : 0
+      for (const img of plan.images) {
+        const [x0, y0, x1, y1] = img.srcRect
+        crops.push(canvas ? await cropToPng(canvas, { x: x0 * k, y: y0 * k, width: (x1 - x0) * k, height: (y1 - y0) * k }) : null)
+      }
+    }
 
     await exclusiveOp(async () => {
       // Into the content stream, not as an annotation: annotations paint over
@@ -349,21 +384,33 @@ async function bakeOcrEdits(): Promise<number> {
       for (const patch of plan.patches) {
         await pdfEngine.fillRect(pageIndex, patch.rect, patch.color)
       }
+      for (const [i, img] of plan.images.entries()) {
+        const png = crops[i]
+        if (png) await pdfEngine.drawImageInContent(pageIndex, img.dstRect, png, false)
+      }
       for (const t of plan.texts) {
         // addText takes a bottom-left origin baseline; OCR works top-left.
-        await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId)
-        written++
+        await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible)
+        if (!t.invisible) written++
       }
     })
   }
+  ;(window as any).__ocrBakeReport = modes
 
   if (written > 0 || ocrStore.hasEdits) {
     docStore.markModified()
     await syncAfterEdit()
     // The runs are in the document now; drawing them again on the next save
-    // would stack a second copy on the first.
-    for (const [, page] of ocrStore.pages) {
-      for (const item of page.items) { item.edited = false; item.removed = false; item.originalText = item.text }
+    // would stack a second copy on the first. A drawn run is also marked
+    // `baked`: the raster under it no longer shows its original ink, so its
+    // glyph cut is forgotten and neither a partial redraw nor a trace is made
+    // from it again until the page is recognised afresh.
+    for (const [pageIndex, page] of ocrStore.pages) {
+      if (page.items.some(i => i.edited || i.removed)) ocr.forgetTraceRaster(pageIndex)
+      for (const item of page.items) {
+        if (item.edited || item.removed) { item.baked = true; ocr.forgetSpanCut(item.id) }
+        item.edited = false; item.removed = false; item.restyled = false; item.originalText = item.text
+      }
     }
   }
   return written
@@ -1045,6 +1092,9 @@ async function handleDrop(e: DragEvent) {
 
 // ===== PROVIDE to whole tree =====
 provide('runOcrOnPage', runOcrOnPage)
+// The recogniser has no viewer of its own; lend it ours so it can render a
+// page again at tracing resolution (see `traceRasterFor`).
+ocr.setPageRenderer((pageIndex, scale) => pdfViewer.renderPageToCanvas(pageIndex + 1, scale))
 provide('bakeOcrEdits', bakeOcrEdits)
 // For the sweep drivers (public/_sweep/*.js): a production build strips the
 // Vue internals they used to walk to these, so they are put on window like

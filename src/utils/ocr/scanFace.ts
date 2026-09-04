@@ -1,6 +1,7 @@
 import * as opentype from 'opentype.js'
 import { init as potraceInit, potrace } from 'esm-potrace-wasm'
-import { cutGlyphs, cellBitmap, expectedAdvance, lastCutReason } from './glyphCut'
+import { cutGlyphs, cellBitmap, expectedAdvance, lastCutReason, type GlyphCutResult } from './glyphCut'
+import { commonAffix } from './partialRedraw'
 import type { OcrBox } from './ocrEngine'
 
 /**
@@ -105,11 +106,13 @@ export async function traceRunIntoFace(
   text: string,
   symbols?: OcrBox[],
   /** What the user made of the run; characters they changed are not traced. */
-  editedText?: string
+  editedText?: string,
+  /** A cut already made for this run (the partial redraw needs it whether or not there is anything to trace). */
+  precut?: GlyphCutResult | null
 ): Promise<TraceResult> {
   const wanted = [...text].filter(c => c !== ' ' && !face.glyphs.has(c))
   if (!wanted.length) return { added: 0, refused: null }
-  const cut = cutGlyphs(ctx, inkRect, text, symbols)
+  const cut = precut ?? cutGlyphs(ctx, inkRect, text, symbols)
   // A refused cut is the one outcome the user has to be told about: the run
   // still bakes, in a base-14 face, so the line comes out legible but in the
   // wrong letterforms. Silence here is what made the misaligned-cut bug so
@@ -127,6 +130,23 @@ export async function traceRunIntoFace(
   const trusted = trustedCells(cut.cells.length, [...text].filter(c => c !== ' '), editedText ? [...editedText].filter(c => c !== ' ') : null)
 
   const scale = UPM / cut.emPx
+  // The run's own letter spacing: the median gap between adjacent cells that
+  // no space separates, measured on the trusted ones.
+  const gaps: number[] = []
+  {
+    let cellIndex = -1, pendingSpace = false, prev: { x1: number; suspect?: boolean } | null = null
+    for (const ch of text) {
+      if (ch === ' ') { pendingSpace = true; continue }
+      cellIndex++
+      const cell = cut.cells[cellIndex]
+      if (!cell) break
+      if (prev && !pendingSpace && !prev.suspect && !cell.suspect && cell.x0 >= prev.x1) gaps.push(cell.x0 - prev.x1)
+      prev = cell
+      pendingSpace = false
+    }
+  }
+  const medianGap = gaps.length >= 3 ? [...gaps].sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : null
+  const bearing = medianGap === null ? UPM * 0.05 : Math.min(UPM * 0.12, Math.max(UPM * 0.02, Math.round(medianGap / 2 * scale)))
   let added = 0
   for (const [index, cell] of cut.cells.entries()) {
     if (!trusted(index) || cell.suspect) continue
@@ -137,11 +157,12 @@ export async function traceRunIntoFace(
     try {
       svg = await potrace(bmp.image, { turdsize: 1, alphamax: 1, opticurve: 1, opttolerance: 0.2, pathonly: false, extractcolors: false })
     } catch (_) { continue }
-    const path = svgToGlyphPath(svg, bmp, cell, cut.baselineAt((cell.x0 + cell.x1) / 2), scale)
+    const path = svgToGlyphPath(svg, bmp, cell, cut.baselineAt((cell.x0 + cell.x1) / 2), scale, bearing)
     if (!path) continue
-    // Side bearings of a twentieth of an em each; the advance is the cell's
-    // width plus both, so traced text sets at the scan's own spacing.
-    const bearing = UPM * 0.05
+    // Side bearings of half the run's own inter-letter gap each (a twentieth
+    // of an em when the run cannot say), so traced text sets at the scan's
+    // own spacing: a fixed twentieth set a heavy 35pt title visibly looser
+    // than its neighbours.
     const advance = Math.round((cell.x1 - cell.x0) * scale + bearing * 2)
     face.glyphs.set(cell.char, { char: cell.char, path, advance })
     added++
@@ -157,13 +178,9 @@ export async function traceRunIntoFace(
  */
 function trustedCells(count: number, original: string[], edited: string[] | null): (index: number) => boolean {
   if (!edited) return () => true
-  let prefix = 0
-  while (prefix < original.length && prefix < edited.length && original[prefix] === edited[prefix]) prefix++
-  let suffix = 0
-  while (
-    suffix < original.length - prefix && suffix < edited.length - prefix &&
-    original[original.length - 1 - suffix] === edited[edited.length - 1 - suffix]
-  ) suffix++
+  // The same prefix/suffix the partial redraw uses to decide what to keep of
+  // the scan's pixels - the two must agree on what "unchanged" means.
+  const { prefix, suffix } = commonAffix(original, edited)
   const cut = Math.min(count, original.length)
   return (index: number) => index < prefix || index >= cut - suffix
 }
@@ -181,13 +198,14 @@ function svgToGlyphPath(
   bmp: { x: number; y: number },
   cell: { x0: number; x1: number },
   baselineY: number,
-  scale: number
+  scale: number,
+  /** Left side bearing in font units — the outline starts this far right of the pen. */
+  bearing: number = UPM * 0.05
 ): opentype.Path | null {
   const tf = parseTransform(svg)
   const ds = [...svg.matchAll(/<path[^>]*\sd="([^"]+)"/g)].map(m => m[1])
   if (!ds.length) return null
   const path = new opentype.Path()
-  const bearing = UPM * 0.05
   // Bitmap pixel → font units.
   const map = (px: number, py: number): [number, number] => {
     const bx = tf.a * px + tf.c * py + tf.e

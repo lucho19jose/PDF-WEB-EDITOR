@@ -3590,6 +3590,91 @@ others are the known ones — the "EL EGO" 170pt cover title (2 of 5 cells
 suspect), "Zone" on the 79-page calibration scan, "distance", "Detracción".
 No traced row reads back under 0.85 apart from that date.
 
+### Only the CHANGED stretch of a scanned run is redrawn; the rest keeps the scan's pixels
+The export used to paint over a run's whole ink box and draw the whole new
+text again, so every word the user never touched was replaced — by a traced
+outline, or by Helvetica for the half of all runs whose cut refuses. A scan's
+own pixels are the most faithful rendering of its words there is.
+`partialRedraw.ts` keeps them:
+
+- **The glyph cut is made at COMMIT time and kept** (`useOCR.spanCuts`, keyed
+  by item id, in points so it outlives the raster LRU): where each letter of
+  the ORIGINAL text sits, the fitted baseline, the median letter and word
+  gaps. `traceItem` now always cuts, even when every glyph is already in the
+  face, and hands the cut to `traceRunIntoFace` (new `precut` parameter).
+- **What changed is the common prefix/suffix** (`commonAffix`, shared with the
+  tracer's `trustedCells` so the two agree). `planPartial` places the new
+  stretch at the old span's start (or after the head plus the measured gap),
+  on the fitted baseline, at the em measured on the LETTERS — and decides:
+  **fits** (the tail keeps at least 40% of the gap before it, or the gap opens
+  by up to a space) → patch the old stretch only; **shift** → the untouched
+  tail's pixels are transplanted (cropped from a fresh 300 DPI render of the
+  pre-bake page in `bakeOcrEdits`, drawn with `drawImageInContent`) by exactly
+  the width difference, when it will not run into the next run or the page
+  edge; otherwise the whole-run redraw as before, with the reason in
+  `plan.modes` / `window.__ocrBakeReport`.
+- **Widths are measured in the engine with the fonts that will draw them**
+  (`measureRuns` → `measureRunWidth`, sharing `segmentRun` with
+  `addTextToPage`), never estimated: a 10% guess on a ten-letter stretch is
+  several points, enough to call "fits" wrongly.
+- **The em comes from the letters, not the box.** `cutGlyphs` now returns the
+  median capital height / 0.72 (or x-height / 0.52) as `emPx` when it can: the
+  box's height is what a crossing rule inflates, and an em from a box 82 rows
+  tall around 46-row letters drew a fallback "C" beside them at 1.7× their
+  size. Both the traced face's scale and the partial size use it, so traced
+  and fallback glyphs agree.
+- **The unchanged words go back into the page as INVISIBLE text** (`addText`
+  `invisible` → `3 Tr`, in q/Q because render mode outlives ET) at their ink
+  positions, or only the stretch would be text and the line would no longer
+  extract, copy or search as one.
+- **`drawImageInContent` now applies the same two corrections as `fillRect`**
+  (the /Rotate inverse and the inverse of the CTM in force where it appends);
+  written raw, the transplanted tail landed elsewhere than its patch on the
+  MSP scan, whose stream leaves an unbracketed `cm` in force. Prepended images
+  get only the /Rotate inverse: nothing has run yet where they are written.
+- A drawn run is `baked`: its glyph cut is forgotten and neither a partial
+  redraw nor a trace is made from it again until the page is recognised
+  afresh — the raster under it is a patch and new text now. A run whose style
+  or place the user changed is `restyled` and takes the whole-run redraw.
+
+Verified in the browser: 005.pdf "PERU → PERO" patches only the U and draws
+the traced O on the neighbours' baseline (bottoms at the same row, measured);
+"S.A. → S.A.C." draws only "C."; "PERU → PERUANA" shifts "S.A." right as
+pixels. MSP: "DE LA NUEVA INFRAESTRUCTURA" shifts the tail through the
+stream's `cm`, "204,754.68 → 304,754.68" redraws the one digit. Corpus, fits
+only (no shifting): 71/71 read back, average re-read similarity 0.896 → 0.902,
+the dashed date 0.27 → 0.73 because its digits are now the scan's own pixels.
+The sweep's `traced` count (font of the block holding the edited text) is no
+longer meaningful — that block is the invisible head now.
+
+Two smaller fidelity changes went in with it:
+
+- **Letter spacing from the scan.** A traced glyph's side bearings were a
+  fixed twentieth of an em; `traceRunIntoFace` now uses half the run's median
+  inter-letter gap (adjacent trusted cells with no space between, clamped to
+  0.02–0.12 em), so traced text sets at the scan's own spacing — the fixed
+  value set a heavy 35pt title visibly looser than its neighbours.
+- **Tracing from a 2× raster.** Recognition is happy at 220 DPI; Potrace is
+  not — a bold face's crossbar is a one-pixel bump there. `useOCR` borrows the
+  layout's renderer (`setPageRenderer`) and renders the page again at 440 DPI
+  the first time a run on it is traced (`traceRasterFor`, one page kept, ~72 MB
+  at Letter, capped so no canvas side passes 16 000 px); the cut, the face and
+  the Tesseract glyph-box fallback read that raster, everything downstream
+  being scale-relative. The raster is dropped when the page is recognised
+  again, after a bake on it, and on reset. Where the layout lends no renderer
+  the OCR raster stands in — and where the finer raster's cut REFUSES: the
+  cut's pixel floors were calibrated at 220 DPI, and a 35pt line that cuts
+  21/3 there came back 21/5 at 440; refusing it would have cost the partial
+  redraw too, so the tracer falls back to the OCR raster for that run.
+
+Corpus after all five steps: 70/71 read back, average re-read similarity
+0.896 → 0.918; last-page bakes 28 whole / 13 partial / 1 shift. The one
+text-layer miss ("CUMPLIÓ: (FINANZAS)") re-reads at 1.0 — MuPDF orders the
+invisible head and tail and the visible stretch as separate blocks, so the
+page's joined text can interleave; the page itself is right. Known: a wide
+cell from a touching pair gives its traced glyph a wide advance ("AN A" on the
+35pt title) — the gap is measured per run, not per glyph.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

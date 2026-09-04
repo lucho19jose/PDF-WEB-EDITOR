@@ -102,9 +102,15 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         const addResult = addTextToPage(
           req.data.pageIndex, req.data.x, req.data.y,
           req.data.text, req.data.fontSize, req.data.fontName, req.data.color,
-          req.data.rotation, req.data.faceId
+          req.data.rotation, req.data.faceId, req.data.invisible
         )
         respond({ id: req.id, type: 'success', data: addResult })
+        break
+      }
+
+      case 'measureRuns': {
+        if (!mupdf) throw new Error('MuPDF not initialized')
+        respond({ id: req.id, type: 'success', data: { widths: req.data.runs.map(r => measureRunWidth(r.text, r.fontSize, r.fontName, r.faceId)) } })
         break
       }
 
@@ -2318,6 +2324,48 @@ function planTextEncoding(
  * Add new text at a given position on a page.
  * Uses standard PDF fonts (Helvetica, Times-Roman, Courier) which are always available.
  */
+/**
+ * A run cut into maximal stretches the scan face can draw and stretches it
+ * cannot. A space joins whichever segment it follows; it draws nothing.
+ * Shared by `addTextToPage` (which draws them) and `measureRunWidth` (which
+ * measures them), so what is measured is exactly what will be drawn.
+ */
+function segmentRun(text: string, face: any | null): { text: string; traced: boolean }[] {
+  const segments: { text: string; traced: boolean }[] = []
+  for (const ch of text) {
+    const traced = !!face && ch !== ' ' && face.encodeCharacter(ch.codePointAt(0)!) !== 0
+    const last = segments[segments.length - 1]
+    if (last && (last.traced === traced || ch === ' ')) last.text += ch
+    else segments.push({ text: ch, traced })
+  }
+  return segments
+}
+
+/**
+ * The pen advance `addTextToPage` would give `text`, in points: traced glyphs
+ * by the face's own advances, WinAnsi text by the base-14 face's, and a
+ * character neither can hold (the CJK fallback) as one em with `exact: false`
+ * — the partial redraw then declines rather than guess.
+ */
+function measureRunWidth(text: string, fontSize: number, fontName: string, faceId?: string): { width: number; exact: boolean } {
+  const face = faceId ? scanFaces.get(faceId) : null
+  let em = 0, exact = true
+  for (const seg of segmentRun(text, face)) {
+    if (seg.traced && face) {
+      for (const ch of seg.text) {
+        if (ch === ' ') { em += 0.3; continue }
+        try { em += face.advanceGlyph(face.encodeCharacter(ch.codePointAt(0)!)) } catch (_) { em += 0.5; exact = false }
+      }
+      continue
+    }
+    const winAnsi = encodeWinAnsiText(seg.text)
+    if ('missing' in winAnsi) { em += [...seg.text].length * 1.0; exact = false; continue }
+    if (!measureFace(fontName)) exact = false
+    em += measureEm(seg.text, fontName)
+  }
+  return { width: em * fontSize, exact }
+}
+
 function addTextToPage(
   pageIndex: number,
   x: number,
@@ -2329,7 +2377,9 @@ function addTextToPage(
   /** Degrees counter-clockwise. 90 sets the text reading up the page. */
   rotation = 0,
   /** A registered traced scan face: its glyphs draw the characters it has. */
-  faceId?: string
+  faceId?: string,
+  /** Render mode 3: no ink, text only — words a reader extracts while the scan's own pixels stay the picture. */
+  invisible = false
 ): { success: boolean; error?: string } {
   if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
 
@@ -2347,14 +2397,7 @@ function addTextToPage(
     // "& 0xFF" would silently mangle €, smart quotes, dashes… — and to a
     // subset of the shipped CJK face for text WinAnsi cannot hold.
     const face = faceId ? scanFaces.get(faceId) : null
-    const segments: { text: string; traced: boolean }[] = []
-    for (const ch of text) {
-      const traced = !!face && ch !== ' ' && face.encodeCharacter(ch.codePointAt(0)!) !== 0
-      const last = segments[segments.length - 1]
-      // A space joins whichever segment it follows; it draws nothing.
-      if (last && (last.traced === traced || ch === ' ')) last.text += ch
-      else segments.push({ text: ch, traced })
-    }
+    const segments = segmentRun(text, face)
     const ops: string[] = []
     for (const seg of segments) {
       if (seg.traced && face) {
@@ -2412,7 +2455,11 @@ function addTextToPage(
       if (endInv) tm = matConcat(tm, endInv)
     }
     const fmt = (n: number) => (Math.abs(n) < 1e-6 ? '0' : n.toFixed(4))
-    const newBlock = `\nBT\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\n`
+    // Render mode is text state and outlives ET, so an invisible block is
+    // bracketed in q/Q or every block appended after it would draw nothing.
+    const newBlock = invisible
+      ? `\nq\nBT\n3 Tr\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\nQ\n`
+      : `\nBT\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\n`
 
     // 4. Append to content stream
     const combined = existingStream + newBlock
@@ -9402,9 +9449,28 @@ function drawImageInContent(
     const h = Math.abs(rect[3] - rect[1])
     // The UI works top-left down; PDF user space is bottom-left up.
     const y = pageHeight - top - h
-    const op = `\nq ${fmtNum(w)} 0 0 ${fmtNum(h)} ${fmtNum(x)} ${fmtNum(y)} cm /${name} Do Q\n`
 
     const existing = readContentStream(pageIndex)
+    // The rect arrives in the VISIBLE frame, like `fillRect`'s and
+    // `addTextToPage`'s, and this used to write it raw: on a /Rotate page, or a
+    // scan whose stream leaves an unbracketed `cm` in force, the picture landed
+    // elsewhere than the patch drawn for the same rectangle. The same two
+    // corrections - the /Rotate inverse, and the inverse of the CTM in force
+    // where the op is written (the stream's end when appended, the identity
+    // when prepended, where nothing has run yet).
+    let correction: Mat6 | null = null
+    const pageRot = pageRotationCtm(pageIndex)
+    if (pageRot) correction = matInvert(pageRot)
+    if (!behind) {
+      const endCtm = getCtmAtOffset(existing, existing.length)
+      if (endCtm.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
+        const inv = matInvert(endCtm)
+        if (inv) correction = correction ? matConcat(correction, inv) : inv
+      }
+    }
+    const undo = correction ? `${correction.map(v => fmtNum(v)).join(' ')} cm ` : ''
+    const op = `\nq ${undo}${fmtNum(w)} 0 0 ${fmtNum(h)} ${fmtNum(x)} ${fmtNum(y)} cm /${name} Do Q\n`
+
     // Prepended, everything already on the page paints over it; appended, it
     // paints over everything.
     const combined = behind ? op + existing : existing + op

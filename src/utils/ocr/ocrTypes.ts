@@ -85,6 +85,15 @@ export interface OcrTextItem {
   edited: boolean
   /** True when the user deleted it: the area is patched and nothing is drawn. */
   removed: boolean
+  /**
+   * True once a bake has drawn this run. The scan no longer shows its original
+   * ink there (a patch and the new text do), so the glyph cut made from the
+   * raster no longer describes it: no partial redraw, no tracing, until the
+   * page is recognised again.
+   */
+  baked?: boolean
+  /** True once the user changed its style or moved it; a partial redraw needs the original face and place. */
+  restyled?: boolean
 }
 
 /** What one page's OCR pass produced. */

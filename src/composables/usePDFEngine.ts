@@ -156,10 +156,11 @@ export function usePDFEngine() {
     fontName: string,
     color?: [number, number, number],
     rotation?: number,
-    faceId?: string
+    faceId?: string,
+    invisible?: boolean
   ): Promise<boolean> {
     try {
-      const result = await bridge.addText(pageIndex, x, y, text, fontSize, fontName, color, rotation, faceId)
+      const result = await bridge.addText(pageIndex, x, y, text, fontSize, fontName, color, rotation, faceId, invisible)
       if (result.success) {
         pageTextCache.delete(pageIndex)
       } else {
@@ -177,6 +178,12 @@ export function usePDFEngine() {
     const result = await bridge.registerFace(faceId, bytes)
     if (!result.success) error.value = result.error || 'Could not register the scan face'
     return result.success
+  }
+
+  /** Exact pen advances for runs `addText` would draw, in points; `exact: false` where a glyph's width is a guess. */
+  async function measureRuns(runs: { text: string; fontSize: number; fontName: string; faceId?: string }[]): Promise<{ width: number; exact: boolean }[]> {
+    if (!runs.length) return []
+    try { return (await bridge.measureRuns(runs)).widths } catch (_) { return runs.map(() => ({ width: 0, exact: false })) }
   }
 
   /**
@@ -477,7 +484,7 @@ export function usePDFEngine() {
     debugBtBlocks,
     readContentStream,
     replaceText,
-    addText, registerFace,
+    addText, registerFace, measureRuns,
     transformTextBlock,
     transformTextBlocks,
     restyleTextBlocks,

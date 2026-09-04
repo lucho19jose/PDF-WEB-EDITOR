@@ -168,7 +168,20 @@ export function cutGlyphs(
   const base = baselineOf(bin, cells)
   const centreX = bin.x + bin.w / 2
   const baselineAt = (x: number) => base.y + base.slope * (x - centreX)
-  return { cells, baselineY: base.y, baselineAt, emPx, threshold: bin.threshold, inverted: bin.inverted, bin: { x: bin.x, y: bin.y, w: bin.w, h: bin.h, ink: bin.ink } }
+  // The em from the LETTERS when they can say: the box's height is what a rule
+  // crossing it or a neighbour's tips inflate, and an em taken from a box 82
+  // rows tall around letters 46 rows high made the traced glyphs half an em
+  // and a fallback "C" beside them a giant. A capital is about 0.72 em, an
+  // x-height letter about 0.52; the median over the trusted cells of either
+  // class is the line's own measure. CJK keeps the box rule - an ideograph
+  // fills its em.
+  const median = (v: number[]) => { const s = [...v].sort((a, b) => a - b); return s[Math.floor(s.length / 2)] }
+  const heightOf = (c: GlyphCell) => { const e = cellExtent(bin, c); return e.top < 0 ? 0 : e.bottom - e.top + 1 }
+  const caps = cjk ? [] : cells.filter(c => !c.suspect && TALL_CHARS.test(c.char)).map(heightOf).filter(h => h > 2)
+  const xs = cjk ? [] : cells.filter(c => !c.suspect && X_HEIGHT_CHARS.test(c.char)).map(heightOf).filter(h => h > 2)
+  const letterEm = caps.length >= 2 ? median(caps) / 0.72 : xs.length >= 3 ? median(xs) / 0.52 : null
+  const em = letterEm !== null && letterEm > 4 ? letterEm : emPx
+  return { cells, baselineY: base.y, baselineAt, emPx: em, threshold: bin.threshold, inverted: bin.inverted, bin: { x: bin.x, y: bin.y, w: bin.w, h: bin.h, ink: bin.ink } }
 }
 
 function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): GlyphCell[] | null {

@@ -89,6 +89,11 @@ export const useOcrStore = defineStore('ocr', () => {
           patch.color !== undefined ||
           patch.align !== undefined ||
           patch.rect !== undefined
+      // A style or a move changes what a partial redraw would have to keep;
+      // remembered here because nothing else records the original style.
+      if (patch.restyled === undefined && (patch.fontSize !== undefined || patch.fontFamily !== undefined ||
+        patch.bold !== undefined || patch.italic !== undefined || patch.color !== undefined ||
+        patch.align !== undefined || patch.rect !== undefined)) after.restyled = true
       const items = [...page.items]
       items[idx] = after
       next.set(key, { ...page, items })
@@ -111,7 +116,8 @@ export const useOcrStore = defineStore('ocr', () => {
       // stays where it was dropped.
       rect: { ...(item.inkRect ?? item.rect) },
       removed: false,
-      edited: false
+      edited: false,
+      restyled: false
     })
   }
 

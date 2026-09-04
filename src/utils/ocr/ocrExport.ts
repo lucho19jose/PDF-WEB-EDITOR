@@ -1,5 +1,6 @@
 import type { OcrTextItem } from './ocrTypes'
 import type { RectT } from '@/engine/types'
+import { planPartial, sizeOf, type PartialContext } from './partialRedraw'
 
 /**
  * Turning edited OCR runs into PDF operations.
@@ -42,11 +43,27 @@ export interface TextOp {
    * character the face holds with it and the rest with `fontName`, in one run.
    */
   faceId?: string
+  /**
+   * Drawn with render mode 3 — no ink, but text a reader extracts, copies and
+   * searches. The partial redraw keeps the scan's pixels for the words it did
+   * not change and puts their words back into the page this way.
+   */
+  invisible?: boolean
+}
+
+/** The scan's own pixels moved: read at `srcRect`, drawn at `dstRect` (same size), page points, top-left origin. */
+export interface ImageOp {
+  srcRect: RectT
+  dstRect: RectT
 }
 
 export interface OcrExportPlan {
   patches: PatchOp[]
+  /** Painted after the patches and before the texts. */
+  images: ImageOp[]
   texts: TextOp[]
+  /** Per edited item id: how it was drawn, or why the partial redraw declined — for the sweep and the status line. */
+  modes: Record<string, string>
 }
 
 /** The base-14 face for a family plus its weight and slant. */
@@ -164,24 +181,56 @@ function nextRunRight(item: OcrTextItem, all: OcrTextItem[]): number | null {
   for (const o of all) {
     if (o === item || o.vertical) continue
     if (midY < o.rect.y || midY > o.rect.y + o.rect.height) continue
-    if (o.rect.x < floor) continue
-    if (best === null || o.rect.x < best) best = o.rect.x
+    // Its INK is what is really there on the paper, wherever its box was dragged.
+    const left = Math.min(o.rect.x, o.inkRect?.x ?? o.rect.x)
+    if (left < floor) continue
+    if (best === null || left < best) best = left
   }
   // A hair of clearance, so the two runs do not touch.
   return best === null ? null : best - 2
 }
 
-export function planOcrExport(items: OcrTextItem[], faceIdFor?: (item: OcrTextItem) => string | undefined, pageWidth?: number): OcrExportPlan {
+export function planOcrExport(
+  items: OcrTextItem[],
+  faceIdFor?: (item: OcrTextItem) => string | undefined,
+  pageWidth?: number,
+  /** The span geometry and measured stretch width for an item, when the caller has them — enables the partial redraw. */
+  partialFor?: (item: OcrTextItem) => Omit<PartialContext, 'fontName' | 'color' | 'faceId'> | null
+): OcrExportPlan {
   const patches: PatchOp[] = []
+  const images: ImageOp[] = []
   const texts: TextOp[] = []
+  const modes: Record<string, string> = {}
 
   for (const item of items) {
     if (!item.edited && !item.removed) continue
 
-    patches.push({ rect: patchRect(item), color: plainColor(item.background) })
-    if (item.removed) continue
+    if (item.removed) {
+      patches.push({ rect: patchRect(item), color: plainColor(item.background) })
+      modes[item.id] = 'removed'
+      continue
+    }
 
     const fontName = base14(item.fontFamily, item.bold, item.italic)
+
+    // Only the CHANGED stretch, when its geometry is known: the untouched
+    // head and tail keep the scan's own pixels. See partialRedraw.ts.
+    const partial = !item.vertical ? partialFor?.(item) : null
+    if (partial) {
+      const outcome = planPartial(item, { ...partial, fontName, color: plainColor(item.color), faceId: faceIdFor?.(item) }, items, pageWidth)
+      if ('mode' in outcome) {
+        patches.push(...outcome.patches)
+        images.push(...outcome.images)
+        texts.push(...outcome.texts)
+        modes[item.id] = outcome.mode
+        continue
+      }
+      modes[item.id] = `whole (${outcome.reason})`
+    } else {
+      modes[item.id] = 'whole'
+    }
+
+    patches.push({ rect: patchRect(item), color: plainColor(item.background) })
 
     if (item.vertical) {
       // Rotated a quarter turn anti-clockwise, the glyphs' own "up" points LEFT
@@ -215,11 +264,15 @@ export function planOcrExport(items: OcrTextItem[], faceIdFor?: (item: OcrTextIt
       x = Math.max(x, item.rect.x)
     }
 
+    // With a cut in hand the size comes from the letters themselves, not from
+    // the box (see `sizeOf`); the whole-run redraw then agrees with the
+    // partial one and with the traced face's own proportions.
+    const sized = partial ? { ...item, fontSize: sizeOf(item, partial.cut) } : item
     texts.push({
       text: String(item.text),
       x: Number(x),
       y: Number(baselineY),
-      fontSize: Number(fitSize(item, item.text, pageWidth, items)),
+      fontSize: Number(fitSize(sized, item.text, pageWidth, items)),
       fontName,
       color: plainColor(item.color),
       rotation: 0,
@@ -227,5 +280,5 @@ export function planOcrExport(items: OcrTextItem[], faceIdFor?: (item: OcrTextIt
     })
   }
 
-  return { patches, texts }
+  return { patches, images, texts, modes }
 }

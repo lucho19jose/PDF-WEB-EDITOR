@@ -10,6 +10,7 @@ import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
 import { inkBounds, inkGaps, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
 import { cutGlyphs, lastCutReason, expectedAdvance } from '@/utils/ocr/glyphCut'
+import { toSpanCut, type SpanCut } from '@/utils/ocr/partialRedraw'
 
 /**
  * Recognising the text in a scanned page.
@@ -210,6 +211,7 @@ function createOCR() {
   function keepRaster(pageIndex: number, entry: { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; toPt: number }) {
     rasters.delete(pageIndex)
     rasters.set(pageIndex, entry)
+    traceRasters.delete(pageIndex)
     while (rasters.size > 2) rasters.delete(rasters.keys().next().value!)
   }
   /** Bumped whenever a page's scan face gains glyphs; the layer's styles watch it. */
@@ -230,6 +232,53 @@ function createOCR() {
    * were a moment away. `bakeOcrEdits` awaits `settleTraces()` first.
    */
   const pendingTraces = new Set<Promise<unknown>>()
+
+  /**
+   * Where each letter of a run's ORIGINAL text sits on the page, from the glyph
+   * cut made when the edit was committed — what the partial redraw keeps and
+   * what it replaces. Keyed by item id (stable until the page is recognised
+   * again), in points, so it outlives the raster LRU. Not reactive: nothing on
+   * screen depends on it.
+   */
+  const spanCuts = new Map<string, SpanCut>()
+  function spanCutFor(item: OcrTextItem): SpanCut | null { return spanCuts.get(item.id) ?? null }
+  function forgetSpanCut(id: string) { spanCuts.delete(id) }
+
+  /**
+   * A second raster, at twice the OCR resolution, for TRACING only.
+   *
+   * Recognition is happy at 220 DPI; an outline tracer is not — a bold face's
+   * crossbar is a one-pixel bump there and Potrace smooths it away ("Cta. Cte"
+   * traced as "Cla. Cle"). The page is rendered again at 440 DPI the first time
+   * a run on it is traced, through a renderer the layout lends us (this
+   * composable has no viewer of its own), and kept for one page: at Letter
+   * size it is ~72 MB of pixels. Everything downstream is scale-relative (the
+   * em from the letters, `scale = UPM / emPx`), so the cut and the face need
+   * no other change. Capped so no side exceeds what a canvas may be.
+   */
+  const TRACE_DPI = 440
+  const MAX_CANVAS_SIDE = 16000
+  let pageRenderer: ((pageIndex: number, scale: number) => Promise<HTMLCanvasElement | null>) | null = null
+  function setPageRenderer(fn: typeof pageRenderer) { pageRenderer = fn }
+  const traceRasters = new Map<number, { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; toPt: number }>()
+  async function traceRasterFor(pageIndex: number, base: { canvas: HTMLCanvasElement; toPt: number }) {
+    const have = traceRasters.get(pageIndex)
+    if (have) return have
+    if (!pageRenderer) return null
+    const pageWidth = base.canvas.width * base.toPt, pageHeight = base.canvas.height * base.toPt
+    const scale = Math.min(TRACE_DPI / PDF_DPI, MAX_CANVAS_SIDE / Math.max(pageWidth, pageHeight))
+    if (scale <= (OCR_DPI / PDF_DPI) * 1.2) return null
+    try {
+      const canvas = await pageRenderer(pageIndex, scale)
+      const ctx = canvas?.getContext('2d', { willReadFrequently: true })
+      if (!canvas || !ctx) return null
+      const entry = { canvas, ctx, toPt: pageWidth / canvas.width }
+      traceRasters.clear()
+      traceRasters.set(pageIndex, entry)
+      return entry
+    } catch (_) { return null }
+  }
+  function forgetTraceRaster(pageIndex: number) { traceRasters.delete(pageIndex) }
   async function settleTraces(): Promise<void> {
     while (pendingTraces.size) await Promise.allSettled([...pendingTraces])
   }
@@ -241,19 +290,44 @@ function createOCR() {
   }
 
   async function traceItemNow(item: OcrTextItem): Promise<TraceResult> {
-    const raster = rasters.get(item.pageIndex)
-    if (!raster || item.vertical) return { added: 0, refused: null }
+    const base = rasters.get(item.pageIndex)
+    if (!base || item.vertical) return { added: 0, refused: null }
+    // Trace from the 2x raster when the layout can render one; the OCR raster
+    // stands in where it cannot - and where the finer raster's cut REFUSES: the
+    // cut's pixel floors were calibrated at 220 DPI, and a 35pt line that cuts
+    // 21/3 there came back 21/5 at 440 and was refused, which would have cost
+    // it the partial redraw as well as the trace. Every conversion below goes
+    // through `toPt`.
+    const hi = await traceRasterFor(item.pageIndex, base)
+    let raster = hi ?? base
+    if (hi) {
+      const kHi = 1 / hi.toPt
+      const rectHi = { x: item.inkRect.x * kHi, y: item.inkRect.y * kHi, width: item.inkRect.width * kHi, height: item.inkRect.height * kHi }
+      const perGlyphHi = !!item.symbols && item.symbols.length === [...item.originalText].filter(c => c !== ' ').length
+      const symbolsHi = perGlyphHi ? item.symbols!.map(s => ({ x0: s.x * kHi, y0: s.y * kHi, x1: (s.x + s.width) * kHi, y1: (s.y + s.height) * kHi })) : undefined
+      if (!cutGlyphs(hi.ctx, rectHi, item.originalText, symbolsHi)) raster = base
+    }
     const k = 1 / raster.toPt
     const rect = { x: item.inkRect.x * k, y: item.inkRect.y * k, width: item.inkRect.width * k, height: item.inkRect.height * k }
     const symbols = item.symbols?.map(s => ({ x0: s.x * k, y0: s.y * k, x1: (s.x + s.width) * k, y1: (s.y + s.height) * k }))
+    // A run a bake has already drawn: the raster under it is a patch and new
+    // text, not its original ink, so neither a cut nor a trace can be made.
+    if (item.baked) return { added: 0, refused: null }
     const face = scanFaceFor(item.pageIndex, styleKeyOf(item))
     try {
-      const res = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, symbols, item.text)
-      if (res.added) faceVersion.value++
+      // The cut is made FIRST and kept whatever the tracer then does with it:
+      // the partial redraw needs the letters' positions even when every glyph
+      // is already in the face and there is nothing to trace.
       // A PaddleOCR run carries ONE box as its "symbols" (its own line box,
       // from `refineLines`); only a box per character is a glyph cut.
       const perGlyph = !!symbols && symbols.length === [...item.originalText].filter(c => c !== ' ').length
-      if (res.added || !res.refused || perGlyph) return res
+      let cut = cutGlyphs(raster.ctx, rect, item.originalText, perGlyph ? symbols : undefined)
+      let source: SpanCut['source'] = perGlyph ? 'symbols' : 'profile'
+      const firstReason = cut ? '' : lastCutReason()
+      if (cut) spanCuts.set(item.id, toSpanCut(cut, raster.toPt, item.originalText, source))
+      const res = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, perGlyph ? symbols : undefined, item.text, cut)
+      if (res.added) faceVersion.value++
+      if (res.added || !res.refused || perGlyph || cut) return res
       // The profile cut refused — letters that touch, too many fragments, a
       // misaligned end. PaddleOCR reports no glyph boxes, and the column
       // profile is the only cut there was; Tesseract does report them, and
@@ -263,11 +337,14 @@ function createOCR() {
       // to agree with the run's text (same count, four letters in five the
       // same) or the boxes describe some other line; and the cells it gives
       // are vetted exactly as a profile cut is.
-      const boxes = await glyphBoxesFromTesseract(raster.ctx, rect, item.originalText).catch(() => null)
+      const boxes = await glyphBoxesFromTesseract(raster.ctx, rect, item.originalText, item.inkRect.height).catch(() => null)
       if (!boxes) return res
-      const again = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, boxes, item.text)
+      cut = cutGlyphs(raster.ctx, rect, item.originalText, boxes)
+      source = 'tesseract'
+      if (cut) spanCuts.set(item.id, toSpanCut(cut, raster.toPt, item.originalText, source))
+      const again = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, boxes, item.text, cut)
       if (again.added) { faceVersion.value++; return again }
-      return { added: 0, refused: `${res.refused}; on Tesseract's glyph boxes: ${again.refused || 'nothing to add'}` }
+      return { added: 0, refused: `${firstReason || res.refused}; on Tesseract's glyph boxes: ${again.refused || 'nothing to add'}` }
     } catch (err) {
       console.warn('[OCR] scan face tracing failed:', err)
       return { added: 0, refused: null }
@@ -279,7 +356,7 @@ function createOCR() {
    * raster coordinates and reading order — or null when its reading does not
    * match `text` closely enough to trust the boxes.
    */
-  async function glyphBoxesFromTesseract(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; width: number; height: number }, text: string): Promise<OcrBox[] | null> {
+  async function glyphBoxesFromTesseract(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; width: number; height: number }, text: string, heightPt: number): Promise<OcrBox[] | null> {
     const chars = [...text].filter(c => c !== ' ')
     // Eight characters at least: on the corpus the fallback's wrong traces were
     // the short runs ("MINERA", "EL EGO"), where a count that matches and four
@@ -288,7 +365,7 @@ function createOCR() {
     // And a run tall enough to trace at all: a 4.7pt "Escaneado con
     // CamScanner" watermark (14px of ink) passed every other gate and traced
     // at 0.67 similarity — glyphs seven pixels tall are not letterforms.
-    if (rect.height < 20) return null
+    if (heightPt < 6.5) return null
     // Room around the run: the recogniser wants margin, and a crop cut at the
     // ink loses the descenders' tails and the accents.
     const pad = Math.max(6, Math.round(rect.height * 0.6))
@@ -367,6 +444,8 @@ function createOCR() {
   /** Forget rasters and faces — a different document is being opened. */
   function reset() {
     rasters.clear()
+    traceRasters.clear()
+    spanCuts.clear()
     clearScanFaces()
     faceVersion.value++
   }
@@ -1174,5 +1253,5 @@ function createOCR() {
     engines.clear()
   }
 
-  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, cutFor, faceOf, facesOf, reset, destroy }
+  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, spanCutFor, forgetSpanCut, setPageRenderer, forgetTraceRaster, cutFor, faceOf, facesOf, reset, destroy }
 }
