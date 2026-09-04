@@ -7,7 +7,7 @@ import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
 import { TesseractEngine } from '@/utils/ocr/engines/tesseractEngine'
 import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
-import { inkBounds, inkGaps, extendDescenders, type InkCut } from '@/utils/ocr/inkMeasure'
+import { inkBounds, inkGaps, inkBands, extendDescenders, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
 import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance } from '@/utils/ocr/glyphCut'
 import { toSpanCut, type SpanCut } from '@/utils/ocr/partialRedraw'
@@ -722,7 +722,7 @@ function createOCR() {
    * nearest space. Lines that already have words are returned untouched.
    */
   async function refineLines(lines: OcrLine[], ctx: CanvasRenderingContext2D, engine: OcrEngine, lang: string, reread = true): Promise<OcrLine[]> {
-    type Piece = { line: OcrLine; text: string; ink: { x: number; y: number; width: number; height: number }; cut: boolean }
+    type Piece = { line: OcrLine; text: string; ink: { x: number; y: number; width: number; height: number }; cut: boolean; band?: boolean }
     const pieces: Piece[] = []
     const passthrough = new Set<OcrLine>()
     for (const line of lines) {
@@ -753,6 +753,42 @@ function createOCR() {
       // `splitRuns` sets): justified prose opens word gaps past an em, and a
       // 1.2 em bar cut "En caso de incumplimiento…" in two and the re-read
       // pieces came back with a space inside a word. Rules cut regardless.
+      // A box holding two STACKED lines — a table header set as "PAGADO" over
+      // "SOLES" — is two runs, not one tall one: drawn as one it took its size
+      // from the double-height box and ran off the page at 14pt. Two or three
+      // row bands, each at least a quarter of the box and a few rows tall,
+      // become their own pieces, read again like a cut piece; the words are
+      // shared out by count only as the fallback for a band that reads as
+      // nothing.
+      const bands = reread ? inkBands(ctx, ink).filter(b => b.y1 - b.y0 >= Math.max(4, ink.height * 0.25)) : []
+      // Lines of ONE text, so of similar height: a 93pt logo with its 16pt
+      // tagline in the same box, or a cover title over a line of small print,
+      // is not a stacked header, and re-reading those bands replaced a right
+      // reading ("Ingenium") with a worse one ("Inaenium").
+      const bandH = bands.map(b => b.y1 - b.y0)
+      const similar = bands.length >= 2 && Math.max(...bandH) <= 2 * Math.min(...bandH)
+      // And a box that is TALL for its text: two lines of the words it holds
+      // need close to twice the line height its width implies (the em guessed
+      // from the advances). A 93pt logo whose letters happen to break into
+      // two row bands is one line by that measure — its box is 1.6 lines,
+      // not 2 — and it has one word, which cannot be shared over two bands.
+      const words = line.text.split(/\s+/).filter(Boolean)
+      const stacked = similar && ink.height >= 1.8 * emGuess * 0.95 && words.length >= bands.length
+      if (stacked && bands.length <= 3 && !isMostlyCjk(line.text)) {
+        const groups: string[][] = bands.map(() => [])
+        const total = words.reduce((s, w) => s + w.length, 0) || 1
+        let acc = 0
+        for (const w of words) {
+          const idx = Math.min(bands.length - 1, Math.floor((acc + w.length / 2) / total * bands.length))
+          groups[idx].push(w)
+          acc += w.length
+        }
+        bands.forEach((b, i) => {
+          const bandRect = { x: ink.x, y: b.y0, width: ink.width, height: b.y1 - b.y0 }
+          pieces.push({ line, text: groups[i].join(' ') || line.text, ink: inkBounds(ctx, bandRect, emGuess), cut: true, band: true })
+        })
+        continue
+      }
       const cuts = reread ? inkGaps(ctx, { x: ink.x, y: ink.y, width: ink.width, height: ink.height }, Math.max(6, emPx * 2.5), emGuess) : []
       const parts = cuts.length ? splitTextAtCuts(line.text, ink, cuts) : [{ text: line.text, x0: ink.x, x1: ink.x + ink.width }]
       for (const part of parts) {
@@ -769,6 +805,13 @@ function createOCR() {
     // nothing.
     const toRead = pieces.filter(p => p.cut && reread)
     const reads = toRead.length ? await recognizeSheet(ctx, toRead.map(p => p.ink), engine, lang) : []
+    // A stacked band's re-read is trusted like any cut piece's. A guard that
+    // kept the word-count share unless the re-read resembled it was tried and
+    // was wrong on the very cell it was written for: the detector's box
+    // "PAGADO SOLES" covered the lines "IMPORTE" and "PAGADO SOLES", the
+    // shares were "PAGADO" / "SOLES", and the re-reads "MPORTE" / "PAGADO
+    // SOLES" — right, and rejected. The share is only the fallback for a
+    // band that reads as nothing.
     toRead.forEach((p, i) => { if (reads[i]) p.text = reads[i]! })
 
     const out: OcrLine[] = []
@@ -820,11 +863,17 @@ function createOCR() {
     // CAPACITACIÓ", each with a letter of the piece next door.
     const pad = (h: number) => Math.round(h * 0.6)
     const padX = (h: number) => Math.round(h * 0.12) + 2
+    // Drawn 1:1. Enlarging pieces under 20px to twice their size was tried
+    // for the 11px bands of a stacked table header and the detector then
+    // found NOTHING in them, where at 1:1 it reads them (noisily: "PAGADO
+    // SOLES" one run, "PAGADO SCES the" the next). The scale hook stays for
+    // a measured retry.
+    const scaleOf = (_h: number) => 1
     const bands: { y: number; h: number; ok: boolean }[] = []
     let sheetW = 0, sheetH = 0
     for (const ink of inks) {
-      const p = pad(ink.height), px = padX(ink.height)
-      const w = ink.width + px * 2, h = ink.height + p * 2
+      const p = pad(ink.height), px = padX(ink.height), s = scaleOf(ink.height)
+      const w = (ink.width + px * 2) * s, h = (ink.height + p * 2) * s
       const ok = ink.width >= 2 && ink.height >= 2
       bands.push({ y: sheetH, h, ok })
       sheetW = Math.max(sheetW, w)
@@ -840,11 +889,11 @@ function createOCR() {
     sctx.fillRect(0, 0, sheetW, sheetH)
     inks.forEach((ink, i) => {
       if (!bands[i].ok) return
-      const p = pad(ink.height), px = padX(ink.height)
+      const p = pad(ink.height), px = padX(ink.height), s = scaleOf(ink.height)
       const x = Math.max(0, ink.x - px), y = Math.max(0, ink.y - p)
       const w = Math.min(ctx.canvas.width - x, ink.width + px * 2)
       const h = Math.min(ctx.canvas.height - y, ink.height + p * 2)
-      if (w > 0 && h > 0) sctx.drawImage(ctx.canvas, x, y, w, h, 0, bands[i].y, w, h)
+      if (w > 0 && h > 0) sctx.drawImage(ctx.canvas, x, y, w, h, 0, bands[i].y, w * s, h * s)
     })
     try {
       const res = await engine.recognize(sheet, { lang })

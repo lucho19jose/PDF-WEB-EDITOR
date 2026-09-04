@@ -3879,6 +3879,46 @@ status line saying why. Corpus: main 72 of 74, 0.915, 44 cuts accepted
 the re-read cannot detect 4.3pt Helvetica at 220 DPI — the crop shows it
 drawn in its cell; the metric, not the page, is at its floor there.
 
+### A box of two stacked lines is two runs, and a run's WIDTH is the size that cannot lie
+A table header set as "IMPORTE" over "PAGADO SOLES" came from the detector
+as ONE box 13.7pt tall, and the whole-run redraw drew "PAGADO SOLES X" at
+14pt across the two lines and off the page edge (the sweep read back "PAGA").
+Three things, on the payment-order corpus file:
+
+- **`inkBands`** finds the horizontal bands of ink in a box (rows with a
+  stem's worth of ink, separated by two or more empty rows, rows inked
+  across 60% of the width — a border — counting as empty). Two or three
+  bands each at least a quarter of the box become their own pieces in
+  `refineLines`, RE-READ like a cut piece. The words are shared out by count
+  only as the fallback for a band that reads as nothing: a guard that kept
+  the share unless the re-read resembled it was written and reverted the same
+  hour, because on this very cell the shares were "PAGADO" / "SOLES" and the
+  re-reads "MPORTE" / "PAGADO SOLES" — right, and rejected.
+- **A border's fringe comes off the box.** A scanned rule is grey and blurred,
+  and its blur reaches the letters with no empty row between; `trimProfile`
+  strips end rows holding under a quarter of the densest row's ink unless
+  that ink is a few narrow stems (a descender, an accent).
+- **`fitSize` caps the redraw by the run's ink WIDTH.** Height is what a
+  tilted line, a joined border or a two-line box inflates; width is not. The
+  original words in the base-14 face at the box's size should be about as
+  wide as their ink; a quarter wider or more brings the size down to match
+  (never below six tenths). "PAGADO SOLES" went from 9.5pt to 6.5pt and sits
+  in its cell.
+
+Two guards keep the split off boxes that are not stacked headers, each
+learned from a regression the sweep showed: the bands must be of similar
+height (within 2×) and the box must be tall for its text — at least 1.8 lines
+by the em its width implies — with a word for every band. A 93pt logo whose
+letters break into two row bands, or a cover title with a line of small print
+below it, was being split and re-read WORSE ("Ingenium" → "Inaenium"). And the
+fringe trim is confined to boxes under 40px and four rows: on the logo it ate
+the rounded tops of the letters row by row.
+
+Corpus: main 74 of 74 read back, average 0.959 (was 0.915), 42 cuts
+accepted; second corpus 33 of 33, 0.966. Drawing sheet pieces under 20px at
+2× was tried for the 11px bands and the detector then found nothing in them;
+1:1 stays (the hook remains in `recognizeSheetOnce`).
+
 ### A scan signed through a stamping service still has "text" — judge it by COVERAGE
 `judgeScanned` counted characters: over 12 and the page was a text page. An
 Intellisign-signed scan carries the service's ID strip — one 8pt line at the

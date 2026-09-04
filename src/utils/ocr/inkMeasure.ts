@@ -287,6 +287,36 @@ export function extendDescenders(ctx: CanvasRenderingContext2D, box: InkRect, te
   return ext ? { ...box, height: box.height + ext } : box
 }
 
+/**
+ * The horizontal BANDS of ink inside a box — runs of inked rows separated by
+ * `minGap` or more empty rows — as canvas-pixel y ranges, top to bottom.
+ *
+ * A table header stacked on two lines ("PAGADO" over "SOLES") comes from the
+ * detector as ONE box, and drawn as one line at a size taken from the
+ * double-height box it ran off the page at 14pt. Two bands each tall enough
+ * to be a line of their own are two lines; the caller reads each again.
+ */
+export function inkBands(ctx: CanvasRenderingContext2D, rect: InkRect, minGap = 2): { y0: number; y1: number }[] {
+  const p = profile(ctx, rect)
+  if (!p) return []
+  const bands: { y0: number; y1: number }[] = []
+  let start = -1, gap = 0
+  for (let yy = 0; yy <= p.height; yy++) {
+    // A row inked across most of the width is a cell border, not letters —
+    // a scanned border is grey and broken, so it falls short of the 80% that
+    // `profile` clears — and it separates bands as an empty row would. Left
+    // in, the bottom border doubled the "SOLES" band and the redraw came out
+    // at 9.5pt over the 4.7pt line above it.
+    const on = yy < p.height && p.rows[yy] >= 2 && p.rows[yy] < p.width * 0.6
+    if (on) { if (start < 0) start = yy; gap = 0 }
+    else if (start >= 0) {
+      gap++
+      if (gap >= minGap || yy === p.height) { bands.push({ y0: p.y + start, y1: p.y + yy - gap + 1 }); start = -1; gap = 0 }
+    }
+  }
+  return bands
+}
+
 /** The tight ink extent of a profile, or null when it holds nothing worth boxing. */
 function trimProfile(p: Profile, emHint?: number): { top: number; bottom: number; left: number; right: number } | null {
   // Never one pixel: the edge column of a three-pixel cell border is inked
@@ -380,6 +410,39 @@ function trimProfile(p: Profile, emHint?: number): { top: number; bottom: number
   }
   for (let n = 0; n < 3; n++) { const t = strayBand(top, bottom, 1); if (t === top) break; top = t }
   for (let n = 0; n < 3; n++) { const b = strayBand(bottom, top, -1); if (b === bottom) break; bottom = b }
+  // The FRINGE of a border: a scanned cell rule is grey and blurred, and its
+  // blur reaches the letters above it with no empty row between — a tail of
+  // rows holding a few percent of the width each, spread thinly across it.
+  // On a 3.6pt "PAGADO SOLES" that tail doubled the box to 7.2pt and the
+  // replacement was drawn at twice its size over the line above. A row at
+  // either end with under a quarter of the densest row's ink is a glyph row
+  // only if its ink is a few NARROW stems (descenders, ascenders, an accent);
+  // spread across many columns it is the fringe, and comes off.
+  {
+    let densest = 0
+    for (let yy = top; yy <= bottom; yy++) if (p.rows[yy] > densest) densest = p.rows[yy]
+    const bodyH = bottom - top + 1
+    const stemsOnly = (yy: number): boolean => {
+      let runs = 0, run = 0, widest = 0
+      for (let xx = 0; xx <= p.width; xx++) {
+        const on = xx < p.width && p.ink[yy * p.width + xx] === 1 && !p.ruleCol[xx]
+        if (on) run++
+        else if (run) { runs++; if (run > widest) widest = run; run = 0 }
+      }
+      return runs <= 4 && widest <= Math.max(2, bodyH * 0.35)
+    }
+    const fringe = (yy: number) => p.rows[yy] < densest * 0.25 && !stemsOnly(yy)
+    // Small boxes only — a table cell's few rows — and a few rows at most.
+    // Applied to a 93pt logo it ate the rounded tops of its letters row by
+    // row (each top row is thin and spread across every letter), the box
+    // changed shape, and the re-read of the pieces that followed turned
+    // "Ingenium" into "Inaenium".
+    if (bodyH <= 40) {
+      const maxTrim = Math.min(4, Math.round(bodyH * 0.2))
+      for (let n = 0; n < maxTrim && bottom > top + 2 && fringe(bottom); n++) bottom--
+      for (let n = 0; n < maxTrim && top < bottom - 2 && fringe(top); n++) top++
+    }
+  }
   let left = 0, right = p.width - 1
   while (left < right && p.cols[left] < minCol) left++
   while (right > left && p.cols[right] < minCol) right--

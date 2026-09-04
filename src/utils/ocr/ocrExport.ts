@@ -152,8 +152,22 @@ function plainColor(c: readonly number[] | undefined): [number, number, number] 
  * half the original.
  */
 function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined, all: OcrTextItem[]): number {
-  const size = item.fontSize
+  let size = item.fontSize
   if (item.vertical) return size
+  // The run's own WIDTH is the one measure a box cannot inflate. Its height
+  // can: a tilted line's box is taller than its letters, a blurred cell
+  // border with no empty row above it joins the box, and a table header set
+  // at 4.7pt read 9.5pt from a 7.2pt box — the redraw then covered the row
+  // above and ran across the next column. Set at the box's size, the
+  // ORIGINAL words in the base-14 face should be about as wide as their ink;
+  // when they come out a quarter wider or more, the size is brought down so
+  // they are, never below six tenths.
+  const ink = item.inkRect ?? item.rect
+  const original = (item.originalText || item.text).trim()
+  if (original && ink.width > 4) {
+    const natural = approxWidth(original, size, item.fontFamily)
+    if (natural > ink.width * 1.25) size = Math.max(size * 0.6, Math.round(size * (ink.width * 1.1 / natural) * 10) / 10)
+  }
   const margin = 12
   let room = pageWidth ? Math.max(20, pageWidth - margin - item.rect.x) : Infinity
   const near = nextRunRight(item, all)
