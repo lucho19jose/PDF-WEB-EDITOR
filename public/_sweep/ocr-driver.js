@@ -126,12 +126,19 @@ async function rereadEdits(pageIndex, edits) {
     if (!e.text || !e.rect) continue
     const want = fold(e.text)
     let best = null
+    // The re-read run that best MATCHES the edited run's box (intersection
+    // over union), not the one that overlaps it most: a 93pt logo's box
+    // contains the whole 16pt tagline under it, so by overlap alone the
+    // tagline's edit was scored against the logo's text (0.11) while the
+    // tagline itself had been traced correctly.
     for (const it of res.items) {
       const r = it.rect
       const ox = Math.min(r.x + r.width, e.rect.x + e.rect.width) - Math.max(r.x, e.rect.x)
       const oy = Math.min(r.y + r.height, e.rect.y + e.rect.height) - Math.max(r.y, e.rect.y)
       if (ox <= 0 || oy <= 0) continue
-      const area = ox * oy
+      const inter = ox * oy
+      const union = r.width * r.height + e.rect.width * e.rect.height - inter
+      const area = inter / Math.max(union, 1e-6)
       if (!best || area > best.area) best = { area, text: it.text }
     }
     const got = fold(best?.text)

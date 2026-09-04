@@ -3726,6 +3726,69 @@ redraw on a navy cover (the bake was inspected and is right, as is the traced
 "EL GO" beside it); "15-09-2021" 0.73 → 0.91 and "COMPROBANTE" 0.42 → 0.92
 are gains. No traced run reads back wrong.
 
+### The detector's box stops at the BASELINE, and everything downstream believed it
+The same contract's body lines all fell back to Helvetica, and a quarter too
+small. PaddleOCR boxes a line of small body text at its baseline, and
+`inkBounds` only ever measures INTO the box it is given, so every p, q and g
+had its descender outside the box: `boxPerEm` read the box as 0.95 em of a
+7.6pt line where the letters were 10pt, the whole-run replacements were drawn
+at 7.6, and `flagByShape` marked every descender as not descending — 18 to
+29 of 80 cells on lines whose cut was right. `extendDescenders` walks DOWN
+from the tight box through rows that hold a stem's worth of ink and stay
+sparse (under 15% of the width), up to 0.35 of the height, and stops at the
+first empty or dense row. Two things it must not do, both tried:
+
+- **Pad the probe and let `inkBounds` trim.** On this leading a line's
+  descenders touch the next line's ascenders, so a probe padded 0.4 of the
+  height each way came back holding a line and a half: 7.2pt boxes became
+  14.7, the title read 19.8pt. The walk must STOP at the gap, not cross it.
+- **Ask for a share of the width per row.** Four descenders on an 81-letter
+  line are six pixels at 220 DPI; one percent of that line's width is
+  thirteen, and the walk stopped on its first row. A stem's worth is two.
+
+Three more things stood between these lines and the face, each measured on
+the same page:
+
+- **`expectedAdvance` is a per-letter table now**, the mean of Helvetica's
+  and Times-Roman's AFM widths in ems (`ADVANCE_TABLE`; accents folded onto
+  the base letter). The four buckets it replaces put "p", "s" and "e" at one
+  width, and on a Times-like scan whose letters touch, cells are cut and
+  vetted BY these expectations — every "s" and "e" beside a "p" was the wrong
+  width.
+- **A dotted i and an accented vowel RISE.** They were in `X_HEIGHT_CHARS`,
+  so on a Spanish line every i, í, á, é, ó, ú and ñ failed the shape test
+  (rise 0.45–0.52 against a bar of 0.3) and pulled the x-height median up.
+  `MARKED_X_HEIGHT_CHARS` may rise and must not descend.
+- **The Latin fragment budget is half the characters**, not a third: at 440
+  DPI a typewriter serif breaks at its hairlines (113 runs for 81 letters).
+  Under the gap merge a bigger budget bought wrong merges; under the width
+  fit a merge that does not improve the fit is not made.
+
+Measured on the contract page: ten probed lines — the title, the code, eight
+body lines of 75–89 letters — all cut cleanly on the tracing raster (0–4
+suspects each, was 17–74) and size at 9.3–10.3pt. Corpus (15 documents, 26
+scanned pages, 74 edits): 71 read back, average re-read similarity 0.918
+(was 0.911 before this round), 38 of 74 cuts accepted against 27. Every row
+under 1.0 was inspected or is a known one: the 009 cover's re-read noise, the
+calibration scan's "distance"/"Zone" cells, "Fecha de transferencia",
+"CUMPLIÓ" and "Test Parameters" (extraction order of the invisible head), the
+dashed date. Two new rows are new picks on the Ingenium report's page 2 (the
+items' sizes changed, so `pickRuns` chose other runs).
+
+**The sweep's re-read matches boxes by IoU, not by overlap.** The 93pt logo's
+re-read box CONTAINS the 16pt tagline under it, so by overlap alone the
+tagline's edit was scored against the logo's text (0.11) while the tagline
+itself had been traced correctly — a measurement artifact that read as a
+regression for a whole round.
+
+**A gap inside a word is a typo, not a fit.** `planPartial` called a stretch
+"fits" when the tail's gap opened by up to a space's worth — right between
+words, wrong inside one: deleting the "e" of "presente" left "pres nte" on
+the page and extraction put a space in it. With no space on either side of
+the change the tail may open by a letter gap and a hair; past that it is
+shifted onto the vacated ink. Measured: "presnte" and "Rgistro" bake closed
+up (partial+shift) and extract as typed.
+
 ### A scan signed through a stamping service still has "text" — judge it by COVERAGE
 `judgeScanned` counted characters: over 12 and the page was a text page. An
 Intellisign-signed scan carries the service's ID strip — one 8pt line at the

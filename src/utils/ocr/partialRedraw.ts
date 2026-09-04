@@ -269,8 +269,14 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const padTail = Math.min(1, Math.max(0.4, gapAfter / 2))
   // Fits when the tail keeps at least 40% of the gap before it (a word gap
   // closing from 6.5pt to 4 is invisible; a letter gap of 1.6pt yields a
-  // pixel), or opens by up to a space's worth.
-  if (dx <= Math.max(TOUCH_PT, gapAfter * 0.6) && dx >= -0.6 * sizePt) {
+  // pixel), or opens by up to a space's worth — BETWEEN words. Inside a word
+  // a gap of a letter's width reads as a typo: deleting the "e" of
+  // "presente" left "pres nte" on the page, and extraction put a space in
+  // it. There the tail may open by a letter gap and a hair, no more; past
+  // that it is shifted onto the vacated ink.
+  const insideWord = prefix > 0 && suffix > 0 && !st.spaceBefore && !st.spaceAfter
+  const mayOpen = insideWord ? cut.letterGapPt * 1.5 + TOUCH_PT : 0.6 * sizePt
+  if (dx <= Math.max(TOUCH_PT, gapAfter * 0.6) && dx >= -mayOpen) {
     return {
       mode: 'partial',
       patches: [{ rect: [patchX0, ink.y - padY, tailStart - padTail, ink.y + ink.height + padY], color: plain(item.background) }],

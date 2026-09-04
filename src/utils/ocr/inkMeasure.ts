@@ -236,6 +236,57 @@ export function inkBounds(ctx: CanvasRenderingContext2D, rect: InkRect, emHint?:
   return { x: p.x + box.left, y: p.y + box.top, width: box.right - box.left + 1, height: box.bottom - box.top + 1 }
 }
 
+/**
+ * Extend a tight ink box DOWN through the rows its descenders occupy.
+ *
+ * PaddleOCR's detector boxes a line of small body text at its baseline, so
+ * `inkBounds`, which only ever measures into the box it is given, returned a
+ * box with no descender in it: the letters were sized a quarter too small and
+ * the glyph cut flagged every p, q and g as not descending. Below the baseline
+ * a line's ink is a few stems — sparse rows — and then an empty row before the
+ * next line's ascenders. Rows are taken while they hold a stem's worth of ink
+ * and stay sparse (under 15% of the width inked), up to 0.35 of the box's
+ * height; the first empty or dense row stops it, so a neighbouring line is
+ * never entered. A box that already held its descenders meets the empty row at
+ * once and is unchanged.
+ */
+export function extendDescenders(ctx: CanvasRenderingContext2D, box: InkRect, text: string): InkRect {
+  // Only a run that HAS descenders, and only as many stems as it has. Judged
+  // on sparseness alone the walk went wherever the ink under a line was thin
+  // enough: a 93pt logo's box grew down through the 16pt tagline beneath it
+  // (the tagline's rows are under 15% of the logo's width), so the logo's
+  // patch painted the tagline out; and under a book cover's title the
+  // photograph read as sparse rows, the box grew into it, and the re-read
+  // pieces came back as "ENE 40 ES". A descender row is a few NARROW stems —
+  // at most one per descending letter, plus a couple for a comma or a tail
+  // the box edge split — each no wider than a third of the line's height.
+  const descenders = [...text].filter(c => /[gjpqyQ]/.test(c)).length
+  if (!descenders) return box
+  const maxRows = Math.round(box.height * 0.35)
+  if (maxRows < 1) return box
+  const band = { x: box.x, y: box.y + box.height, width: box.width, height: maxRows }
+  const p = profile(ctx, band, box.width * 4)
+  if (!p) return box
+  // A stem's worth, NOT a share of the width: four descenders on an 81-letter
+  // line are six pixels at 220 DPI, and one percent of that line's width is
+  // thirteen — the walk stopped on the first row and nothing was extended.
+  const minRow = 2
+  const dense = p.width * 0.15
+  const maxRun = Math.max(2, box.height * 0.34)
+  const stemsOnly = (yy: number): boolean => {
+    let runs = 0, run = 0
+    for (let xx = 0; xx <= p.width; xx++) {
+      const on = xx < p.width && p.ink[yy * p.width + xx] === 1
+      if (on) run++
+      else if (run) { if (run > maxRun) return false; runs++; run = 0 }
+    }
+    return runs <= descenders + 2
+  }
+  let ext = 0
+  while (ext < p.height && p.rows[ext] >= minRow && p.rows[ext] < dense && stemsOnly(ext)) ext++
+  return ext ? { ...box, height: box.height + ext } : box
+}
+
 /** The tight ink extent of a profile, or null when it holds nothing worth boxing. */
 function trimProfile(p: Profile, emHint?: number): { top: number; bottom: number; left: number; right: number } | null {
   // Never one pixel: the edge column of a three-pixel cell border is inked

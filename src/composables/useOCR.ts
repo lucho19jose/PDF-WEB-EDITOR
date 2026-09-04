@@ -7,7 +7,7 @@ import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
 import { TesseractEngine } from '@/utils/ocr/engines/tesseractEngine'
 import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
-import { inkBounds, inkGaps, type InkCut } from '@/utils/ocr/inkMeasure'
+import { inkBounds, inkGaps, extendDescenders, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
 import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance } from '@/utils/ocr/glyphCut'
 import { toSpanCut, type SpanCut } from '@/utils/ocr/partialRedraw'
@@ -735,7 +735,18 @@ function createOCR() {
       // fragment or a neighbouring line inflates the box's height, which is
       // exactly when it is needed.
       const emGuess = rect.width / Math.max(1, [...line.text].filter(c => c !== ' ').reduce((s, c) => s + expectedAdvance(c), 0))
-      const ink = inkBounds(ctx, rect, emGuess)
+      // The detector's box is measured INTO, never out of, and PaddleOCR's
+      // box for a line of small body text stops at the BASELINE: on a 10pt
+      // contract the descenders of every p, q and g sat below the box, the
+      // box read as 0.95 em of a 7.6pt line, the replacements were drawn a
+      // quarter too small, and the glyph cut flagged every descender as not
+      // descending. The tight box is therefore extended DOWN through the
+      // sparse rows a few descenders make, stopping at the first empty row.
+      // Padding the probe on both sides was tried first and swallowed the
+      // neighbouring lines whole (a 7pt box became 15pt): a line's descenders
+      // touch the next line's ascenders on this leading, so the probe must
+      // not cross the gap — it must stop at it.
+      const ink = extendDescenders(ctx, inkBounds(ctx, rect, emGuess), line.text)
       const cjk = isMostlyCjk(line.text)
       const emPx = ink.height / (cjk ? GLYPH_BOX_PER_EM_CJK : boxPerEm(line.text))
       // Only an UNMISTAKABLE gap cuts (two and a half ems — the same bar

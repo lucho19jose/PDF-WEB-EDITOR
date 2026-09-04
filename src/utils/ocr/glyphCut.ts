@@ -58,7 +58,7 @@ export function lastCutReason(): string { return refusedBecause }
 function refuse(why: string): null { refusedBecause = why; return null }
 
 /** What the last profile cut saw, refused or not — for the harness. */
-const cutDebug: { runs: string; cells: string } = { runs: '', cells: '' }
+const cutDebug: { runs: string; cells: string; shape: string; rows: string } = { runs: '', cells: '', shape: '', rows: '' }
 export function lastCutDebug() { return { ...cutDebug } }
 
 const DESCENDER_CHARS = /[gjpqyQ,;()\[\]{}]/
@@ -123,10 +123,36 @@ function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; w
  */
 export function expectedAdvance(ch: string): number {
   if (CJK.test(ch)) return 0.95
-  if (/[iljtfrI.,;:'!|1]/.test(ch)) return 0.3
-  if (/[mwMW@%]/.test(ch)) return 0.85
-  if (/[A-Z0-9]/.test(ch)) return 0.65
+  const base = ch.normalize('NFD').replace(/\p{M}/gu, '')
+  const w = ADVANCE_TABLE[base]
+  if (w !== undefined) return w
+  if (/[A-Z0-9]/.test(base)) return 0.65
   return 0.52
+}
+
+/**
+ * Per-letter advances, the mean of Helvetica's and Times-Roman's AFM widths
+ * in ems. The four-bucket table this replaces (thin 0.3, wide 0.85, capital
+ * 0.65, everything else 0.52) put a "p", an "s" and an "e" at the same width,
+ * and on a Times-like typewriter scan whose letters touch, the cells are cut
+ * by these expectations: every "s" (0.44 em) and "e" (0.50) beside a "p"
+ * (0.53) was flagged as the wrong width and a body line refused at 22 of 81
+ * cells suspect while its cut was right. Serif against sans cannot be read
+ * from the ink (see the OCR font notes), so the mean of the two stands in for
+ * whichever the page uses; the fit scales the whole table to the run anyway.
+ */
+const ADVANCE_TABLE: Record<string, number> = {
+  a: 0.500, b: 0.528, c: 0.472, d: 0.528, e: 0.500, f: 0.306, g: 0.528, h: 0.528, i: 0.250, j: 0.250,
+  k: 0.500, l: 0.250, m: 0.806, n: 0.528, o: 0.528, p: 0.528, q: 0.528, r: 0.333, s: 0.444, t: 0.278,
+  u: 0.528, v: 0.500, w: 0.722, x: 0.500, y: 0.500, z: 0.472,
+  A: 0.694, B: 0.667, C: 0.694, D: 0.722, E: 0.639, F: 0.583, G: 0.750, H: 0.722, I: 0.306, J: 0.444,
+  K: 0.694, L: 0.583, M: 0.861, N: 0.722, O: 0.750, P: 0.611, Q: 0.750, R: 0.694, S: 0.611, T: 0.611,
+  U: 0.722, V: 0.694, W: 0.944, X: 0.694, Y: 0.694, Z: 0.611,
+  '0': 0.528, '1': 0.528, '2': 0.528, '3': 0.528, '4': 0.528, '5': 0.528, '6': 0.528, '7': 0.528, '8': 0.528, '9': 0.528,
+  '.': 0.264, ',': 0.264, ':': 0.278, ';': 0.278, '-': 0.333, '(': 0.333, ')': 0.333, "'": 0.186, '"': 0.381,
+  '!': 0.306, '?': 0.500, '/': 0.278, '%': 0.861, '&': 0.722, '@': 0.968, '°': 0.400, 'º': 0.370, 'ª': 0.370,
+  '*': 0.444, '+': 0.574, '=': 0.574, '$': 0.528, '#': 0.528, '[': 0.306, ']': 0.306, '_': 0.528, '|': 0.230,
+  '¿': 0.500, '¡': 0.306, '<': 0.574, '>': 0.574, '€': 0.556, '–': 0.556, '—': 1.000
 }
 
 /**
@@ -233,11 +259,22 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
   // first) and a CJK cell is close to square, so a wrong merge shows up as a
   // width outlier in the suspect check below. Two merges per character covers
   // a three-part ideograph.
-  const budget = cjk ? Math.max(1, target * 2) : Math.max(1, Math.round(target * 0.35))
+  // Half the characters for Latin, now that merges are decided by width: at
+  // the 440 DPI tracing raster a typewriter serif breaks into pieces at its
+  // hairlines (a contract's 7.6pt body line came in 113 runs for 81 letters)
+  // and the old third refused every such line whole. Under the gap merge a
+  // bigger budget meant more wrong merges; under the width fit a merge that
+  // does not help the fit is not made.
+  const budget = cjk ? Math.max(1, target * 2) : Math.max(1, Math.round(target * 0.5))
   let edits = 0
 
   cutDebug.runs = runs.map(r => `${r.x0}-${r.x1}`).join(' ')
   cutDebug.cells = ''
+  {
+    const rows: number[] = []
+    for (let yy = 0; yy < bin.h; yy++) { let n = 0; for (let xx = 0; xx < bin.w; xx++) n += bin.ink[yy * bin.w + xx]; rows.push(n) }
+    cutDebug.rows = `y=${bin.y} h=${bin.h} ${rows.join(',')}`
+  }
 
   // Too many pieces: an ideograph's radicals, a broken stroke, an accent
   // above its letter. Merge the pair with the smallest gap first.
@@ -345,10 +382,15 @@ function vetCells(bin: Bin, cells: GlyphCell[], chars: string[]): GlyphCell[] | 
     const thinChar = (c: GlyphCell) => /[iljtfrI.,;:'!|1]/.test(c.char)
     const wide = cells.map(c => !thinChar(c) && (c.x1 - c.x0) > wantOf(c) * 1.6 && (c.x1 - c.x0) - wantOf(c) > 3)
     const sliver = cells.map(c => !thinChar(c) && wantOf(c) > 2 && (c.x1 - c.x0) < wantOf(c) * 0.35)
+    // Within a dozen cells: a shift runs from the fused cell to the sliver
+    // that absorbs it, and on the title that was nine letters. Paired with a
+    // fused cell anywhere on the run, a sliver twenty letters away marked a
+    // whole clause suspect on a line whose cut was otherwise right.
+    const REACH = 12
     for (let s = 0; s < cells.length; s++) {
       if (!sliver[s]) continue
       let f = -1
-      for (let d = 1; d < cells.length && f < 0; d++) {
+      for (let d = 1; d <= REACH && f < 0; d++) {
         if (s - d >= 0 && wide[s - d]) f = s - d
         else if (s + d < cells.length && wide[s + d]) f = s + d
       }
@@ -458,7 +500,15 @@ function splitAt(cols: Uint16Array, want: number, lo: number, hi: number, emPx: 
   return best
 }
 
-const X_HEIGHT_CHARS = /^[aceimnorsuvwxzáéíóúñäëïöüàèìòùâêîôû]$/
+// Letters whose ink stays between the baseline and the x-height line. A
+// dotted "i" and every accented vowel used to be counted here, and they RISE
+// — a dot or an acute sits a third to a half of the x-height above it — so on
+// a Spanish line every i, í, á, é, ó, ú and ñ was flagged as the wrong shape
+// (measured: rise 0.45–0.52 against a bar of 0.3) and the x-height median was
+// pulled up by them. They have their own class: they may rise, they must not
+// descend.
+const X_HEIGHT_CHARS = /^[acemnorsuvwxz]$/
+const MARKED_X_HEIGHT_CHARS = /^[iíáéóúñäëïöüàèìòùâêîôû]$/
 const ASCENDER_CHARS = /^[bdfhklt]$/
 const DESCENDER_ONLY = /^[gpqy]$/
 const TALL_CHARS = /^[A-Z0-9ÁÉÍÓÚÑ]$/
@@ -516,6 +566,7 @@ function flagByShape(bin: Bin, cells: GlyphCell[]): number {
   const xTop = xTops[Math.floor(xTops.length / 2)]
   const xh = Math.max(3, baseline - xTop)
   let flagged = 0
+  const shapeLog: string[] = []
   cells.forEach((c, i) => {
     const e = extents[i]
     if (e.top < 0 || c.suspect) return
@@ -523,10 +574,13 @@ function flagByShape(bin: Bin, cells: GlyphCell[]): number {
     const drop = (e.bottom - baseline) / xh   // how far below the baseline
     let bad = false
     if (X_HEIGHT_CHARS.test(c.char)) bad = rise > 0.3 || drop > 0.25
+    else if (MARKED_X_HEIGHT_CHARS.test(c.char)) bad = drop > 0.25
     else if (DESCENDER_ONLY.test(c.char)) bad = drop < 0.15 || rise > 0.3
     else if (ASCENDER_CHARS.test(c.char) || TALL_CHARS.test(c.char)) bad = rise < 0.12 || drop > 0.25
     if (bad) { c.suspect = true; flagged++ }
+    shapeLog.push(`${c.char}${rise.toFixed(2)}/${drop.toFixed(2)}${bad ? '!' : ''}`)
   })
+  cutDebug.shape = `base=${baseline} xTop=${xTop} xh=${xh} | ${shapeLog.join(' ')} || extents: ${cells.map((c, i) => `${c.char}${c.suspect ? '!' : ''}:${extents[i].top < 0 ? 'none' : `${Math.round(extents[i].top)}-${Math.round(extents[i].bottom)}`}`).join(' ')}`
   return flagged
 }
 
