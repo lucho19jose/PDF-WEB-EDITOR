@@ -48,3 +48,4 @@ public/_sweep/r6/
 
 # chrome-devtools MCP session artefacts
 .playwright-mcp/
+public/_sweep/ocr2/
