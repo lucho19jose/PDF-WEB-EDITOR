@@ -7,7 +7,7 @@ import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
 import { TesseractEngine } from '@/utils/ocr/engines/tesseractEngine'
 import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
-import { inkBounds, inkGaps, inkBands, extendDescenders, extendAscenders, type InkCut } from '@/utils/ocr/inkMeasure'
+import { inkBounds, inkGaps, inkBands, extendDescenders, extendAscenders, walkNote, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
 import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance } from '@/utils/ocr/glyphCut'
 import { toSpanCut, sizeOf, type SpanCut } from '@/utils/ocr/partialRedraw'
@@ -768,7 +768,9 @@ function createOCR() {
       // And UP through the ascenders, which the same detector clips on small
       // body text — see `extendAscenders`.
       const cjk = isMostlyCjk(line.text)
+      if (typeof window !== 'undefined' && (window as any).__lastWalkDebug) walkNote(`line "${line.text.slice(0, 30)}" box=${[rect.x, rect.y, rect.width, rect.height].map(v => v.toFixed(1)).join(',')} em=${emGuess.toFixed(1)}`)
       const ink = extendAscenders(ctx, extendDescenders(ctx, inkBounds(ctx, rect, emGuess, !cjk), line.text), line.text)
+      if (typeof window !== 'undefined' && (window as any).__lastWalkDebug) walkNote(`  ink=${[ink.x, ink.y, ink.width, ink.height].map(v => v.toFixed(1)).join(',')}`)
       const emPx = ink.height / (cjk ? GLYPH_BOX_PER_EM_CJK : boxPerEm(line.text))
       // Only an UNMISTAKABLE gap cuts (two and a half ems — the same bar
       // `splitRuns` sets): justified prose opens word gaps past an em, and a

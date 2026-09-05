@@ -15,6 +15,8 @@ export interface InkRect { x: number; y: number; width: number; height: number }
 /** What the last box trims and ascender/descender walks saw — for the lab. */
 const walkDebug: string[] = []
 export function lastWalkDebug(): string[] { return walkDebug.splice(0) }
+/** A caller's own line in the walk log (the lab reads the log in order). */
+export function walkNote(s: string) { walkDebug.push(s) }
 if (typeof window !== 'undefined') (window as any).__lastWalkDebug = lastWalkDebug
 
 interface Profile {
@@ -501,6 +503,14 @@ function trimProfile(p: Profile, emHint?: number, dipStrip = true): { top: numbe
         if (ink <= stray) return next
         const bandH = Math.abs(yy - from) + 1
         const bodyH = Math.abs(limit - next) + 1
+        // A THIN band behind a clear gap holding little of the ink is a cell
+        // border's blurred fringe, not an accent: an accent or an "i" dot sits
+        // a row or two above its letter, never three empty rows away. On a
+        // payment order's stacked header the fringe of the top border (rows of
+        // 3, 6, 8 pixels, ten empty rows above "MPORTE") and of the bottom one
+        // (7, 4, 3, 3 under "PAGADO SOLES") were 3% of the ink — over the
+        // 1.5% stray bar — and each box read 8.5pt for 4.7pt of letters.
+        if (bandH <= 4 && ink < totalInk * 0.1) return next
         // A dense band behind a clear gap is the neighbouring line whatever
         // its height, up to most of the body's: a 4.5pt table set at 5.2pt
         // leading (the OT-GA order) put the bottom HALF of "ELABORACION" in
