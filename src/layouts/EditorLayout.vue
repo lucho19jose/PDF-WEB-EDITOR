@@ -386,7 +386,16 @@ async function bakeOcrEdits(): Promise<number> {
       stretchWidthPt: measured[i]?.exact ? measured[i].width : null,
       allowShift: true
     }]))
-    const plan = planOcrExport(page.items, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null)
+    // And every edited run's FULL text, at 10pt, in the fonts that will draw
+    // it — the whole-run redraw fits its size to the paper and to the run
+    // beside it by this width, where an estimate of half an em per character
+    // let a traced calligraphic "中國銀行 X" run across its neighbour.
+    const wholeItems = page.items.filter(i => i.edited && !i.removed && !i.vertical)
+    const wholeMeasured = await pdfEngine.measureRuns(wholeItems.map(item => ({
+      text: item.text, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item)
+    })))
+    const widthAt10 = new Map(wholeItems.map((item, i) => [item.id, wholeMeasured[i]?.exact ? wholeMeasured[i].width : null]))
+    const plan = planOcrExport(page.items, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null)
     modes[pageIndex] = plan.modes
     if (plan.patches.length === 0 && plan.texts.length === 0 && plan.images.length === 0) continue
 

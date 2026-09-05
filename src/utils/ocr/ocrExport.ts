@@ -151,7 +151,7 @@ function plainColor(c: readonly number[] | undefined): [number, number, number] 
  * page, less a small margin; the size comes down just enough, never below
  * half the original.
  */
-function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined, all: OcrTextItem[]): number {
+function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined, all: OcrTextItem[], widthAt10: number | null = null): number {
   let size = item.fontSize
   if (item.vertical) return size
   // The run's own WIDTH is the one measure a box cannot inflate. Its height
@@ -173,7 +173,12 @@ function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined,
   const near = nextRunRight(item, all)
   if (near !== null) room = Math.min(room, Math.max(20, near - item.rect.x))
   if (!Number.isFinite(room)) return size
-  const width = approxWidth(text, size, item.fontFamily)
+  // The width the ENGINE will draw when the caller could measure it (the
+  // traced face's own advances, the CJK face's ems), else the estimate: the
+  // estimate counts every character as half an em, and "中國銀行 X" in a
+  // traced calligraphic face is twice that, so the appended X was drawn
+  // across the "秘鲁" beside it while the estimate said it fit.
+  const width = widthAt10 !== null ? widthAt10 * size / 10 : approxWidth(text, size, item.fontFamily)
   if (width <= room) return size
   return Math.max(size * 0.5, Math.round(size * (room / width) * 10) / 10)
 }
@@ -218,7 +223,9 @@ export function planOcrExport(
   faceIdFor?: (item: OcrTextItem) => string | undefined,
   pageWidth?: number,
   /** The span geometry and measured stretch width for an item, when the caller has them — enables the partial redraw. */
-  partialFor?: (item: OcrTextItem) => Omit<PartialContext, 'fontName' | 'color' | 'faceId'> | null
+  partialFor?: (item: OcrTextItem) => Omit<PartialContext, 'fontName' | 'color' | 'faceId'> | null,
+  /** The engine-measured width of an item's full text at 10pt in the fonts that will draw it, when the caller has it. */
+  widthAt10For?: (item: OcrTextItem) => number | null
 ): OcrExportPlan {
   const patches: PatchOp[] = []
   const images: ImageOp[] = []
@@ -278,8 +285,9 @@ export function planOcrExport(
     const baselineY = item.rect.y + item.rect.height - Math.max(1, item.rect.height * 0.2)
 
     let x = item.rect.x
+    const widthAt10 = widthAt10For?.(item) ?? null
     if (item.align !== 'left') {
-      const w = approxWidth(item.text, item.fontSize, item.fontFamily)
+      const w = widthAt10 !== null ? widthAt10 * item.fontSize / 10 : approxWidth(item.text, item.fontSize, item.fontFamily)
       x = item.align === 'center'
         ? item.rect.x + (item.rect.width - w) / 2
         : item.rect.x + item.rect.width - w
@@ -295,7 +303,7 @@ export function planOcrExport(
       text: String(item.text),
       x: Number(x),
       y: Number(baselineY),
-      fontSize: Number(fitSize(sized, item.text, pageWidth, items)),
+      fontSize: Number(fitSize(sized, item.text, pageWidth, items, widthAt10)),
       fontName,
       color: plainColor(item.color),
       rotation: 0,
