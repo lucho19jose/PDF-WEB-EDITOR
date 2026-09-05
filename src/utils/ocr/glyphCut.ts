@@ -104,6 +104,25 @@ function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; w
     const d = (hi - gray[j]) / (hi - lo)
     darkness[j] = inverted ? 1 - d : d
   }
+  // Darkness is stated against the PAPER, not the box's lightest pixel. On
+  // an identity card's teal strip the lightest pixel is a white speck, the
+  // teal reads a third dark, and to the stroke-relative tracer a third-dark
+  // field is a faint stroke everywhere: "CONSTANCIA" traced as ten solid
+  // blocks. The paper is the median of what the cut did not call ink; on
+  // white paper that is a few hundredths and nothing changes.
+  {
+    const bg: number[] = []
+    const stride = Math.max(1, Math.floor(Math.sqrt(gray.length / 4000)))
+    for (let j = 0; j < darkness.length; j += stride) if (!ink[j]) bg.push(darkness[j])
+    if (bg.length > 8) {
+      bg.sort((a, b) => a - b)
+      const paper = bg[Math.floor(bg.length / 2)]
+      if (paper > 0.05 && paper < 0.9) {
+        const span = 1 - paper
+        for (let j = 0; j < darkness.length; j++) darkness[j] = Math.max(0, (darkness[j] - paper) / span)
+      }
+    }
+  }
   // A rule across the box — an underline, a cell border — joins every glyph
   // column into one run and drags the baseline down. Rows inked across most
   // of the width are not glyph rows; clear them.
