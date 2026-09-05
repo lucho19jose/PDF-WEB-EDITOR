@@ -4048,6 +4048,17 @@ which is what found both.
 The word's cut is then refused honestly ("widths do not fit the letters") and
 "MINRA" bakes in Helvetica-Bold at 6.5pt over an intact "SHOUXIN".
 
+**A thin band behind a clear gap holding little of the ink is a border's
+fringe.** The stray-band rule kept any band worth over 1.5% of the ink as
+"an accent or an i-dot"; a cell border's blurred fringe (3, 6, 8 pixels, ten
+empty rows above "MPORTE" on a payment order's header, 7, 4, 3, 3 under
+"PAGADO SOLES") is 3%, and each box read 8.5pt for 4.7pt of letters. A band of
+four rows or fewer behind three empty rows, under a tenth of the ink, is
+stripped: an accent sits a row or two above its letter, never three empty
+rows away. PaddleOCR's boxes for that header differ from run to run (one
+two-line box, or two overlapping one-line boxes), so the band-split path and
+this path both have to get it right.
+
 ### The whole-run redraw is fitted by the width the engine will draw
 `fitSize` sized a redraw against the paper and the run beside it with
 `approxWidth`, half an em per character whatever the face. A letterhead's
@@ -4059,6 +4070,17 @@ edited run's full text at 10pt in the fonts that will draw it (the same
 that (`widthAt10For`); the estimate stays only for a run the engine cannot
 measure exactly. Measured: the run bakes at 22.5pt ending at x 195.4, two
 points clear of the neighbour at 197.6, where it was 25.6pt ending at 210.
+
+### Tried and dropped: lower darkness floors for a laser letterhead's faint bars
+A Lexmark-scanned letterhead (ocr4/003) prints its bold face with dark stems
+and horizontal bars at a tenth to a fifth of the paper-to-ink range: the top
+bar of every "E" and "F" reads 0.1–0.2 darkness over most of its span, so the
+traced E is an "Ł" and the F a stem with one arm. Lowering `MIN_PEAK` to 0.18
+and `MIN_DARK` to 0.12 was measured in the lab and changed nothing on those
+bars (the pixels are 0.11 and 0.22, patchy either way) while opening the
+floors to grain and JPEG ringing; reverted. What the scan holds at that level
+is what a reader sees as a weak E; the honest fix would be a stroke-aware
+fill along a bar whose ends are dark, which is not implemented.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
