@@ -4026,6 +4026,40 @@ majority rule remains only for a box at the canvas edge with no band to
 read. Measured: the label samples 0.01 on 1.0; the navy cover's "EL EGO",
 "ENEMIGO" and "RYAN HOLIDAY" still sample white on navy.
 
+### Two lines that touch are told apart by the trough between them
+A logo's "MINERA" over its "SHOUXIN" (ocr3/016) kept the tops of the line
+below inside its box: the rows between the two held two pixels each — a
+speck, a fringe — so by the empty-row test (`< minRow`, and minRow is 2) there
+was no gap, the box read 7.5pt for 4.9pt of letters, the em 9.9 for 6.5, and
+the traced M was half an S ("MINRA" baked as slashes). `trimProfile` now reads
+a dense band at the box's edge as the neighbouring line behind QUIET rows
+(under a tenth of the box's densest row) as well as behind empty ones, and —
+on a Latin line only, because an ideograph's own strokes make dense bands with
+dips between them — behind a two-row DIP under three tenths of the peak when
+the band itself reaches half the peak. The width guard is three ems, not four:
+a six-letter word in caps is 3.9 ems, and the density test already keeps an
+accent band out. `extendAscenders` drops a band that ends against a dense row
+(the previous line's baseline): the second of two stamped ID lines had taken
+five rows of the first line's descenders and fringe, sparse stems all, and
+stopped at its baseline — exactly the wrong five rows. Whether a walk or a
+trim did what it did is readable in the lab (`MODE=box`, `lastWalkDebug()`),
+which is what found both.
+
+The word's cut is then refused honestly ("widths do not fit the letters") and
+"MINRA" bakes in Helvetica-Bold at 6.5pt over an intact "SHOUXIN".
+
+### The whole-run redraw is fitted by the width the engine will draw
+`fitSize` sized a redraw against the paper and the run beside it with
+`approxWidth`, half an em per character whatever the face. A letterhead's
+calligraphic "中國銀行" traced beautifully, and appending " X" drew the X across
+the "秘鲁" beside it: the traced glyphs advance a full em each, 120pt for the
+run where the estimate said 80, and 80 fit. `bakeOcrEdits` now measures every
+edited run's full text at 10pt in the fonts that will draw it (the same
+`measureRuns` the partial redraw already uses) and `planOcrExport` scales from
+that (`widthAt10For`); the estimate stays only for a run the engine cannot
+measure exactly. Measured: the run bakes at 22.5pt ending at x 195.4, two
+points clear of the neighbour at 197.6, where it was 25.6pt ending at 210.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
