@@ -38,7 +38,7 @@ const doc = mupdf.Document.openDocument(fs.readFileSync(pdf), 'application/pdf')
 const page = doc.loadPage(pageIndex)
 const k = dpi / 72
 const pix = page.toPixmap(mupdf.Matrix.scale(k, k), mupdf.ColorSpace.DeviceRGB, false, true)
-const W = pix.getWidth(), H = pix.getHeight(), n = pix.getNumberOfComponents()
+const W = pix.getWidth(), H = pix.getHeight(), n = pix.getNumberOfComponents(), n_ = n
 const samples = pix.getPixels()
 const ctx = {
   canvas: { width: W, height: H },
@@ -63,6 +63,16 @@ if (process.env.MODE === 'box') {
   const b2 = ink.extendAscenders(ctx, b1, text)
   console.log(`detector  ${pt(rect)}\ninkBounds ${pt(b0)}\n+descend  ${pt(b1)}\n+ascend   ${pt(b2)}`)
   for (const d of ink.lastWalkDebug()) console.log('  ' + d.slice(0, 400))
+  // Row ink of the detector box and a margin above/below (pixels darker than 200), one number per raster row.
+  const m = Math.round(rect.height * 0.5)
+  const rows = []
+  for (let yy = Math.floor(rect.y) - m; yy < Math.ceil(rect.y + rect.height) + m; yy++) {
+    if (yy < 0 || yy >= H) continue
+    let n = 0
+    for (let xx = Math.floor(rect.x); xx < Math.ceil(rect.x + rect.width); xx++) { const s = (yy * W + xx) * n_; if ((samples[s] * 299 + samples[s + 1] * 587 + samples[s + 2] * 114) / 1000 < 200) n++ }
+    rows.push(`${yy}${yy === Math.floor(rect.y) ? '[' : yy === Math.ceil(rect.y + rect.height) - 1 ? ']' : ''}:${n}`)
+  }
+  console.log('  rows: ' + rows.join(' '))
   await server.close()
   process.exit(0)
 }

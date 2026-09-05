@@ -12,6 +12,11 @@
 
 export interface InkRect { x: number; y: number; width: number; height: number }
 
+/** What the last box trims and ascender/descender walks saw — for the lab. */
+const walkDebug: string[] = []
+export function lastWalkDebug(): string[] { return walkDebug.splice(0) }
+if (typeof window !== 'undefined') (window as any).__lastWalkDebug = lastWalkDebug
+
 interface Profile {
   /** Ink pixels per column, left to right. */
   cols: Uint16Array
@@ -209,7 +214,7 @@ function profile(ctx: CanvasRenderingContext2D, rect: InkRect, ruleSpan?: number
  * AFTER trimming the outermost such rows. Rules are handled by the caller
  * where they matter (they are wide, glyph rows are not).
  */
-export function inkBounds(ctx: CanvasRenderingContext2D, rect: InkRect, emHint?: number): InkRect {
+export function inkBounds(ctx: CanvasRenderingContext2D, rect: InkRect, emHint?: number, dipStrip = true): InkRect {
   // Two ems is a span no glyph reaches (an ideograph is about one), and the
   // em can be GUESSED from the text before any ink is measured — the box's
   // width over the advances its characters are expected to take — which is
@@ -218,7 +223,7 @@ export function inkBounds(ctx: CanvasRenderingContext2D, rect: InkRect, emHint?:
   const hinted = emHint && emHint > 2 ? emHint * 2 : undefined
   const p = profile(ctx, rect, hinted)
   if (!p) return rect
-  let box = trimProfile(p, emHint)
+  let box = trimProfile(p, emHint, dipStrip)
   if (!box) return rect
   // Second pass with the rule bar set from the TIGHT height. The first pass
   // could only measure spans against the detector's padded box, and a thick
@@ -230,7 +235,7 @@ export function inkBounds(ctx: CanvasRenderingContext2D, rect: InkRect, emHint?:
   const tight = box.bottom - box.top + 1
   if (tight * 2 < (hinted ?? p.height * 1.5)) {
     const p2 = profile(ctx, rect, tight * 2)
-    const box2 = p2 && trimProfile(p2, emHint)
+    const box2 = p2 && trimProfile(p2, emHint, dipStrip)
     if (p2 && box2) return { x: p2.x + box2.left, y: p2.y + box2.top, width: box2.right - box2.left + 1, height: box2.bottom - box2.top + 1 }
   }
   return { x: p.x + box.left, y: p.y + box.top, width: box.right - box.left + 1, height: box.bottom - box.top + 1 }
@@ -250,10 +255,6 @@ export function inkBounds(ctx: CanvasRenderingContext2D, rect: InkRect, emHint?:
  * never entered. A box that already held its descenders meets the empty row at
  * once and is unchanged.
  */
-/** What the last ascender/descender walks saw — for the lab. */
-const walkDebug: string[] = []
-export function lastWalkDebug(): string[] { return walkDebug.splice(0) }
-
 export function extendDescenders(ctx: CanvasRenderingContext2D, box: InkRect, text: string): InkRect {
   // Only a run that HAS descenders, and only as many stems as it has. Judged
   // on sparseness alone the walk went wherever the ink under a line was thin
@@ -356,6 +357,12 @@ export function extendAscenders(ctx: CanvasRenderingContext2D, box: InkRect, tex
     if (!(p.rows[yy] >= minRow && p.rows[yy] < dense && p.rows[yy] <= limit && stemsOnly(yy))) break
     ext++
   }
+  // An ascender band ends in QUIET — the box's edge, or empty rows. A band
+  // of sparse rows that ends against a DENSE row is the previous line's
+  // descenders and fringe: the second of two stamped ID lines took five rows
+  // of 3–7 pixels above its box and stopped at the first line's baseline
+  // (230 pixels), which is exactly the wrong five rows.
+  if (ext > 0 && ext < p.height - 1 && p.rows[p.height - 2 - ext] >= Math.max(dense, head * 0.5)) ext = 0
   walkDebug.push(`ascend rows=[${Array.from(p.rows).join(',')}] limit=${limit} dense=${dense.toFixed(0)} maxRun=${maxRun.toFixed(1)} risers=${risers} ext=${ext}` + (ext < p.height - 1 ? ` stop: row=${p.rows[p.height - 2 - ext]} stems=${stemsOnly(p.height - 2 - ext)}` : ''))
   return ext ? { ...box, y: box.y - ext, height: box.height + ext } : box
 }
@@ -391,7 +398,12 @@ export function inkBands(ctx: CanvasRenderingContext2D, rect: InkRect, minGap = 
 }
 
 /** The tight ink extent of a profile, or null when it holds nothing worth boxing. */
-function trimProfile(p: Profile, emHint?: number): { top: number; bottom: number; left: number; right: number } | null {
+/**
+ * @param dipStrip whether a dense band behind a DIP (not a gap) may be read
+ *   as the neighbouring line — Latin only: an ideograph's own strokes make
+ *   dense bands with dips between them.
+ */
+function trimProfile(p: Profile, emHint?: number, dipStrip = true): { top: number; bottom: number; left: number; right: number } | null {
   // Never one pixel: the edge column of a three-pixel cell border is inked
   // down 77% of the box, under the rule test's 80%, and its one pixel per row
   // held a box nine empty rows above its word ("Detracción", 15.1pt for a
@@ -442,6 +454,17 @@ function trimProfile(p: Profile, emHint?: number): { top: number; bottom: number
   // patch painted over the bottom of the line above, and its em, taken from
   // a box four rows too tall, drew the traced glyphs at 85% of their size.
   const emPx = emHint && emHint > 2 ? emHint : 0
+  // A QUIET row for the neighbour test: the gap between a logo's "MINERA"
+  // and the "SHOUXIN" under it held two pixels a row (a speck, a fringe), so
+  // by the empty-row test there was no gap, the tops of the next line stayed
+  // in the box, and the traced M was half an S. Under a tenth of the box's
+  // densest row is quiet. Only the DENSE-band branch reads quiet rows as a
+  // gap: to the sparse branch a lone ascender's stem is quiet too.
+  let peakRow = 0
+  for (let r = top; r <= bottom; r++) if (p.rows[r] > peakRow) peakRow = p.rows[r]
+  const quietRow = Math.max(minRow, Math.round(peakRow * 0.1))
+  const dipRow = Math.max(quietRow, Math.round(peakRow * 0.3))
+  walkDebug.push(`trim rows=[${Array.from(p.rows).join(',')}] top=${top} bottom=${bottom} peak=${peakRow} quiet=${quietRow} dip=${dipRow} minRow=${minRow}`)
   const strayBand = (from: number, limit: number, step: 1 | -1): number => {
     let yy = from, ink = 0, densest = 0
     while (Math.abs(yy - from) < bandRows && yy !== limit) {
@@ -449,6 +472,30 @@ function trimProfile(p: Profile, emHint?: number): { top: number; bottom: number
       if (p.rows[yy] > densest) densest = p.rows[yy]
       let gap = 0
       while (yy + step * (1 + gap) !== limit + step && p.rows[yy + step * (1 + gap)] < minRow) gap++
+      if (gap < gapRows) {
+        let quiet = 0
+        while (yy + step * (1 + quiet) !== limit + step && p.rows[yy + step * (1 + quiet)] < quietRow) quiet++
+        // Or a DIP: two lines that touch — a logo's "MINERA" over its
+        // "SHOUXIN" — leave no quiet row at all, only a trough (12, 6, 12
+        // pixels between rows of 50) where the caps' bottoms end and the
+        // next line's tops begin. Two rows under a quarter of the peak,
+        // beyond which the ink climbs back to half the peak, is that trough.
+        let dip = 0
+        while (yy + step * (1 + dip) !== limit + step && p.rows[yy + step * (1 + dip)] < dipRow) dip++
+        const through = quiet >= gapRows ? quiet : dipStrip && dip >= 2 && densest >= peakRow * 0.5 ? dip : 0
+        if (through) {
+          const next = yy + step * (1 + through)
+          const bandH = Math.abs(yy - from) + 1
+          const bodyH = Math.abs(limit - next) + 1
+          // Three ems: "MINERA" is 3.9 ems and the band under it is as dense
+          // as the word itself; density already keeps an accent band out.
+          const wide = p.width >= emPx * 3
+          const neighbour = emPx > 0 && wide && densest >= p.width * 0.15 &&
+            bandH < bodyH * 0.8 && bodyH >= emPx * 0.5
+          walkDebug.push(`strip${step > 0 ? 'Top' : 'Bottom'} quiet=${quiet} dip=${dip} densest=${densest} peak=${peakRow} bandH=${bandH} bodyH=${bodyH} em=${emPx.toFixed(1)} w=${p.width} -> ${neighbour ? 'strip' : 'keep'}`)
+          if (neighbour) return next
+        }
+      }
       if (gap >= gapRows) {
         const next = yy + step * (1 + gap)
         if (ink <= stray) return next
@@ -462,7 +509,7 @@ function trimProfile(p: Profile, emHint?: number): { top: number; bottom: number
         // letters, the em came out 7.8pt for 4.6, and the redraw painted
         // over the row above. The gap is what separates lines; accents and
         // dots never reach 15% of the width, so density still keeps them.
-        const neighbour = emPx > 0 && p.width >= emPx * 4 && densest >= p.width * 0.15 &&
+        const neighbour = emPx > 0 && p.width >= emPx * 3 && densest >= p.width * 0.15 &&
           bandH < bodyH * 0.8 && bodyH >= emPx * 0.5
         if (neighbour) return next
         // A blob in one CORNER: the black edge of a scanned page reaching into

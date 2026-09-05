@@ -214,7 +214,10 @@ export async function runPdf(entry, opts = {}) {
         const picks = pickRuns(result.items, maxRuns)
         page.edits = []
         for (const [k, item] of picks.entries()) {
-          const e = { original: item.text, fontSize: item.fontSize, bold: item.bold, italic: item.italic, conf: item.confidence }
+          // The sampled colours travel with the row: a replacement drawn in the
+          // paper's own colour reads back perfectly and shows nothing, and
+          // without them that row is indistinguishable from a wrong trace.
+          const e = { original: item.text, fontSize: item.fontSize, bold: item.bold, italic: item.italic, conf: item.confidence, color: item.color?.map(v => +v.toFixed(2)), background: item.background?.map(v => +v.toFixed(2)) }
           page.edits.push(e)
           try {
             const cut = layer.ocr.cutFor(item)

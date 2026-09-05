@@ -767,8 +767,8 @@ function createOCR() {
       // not cross the gap — it must stop at it.
       // And UP through the ascenders, which the same detector clips on small
       // body text — see `extendAscenders`.
-      const ink = extendAscenders(ctx, extendDescenders(ctx, inkBounds(ctx, rect, emGuess), line.text), line.text)
       const cjk = isMostlyCjk(line.text)
+      const ink = extendAscenders(ctx, extendDescenders(ctx, inkBounds(ctx, rect, emGuess, !cjk), line.text), line.text)
       const emPx = ink.height / (cjk ? GLYPH_BOX_PER_EM_CJK : boxPerEm(line.text))
       // Only an UNMISTAKABLE gap cuts (two and a half ems — the same bar
       // `splitRuns` sets): justified prose opens word gaps past an em, and a
