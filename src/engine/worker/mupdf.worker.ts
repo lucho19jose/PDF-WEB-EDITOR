@@ -736,20 +736,41 @@ function blankInvisibleTextIn(pageIndex: number, rects: [number, number, number,
 function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
 
 /**
+ * Where `/Tag BMC` opens on the page. The tag is a NAME token and
+ * `maskStreamLiterals` blanks names along with strings, so the search runs
+ * on the RAW stream and each hit is accepted only where the masked stream
+ * still shows the operator — inside a string literal it would be blanked too.
+ * Returns the offset of the operator's `B`.
+ */
+function findTagBmc(stream: string, masked: string, tag: string): { start: number; op: number }[] {
+  const re = new RegExp(`\\/${escapeRe(tag)}\\s+BMC(?![A-Za-z])`, 'g')
+  const out: { start: number; op: number }[] = []
+  let m: RegExpExecArray | null
+  while ((m = re.exec(stream)) !== null) {
+    const op = m.index + m[0].length - 3
+    if (masked.slice(op, op + 3) === 'BMC') out.push({ start: m.index, op })
+  }
+  return out
+}
+
+/**
  * `/Tag BMC … EMC` sections this editor wrote (a searchable OCR layer) are
- * blanked in place — nesting-aware, on the literal-masked stream so a BMC
- * inside a string cannot fool the count. Offsets of everything else stay valid.
+ * blanked in place — nesting-aware, so a marked section inside the layer
+ * cannot close it early. Offsets of everything else stay valid.
  */
 function removeMarkedContent(pageIndex: number, tag: string): { removed: number } {
   const stream = readContentStream(pageIndex)
   const masked = maskStreamLiterals(stream)
-  const re = new RegExp(`\\/${escapeRe(tag)}\\s+BMC(?![A-Za-z])|(?<![A-Za-z/])(BDC|BMC|EMC)(?![A-Za-z])`, 'g')
+  const tagOps = new Map(findTagBmc(stream, masked, tag).map(t => [t.op, t.start]))
+  if (!tagOps.size) return { removed: 0 }
+  const re = /(?<![A-Za-z/])(BDC|BMC|EMC)(?![A-Za-z])/g
   const spans: [number, number][] = []
   let depth = 0, open = -1
   let m: RegExpExecArray | null
   while ((m = re.exec(masked)) !== null) {
-    if (m[1] === undefined) { // our tag's BMC
-      if (open < 0) { open = m.index; depth = 1 } else depth++
+    const tagStart = tagOps.get(m.index)
+    if (tagStart !== undefined) {
+      if (open < 0) { open = tagStart; depth = 1 } else depth++
       continue
     }
     if (open < 0) continue
@@ -767,8 +788,8 @@ function removeMarkedContent(pageIndex: number, tag: string): { removed: number 
 }
 
 function hasMarkedContent(pageIndex: number, tag: string): boolean {
-  const masked = maskStreamLiterals(readContentStream(pageIndex))
-  return new RegExp(`\\/${escapeRe(tag)}\\s+BMC(?![A-Za-z])`).test(masked)
+  const stream = readContentStream(pageIndex)
+  return findTagBmc(stream, maskStreamLiterals(stream), tag).length > 0
 }
 
 /** What a well-behaved ToUnicode legitimately expands ONE glyph to. */
@@ -2630,7 +2651,22 @@ function measureRunWidth(text: string, fontSize: number, fontName: string, faceI
  * the base-14 face, or a subset of the CJK face). Shared by `addTextToPage`
  * and `addTextRunToPage`.
  */
-function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: string, faceId?: string): { ops: string } | { error: string } {
+/** `text` without the characters neither WinAnsi nor the CJK face can draw. */
+function dropUnencodable(text: string): string {
+  let out = ''
+  for (const ch of text) {
+    if (!('missing' in encodeWinAnsiText(ch))) { out += ch; continue }
+    if (hasCjk(ch) && cjkFont) {
+      try { if (cjkFont.charToGlyph(ch).index > 0) out += ch } catch (_) { /* dropped */ }
+    }
+  }
+  return out
+}
+
+/** One CJK subset registered for a whole text object — see `sharedCjkFontFor`. */
+interface SharedCjk { refName: string; font: any }
+
+function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: string, faceId?: string, sharedCjk?: SharedCjk | null): { ops: string } | { error: string } {
   const face = faceId ? scanFaces.get(faceId) : null
   const segments = segmentRun(text, face)
   const ops: string[] = []
@@ -2641,6 +2677,17 @@ function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: st
     }
     const winAnsi = encodeWinAnsiText(seg.text)
     if ('missing' in winAnsi) {
+      if (sharedCjk && hasCjk(seg.text)) {
+        // The subset registered for the whole object holds every glyph the
+        // object needs, so the segment is encoded against it directly.
+        let hex = ''
+        for (const ch of seg.text) {
+          const gid = sharedCjk.font.encodeCharacter(ch.codePointAt(0)!)
+          if (!gid) { hex = ''; break }
+          hex += gid.toString(16).padStart(4, '0')
+        }
+        if (hex) { ops.push(`/${sharedCjk.refName} ${fontSize} Tf <${hex}> Tj`); continue }
+      }
       const cjk = hasCjk(seg.text) ? registerCjkRun(pageObj, seg.text) : null
       if (!cjk) {
         const why = hasCjk(seg.text) && !cjkFont
@@ -2707,9 +2754,20 @@ function addTextRunToPage(
     const existingStream = readContentStream(pageIndex)
     const fmt = (n: number) => (Math.abs(n) < 1e-6 ? '0' : n.toFixed(4))
     const chunks: string[] = []
+    const sharedCjk = sharedCjkFontFor(pageObj, parts.map(p => p.invisible ? dropUnencodable(p.text) : p.text))
     for (const part of parts) {
       if (!part.text) continue
-      const built = buildShowOps(pageObj, part.text, part.fontSize, part.fontName, part.faceId)
+      let text = part.text
+      let built = buildShowOps(pageObj, text, part.fontSize, part.fontName, part.faceId, sharedCjk)
+      if ('error' in built && part.invisible) {
+        // An invisible run stands for the scan's own pixels, so a character
+        // no face can hold costs nothing visible. Dropping it beats losing a
+        // whole page's searchable layer to one "①" the recogniser read.
+        text = dropUnencodable(text)
+        if (!text.trim()) continue
+        built = buildShowOps(pageObj, text, part.fontSize, part.fontName, part.faceId, sharedCjk)
+        if ('error' in built) continue
+      }
       if ('error' in built) { page.destroy(); return { success: false, error: built.error } }
       const tm = appendedTextMatrix(pageIndex, existingStream, part.x, part.y, rotation)
       const r = part.color?.[0] ?? 0, g = part.color?.[1] ?? 0, b = part.color?.[2] ?? 0
@@ -2719,7 +2777,7 @@ function addTextRunToPage(
       // space or a collision. `Tz` scales the advance to the ink's span.
       let tz = 100
       if (part.fitWidth && part.fitWidth > 0) {
-        const natural = measureRunWidth(part.text, part.fontSize, part.fontName, part.faceId).width
+        const natural = measureRunWidth(text, part.fontSize, part.fontName, part.faceId).width
         if (natural > 0) tz = Math.min(200, Math.max(50, (part.fitWidth / natural) * 100))
       }
       chunks.push(
@@ -2976,6 +3034,38 @@ function registerFontIn(resources: any, font: any, prefix: string): string | nul
   const refName = `${prefix}${n}`
   fontDict.put(refName, pdfDoc.addFont(font))
   return refName
+}
+
+/**
+ * ONE CJK subset for every run of a text object that needs the fallback face.
+ *
+ * `registerCjkRun` embeds a subset per RUN, which is right for one edited line
+ * and ruinous for a searchable layer: a bilingual contract page has a dozen
+ * Chinese lines, each carried its own copy of the face's tables, and the
+ * layer cost ~150 KB a page — 6 MB over the 43-page file. The union of the
+ * object's CJK text goes into one subset, registered once, and every segment
+ * encodes against it. Null when nothing in `texts` needs the face.
+ */
+function sharedCjkFontFor(pageObj: any, texts: string[]): SharedCjk | null {
+  const chars = new Set<string>()
+  for (const t of texts) for (const seg of segmentRun(t, null)) {
+    if (!('missing' in encodeWinAnsiText(seg.text))) continue
+    if (!hasCjk(seg.text)) continue
+    // Every character of the segment the face holds, not only the ideographs:
+    // a fullwidth bracket beside them is not CJK to `hasCjk` but is drawn
+    // by the same segment, and left out of the union it sent the whole
+    // segment back to a subset of its own.
+    for (const ch of seg.text) {
+      if (ch === ' ') continue
+      try { if (cjkFont.charToGlyph(ch).index > 0) chars.add(ch) } catch (_) { /* not in the face */ }
+    }
+  }
+  if (!chars.size) return null
+  const union = [...chars].join('')
+  const font = miniCjkFontFor(union)
+  if (!font) return null
+  const reg = registerEmbeddedRun(pageObj, font, union, 'FCJK')
+  return reg ? { refName: reg.refName, font } : null
 }
 
 function registerCjkRun(pageObj: any, text: string): { refName: string; hex: string } | null {

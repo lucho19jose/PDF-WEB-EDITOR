@@ -4101,6 +4101,69 @@ floors to grain and JPEG ringing; reverted. What the scan holds at that level
 is what a reader sees as a weak E; the honest fix would be a stroke-aware
 fill along a bar whose ends are dark, which is not implemented.
 
+### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
+Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)
+leaves a scan's words in the content stream as INVISIBLE text: render mode 3,
+one BT, ordinary fonts (Times, Helvetica, `HiddenHorzOCR` only for the words it
+doubted). MuPDF extracts them like any text, so the edit tool listed the words
+of a signed contract, the user edited one, the engine rewrote the glyphs
+faithfully in the same mode, and the page did not change: "when I edit it it
+does not show". Render mode is graphics state the extraction does not report,
+so it is read off the stream: `collectShowOpOrigins` walks every content
+source once (q/Q, `Tr`, the text matrix as `scanShowOps` tracks it) and
+records where each show op draws, in top-left page space, and whether it is
+visible; `markInvisibleBlocks` flags a block whose glyph origins coincide only
+with invisible ops (`TextBlock.invisible`). A block with hits on both sides is
+left visible — hiding a real block makes it uneditable, the worse error — and
+a block matching no op at all is invisible only on a page whose EVERY op is.
+
+Three consumers: `textLayerOf` ignores flagged blocks, so the coverage judge
+calls the page a scan (the visible Intellisign ID strip alone is under 2%);
+`TextBlockOverlay` never offers them (`hiddenLayer` also lets a click on the
+paper recognise the page while the strip stays editable as text); and the bake
+calls `blankInvisibleText` under each edited run, so the old words are not
+found by search beside the new ones. A font-name test would not have done:
+the layer's fonts are the page's ordinary faces, distinguished only by the
+RESOURCE name under which the visible strip is set.
+
+Measured on the contract (43 pages, Acrobat-OCR'd, Intellisign-signed): page 3
+reports 49 invisible blocks and 1 visible, page 1 of real text none; the click
+recognises the page, "MSP-SIST-CS-2025-004" edits to "-2026-999" with the scan
+pixels kept around the changed digits, extraction reads the new number and no
+longer the old. Text sweep experiment-identical to baseline (262/236, 0/0/0).
+
+### "Reconocer texto en este archivo": a searchable layer, tagged so it can be replaced
+`recognizeDocument` (layout; dialog `OcrRecognizeDialog`, menu item under the
+OCR button) recognises the chosen pages and writes each an invisible layer —
+`3 Tr`, one run per recognised line, `Tz`-fitted to the width of the ink it
+stands for, one `addTextRun` per page — inside `/OCRLayer BMC … EMC`.
+`removeMarkedContent` blanks that section before a re-run, nesting-aware, so
+recognising twice leaves ONE layer; pages with real text are skipped, pages
+that already carry a layer (Acrobat's or ours) are skipped unless "replace",
+in which case `blankInvisibleText` over the whole page clears the old one.
+One undo point for the whole run: the snapshot is pushed just before the
+final sync, when the store's bytes are still the pre-run document.
+
+Three things measured wrong first:
+- **`maskStreamLiterals` blanks NAME tokens**, so `/OCRLayer BMC` searched on
+  the masked stream matched nothing — the layer was written, `hasMarkedContent`
+  said no, and a re-run would have stacked. `findTagBmc` searches the RAW
+  stream and accepts a hit only where the masked stream still shows the
+  operator (inside a string it would be blanked too).
+- **One character no face holds failed a whole page's layer.** Paddle read a
+  "①" and `addTextRun` refused the 54-run object ("Characters not supported by
+  Helvetica: ①"), leaving page 3 with no layer while page 4 got one. For an
+  INVISIBLE part the character costs nothing visible, so `dropUnencodable`
+  strips it and the run is encoded again; a visible part still refuses.
+- **A CJK subset per RUN is ruinous at layer scale.** `registerCjkRun` embeds
+  a subset per segment, right for one edited line; a bilingual page has a
+  dozen Chinese lines and the layer cost ~150 KB a page. `sharedCjkFontFor`
+  registers ONE subset for the union of the object's non-WinAnsi glyphs and
+  every segment encodes against it (162 KB for two pages, was 316).
+
+The layer's runs stay in the OCR store, so any line can be edited afterwards
+exactly as on a page recognised by hand.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

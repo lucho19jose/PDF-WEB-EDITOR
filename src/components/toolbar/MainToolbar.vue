@@ -67,6 +67,13 @@
             <q-item-section side><q-icon name="refresh" size="xs" /></q-item-section>
             <q-item-section>Recognise this page again</q-item-section>
           </q-item>
+          <q-item clickable :disable="!docStore.loaded || ocr.busy.value || recognizeProgress.running" @click="recognizeOpen = true">
+            <q-item-section side><q-icon name="find_in_page" size="xs" /></q-item-section>
+            <q-item-section>
+              <q-item-label>Reconocer texto en este archivo…</q-item-label>
+              <q-item-label caption class="text-grey-5">Searchable text layer on every scanned page</q-item-label>
+            </q-item-section>
+          </q-item>
           <q-item clickable @click="ocrSettingsOpen = true">
             <q-item-section side><q-icon name="settings" size="xs" /></q-item-section>
             <q-item-section>OCR settings…</q-item-section>
@@ -74,6 +81,7 @@
         </q-list>
       </q-btn-dropdown>
       <OcrSettingsDialog v-model="ocrSettingsOpen" />
+      <OcrRecognizeDialog v-model="recognizeOpen" :progress="recognizeProgress" @run="onRecognizeRun" @cancel="cancelRecognizeDocument()" />
 
       <q-separator vertical inset class="q-mx-xs" />
 
@@ -215,11 +223,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, ref, watch } from 'vue'
+import { computed, inject, ref, watch, type Ref } from 'vue'
 import { useOcrStore } from '@/stores/ocr'
 import { useOCR, OCR_DEFAULT_LANG } from '@/composables/useOCR'
 import type { OcrEngineId } from '@/utils/ocr/ocrEngine'
 import OcrSettingsDialog from '@/components/dialogs/OcrSettingsDialog.vue'
+import OcrRecognizeDialog, { type RecognizeDocumentOptions, type RecognizeProgress } from '@/components/dialogs/OcrRecognizeDialog.vue'
 import { hexToRgb01, rgb01ToHex } from '@/utils/color'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, type Tool } from '@/stores/editor'
@@ -277,6 +286,15 @@ async function runOcr() {
   await runOcrOnPage(OCR_DEFAULT_LANG)
 }
 const ocrSettingsOpen = ref(false)
+const recognizeOpen = ref(false)
+const recognizeDocument = inject<(opts: RecognizeDocumentOptions) => Promise<void>>('recognizeDocument', async () => {})
+const cancelRecognizeDocument = inject<() => void>('cancelRecognizeDocument', () => {})
+const recognizeProgress = inject<Ref<RecognizeProgress>>('recognizeProgress', ref({ running: false, page: 0, total: 0, done: 0, layered: 0, skipped: 0, stage: '' }))
+/** The dialog stays open showing progress and closes itself when the run ends. */
+async function onRecognizeRun(opts: RecognizeDocumentOptions) {
+  await recognizeDocument(opts)
+  recognizeOpen.value = false
+}
 const engineOptions: { value: OcrEngineId; label: string; caption: string }[] = [
   { value: 'paddle', label: 'PaddleOCR', caption: 'In the browser, offline. Best on Chinese and mixed text.' },
   { value: 'tesseract', label: 'Tesseract', caption: 'In the browser, offline. Spanish + Chinese models.' },

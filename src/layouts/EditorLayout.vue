@@ -91,6 +91,7 @@ import { planOcrExport, base14 } from '@/utils/ocr/ocrExport'
 import { stretchOf, sizeOf } from '@/utils/ocr/partialRedraw'
 import { cropToPng } from '@/utils/ocr/pixelCrop'
 import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
+import type { RecognizeDocumentOptions, RecognizeProgress } from '@/components/dialogs/OcrRecognizeDialog.vue'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
 import { getMuPDFBridge } from '@/engine/bridge'
@@ -1166,12 +1167,122 @@ async function renderForOcr(pageIndex: number, scale: number): Promise<HTMLCanva
   return pdfViewer.renderPageToCanvas(pageIndex + 1, scale).catch(() => null)
 }
 provide('bakeOcrEdits', bakeOcrEdits)
+
+// ===== RECOGNISE TEXT IN THIS FILE (Acrobat's "Reconocer texto → En este archivo") =====
+/**
+ * The marked-content tag on the searchable layer this editor writes, so a
+ * later run finds and replaces its own layer rather than stacking a second.
+ */
+const OCR_LAYER_TAG = 'OCRLayer'
+const recognizeProgress = ref<RecognizeProgress>({ running: false, page: 0, total: 0, done: 0, layered: 0, skipped: 0, stage: '' })
+let recognizeCancel = false
+
+/**
+ * Recognise every scanned page asked for and give each an INVISIBLE text
+ * layer — `3 Tr`, one run per recognised line, stretched with `Tz` to the
+ * width of the ink it stands for — so the file searches, copies and reads
+ * aloud while the page keeps its own pixels. Acrobat calls the result a
+ * "searchable image". Pages with real text are skipped; pages that already
+ * carry a layer (Acrobat's, or ours) are skipped unless asked to replace it,
+ * in which case the old layer is blanked first. The recognised runs stay in
+ * the OCR store, so any of them can be edited afterwards exactly as a page
+ * recognised by hand — and the bake blanks the layer's words under a run it
+ * redraws. One undo point for the whole run.
+ */
+async function recognizeDocument(opts: RecognizeDocumentOptions): Promise<void> {
+  if (!docStore.loaded || recognizeProgress.value.running || ocr.busy.value) return
+  recognizeCancel = false
+  const p = recognizeProgress.value
+  Object.assign(p, { running: true, page: 0, total: opts.pageIndices.length, done: 0, layered: 0, skipped: 0, stage: '' })
+  const why = { text: 0, layer: 0, blank: 0, nothing: 0 }
+  let changed = false
+  // Progress inside the dialog: a page of Chinese and Spanish takes long
+  // enough that a still bar reads as a hang.
+  const stopProgress = watch([ocr.stage, ocr.progress], ([stage, pct]) => {
+    if (!ocr.busy.value) return
+    p.stage = `Recognising page ${p.page}… ${stage && stage !== 'recognizing text' && stage !== 'Recognising text...' ? stage : `${pct}%`}`
+  })
+  try {
+    for (const pi of opts.pageIndices) {
+      if (recognizeCancel) break
+      p.page = pi + 1
+      p.stage = `Checking page ${pi + 1}…`
+      const blocks = await pdfEngine.getTextBlocks(pi).catch(() => [])
+      const hasLayer = blocks.some(b => b.invisible)
+      if (!(await isScanLikePage(pi))) {
+        // Real text, or a blank sheet: the text judge said so.
+        if (blocks.some(b => !b.invisible && b.text.trim())) why.text++; else why.blank++
+        p.skipped++; p.done++
+        continue
+      }
+      if (hasLayer && !opts.replaceExisting) { why.layer++; p.skipped++; p.done++; continue }
+
+      p.stage = `Recognising page ${pi + 1}…`
+      await runOcrNow(pi, opts.lang)
+      const items = ocrStore.itemsFor(pi).filter(i => i.text.trim() && !i.removed)
+      if (!items.length) { why.nothing++; p.skipped++; p.done++; continue }
+
+      p.stage = `Writing the text layer of page ${pi + 1}…`
+      const size = await pdfEngine.getPageSize(pi)
+      await exclusiveOp(async () => {
+        await pdfEngine.removeMarkedContent(pi, OCR_LAYER_TAG)
+        if (hasLayer) await pdfEngine.blankInvisibleText(pi, [[0, 0, size.width, size.height]])
+        // addTextRun takes a bottom-left baseline; OCR boxes are top-left. The
+        // baseline sits about four fifths of the way down the box, as the
+        // export planner places visible replacements.
+        const horizontal = items.filter(i => !i.vertical).map(i => ({
+          x: i.rect.x,
+          y: size.height - (i.rect.y + i.rect.height - Math.max(1, i.rect.height * 0.2)),
+          text: i.text, fontSize: i.fontSize, fontName: 'Helvetica',
+          invisible: true, fitWidth: i.rect.width
+        }))
+        if (horizontal.length) await pdfEngine.addTextRun(pi, horizontal, 0, OCR_LAYER_TAG)
+        // A sideways run reads UP its box: it starts at the foot, baseline down
+        // the right-hand side, the same geometry the visible bake uses.
+        for (const v of items.filter(i => i.vertical)) {
+          await pdfEngine.addTextRun(pi, [{
+            x: v.rect.x + v.rect.width * 0.8, y: size.height - (v.rect.y + v.rect.height),
+            text: v.text, fontSize: v.fontSize, fontName: 'Helvetica', invisible: true, fitWidth: v.rect.height
+          }], 90, OCR_LAYER_TAG)
+        }
+      })
+      changed = true
+      p.layered++; p.done++
+    }
+    if (changed) {
+      p.stage = 'Saving the document…'
+      // The snapshot is the PRE-run bytes: the worker's document has changed,
+      // the store's bytes have not until the sync below.
+      pushUndo()
+      docStore.markModified()
+      await syncAfterEdit()
+    }
+  } catch (err: any) {
+    editorStore.setStatus(`Recognition stopped: ${err?.message || err}`)
+  } finally {
+    stopProgress()
+    p.running = false
+  }
+  const skipped: string[] = []
+  if (why.text) skipped.push(`${why.text} with text already`)
+  if (why.layer) skipped.push(`${why.layer} with a text layer already`)
+  if (why.blank) skipped.push(`${why.blank} blank`)
+  if (why.nothing) skipped.push(`${why.nothing} where nothing was read`)
+  const tail = skipped.length ? ` — skipped ${skipped.join(', ')}` : ''
+  editorStore.setStatus(p.layered
+    ? `Text recognised on ${p.layered} page${p.layered === 1 ? '' : 's'}${recognizeCancel ? ' (stopped)' : ''}: the file is now searchable${tail}. Click a recognised line to edit it; Ctrl+Z undoes the whole run.`
+    : `No page was recognised${tail}`)
+}
+function cancelRecognizeDocument() { recognizeCancel = true }
+provide('recognizeDocument', recognizeDocument)
+provide('cancelRecognizeDocument', cancelRecognizeDocument)
+provide('recognizeProgress', recognizeProgress)
 // For the sweep drivers (public/_sweep/*.js): a production build strips the
 // Vue internals they used to walk to these, so they are put on window like
 // __pdfEngine and __pdfViewer already are.
 ;(window as any).__pdfHooks = {
   ocrController: { isScanLike: isScanLikePage, recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG), busy: ocr.busy },
-  bakeOcrEdits, runOcrOnPage, undo, redo, ocr
+  bakeOcrEdits, runOcrOnPage, undo, redo, ocr, recognizeDocument, recognizeProgress
 }
 provide('openFile', openFile)
 provide('openPdfFile', openPdfFile)
