@@ -208,7 +208,9 @@ export async function runPdf(entry, opts = {}) {
         page.vertical = result.verticalCount || 0
         page.status = editor.statusMessage
         const layer = ocrLayerApi()
-        if (!layer) { page.error = 'no OCR layer'; continue }
+        // A scan page that reads as NOTHING (the blank back of a sheet) has no
+        // layer to edit in; that is the app's answer, not a harness failure.
+        if (!layer) { if (result.items.length) page.error = 'no OCR layer'; else page.note = 'no text recognised'; continue }
         const picks = pickRuns(result.items, maxRuns)
         page.edits = []
         for (const [k, item] of picks.entries()) {

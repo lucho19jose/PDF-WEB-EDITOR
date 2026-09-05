@@ -1,6 +1,6 @@
 import * as opentype from 'opentype.js'
 import { init as potraceInit, potrace } from 'esm-potrace-wasm'
-import { cutGlyphs, cellBitmap, expectedAdvance, lastCutReason, type GlyphCutResult } from './glyphCut'
+import { cutGlyphs, cellBitmap, cellBitmapTraced, traceLevel, expectedAdvance, lastCutReason, type GlyphCutResult } from './glyphCut'
 import { commonAffix } from './partialRedraw'
 import type { OcrBox } from './ocrEngine'
 
@@ -26,6 +26,8 @@ import type { OcrBox } from './ocrEngine'
 const UPM = 1000
 const ASCENDER = 800
 const DESCENDER = -200
+/** Bitmap pixels per raster pixel when tracing — see `cellBitmapTraced`. */
+const TRACE_RES = 2
 
 export interface TracedGlyph {
   char: string
@@ -147,17 +149,23 @@ export async function traceRunIntoFace(
   }
   const medianGap = gaps.length >= 3 ? [...gaps].sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : null
   const bearing = medianGap === null ? UPM * 0.05 : Math.min(UPM * 0.12, Math.max(UPM * 0.02, Math.round(medianGap / 2 * scale)))
+  // The outlines are traced from the darkness itself, at a share of each
+  // stroke's own peak (`traceLevel` picks the share, mass-conserving on the
+  // run) and at twice the raster's resolution — the cut's own bitmap is the
+  // segmentation, not the weight. See `cellBitmapTraced`.
+  const level = traceLevel(cut)
   let added = 0
   for (const [index, cell] of cut.cells.entries()) {
     if (!trusted(index) || cell.suspect) continue
     if (face.glyphs.has(cell.char)) continue
-    const bmp = cellBitmap(cut, cell, 1)
+    const traced = cellBitmapTraced(cut, cell, 1, TRACE_RES, level)
+    const bmp = traced ?? (() => { const b = cellBitmap(cut, cell, 1); return b ? { ...b, res: 1 } : null })()
     if (!bmp) continue
     let svg: string
     try {
-      svg = await potrace(bmp.image, { turdsize: 1, alphamax: 1, opticurve: 1, opttolerance: 0.2, pathonly: false, extractcolors: false })
+      svg = await potrace(bmp.image, { turdsize: bmp.res * bmp.res, alphamax: 1, opticurve: 1, opttolerance: 0.2, pathonly: false, extractcolors: false })
     } catch (_) { continue }
-    const path = svgToGlyphPath(svg, bmp, cell, cut.baselineAt((cell.x0 + cell.x1) / 2), scale, bearing)
+    const path = svgToGlyphPath(svg, bmp, cell, cut.baselineAt((cell.x0 + cell.x1) / 2), scale, bearing, bmp.res)
     if (!path) continue
     // Side bearings of half the run's own inter-letter gap each (a twentieth
     // of an em when the run cannot say), so traced text sets at the scan's
@@ -200,7 +208,9 @@ function svgToGlyphPath(
   baselineY: number,
   scale: number,
   /** Left side bearing in font units — the outline starts this far right of the pen. */
-  bearing: number = UPM * 0.05
+  bearing: number = UPM * 0.05,
+  /** Bitmap pixels per raster pixel (the traced bitmap is sampled finer than the raster). */
+  res = 1
 ): opentype.Path | null {
   const tf = parseTransform(svg)
   const ds = [...svg.matchAll(/<path[^>]*\sd="([^"]+)"/g)].map(m => m[1])
@@ -210,7 +220,7 @@ function svgToGlyphPath(
   const map = (px: number, py: number): [number, number] => {
     const bx = tf.a * px + tf.c * py + tf.e
     const by = tf.b * px + tf.d * py + tf.f
-    const cx = bmp.x + bx, cy = bmp.y + by
+    const cx = bmp.x + bx / res, cy = bmp.y + by / res
     return [(cx - cell.x0) * scale + bearing, (baselineY - cy) * scale]
   }
   let drew = false

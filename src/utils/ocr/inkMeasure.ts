@@ -250,6 +250,10 @@ export function inkBounds(ctx: CanvasRenderingContext2D, rect: InkRect, emHint?:
  * never entered. A box that already held its descenders meets the empty row at
  * once and is unchanged.
  */
+/** What the last ascender/descender walks saw — for the lab. */
+const walkDebug: string[] = []
+export function lastWalkDebug(): string[] { return walkDebug.splice(0) }
+
 export function extendDescenders(ctx: CanvasRenderingContext2D, box: InkRect, text: string): InkRect {
   // Only a run that HAS descenders, and only as many stems as it has. Judged
   // on sparseness alone the walk went wherever the ink under a line was thin
@@ -282,9 +286,78 @@ export function extendDescenders(ctx: CanvasRenderingContext2D, box: InkRect, te
     }
     return runs <= descenders + 2
   }
+  // The first row or two under the tight box are the letters' own blurred
+  // bottoms — wide runs, not stems — when the fringe trim took them off the
+  // box: on a 6pt paragraph the walk met a 113-pixel row of letter bottoms,
+  // refused it as "not stems", and never reached the four rows of descenders
+  // under it. Those rows pass on sparseness alone.
   let ext = 0
-  while (ext < p.height && p.rows[ext] >= minRow && p.rows[ext] < dense && stemsOnly(ext)) ext++
+  while (ext < p.height && p.rows[ext] >= minRow && p.rows[ext] < dense && (ext < 2 || stemsOnly(ext))) ext++
+  walkDebug.push(`descend rows=[${Array.from(p.rows).join(',')}] dense=${dense.toFixed(0)} maxRun=${maxRun.toFixed(1)} descenders=${descenders} ext=${ext}` + (ext < p.height ? ` stop: row=${p.rows[ext]} stems=${stemsOnly(ext)}` : ''))
   return ext ? { ...box, height: box.height + ext } : box
+}
+
+/**
+ * Extend a tight ink box UP through the rows its ascenders occupy — the
+ * mirror of `extendDescenders`, for the same detector: it boxes a line of
+ * small body text just under the tops of its ascenders as well. On a
+ * comparison sheet's 6pt paragraph the box held ONE row of the L, d, l and t
+ * while seven rows of them sat above it, so the em read 6.2pt for a 7.7pt
+ * line and the glyph cut flagged every ascender as not rising (22 of 83
+ * cells) — the whole paragraph fell back to Helvetica. Only a run whose text
+ * HAS risers, as many stems as it has risers, sparse rows only, and never
+ * past an empty row — the previous line's descenders sit behind one.
+ */
+export function extendAscenders(ctx: CanvasRenderingContext2D, box: InkRect, text: string): InkRect {
+  const risers = [...text].filter(c => /[A-Zbdfhkltij0-9ÁÉÍÓÚÑÜáéíóúñü"'°º!?¡¿]/.test(c)).length
+  if (!risers) return box
+  const maxRows = Math.round(box.height * 0.35)
+  if (maxRows < 1) return box
+  const top = Math.max(0, box.y - maxRows)
+  // The band takes the box's own top row with it, so the head row it is
+  // measured against below is counted under the SAME threshold: a profile
+  // binarises at the midpoint of its own range, and a three-row head of
+  // faint descender tips read 227 pixels on its own against 6 in the band.
+  const band = { x: box.x, y: top, width: box.width, height: box.y - top + 1 }
+  if (band.height < 3) return box
+  const p = profile(ctx, band, box.width * 4)
+  if (!p || p.height < 2) return box
+  const minRow = 2
+  // Risers are more numerous than descenders and wider at the top — a
+  // capital's bar, a t's crossbar, an accent — so the bars are set by what
+  // the TEXT can put in an ascender row: a run as wide as the box is tall is
+  // no glyph top, and a short word's few risers must not read as dense.
+  const dense = Math.max(p.width * 0.15, risers * box.height * 0.2)
+  const maxRun = Math.max(3, box.height)
+  const stemsOnly = (yy: number): boolean => {
+    let runs = 0, run = 0
+    for (let xx = 0; xx <= p.width; xx++) {
+      const on = xx < p.width && p.ink[yy * p.width + xx] === 1
+      if (on) run++
+      else if (run) { if (run > maxRun) return false; runs++; run = 0 }
+    }
+    return runs <= risers + 2
+  }
+  // Ascenders THIN OUT going up — fewer stems reach each higher row — where
+  // the line above gets denser towards its x-height. A row holding more than
+  // twice the ink of the box's own top row belongs to a neighbour: the
+  // second of two stamped ID lines had the first's descender tips as its top
+  // row (6 pixels) and the first's baseline fringe (112) above that, and
+  // took two rows of it before this bar.
+  const head = p.rows[p.height - 1]
+  const limit = Math.max(minRow * 2, 2 * head)
+  let ext = 0
+  while (ext < p.height - 1) {
+    const yy = p.height - 2 - ext
+    // No fringe tolerance going up: the fringe trim keeps a few narrow
+    // stems, which is what ascender rows are, and the rows above a box are
+    // more often the previous line's bottom — many short runs, one per
+    // letter — which the stem count refuses.
+    if (!(p.rows[yy] >= minRow && p.rows[yy] < dense && p.rows[yy] <= limit && stemsOnly(yy))) break
+    ext++
+  }
+  walkDebug.push(`ascend rows=[${Array.from(p.rows).join(',')}] limit=${limit} dense=${dense.toFixed(0)} maxRun=${maxRun.toFixed(1)} risers=${risers} ext=${ext}` + (ext < p.height - 1 ? ` stop: row=${p.rows[p.height - 2 - ext]} stems=${stemsOnly(p.height - 2 - ext)}` : ''))
+  return ext ? { ...box, y: box.y - ext, height: box.height + ext } : box
 }
 
 /**

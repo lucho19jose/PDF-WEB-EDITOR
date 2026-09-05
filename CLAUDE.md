@@ -3933,6 +3933,83 @@ stamp, a footer or a page number whatever its character count, and both
 pages 1–2 (real text, 2500+ characters) stay text pages, pages 3–5 (the
 scanned contract) are scans.
 
+### A traced glyph's weight is the STROKE's, its holes are the cut's, and its edge is a cell border's
+The comparison sheet the user showed (OT-GA-2026-036, page 3: "CUADRO" →
+"CUADROO", "COSFESA" → "COSFEEESA", "DE" → "DEee") baked its inserted
+letters visibly thinner than the scanned letters beside them, and previewed
+the title a quarter too large. Measured on the 440 DPI raster, the cut's
+0.42-of-range threshold traced those three lines with 9–18% less ink than
+the page holds (traced area over grey mass 0.91, 0.85, 0.82), and on the
+serif title no single level could work at all: the U's right stem and the
+A's left leg are hairlines at a third of the stems' darkness on a ~150 DPI
+scan — invisible at 0.5, while 0.3 turned every stem into a slab. The trace
+lab (`tools/ocr-calibrate/trace-lab.mjs`, MuPDF + the real `glyphCut.ts`
+in node, ASCII bitmaps) is what showed each of these; a baked render at 300%
+shows only that "something is off".
+
+`cellBitmapTraced` now traces from the DARKNESS, not the cut's bitmap:
+
+- **Level as a share of the local peak.** Ink where darkness ≥ share × the
+  peak within three pixels (`traceLevel` picks the share so that the run's
+  traced area equals its grey mass — blur conserves ink — held to
+  [0.35, 0.65]), never below 0.15 absolute, only where the peak reaches
+  0.25. A hairline peaking at 0.3 keeps its own width; a saturated stem gets
+  the mass-conserving contour. A piece with no pixel darker than 0.55 is a
+  neighbour's ring or the paper's grain and is dropped.
+- **Sampled at 2× through a smoothed field.** A scan drawn at three times
+  its own resolution is a field of 3-pixel plateaus, and a contour through
+  plateaus is a staircase whatever the level. A 5-tap binomial (σ ≈ 1) from
+  48 px of em, 3-tap below — σ = 1 fills the two-pixel counter of a 6pt bold
+  "e" — then bilinear sampling puts the contour between pixels.
+- **The cut's SMALL holes stay holes.** The level fills a counter the blur
+  has half filled: the 6pt bold "e" was a blob. A hole in the cut bitmap
+  under a fifth of an em keeps the cut's outline; an O's counter takes the
+  level contour like the outer edge.
+- **A tall narrow piece on the cell's edge is a cell border**, in the cut
+  (`stripEdgeCrumbs`) and the trace alike: the grey rule beside the "C" of
+  "CONTRATO" held a third of the cell's ink — over the crumb rule's quarter —
+  and every C on the page read back as "IC". A stem on a glyph's edge (E, L,
+  B) is joined to the rest of it; a lone stem (I, l, 1) has a cell no wider
+  than itself.
+
+Two things around it, found on the same page:
+
+- **The run's size is the LETTERS' em from the commit on** (`traceItemNow`
+  adopts `sizeOf(item, cut)` into the store, `restyled` runs excepted, and
+  chooses the face AFTER — the face is keyed by size). The preview and the
+  properties bar showed 12.1pt over a 9.8pt title while the bake, which
+  already used the cut, drew 9.8.
+- **`extendAscenders`** — PaddleOCR clips a line of 6pt body text at its
+  x-height top as it clips it at the baseline. On the sheet's paragraph the
+  box held ONE row of the L, d, l, t with seven above it; the em read 6.2pt
+  for 7.7 and the cut flagged every ascender as not rising (22 of 83 cells),
+  so the whole paragraph fell back to Helvetica. The walk up takes sparse
+  rows of a stem's worth (dense = max(15% of the width, risers × height /
+  5), a run no wider than the box is tall, no more runs than risers + 2), and
+  is bounded by the box's own top row: ascenders THIN OUT going up where the
+  line above gets denser, so a row over twice the head row's ink is the
+  neighbour's. The head row is counted in the SAME profile as the band
+  (each profile binarises at the midpoint of its own range — a three-row
+  head measured alone read 227 pixels against 6). The descender walk got a
+  two-row tolerance for the box's own blurred bottoms (a 113-pixel row of
+  letter bottoms was "not stems" and the four rows of descenders under it
+  were never reached); the ascender walk deliberately has none — the fringe
+  trim keeps a few narrow stems, which is what ascender rows are.
+
+**Known limitation:** a box that already holds the previous line's descender
+tips (two stamped ID lines 0.7pt apart) keeps them; the walk refuses to make
+it worse, it does not make it right.
+
+Measured on the 15-document OCR corpus against a HEAD baseline run in
+parallel (two Playwright contexts, same per-document speed): 74 of 74 edits
+read back on both; cuts accepted 42 → 46 (the ascender walk); average re-read
+similarity 0.959 → 0.949, where the whole loss is two re-reads of a halftoned
+logo ("MARK" → "MARK X" on the fax scan, 0.56 → 0.2) whose bake was inspected
+and is right — the X sits beside the untouched logo — and "Test Parameters"
+0.97 → 0.94 twice; gains on four CJK and Spanish rows. The tracer changes on
+their own are row-for-row neutral on this metric (0.959 → 0.959): a re-read
+cannot see stroke weight, which is why the lab exists.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

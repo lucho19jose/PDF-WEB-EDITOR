@@ -47,10 +47,16 @@ export interface GlyphCutResult {
    * cleared border fragment back on top of the letters under it, and a title
    * came out with a bar over its J, E and T.
    */
-  bin: { x: number; y: number; w: number; h: number; ink: Uint8Array }
+  bin: { x: number; y: number; w: number; h: number; ink: Uint8Array; dark?: Float32Array }
 }
 
-interface Bin { x: number; y: number; w: number; h: number; ink: Uint8Array; threshold: number; inverted: boolean }
+/**
+ * `dark` is the box's darkness, 0 paper to 1 ink, already flipped for light
+ * glyphs on a dark ground — what the tracer takes its OUTLINE from, at the
+ * level `traceLevel` picks for the run (see there), where `ink` is the fixed
+ * cut the segmentation is made on.
+ */
+interface Bin { x: number; y: number; w: number; h: number; ink: Uint8Array; dark: Float32Array; threshold: number; inverted: boolean }
 
 /** Why the last cut was refused — for the sweep, which counts the reasons. */
 let refusedBecause = ''
@@ -93,6 +99,11 @@ function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; w
   // glyphs are the light side; flip it.
   const inverted = dark > gray.length * 0.5
   if (inverted) for (let j = 0; j < ink.length; j++) ink[j] = 1 - ink[j]
+  const darkness = new Float32Array(w * h)
+  for (let j = 0; j < gray.length; j++) {
+    const d = (hi - gray[j]) / (hi - lo)
+    darkness[j] = inverted ? 1 - d : d
+  }
   // A rule across the box — an underline, a cell border — joins every glyph
   // column into one run and drags the baseline down. Rows inked across most
   // of the width are not glyph rows; clear them.
@@ -108,7 +119,7 @@ function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; w
   // half ems guessed from the text's expected advances — no glyph, CJK
   // included, runs that wide, and a pair of fused bold letters does not either.
   clearRuleSpans(ink, w, h, ruleSpan, ruleThick)
-  return { x, y, w, h, ink, threshold, inverted }
+  return { x, y, w, h, ink, dark: darkness, threshold, inverted }
 }
 
 /**
@@ -216,7 +227,7 @@ export function cutGlyphs(
   const xs = cjk ? [] : cells.filter(c => !c.suspect && X_HEIGHT_CHARS.test(c.char)).map(heightOf).filter(h => h > 2)
   const letterEm = caps.length >= 2 ? median(caps) / 0.72 : xs.length >= 3 ? median(xs) / 0.52 : null
   const em = letterEm !== null && letterEm > 4 ? letterEm : emPx
-  return { cells, baselineY: base.y, baselineAt, emPx: em, threshold: bin.threshold, inverted: bin.inverted, bin: { x: bin.x, y: bin.y, w: bin.w, h: bin.h, ink: bin.ink } }
+  return { cells, baselineY: base.y, baselineAt, emPx: em, threshold: bin.threshold, inverted: bin.inverted, bin: { x: bin.x, y: bin.y, w: bin.w, h: bin.h, ink: bin.ink, dark: bin.dark } }
 }
 
 function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): GlyphCell[] | null {
@@ -777,11 +788,22 @@ function baselineOf(bin: Bin, cells: GlyphCell[]): { y: number; slope: number } 
  * plus `pad` white pixels all round. `x`/`y` are the bitmap's origin in canvas
  * pixels, which is what the outline is placed by.
  */
-export function cellBitmap(
-  cut: Pick<GlyphCutResult, 'bin'> & Partial<Pick<GlyphCutResult, 'cells' | 'baselineAt' | 'emPx'>>,
-  cell: GlyphCell,
-  pad = 1
-): { image: ImageData; x: number; y: number } | null {
+type CutForCell = Pick<GlyphCutResult, 'bin'> & Partial<Pick<GlyphCutResult, 'cells' | 'baselineAt' | 'emPx'>>
+
+interface CellMask {
+  on: Uint8Array
+  x: number
+  y: number
+  w: number
+  h: number
+  /** Canvas y below which nothing belongs to the glyph (Infinity for a descender). */
+  floor: number
+  /** Bitmap columns the glyph may occupy after the touching sides are eroded. */
+  colMin: number
+  colMax: number
+}
+
+function cellMask(cut: CutForCell, cell: GlyphCell, pad: number): CellMask | null {
   const { bin } = cut
   const x = cell.x0 - pad, y = bin.y - pad
   const w = cell.x1 - cell.x0 + pad * 2
@@ -813,6 +835,7 @@ export function cellBitmap(
   // instead: one to three columns on the touching side, which costs a sliver
   // off a stem and removes the "I" drawn with a piece of the "N" beside it.
   const cells = (cut as GlyphCutResult).cells
+  let colMin = pad, colMax = w - 1 - pad
   if (cells) {
     const i = cells.indexOf(cell)
     const k = Math.max(1, Math.min(3, Math.round((cell.x1 - cell.x0) * 0.08)))
@@ -822,8 +845,17 @@ export function cellBitmap(
       if (touchesLeft) for (let xx = pad; xx < pad + k && xx < w; xx++) on[yy * w + xx] = 0
       if (touchesRight) for (let xx = w - 1 - pad; xx > w - 1 - pad - k && xx >= 0; xx--) on[yy * w + xx] = 0
     }
+    if (touchesLeft) colMin = pad + k
+    if (touchesRight) colMax = w - 1 - pad - k
   }
   stripEdgeCrumbs(on, w, h, pad)
+  return { on, x, y, w, h, floor, colMin, colMax }
+}
+
+export function cellBitmap(cut: CutForCell, cell: GlyphCell, pad = 1): { image: ImageData; x: number; y: number } | null {
+  const m = cellMask(cut, cell, pad)
+  if (!m) return null
+  const { on, w, h, x, y } = m
   const out = new ImageData(w, h)
   const o = out.data
   for (let j = 0; j < on.length; j++) {
@@ -831,6 +863,294 @@ export function cellBitmap(
     o[j * 4] = v; o[j * 4 + 1] = v; o[j * 4 + 2] = v; o[j * 4 + 3] = 255
   }
   return { image: out, x, y }
+}
+
+/** The darkness level the cut's own 0.42-of-range threshold amounts to. */
+const CUT_LEVEL = 0.58
+
+/**
+ * The darkness level a run's outlines are traced at: the level at which the
+ * traced AREA equals the ink's MASS.
+ *
+ * A scanned stroke is a blur, and blurring conserves ink — the grey ramp on
+ * either side of a stem holds exactly what the sharp stem lost — so the
+ * contour that encloses as much area as the summed darkness is the stroke the
+ * scanner saw. No fixed level is right for every page. The cut's threshold
+ * (0.42 of the range, i.e. darkness 0.58) is where the segmentation is made
+ * and is not changed by this; traced at that level, the title of a comparison
+ * sheet carried 9–18% less ink than the page (area/mass 0.91, 0.85, 0.82 on
+ * its three edited lines, measured on the 440 DPI raster) and an inserted "O"
+ * stood visibly thinner than the "O" beside it, while on a sharper scan the
+ * midpoint had made glyphs visibly heavier. Measured on the ink and its ring
+ * (pixels within three of the cut's ink, so a cleared rule and the paper's
+ * grain count for nothing) and held to [0.35, 0.65].
+ */
+export function traceLevel(cut: Pick<GlyphCutResult, 'bin'>): number {
+  const { bin } = cut
+  const dark = bin.dark
+  if (!dark) return CUT_LEVEL
+  const { w, h, ink } = bin
+  const R = 3
+  const mask = new Uint8Array(w * h)
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (!ink[y * w + x]) continue
+      for (let dy = -R; dy <= R; dy++) {
+        const yy = y + dy
+        if (yy < 0 || yy >= h) continue
+        for (let dx = -R; dx <= R; dx++) {
+          const xx = x + dx
+          if (xx >= 0 && xx < w) mask[yy * w + xx] = 1
+        }
+      }
+    }
+  }
+  const BINS = 256
+  const hist = new Float64Array(BINS + 1)
+  let mass = 0, n = 0
+  for (let j = 0; j < mask.length; j++) {
+    if (!mask[j]) continue
+    const d = Math.min(1, Math.max(0, dark[j]))
+    mass += d
+    n++
+    hist[Math.round(d * BINS)]++
+  }
+  if (!n || mass < 4) return CUT_LEVEL
+  let count = 0, level = BINS
+  while (level > 0 && count + hist[level] < mass) { count += hist[level]; level-- }
+  return Math.min(0.65, Math.max(0.35, level / BINS))
+}
+
+/**
+ * The cell's bitmap for TRACING: the darkness sampled at `res` times the
+ * raster's resolution and cut at `level`, inside the cell's own ink dilated
+ * by two pixels — the ring around a stroke belongs to it, a neighbour's does
+ * not — under the same floor and eroded edges as `cellBitmap`. Thresholding
+ * the INTERPOLATED darkness puts the contour between pixels, where the ramp
+ * crosses the level, so a stem's edge is a line where a binarised pixel
+ * edge is a staircase that the tracer keeps as bumps.
+ */
+export function cellBitmapTraced(
+  cut: CutForCell,
+  cell: GlyphCell,
+  pad = 1,
+  res = 2,
+  level = CUT_LEVEL,
+  /** Smoothing taps, 3 or 5; by default 5 from 48 px of em (σ ≈ 1 raster pixel), 3 below — a 6pt bold "e" at 440 DPI has a two-pixel counter that σ = 1 fills. */
+  taps: 3 | 5 = (cut.emPx ?? 0) >= 48 ? 5 : 3
+): { image: ImageData; x: number; y: number; res: number } | null {
+  const { bin } = cut
+  const dark = bin.dark
+  if (!dark || res < 1) {
+    const b = cellBitmap(cut, cell, pad)
+    return b ? { ...b, res: 1 } : null
+  }
+  const m = cellMask(cut, cell, pad)
+  if (!m) return null
+  const { on, x, y, w, h, floor, colMin, colMax } = m
+  // What the cut REMOVED from the cell — a neighbour's crumb, a speck, the
+  // fringe of a cleared rule — stays removed, with a pixel of margin.
+  // (Rows under the floor are not "removed": they are cut off below anyway,
+  // and counting them would strip the margin's pixel off every glyph bottom.)
+  const removed = new Uint8Array(w * h)
+  for (let yy = 0; yy < h; yy++) {
+    if (y + yy > floor) continue
+    for (let xx = 0; xx < w; xx++) {
+      const bx = x + xx - bin.x, by = y + yy - bin.y
+      const raw = bx >= 0 && bx < bin.w && by >= 0 && by < bin.h && bin.ink[by * bin.w + bx] === 1
+      if (raw && !on[yy * w + xx]) {
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const nx = xx + dx, ny = yy + dy
+          if (nx >= 0 && nx < w && ny >= 0 && ny < h) removed[ny * w + nx] = 1
+        }
+      }
+    }
+  }
+  // The darkness field over the cell with a margin, lightly smoothed: a scan
+  // drawn at three times its own resolution is a field of 3-pixel plateaus,
+  // and a contour through plateaus is a staircase whatever the level.
+  const M = 4
+  const fx0 = x - M, fy0 = y - M, fw = w + 2 * M, fh = h + 2 * M
+  const field = new Float32Array(fw * fh)
+  const rawAt = (xx: number, yy: number): number => (xx < 0 || yy < 0 || xx >= bin.w || yy >= bin.h) ? 0 : dark[yy * bin.w + xx]
+  {
+    // A 5-tap binomial (σ ≈ 1 raster pixel) each way: enough to join the
+    // dashes a hairline breaks into across the plateaus, not enough to close
+    // a serif's gap.
+    const K = taps === 5 ? [1, 4, 6, 4, 1] : [1, 2, 1]
+    const KS = K.reduce((a, b) => a + b, 0), KR = (K.length - 1) / 2
+    const tmp = new Float32Array(fw * fh)
+    for (let yy = 0; yy < fh; yy++) for (let xx = 0; xx < fw; xx++) {
+      const bx = fx0 + xx - bin.x, by = fy0 + yy - bin.y
+      let s = 0
+      for (let t = -KR; t <= KR; t++) s += K[t + KR] * rawAt(bx + t, by)
+      tmp[yy * fw + xx] = s / KS
+    }
+    for (let yy = 0; yy < fh; yy++) for (let xx = 0; xx < fw; xx++) {
+      let s = 0
+      for (let t = -KR; t <= KR; t++) { const ny = yy + t; if (ny >= 0 && ny < fh) s += K[t + KR] * tmp[ny * fw + xx] }
+      field[yy * fw + xx] = s / KS
+    }
+  }
+  // The local PEAK darkness (a 3-pixel radius reaches the centre of any
+  // stroke a scan blurs), so the level is stated as a share of the stroke's
+  // own darkness: a serif face's hairline peaks at a third of its stems'
+  // darkness on a 150 DPI scan and no global level holds both — at 0.5 the
+  // "U" of a comparison sheet's title lost its right stem and the "A" its
+  // left leg, while 0.3 turned every stem into a slab.
+  const PEAK_R = 3
+  const peak = new Float32Array(fw * fh)
+  {
+    const tmp = new Float32Array(fw * fh)
+    for (let yy = 0; yy < fh; yy++) for (let xx = 0; xx < fw; xx++) {
+      let mx = 0
+      for (let dx = -PEAK_R; dx <= PEAK_R; dx++) { const nx = xx + dx; if (nx >= 0 && nx < fw) mx = Math.max(mx, field[yy * fw + nx]) }
+      tmp[yy * fw + xx] = mx
+    }
+    for (let yy = 0; yy < fh; yy++) for (let xx = 0; xx < fw; xx++) {
+      let mx = 0
+      for (let dy = -PEAK_R; dy <= PEAK_R; dy++) { const ny = yy + dy; if (ny >= 0 && ny < fh) mx = Math.max(mx, tmp[ny * fw + xx]) }
+      peak[yy * fw + xx] = mx
+    }
+  }
+  const fieldAt = (xx: number, yy: number): number => (xx < 0 || yy < 0 || xx >= fw || yy >= fh) ? 0 : field[yy * fw + xx]
+  // Darkness at a canvas point, bilinear between pixel centres.
+  const sample = (cx: number, cy: number): number => {
+    const bx = cx - 0.5 - fx0, by = cy - 0.5 - fy0
+    const x0 = Math.floor(bx), y0 = Math.floor(by)
+    const gx = bx - x0, gy = by - y0
+    return fieldAt(x0, y0) * (1 - gx) * (1 - gy) + fieldAt(x0 + 1, y0) * gx * (1 - gy) + fieldAt(x0, y0 + 1) * (1 - gx) * gy + fieldAt(x0 + 1, y0 + 1) * gx * gy
+  }
+  // The cut's SMALL holes are kept as holes. A level stated against the
+  // stroke's peak fills a counter the blur has half filled: a 6pt bold "e"
+  // at 440 DPI has a two-pixel counter whose centre is as dark as the level,
+  // and traced without this it was a blob. A counter under a fifth of an em
+  // (either way) keeps the cut's own outline; a large counter — an O's — takes
+  // the level contour like the outer edge, so the stroke keeps its weight.
+  const hole = new Uint8Array(w * h)
+  {
+    const seen = new Uint8Array(w * h)
+    const q: number[] = []
+    for (let xx = 0; xx < w; xx++) { q.push(xx, (h - 1) * w + xx) }
+    for (let yy = 0; yy < h; yy++) { q.push(yy * w, yy * w + w - 1) }
+    for (const j of q) if (!on[j]) seen[j] = 1
+    while (q.length) {
+      const j = q.pop()!
+      if (on[j]) continue
+      const xx = j % w, yy = (j - xx) / w
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = xx + dx, ny = yy + dy
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
+        const nj = ny * w + nx
+        if (!on[nj] && !seen[nj]) { seen[nj] = 1; q.push(nj) }
+      }
+    }
+    const small = (cut.emPx ?? 0) * 0.2
+    const hid = new Int32Array(w * h)
+    let next = 0
+    for (let start = 0; start < w * h; start++) {
+      if (on[start] || seen[start] || hid[start]) continue
+      next++
+      const members: number[] = []
+      let x0 = w, x1 = -1, y0 = h, y1 = -1
+      const st = [start]; hid[start] = next
+      while (st.length) {
+        const j = st.pop()!
+        members.push(j)
+        const xx = j % w, yy = (j - xx) / w
+        if (xx < x0) x0 = xx
+        if (xx > x1) x1 = xx
+        if (yy < y0) y0 = yy
+        if (yy > y1) y1 = yy
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nx = xx + dx, ny = yy + dy
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
+          const nj = ny * w + nx
+          if (!on[nj] && !seen[nj] && !hid[nj]) { hid[nj] = next; st.push(nj) }
+        }
+      }
+      if (small > 0 && (x1 - x0 + 1 < small || y1 - y0 + 1 < small)) for (const j of members) hole[j] = 1
+    }
+  }
+  const MIN_PEAK = 0.25   // a stroke at all — paper grain and a JPEG ring peak lower; a hairline peaks near 0.3
+  const MIN_DARK = 0.15   // never ink below this whatever the peak
+  const STROKE = 0.55     // a component must hold at least one pixel this dark
+  const W = w * res, H = h * res
+  const ink = new Uint8Array(W * H)
+  const darkAt = new Float32Array(W * H)
+  for (let Y = 0; Y < H; Y++) {
+    const ny = Math.min(h - 1, Math.floor(Y / res))
+    if (y + ny > floor) continue
+    const cy = y + (Y + 0.5) / res
+    for (let X = 0; X < W; X++) {
+      const nx = Math.min(w - 1, Math.floor(X / res))
+      if (nx < colMin || nx > colMax || removed[ny * w + nx] || hole[ny * w + nx]) continue
+      const pk = peak[(ny + M) * fw + nx + M]
+      if (pk < MIN_PEAK) continue
+      const d = sample(x + (X + 0.5) / res, cy)
+      darkAt[Y * W + X] = d
+      if (d >= Math.max(MIN_DARK, level * pk)) ink[Y * W + X] = 1
+    }
+  }
+  // Only pieces that hold a real stroke: a faint piece on its own is a
+  // neighbour's ring or the paper's grain, not a hairline — a hairline is
+  // joined to the stem it serves. And the same crumb rule the cut applies
+  // (`stripEdgeCrumbs`), because a level stated against the LOCAL peak
+  // admits what the cut's fixed threshold never saw: the grey border of a
+  // table cell beside its first letter, a bar too faint for the cut and so
+  // never in `removed`, was traced in front of a "C" and every C on the page
+  // read back as "IC". A narrow piece on the cell's edge holding little of
+  // its ink is not the glyph's.
+  const label = new Int32Array(W * H)
+  const stack: number[] = []
+  const pieces: { members: number[]; area: number; darkest: number; x0: number; x1: number; y0: number; y1: number }[] = []
+  let total = 0
+  for (let start = 0; start < ink.length; start++) {
+    if (!ink[start] || label[start]) continue
+    const id = pieces.length + 1
+    const piece = { members: [] as number[], area: 0, darkest: 0, x0: W, x1: -1, y0: H, y1: -1 }
+    stack.push(start); label[start] = id
+    while (stack.length) {
+      const j = stack.pop()!
+      piece.area++
+      piece.members.push(j)
+      if (darkAt[j] > piece.darkest) piece.darkest = darkAt[j]
+      const xx = j % W, yy = (j - xx) / W
+      if (xx < piece.x0) piece.x0 = xx
+      if (xx > piece.x1) piece.x1 = xx
+      if (yy < piece.y0) piece.y0 = yy
+      if (yy > piece.y1) piece.y1 = yy
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue
+        const nx = xx + dx, ny = yy + dy
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue
+        const nj = ny * W + nx
+        if (ink[nj] && !label[nj]) { label[nj] = id; stack.push(nj) }
+      }
+    }
+    pieces.push(piece)
+    total += piece.area
+  }
+  const left = colMin * res, right = (colMax + 1) * res - 1
+  const cellW = Math.max(1, right - left + 1)
+  for (const piece of pieces) {
+    const touchesEdge = piece.x0 <= left || piece.x1 >= right
+    const speck = piece.area <= Math.max(4 * res * res, Math.round(total * 0.03))
+    const narrow = touchesEdge && (piece.x1 - piece.x0 + 1) < cellW * 0.2
+    const crumb = narrow && piece.area < total * 0.25
+    const rule = narrow && (piece.y1 - piece.y0 + 1) >= H * 0.8
+    if (piece.darkest < STROKE || speck || crumb || rule) for (const j of piece.members) ink[j] = 0
+  }
+  const out = new ImageData(W, H)
+  const o = out.data
+  let inked = 0
+  for (let j = 0; j < ink.length; j++) {
+    const v = ink[j] ? 0 : 255
+    if (ink[j]) inked++
+    o[j * 4] = v; o[j * 4 + 1] = v; o[j * 4 + 2] = v; o[j * 4 + 3] = 255
+  }
+  if (!inked) return null
+  return { image: out, x, y, res }
 }
 
 /**
@@ -855,7 +1175,7 @@ function stripEdgeCrumbs(on: Uint8Array, w: number, h: number, pad: number): voi
   for (let start = 0; start < on.length; start++) {
     if (!on[start] || label[start]) continue
     next++
-    let area = 0, x0 = w, x1 = -1
+    let area = 0, x0 = w, x1 = -1, y0 = h, y1 = -1
     stack.push(start); label[start] = next
     while (stack.length) {
       const j = stack.pop()!
@@ -863,6 +1183,8 @@ function stripEdgeCrumbs(on: Uint8Array, w: number, h: number, pad: number): voi
       const xx = j % w, yy = (j - xx) / w
       if (xx < x0) x0 = xx
       if (xx > x1) x1 = xx
+      if (yy < y0) y0 = yy
+      if (yy > y1) y1 = yy
       for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
         if (!dx && !dy) continue
         const nx = xx + dx, ny = yy + dy
@@ -877,7 +1199,14 @@ function stripEdgeCrumbs(on: Uint8Array, w: number, h: number, pad: number): voi
     // turd size drops only one. Under 3% of the cell's ink is no part of a
     // letter — an "i" dot is a tenth of its stem, an accent more.
     const speck = area <= Math.max(4, Math.round(total * 0.03))
-    if (speck || (touchesEdge && (x1 - x0 + 1) < cellW * 0.2 && area < total * 0.25)) {
+    // A narrow piece on the cell's edge running the HEIGHT of the line is a
+    // cell border, whatever share of the ink it holds: a table's grey rule
+    // beside the "C" of "CONTRATO" was a third of the cell's ink, over the
+    // crumb rule's quarter, and went into the face — every C on the page
+    // then read back as "IC". A stem on a glyph's edge (E, L, B) is joined to
+    // the rest of it; a lone stem (I, l, 1) has a cell no wider than itself.
+    const rule = touchesEdge && (x1 - x0 + 1) < cellW * 0.2 && (y1 - y0 + 1) >= h * 0.8
+    if (speck || rule || (touchesEdge && (x1 - x0 + 1) < cellW * 0.2 && area < total * 0.25)) {
       for (let j = 0; j < on.length; j++) if (label[j] === next) on[j] = 0
     }
   }

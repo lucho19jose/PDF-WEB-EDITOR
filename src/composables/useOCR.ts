@@ -7,10 +7,11 @@ import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
 import { TesseractEngine } from '@/utils/ocr/engines/tesseractEngine'
 import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
-import { inkBounds, inkGaps, inkBands, extendDescenders, type InkCut } from '@/utils/ocr/inkMeasure'
+import { inkBounds, inkGaps, inkBands, extendDescenders, extendAscenders, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
 import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance } from '@/utils/ocr/glyphCut'
-import { toSpanCut, type SpanCut } from '@/utils/ocr/partialRedraw'
+import { toSpanCut, sizeOf, type SpanCut } from '@/utils/ocr/partialRedraw'
+import { useOcrStore } from '@/stores/ocr'
 
 /**
  * Recognising the text in a scanned page.
@@ -315,7 +316,7 @@ function createOCR() {
     // A run a bake has already drawn: the raster under it is a patch and new
     // text, not its original ink, so neither a cut nor a trace can be made.
     if (item.baked) return { added: 0, refused: null }
-    const face = scanFaceFor(item.pageIndex, styleKeyOf(item))
+    let face = scanFaceFor(item.pageIndex, styleKeyOf(item))
     try {
       // The cut is made FIRST and kept whatever the tracer then does with it:
       // the partial redraw needs the letters' positions even when every glyph
@@ -326,7 +327,25 @@ function createOCR() {
       let cut = cutGlyphs(raster.ctx, rect, item.originalText, perGlyph ? symbols : undefined)
       let source: SpanCut['source'] = perGlyph ? 'symbols' : 'profile'
       const firstReason = cut ? '' : lastCutReason()
-      if (cut) spanCuts.set(item.id, toSpanCut(cut, raster.toPt, item.originalText, source))
+      if (cut) {
+        const span = toSpanCut(cut, raster.toPt, item.originalText, source)
+        spanCuts.set(item.id, span)
+        // The run's size is the LETTERS' em from here on, which is what the
+        // bake draws the stretch at: the box's size is what a neighbour's tips
+        // or an ideograph beside the Latin letters inflate — the title of a
+        // comparison sheet was previewed at 12.1pt over a 9.8pt line, so the
+        // editor showed the edit a quarter larger than the page then drew it.
+        // The face is keyed by size, so it is chosen AFTER the size is known;
+        // a size the user set (`restyled`) stands.
+        if (!item.restyled) {
+          const size = sizeOf(item, span)
+          if (Math.abs(size - item.fontSize) > 0.05) {
+            useOcrStore().updateItem(item.id, { fontSize: size, restyled: false })
+            item = { ...item, fontSize: size }
+          }
+        }
+        face = scanFaceFor(item.pageIndex, styleKeyOf(item))
+      }
       const res = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, perGlyph ? symbols : undefined, item.text, cut)
       if (res.added) faceVersion.value++
       if (res.added || !res.refused || perGlyph || cut) return res
@@ -746,7 +765,9 @@ function createOCR() {
       // neighbouring lines whole (a 7pt box became 15pt): a line's descenders
       // touch the next line's ascenders on this leading, so the probe must
       // not cross the gap — it must stop at it.
-      const ink = extendDescenders(ctx, inkBounds(ctx, rect, emGuess), line.text)
+      // And UP through the ascenders, which the same detector clips on small
+      // body text — see `extendAscenders`.
+      const ink = extendAscenders(ctx, extendDescenders(ctx, inkBounds(ctx, rect, emGuess), line.text), line.text)
       const cjk = isMostlyCjk(line.text)
       const emPx = ink.height / (cjk ? GLYPH_BOX_PER_EM_CJK : boxPerEm(line.text))
       // Only an UNMISTAKABLE gap cuts (two and a half ems — the same bar
