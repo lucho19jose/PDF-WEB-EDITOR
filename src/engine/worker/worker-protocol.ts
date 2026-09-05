@@ -26,7 +26,12 @@ export type WorkerRequest =
   | { id: number; type: 'replaceText'; data: { pageIndex: number; blockId: string; newText: string } }
   | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number; faceId?: string; invisible?: boolean } }
   /** Several runs in ONE text object — the invisible head, the visible stretch and the invisible tail of a partial redraw — so extraction reads them as one line. */
-  | { id: number; type: 'addTextRun'; data: { pageIndex: number; rotation?: number; parts: TextRunPart[] } }
+  | { id: number; type: 'addTextRun'; data: { pageIndex: number; rotation?: number; parts: TextRunPart[]; tag?: string } }
+  /** Blank every `/Tag BMC … EMC` section this editor wrote into the page (a searchable OCR layer being recognised again). */
+  | { id: number; type: 'removeMarkedContent'; data: { pageIndex: number; tag: string } }
+  | { id: number; type: 'hasMarkedContent'; data: { pageIndex: number; tag: string } }
+  /** Blank invisible (3 Tr) show ops whose origin lies inside one of the rects (top-left page points) — an existing searchable layer's words under an edited run. */
+  | { id: number; type: 'blankInvisibleText'; data: { pageIndex: number; rects: [number, number, number, number][] } }
   /** A traced scan face (OpenType bytes) the worker keeps by id for `addText` runs that name it. */
   | { id: number; type: 'registerFace'; data: { faceId: string; bytes: ArrayBuffer } }
   /** The exact pen advance `addText` would give each run, in points — measured with the fonts that will draw it. */

@@ -198,9 +198,9 @@ export function usePDFEngine() {
   }
 
   /** Several runs in one text object — see `MuPDFBridge.addTextRun`. */
-  async function addTextRun(pageIndex: number, parts: TextRunPart[], rotation?: number): Promise<boolean> {
+  async function addTextRun(pageIndex: number, parts: TextRunPart[], rotation?: number, tag?: string): Promise<boolean> {
     try {
-      const result = await bridge.addTextRun(pageIndex, parts, rotation)
+      const result = await bridge.addTextRun(pageIndex, parts, rotation, tag)
       if (result.success) {
         pageTextCache.delete(pageIndex)
       } else {
@@ -211,6 +211,28 @@ export function usePDFEngine() {
       error.value = `Failed to add text: ${err.message}`
       throw err
     }
+  }
+
+  /** Blank every `/tag BMC … EMC` section this editor wrote on the page. */
+  async function removeMarkedContent(pageIndex: number, tag: string): Promise<number> {
+    const r = await bridge.removeMarkedContent(pageIndex, tag)
+    if (r.removed > 0) pageTextCache.delete(pageIndex)
+    return r.removed
+  }
+
+  async function hasMarkedContent(pageIndex: number, tag: string): Promise<boolean> {
+    return (await bridge.hasMarkedContent(pageIndex, tag)).has
+  }
+
+  /**
+   * Blank the INVISIBLE text (a searchable layer's words) under the given
+   * rects (top-left page points), so a baked replacement does not leave the
+   * old words findable underneath it.
+   */
+  async function blankInvisibleText(pageIndex: number, rects: [number, number, number, number][]): Promise<number> {
+    const r = await bridge.blankInvisibleText(pageIndex, rects)
+    if (r.blanked > 0) pageTextCache.delete(pageIndex)
+    return r.blanked
   }
 
   /** Register a traced scan face (OpenType bytes) for `addText` runs that name it. */
@@ -524,7 +546,7 @@ export function usePDFEngine() {
     debugBtBlocks,
     readContentStream,
     replaceText,
-    addText, addTextRun, registerFace, measureRuns, renderPageBitmap,
+    addText, addTextRun, removeMarkedContent, hasMarkedContent, blankInvisibleText, registerFace, measureRuns, renderPageBitmap,
     transformTextBlock,
     transformTextBlocks,
     restyleTextBlocks,

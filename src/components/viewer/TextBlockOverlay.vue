@@ -516,6 +516,8 @@ const addTextEditorStyle = computed(() => ({
 // ── Block loading ──
 
 const pageRotated = ref(false)
+/** The page carries invisible (searchable-layer) text that was filtered out of `blocks`. */
+const hiddenLayer = ref(false)
 
 /**
  * @param announce say how many blocks were found.
@@ -541,7 +543,13 @@ async function loadBlocks(announce = false) {
     const size = await pdfEngine.getPageSize(pageIndex).catch(() => null)
     pageRotated.value = !!size && size.rotation % 360 !== 0
 
-    const data = await pdfEngine.getTextBlocks(pageIndex)
+    const all = await pdfEngine.getTextBlocks(pageIndex)
+    // A searchable OCR layer's words are drawn invisibly: an edit made to one
+    // of them can never be seen ("when I edit it it does not show"), so they
+    // are never offered. The page is a scan to this tool, with the visible
+    // stamps (a signing service's ID strip) still editable as text.
+    const data = all.filter(b => !b.invisible)
+    hiddenLayer.value = data.length < all.length
     if (pageRotated.value && data.length > 200 &&
         data.filter(b => b.text.trim().length <= 1).length > data.length * 0.7) {
       blocks.value = []
@@ -558,7 +566,7 @@ async function loadBlocks(announce = false) {
     }
     // A page with nothing to edit may be a picture of a document. Say so, and
     // say what to do — "0 text blocks found" reads as a dead end.
-    if (data.length === 0 && editorStore.currentTool === 'edit' && ocrController) {
+    if ((data.length === 0 || hiddenLayer.value) && editorStore.currentTool === 'edit' && ocrController) {
       const isScan = await ocrController.isScanLike(pageIndex)
       if (isScan && pageIndex === docStore.currentPage - 1) {
         editorStore.setStatus(ocrStore.itemsFor(pageIndex).length > 0
@@ -2081,7 +2089,7 @@ function onMarqueeEnd() {
   // is the request: recognise it and open the line under the pointer.
   if (!dragged) {
     if (!m.additive) { clearSelection(); emit('bandCleared') }
-    if (editorStore.currentTool === 'edit' && blocks.value.length === 0 && ocrController && !ocrController.busy.value) {
+    if (editorStore.currentTool === 'edit' && (blocks.value.length === 0 || hiddenLayer.value) && ocrController && !ocrController.busy.value) {
       const pageIndex = docStore.currentPage - 1
       if (ocrStore.itemsFor(pageIndex).length === 0) {
         ocrController.isScanLike(pageIndex).then(isScan => {

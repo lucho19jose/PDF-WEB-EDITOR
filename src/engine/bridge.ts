@@ -207,8 +207,22 @@ export class MuPDFBridge {
    * the visible stretch and the invisible tail of a partially redrawn line, so
    * extraction reads them in order as one line.
    */
-  async addTextRun(pageIndex: number, parts: TextRunPart[], rotation?: number): Promise<{ success: boolean; error?: string }> {
-    return this.send('addTextRun', { pageIndex, parts, rotation })
+  async addTextRun(pageIndex: number, parts: TextRunPart[], rotation?: number, tag?: string): Promise<{ success: boolean; error?: string }> {
+    return this.send('addTextRun', { pageIndex, parts, rotation, tag })
+  }
+
+  /** Blank every `/tag BMC … EMC` section on the page (this editor's searchable layer, before it is written again). */
+  async removeMarkedContent(pageIndex: number, tag: string): Promise<{ removed: number }> {
+    return this.send('removeMarkedContent', { pageIndex, tag })
+  }
+
+  async hasMarkedContent(pageIndex: number, tag: string): Promise<{ has: boolean }> {
+    return this.send('hasMarkedContent', { pageIndex, tag })
+  }
+
+  /** Blank the invisible (3 Tr) show ops whose origin lies inside one of the rects (top-left page points). */
+  async blankInvisibleText(pageIndex: number, rects: [number, number, number, number][]): Promise<{ blanked: number }> {
+    return this.send('blankInvisibleText', { pageIndex, rects })
   }
 
   /** Hand the worker a traced scan face to embed for runs that name it. */

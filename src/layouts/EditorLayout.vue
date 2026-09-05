@@ -197,7 +197,11 @@ async function runOcrOnPage(lang = OCR_DEFAULT_LANG) {
  */
 async function textLayerOf(pageIndex: number): Promise<{ chars: number; coverage: number }> {
   try {
-    const blocks = await pdfEngine.getTextBlocks(pageIndex)
+    // A searchable OCR layer (Acrobat's "Reconocer texto", or this editor's
+    // own) is text drawn INVISIBLY over a scan: it is not the page's own text
+    // and must not make the page count as a text page — the words the user
+    // sees are the scan's pixels, and only the OCR flow can change those.
+    const blocks = (await pdfEngine.getTextBlocks(pageIndex)).filter(b => !b.invisible)
     const chars = blocks.reduce((n, b) => n + b.text.trim().length, 0)
     const size = await pdfEngine.getPageSize(pageIndex)
     const G = 64
@@ -413,6 +417,15 @@ async function bakeOcrEdits(): Promise<number> {
     }
 
     await exclusiveOp(async () => {
+      // A page that already carries a searchable layer (Acrobat's) has the OLD
+      // words under every edited run as invisible text; the bake writes the
+      // new words (visible, plus their own invisible copy where the redraw is
+      // partial), so the old ones would be found by search a second time.
+      // Blank the layer's ops under each edited run first.
+      const editedRects = page.items
+        .filter(i => (i.edited || i.removed) && !i.baked)
+        .map(i => [i.inkRect.x, i.inkRect.y, i.inkRect.x + i.inkRect.width, i.inkRect.y + i.inkRect.height] as [number, number, number, number])
+      if (editedRects.length) await pdfEngine.blankInvisibleText(pageIndex, editedRects).catch(() => 0)
       // Into the content stream, not as an annotation: annotations paint over
       // page content whatever order they were made in, so a patch drawn as one
       // covered the replacement text and it came out with its start missing.

@@ -111,7 +111,25 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       case 'addTextRun': {
         if (!pdfDoc) throw new Error('No document loaded')
         await ensureCjkFontFor(req.data.parts.map(p => p.text).join(''))
-        respond({ id: req.id, type: 'success', data: addTextRunToPage(req.data.pageIndex, req.data.parts, req.data.rotation ?? 0) })
+        respond({ id: req.id, type: 'success', data: addTextRunToPage(req.data.pageIndex, req.data.parts, req.data.rotation ?? 0, req.data.tag) })
+        break
+      }
+
+      case 'removeMarkedContent': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: removeMarkedContent(req.data.pageIndex, req.data.tag) })
+        break
+      }
+
+      case 'hasMarkedContent': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: { has: hasMarkedContent(req.data.pageIndex, req.data.tag) } })
+        break
+      }
+
+      case 'blankInvisibleText': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: blankInvisibleTextIn(req.data.pageIndex, req.data.rects) })
         break
       }
 
@@ -559,8 +577,198 @@ function extractPageText(pageIndex: number): PageTextData {
   // becomes its own clickable/movable element (e.g., "Label:" and "Value"
   // on the same line become separate blocks instead of one big block)
   const splitBlocks = splitBlocksAtGaps(blocks, pageIndex)
+  markInvisibleBlocks(pageIndex, splitBlocks)
 
   return { pageIndex, blocks: splitBlocks, lines }
+}
+
+/**
+ * Where every show op draws, and whether it can be SEEN.
+ *
+ * Acrobat's "Reconocer texto" (and ABBYY, and this editor's own searchable
+ * layer) put a scan's words into the content stream under `3 Tr` — text
+ * render mode "invisible" — so that search, copy and screen readers work
+ * while the page still shows the scan's own pixels. MuPDF extracts that text
+ * exactly like visible text, so the edit tool listed the words, the user
+ * edited one, the engine rewrote the glyphs faithfully IN THE SAME MODE, and
+ * nothing on the page changed: "when I edit it it does not show". Render mode
+ * is graphics state the extraction does not report, so it is read off the
+ * stream here: one pass over the literal-masked content of every source,
+ * tracking q/Q, Tr, and the text matrix the way `scanShowOps` does, recording
+ * each op's origin in top-left page space.
+ *
+ * Only the ORIGIN of each op is known (advances are not computed here), so a
+ * block is matched through its characters' origins: MuPDF gives the first
+ * glyph of an op the op's own origin, and OCR layers set a Tm per word or
+ * per line. A block with hits on both sides (a fused extraction) is left
+ * visible: hiding a real block makes it uneditable, which is the worse error.
+ */
+interface ShowOpOrigin { x: number; y: number; invisible: boolean; start: number; end: number; source: string }
+
+function collectShowOpOrigins(pageIndex: number): ShowOpOrigin[] {
+  const out: ShowOpOrigin[] = []
+  let pageHeight = 0
+  try { pageHeight = getPageSize(pageIndex).height } catch (_) { return out }
+  const rot = pageRotationCtm(pageIndex)
+  let sources: ContentSource[] = []
+  try { sources = getContentSources(pageIndex) } catch (_) { return out }
+  const re = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm(?![A-Za-z])|(-?[\d.]+)\s+(-?[\d.]+)\s+(Td|TD)(?![A-Za-z])|(-?[\d.]+)\s+TL(?![A-Za-z])|T\*|(\d)\s+Tr(?![A-Za-z])|(?<![A-Za-z])(q|Q|BT|ET)(?![A-Za-z*])|(\]\s*TJ|\)\s*Tj|>\s*Tj|\)\s*'|>\s*'|\)\s*"|>\s*")(?![A-Za-z])/g
+  for (const src of sources) {
+    const masked = maskStreamLiterals(src.stream)
+    let ma = 1, mb = 0, mc = 0, md = 1, ex = 0, ey = 0, ux = 0, uy = 0, leading = 0
+    let tr = 0
+    const stack: number[] = []
+    let m: RegExpExecArray | null
+    while ((m = re.exec(masked)) !== null) {
+      if (m[1] !== undefined) { ma = +m[1]; mb = +m[2]; mc = +m[3]; md = +m[4]; ex = +m[5]; ey = +m[6]; ux = 0; uy = 0; continue }
+      if (m[7] !== undefined) { ux += +m[7]; uy += +m[8]; if (m[9] === 'TD') leading = -(+m[8]); continue }
+      if (m[10] !== undefined) { leading = +m[10]; continue }
+      if (m[0] === 'T*') { uy -= leading; continue }
+      if (m[11] !== undefined) { tr = +m[11]; continue }
+      if (m[12] !== undefined) {
+        if (m[12] === 'q') stack.push(tr)
+        else if (m[12] === 'Q') { if (stack.length) tr = stack.pop()! }
+        else if (m[12] === 'BT') { ma = 1; mb = 0; mc = 0; md = 1; ex = 0; ey = 0; ux = 0; uy = 0 }
+        continue
+      }
+      // A show op. ' and " are an implicit T* first.
+      const op = m[13]
+      if (op.endsWith("'") || op.endsWith('"')) uy -= leading
+      const tx = ex + ma * ux + mc * uy
+      const ty = ey + mb * ux + md * uy
+      // Text space -> this source's user space -> page space (rotation applied).
+      let ctm = getCtmAtOffset(src.stream, m.index)
+      if (src.invokeCtm) ctm = matConcat(ctm, src.invokeCtm)
+      if (rot) ctm = matConcat(ctm, rot)
+      const px = tx * ctm[0] + ty * ctm[2] + ctm[4]
+      const py = tx * ctm[1] + ty * ctm[3] + ctm[5]
+      // The op's START (its literal), so a caller can blank the whole op: the
+      // masked stream keeps every offset, so walk back over the blanked literal.
+      let start = m.index
+      if (op.startsWith(']')) { start = masked.lastIndexOf('[', m.index); if (start < 0) start = m.index }
+      else {
+        let i = m.index - 1
+        while (i >= 0 && /\s/.test(masked[i])) i--
+        // The literal is masked to spaces except its delimiters; step back to its opening one.
+        const openCh = masked[m.index] === '>' ? '<' : '('
+        const o = masked.lastIndexOf(openCh, m.index)
+        start = o >= 0 ? o : (i >= 0 ? i : m.index)
+        if (op.startsWith('"')) {
+          // aw ac (string) " — the two operands belong to the op as well
+          const head = masked.slice(Math.max(0, start - 40), start)
+          const mm = /(-?[\d.]+)\s+(-?[\d.]+)\s*$/.exec(head)
+          if (mm) start -= mm[0].length
+        }
+      }
+      out.push({ x: px, y: pageHeight - py, invisible: tr === 3 || tr === 7, start, end: m.index + op.length, source: src.key })
+    }
+  }
+  return out
+}
+
+const INVISIBLE_ORIGIN_TOL = 1.5
+
+function markInvisibleBlocks(pageIndex: number, blocks: TextBlock[]): void {
+  let origins: ShowOpOrigin[]
+  try { origins = collectShowOpOrigins(pageIndex) } catch (_) { return }
+  if (!origins.some(o => o.invisible)) return
+  // Spatial hash on 2pt cells; a lookup checks the 3x3 neighbourhood.
+  const cell = 2
+  const grid = new Map<string, ShowOpOrigin[]>()
+  for (const o of origins) {
+    const k = `${Math.floor(o.x / cell)}:${Math.floor(o.y / cell)}`
+    const list = grid.get(k); if (list) list.push(o); else grid.set(k, [o])
+  }
+  const lookup = (x: number, y: number): { inv: boolean; vis: boolean } => {
+    const cx = Math.floor(x / cell), cy = Math.floor(y / cell)
+    let inv = false, vis = false
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+      const list = grid.get(`${cx + dx}:${cy + dy}`)
+      if (!list) continue
+      for (const o of list) {
+        if (Math.abs(o.x - x) <= INVISIBLE_ORIGIN_TOL && Math.abs(o.y - y) <= INVISIBLE_ORIGIN_TOL) { if (o.invisible) inv = true; else vis = true }
+      }
+    }
+    return { inv, vis }
+  }
+  const anyVisibleOp = origins.some(o => !o.invisible)
+  for (const b of blocks) {
+    let inv = 0, vis = 0
+    for (const ch of b.chars) {
+      const r = lookup(ch.origin[0], ch.origin[1])
+      if (r.inv) inv++
+      if (r.vis) vis++
+    }
+    if (inv > 0 && vis === 0) b.invisible = true
+    // No op origin coincides with any glyph (a pen-advanced run, or a fused
+    // extraction): on a page whose EVERY show op is invisible the block can
+    // only be invisible too.
+    else if (inv === 0 && vis === 0 && !anyVisibleOp) b.invisible = true
+  }
+}
+
+/**
+ * Blank every INVISIBLE show op whose origin falls inside one of `rects`
+ * (top-left page points). Used when a recognised run on a page that already
+ * carries a searchable layer (Acrobat's) is baked: the new visible text and
+ * its own invisible copy replace the old words, or search would find both.
+ * Blanking keeps every other offset valid. Page stream only — a layer inside
+ * a Form XObject is left alone (never seen from an OCR producer).
+ */
+function blankInvisibleTextIn(pageIndex: number, rects: [number, number, number, number][], margin = 1): { blanked: number } {
+  const origins = collectShowOpOrigins(pageIndex).filter(o => o.invisible && o.source === 'page')
+  if (!origins.length || !rects.length) return { blanked: 0 }
+  const inside = (o: ShowOpOrigin) => rects.some(([x0, y0, x1, y1]) =>
+    o.x >= Math.min(x0, x1) - margin && o.x <= Math.max(x0, x1) + margin &&
+    o.y >= Math.min(y0, y1) - margin && o.y <= Math.max(y0, y1) + margin)
+  const hits = origins.filter(inside)
+  if (!hits.length) return { blanked: 0 }
+  const stream = readContentStream(pageIndex)
+  const chars = stream.split('')
+  for (const h of hits) for (let i = h.start; i < h.end && i < chars.length; i++) chars[i] = ' '
+  const out = chars.join('')
+  const bytes = new Uint8Array(out.length)
+  for (let i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 0xFF
+  writeContentStream(pageIndex, bytes)
+  return { blanked: hits.length }
+}
+
+function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
+
+/**
+ * `/Tag BMC … EMC` sections this editor wrote (a searchable OCR layer) are
+ * blanked in place — nesting-aware, on the literal-masked stream so a BMC
+ * inside a string cannot fool the count. Offsets of everything else stay valid.
+ */
+function removeMarkedContent(pageIndex: number, tag: string): { removed: number } {
+  const stream = readContentStream(pageIndex)
+  const masked = maskStreamLiterals(stream)
+  const re = new RegExp(`\\/${escapeRe(tag)}\\s+BMC(?![A-Za-z])|(?<![A-Za-z/])(BDC|BMC|EMC)(?![A-Za-z])`, 'g')
+  const spans: [number, number][] = []
+  let depth = 0, open = -1
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m[1] === undefined) { // our tag's BMC
+      if (open < 0) { open = m.index; depth = 1 } else depth++
+      continue
+    }
+    if (open < 0) continue
+    if (m[1] === 'EMC') { depth--; if (depth === 0) { spans.push([open, m.index + 3]); open = -1 } }
+    else depth++
+  }
+  if (!spans.length) return { removed: 0 }
+  const chars = stream.split('')
+  for (const [a, b] of spans) for (let i = a; i < b; i++) if (chars[i] !== '\n') chars[i] = ' '
+  const out = chars.join('')
+  const bytes = new Uint8Array(out.length)
+  for (let i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 0xFF
+  writeContentStream(pageIndex, bytes)
+  return { removed: spans.length }
+}
+
+function hasMarkedContent(pageIndex: number, tag: string): boolean {
+  const masked = maskStreamLiterals(readContentStream(pageIndex))
+  return new RegExp(`\\/${escapeRe(tag)}\\s+BMC(?![A-Za-z])`).test(masked)
 }
 
 /** What a well-behaved ToUnicode legitimately expands ONE glyph to. */
@@ -2488,7 +2696,8 @@ function appendedTextMatrix(pageIndex: number, existingStream: string, x: number
 function addTextRunToPage(
   pageIndex: number,
   parts: { x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; faceId?: string; invisible?: boolean; fitWidth?: number }[],
-  rotation = 0
+  rotation = 0,
+  tag?: string
 ): { success: boolean; error?: string } {
   if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
   if (!parts.length) return { success: true }
@@ -2519,7 +2728,9 @@ function addTextRunToPage(
       )
     }
     if (!chunks.length) { page.destroy(); return { success: true } }
-    const newBlock = `\nq\nBT\n${chunks.join('\n')}\nET\nQ\n`
+    const body = `q\nBT\n${chunks.join('\n')}\nET\nQ`
+    // A tagged block can be found and removed again (`removeMarkedContent`).
+    const newBlock = tag ? `\n/${tag} BMC\n${body}\nEMC\n` : `\n${body}\n`
     const combined = existingStream + newBlock
     const streamBytes = new Uint8Array(combined.length)
     for (let i = 0; i < combined.length; i++) streamBytes[i] = combined.charCodeAt(i) & 0xFF

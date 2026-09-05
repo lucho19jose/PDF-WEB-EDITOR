@@ -27,6 +27,14 @@ export interface TextBlock {
 
   /** Characters with individual positions (for precise editing) */
   chars: TextChar[]
+
+  /**
+   * Drawn with text render mode 3 (invisible): a searchable OCR layer over a
+   * scan, Acrobat's or this editor's own. Extraction reports the words, the
+   * page shows the scan's pixels, and an edit made to such a block can never
+   * be seen — so the UI treats the page as a scan and never offers it.
+   */
+  invisible?: boolean
 }
 
 export interface TextChar {
