@@ -97,20 +97,35 @@ export function sampleLineColors(
    * side is the text.
    */
   const threshold = darkest + (lightest - darkest) * 0.42
-  let darkCount = 0
-  for (const p of px) if (p.l < threshold) darkCount++
-  // The share of the box that is dark decides only when the paper AROUND the
-  // box cannot be read. A tight box around small bold text is more than half
-  // ink — "COD PAGO: 419500" at 5.6pt bold on a payment slip — and the
-  // majority rule called its white paper the text: the replacement was drawn
-  // white on white and the label vanished. The bands just above and below
-  // the box are paper for a line on a page and band for a line on a band;
-  // a rule beside the text darkens one band, never both, so the LIGHTER
-  // band decides.
-  const mid = (darkest + lightest) / 2
-  const pad = Math.max(2, Math.round(h * 0.3))
-  const ring = [bandLuma(ctx, x, y - pad, w, pad), bandLuma(ctx, x, y + h, w, pad)].filter((v): v is number => v !== null)
-  const inverted = ring.length ? Math.max(...ring) < mid : darkCount > px.length * 0.5
+  // Which side is the ink is decided on a PADDED box, where text is the
+  // minority again. Inside a tight box around small bold text the ink is the
+  // majority ("COD PAGO: 419500" at 5.6pt sampled white on white and
+  // vanished), while the bands above and below a box are not the paper
+  // either: a cover's orange "efectiva" sits between two orange rules, and
+  // read by its bands the red was the ink. A third of the height above and
+  // below and a sixth of the width to each side is enough paper (or band) to
+  // outvote the letters, and too little of a neighbouring rule or header to
+  // outvote the paper.
+  const padY = Math.max(2, Math.round(h * 0.3)), padX = Math.max(2, Math.round(w * 0.15))
+  const px0 = Math.max(0, x - padX), py0 = Math.max(0, y - padY)
+  const pw = Math.min(ctx.canvas.width - px0, w + 2 * padX), ph = Math.min(ctx.canvas.height - py0, h + 2 * padY)
+  let darkShare = 0
+  try {
+    const pd = ctx.getImageData(px0, py0, pw, ph).data
+    const st = Math.max(1, Math.floor(Math.sqrt((pw * ph) / 3000)))
+    let dark = 0, n = 0
+    for (let row = 0; row < ph; row += st) for (let col = 0; col < pw; col += st) {
+      const i = (row * pw + col) * 4
+      if (luma(pd[i], pd[i + 1], pd[i + 2]) < threshold) dark++
+      n++
+    }
+    darkShare = n ? dark / n : 0
+  } catch (_) {
+    let darkCount = 0
+    for (const p of px) if (p.l < threshold) darkCount++
+    darkShare = darkCount / px.length
+  }
+  const inverted = darkShare > 0.5
 
   const inkCount = Math.max(1, Math.floor(px.length * 0.2))
   // Ink from one end, paper from the other, and never from the middle of the
@@ -125,22 +140,6 @@ export function sampleLineColors(
   }
 
   return { color: mean(ink), background: mean(paper) }
-}
-
-/** Median luminance of a band of the canvas, or null when the band is off the canvas. */
-function bandLuma(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number): number | null {
-  if (y < 0 || y + h > ctx.canvas.height || w < 1 || h < 1) return null
-  let data: Uint8ClampedArray
-  try { data = ctx.getImageData(x, y, w, h).data } catch (_) { return null }
-  const stride = Math.max(1, Math.floor(Math.sqrt((w * h) / 1000)))
-  const l: number[] = []
-  for (let row = 0; row < h; row += stride) for (let col = 0; col < w; col += stride) {
-    const i = (row * w + col) * 4
-    l.push(luma(data[i], data[i + 1], data[i + 2]))
-  }
-  if (!l.length) return null
-  l.sort((a, b) => a - b)
-  return l[Math.floor(l.length / 2)]
 }
 
 /**

@@ -4010,22 +4010,28 @@ and is right — the X sits beside the untouched logo — and "Test Parameters"
 their own are row-for-row neutral on this metric (0.959 → 0.959): a re-read
 cannot see stroke weight, which is why the lab exists.
 
-### Whether a run is light-on-dark is read from the paper AROUND it
+### Whether a run is light-on-dark is decided on a PADDED box
 `sampleLineColors` decided "the glyphs are the light side" when over half of
-the box was dark — the rule `cutByProfile` uses to invert a box. Inside a
-TIGHT box around small bold text the ink IS the majority: "COD PAGO: 419500"
-at 5.6pt bold on a payment slip sampled as white ink (0.9996) on white paper,
-the replacement was drawn white on white, and the label vanished from the
-page while extraction read it back perfectly — the sweep scored it 0 with
-nothing in the status bar to explain. Six of the ocr3 corpus's sim-0 rows
-have this shape (bold labels: "ASUNTO:", "AGENTES DE ADUANA…",
-"METODOLOGÍA", "Contrato de"). The bands just above and below the box are
-paper for a line on a page and band for a line on a band; a rule beside the
-text darkens one band, never both, so the LIGHTER band decides, and the
-majority rule remains only for a box at the canvas edge with no band to
-read. Measured: the label samples 0.01 on 1.0; the navy cover's "EL EGO",
-"ENEMIGO" and "RYAN HOLIDAY" still sample white on navy.
+the box was dark. Inside a TIGHT box around small bold text the ink IS the
+majority: "COD PAGO: 419500" at 5.6pt bold on a payment slip sampled as white
+ink (0.9996) on white paper, the replacement was drawn white on white, and the
+label vanished from the page while extraction read it back perfectly — the
+sweep scored it 0 with nothing in the status bar to explain. Six of the ocr3
+corpus's sim-0 rows had this shape ("ASUNTO:", "AGENTES DE ADUANA…",
+"METODOLOGÍA", "Contrato de").
 
+Two attempts to read the SURROUND instead were measured and dropped. The bands
+above and below the box ("the lighter band decides"): a cover's orange
+"efectiva" sits between two orange rules, so both bands were light and the red
+became the ink. The box's own side columns as a tie-break: a tight box's sides
+are the first and last letters' stems. What holds is the original majority
+rule on a box padded by a third of its height above and below and a sixth of
+its width to each side — enough paper (or band) to outvote the letters, too
+little of a neighbouring rule or header to outvote the paper. Verified on the
+slip (0.01 on 1.0), the red cover (orange 0.96/0.53/0.07 on red), the navy
+cover (white on navy), an identity card's teal strip (its text really is dark
+on teal), and a scan with a genuinely inverted table cell (light digits on
+black — right, and the reason a "1 → 0" row in the sweep was not a bug).
 ### Two lines that touch are told apart by the trough between them
 A logo's "MINERA" over its "SHOUXIN" (ocr3/016) kept the tops of the line
 below inside its box: the rows between the two held two pixels each — a
