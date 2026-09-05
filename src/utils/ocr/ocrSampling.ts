@@ -99,7 +99,18 @@ export function sampleLineColors(
   const threshold = darkest + (lightest - darkest) * 0.42
   let darkCount = 0
   for (const p of px) if (p.l < threshold) darkCount++
-  const inverted = darkCount > px.length * 0.5
+  // The share of the box that is dark decides only when the paper AROUND the
+  // box cannot be read. A tight box around small bold text is more than half
+  // ink — "COD PAGO: 419500" at 5.6pt bold on a payment slip — and the
+  // majority rule called its white paper the text: the replacement was drawn
+  // white on white and the label vanished. The bands just above and below
+  // the box are paper for a line on a page and band for a line on a band;
+  // a rule beside the text darkens one band, never both, so the LIGHTER
+  // band decides.
+  const mid = (darkest + lightest) / 2
+  const pad = Math.max(2, Math.round(h * 0.3))
+  const ring = [bandLuma(ctx, x, y - pad, w, pad), bandLuma(ctx, x, y + h, w, pad)].filter((v): v is number => v !== null)
+  const inverted = ring.length ? Math.max(...ring) < mid : darkCount > px.length * 0.5
 
   const inkCount = Math.max(1, Math.floor(px.length * 0.2))
   // Ink from one end, paper from the other, and never from the middle of the
@@ -114,6 +125,22 @@ export function sampleLineColors(
   }
 
   return { color: mean(ink), background: mean(paper) }
+}
+
+/** Median luminance of a band of the canvas, or null when the band is off the canvas. */
+function bandLuma(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number): number | null {
+  if (y < 0 || y + h > ctx.canvas.height || w < 1 || h < 1) return null
+  let data: Uint8ClampedArray
+  try { data = ctx.getImageData(x, y, w, h).data } catch (_) { return null }
+  const stride = Math.max(1, Math.floor(Math.sqrt((w * h) / 1000)))
+  const l: number[] = []
+  for (let row = 0; row < h; row += stride) for (let col = 0; col < w; col += stride) {
+    const i = (row * w + col) * 4
+    l.push(luma(data[i], data[i + 1], data[i + 2]))
+  }
+  if (!l.length) return null
+  l.sort((a, b) => a - b)
+  return l[Math.floor(l.length / 2)]
 }
 
 /**

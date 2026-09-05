@@ -1,6 +1,6 @@
 // Stage a producer-diverse OCR corpus from a scan census.
 //
-// Usage: node tools/pdf-sweep/stage-scans.mjs <scan-census.json> <srcFolder> <outName> <count>
+// Usage: node tools/pdf-sweep/stage-scans.mjs <scan-census.json> <srcFolder> <outName> <count> [...excludeManifests]
 //
 // Takes documents with scan pages that no earlier corpus holds, drops
 // duplicates (same size and page count — Downloads keeps "(1)" copies), and
@@ -11,9 +11,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-const [censusFile, src, outName, countArg] = process.argv.slice(2)
+const [censusFile, src, outName, countArg, ...excludeManifests] = process.argv.slice(2)
 const want = Number(countArg || 30)
 const rows = JSON.parse(fs.readFileSync(censusFile, 'utf8'))
+// Documents an earlier round of THIS census already staged (extra manifests
+// after the count), so successive rounds cover new documents.
+const already = new Set()
+for (const m of excludeManifests) for (const e of JSON.parse(fs.readFileSync(m, 'utf8'))) already.add(e.file)
+for (const r of rows) if (already.has(r.file)) r.excluded = true
 
 function family(p) {
   const s = (p || '').toLowerCase()
