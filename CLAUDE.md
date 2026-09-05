@@ -3972,6 +3972,14 @@ shows only that "something is off".
   B) is joined to the rest of it; a lone stem (I, l, 1) has a cell no wider
   than itself.
 
+- **Darkness is stated against the PAPER, not the box's lightest pixel.**
+  On an identity card's teal strip the lightest pixel is a white speck, the
+  teal reads a third dark, and to a stroke-relative level a third-dark field
+  is a faint stroke everywhere — "CONSTANCIA" traced as ten solid blocks
+  (`binarise` now subtracts the median darkness of what the cut did not call
+  ink, and rescales). On white paper that median is a few hundredths and
+  nothing changes; the sweep's "1 → 0" on that row is what found it.
+
 Two things around it, found on the same page:
 
 - **The run's size is the LETTERS' em from the commit on** (`traceItemNow`
@@ -4000,15 +4008,20 @@ Two things around it, found on the same page:
 tips (two stamped ID lines 0.7pt apart) keeps them; the walk refuses to make
 it worse, it does not make it right.
 
-Measured on the 15-document OCR corpus against a HEAD baseline run in
-parallel (two Playwright contexts, same per-document speed): 74 of 74 edits
-read back on both; cuts accepted 42 → 46 (the ascender walk); average re-read
-similarity 0.959 → 0.949, where the whole loss is two re-reads of a halftoned
-logo ("MARK" → "MARK X" on the fax scan, 0.56 → 0.2) whose bake was inspected
-and is right — the X sits beside the untouched logo — and "Test Parameters"
-0.97 → 0.94 twice; gains on four CJK and Spanish rows. The tracer changes on
-their own are row-for-row neutral on this metric (0.959 → 0.959): a re-read
-cannot see stroke weight, which is why the lab exists.
+Measured against HEAD baselines run in parallel (separate Playwright
+contexts), with everything in this session's commits in place:
+
+| corpus | docs | edits | read back | cuts accepted | avg re-read |
+|---|---|---|---|---|---|
+| main (`public/_sweep/ocr`) | 15 | 74 | 74 → 74 | 42 → 46 | 0.959 → 0.957 |
+| ocr3 (never-swept Downloads scans) | 30 | 160 | 157 → 159 | 94 → 99 | 0.875 → 0.927 |
+| ocr4 (second batch) | 30 | 141 | 140 → 140 | 85 → 91 | 0.933 → 0.922 |
+
+The tracer changes on their own are row-for-row neutral on this metric
+(0.959 → 0.959): a re-read cannot see stroke weight, which is why the lab
+exists. The ocr4 loss is three rows: a notary's script logo "Notaria" (both
+boxes wrong — the old one held the quill and a header line, the new one the
+x-height only) and a card's "CONSTANCIA" whose bake is inspected below.
 
 ### Whether a run is light-on-dark is decided on a PADDED box
 `sampleLineColors` decided "the glyphs are the light side" when over half of
