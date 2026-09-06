@@ -4348,6 +4348,34 @@ ever loaded by the writers) and the partial redraw declined with "width
 unknown" — a whole line redrawn for one added ideograph. The handler awaits
 `ensureCjkFontFor` like `addText` does.
 
+### pdf.js needs its WebAssembly decoders served, or a page never paints
+"I edited this text but after blur it returns to the same text": the engine
+had applied the edit, the status bar said "Text replaced", and the canvas kept
+the old line. pdf.js 5 decodes ICC colour spaces, JBIG2 and JPX through
+WebAssembly modules fetched from `wasmUrl`; unset, the fetch 404s and the
+render NEVER SETTLES. This editor's own OCR bake writes an ICC-based image
+(the transplanted tail of a partially redrawn line — a PNG MuPDF stores under
+sRGB ICC), so a scanned page edited that way (page 3 of the user's contract)
+rendered in 8 ms in MuPDF and timed out at 30 s in pdf.js, and any JBIG2 or
+JPEG 2000 scan was in that state from the start. `pdfjsDocumentOptions`
+(usePDFViewer.ts) points every `getDocument` — viewer and thumbnails — at
+`public/pdfjs/{wasm,iccs,cmaps,standard_fonts}`, copied from `pdfjs-dist`
+(3.2 MB; re-copy when pdfjs-dist is upgraded). Production must serve `.wasm`
+as application/wasm and may cache `/pdfjs/*` for a year.
+
+The second half of the same report: the render queue is SEQUENTIAL and paints
+the neighbouring pages in the background, and an edit saves and RELOADS the
+document while such a render is in flight. `getPage`/`render` on a destroyed
+pdf.js document never settle, so `renderBusy` stayed true for good and the
+edited page sat behind it — even a scroll could not repaint. A reload now
+drops the document reference BEFORE destroying it, bumps a generation and
+wakes every in-flight render (`abandonRenders`; a render races each await
+against that wake-up and returns nothing, so the queue re-queues the page and
+moves on), and a render arriving mid-reload waits for the new document rather
+than burning its three retries. Measured with the headless-Chrome
+reproduction (`scratchpad/pw/edit-repro.mjs`: type into the inline editor,
+blur, hash the canvas): unchanged before, changed right after blur now.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
