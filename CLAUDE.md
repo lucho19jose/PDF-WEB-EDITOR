@@ -4219,6 +4219,59 @@ columns (r6/038, "Nombres y Apellidos – Sello") still tears — it did before,
 on a different word — because the line group holds all three copies and no
 join matches.
 
+### A CID row takes a substitution AND keeps its columns — two gates, one table
+Microsoft Print to PDF draws a timesheet row as ONE BT holding ONE TJ array
+("06-05-26 16:00:00 18:00:00", cells separated by kerns) in a CID subset that
+holds digits and little else. Every cell edit needing a letter refused with
+"Could not find matching text" — ten rows across three files in round 7 —
+while "DPTO:" → "AREA:" on the same producer had been measured working when
+`readCidWidths` went in. The gate added AFTER it (`encodingName === 'Unknown'
+&& codeBytes !== 1`, meant for two-byte SIMPLE fonts whose codes index
+/Widths as garbage) also matched every Type0 font — a Type0 is always
+'Unknown' (its /Encoding is a CMap name) and two-byte by design — and took the
+CID branch straight back. The gate is now simple-font only; a Type0 is
+admitted by the branch above it, which already demands a known /W.
+
+Opening the gate ALONE edited the wrong row, and the sweep would not have
+seen it (its markers never take this path). Containment candidates were
+ranked by the OP's start (`opRunDistanceToTarget`), and every row's array
+starts in the same column 150pt left of the clicked cell: all rows measured
+148pt, fell into one 8pt bucket, and the tie went to the first row in the
+stream. `runDistanceToTarget` — the per-RUN measure built for the
+one-character label — now reads a CID font's /W as well as /Widths, answers
+in PAGE points (it answered local units; a `0.75 cm` stream scaled them),
+and ranks the containment candidates of both the REPLACE matcher and the MOVE
+matcher's carrying blocks; the op-start distance is the fallback when no run
+is found. The move had the same tie: at HEAD a drag on row two's "16:00:00"
+moved row ONE's, silently.
+
+The same-font (keep-hex) compensation kern read /Widths only, so a CID row
+got NO kern after a same-subset edit and every later cell shifted by the
+width difference — "01-01-26" → "AREA" moved the "8:00" and "16:00:00" beside
+it 8pt left, and an empty replacement 21pt. It reads /W now, like the
+substitution branch. Measured on the three timesheets: "16:00:00" → "17:30:00",
+"8:00" → "9:15", "01-01-26" → "AREA", "" and "SWEEPMARK50" (Helvetica
+substitute) each land in the clicked cell with the row's other cells at their
+original x, and a cell drag moves its own row. Sweep: r3 +4, r5 +6, r7 +7,
+zero lost; the "changed" rows are a 4-character cell replaced by an
+11-character marker that overruns the next cell (char_delta 0, the neighbour
+unmoved) and a right-edge cell whose marker is clipped — both the documented
+justified-line limitation, and both were refusals before.
+
+### /Resources is INHERITABLE — dompdf keeps it on the /Pages node
+`pageObj.get('Resources')` answers MuPDF's null object on every dompdf/CPDF
+page (15 of round 7's 60 files), the `.get('Font')` after it throws "Cannot
+read properties of null (reading '_fromPDFObjectKeep')" (689 times in one
+sweep), every reader caught that as "no font", and the family was edited
+blind: no ToUnicode, no /Widths, no glyph-availability. Worse, the WRITE
+sites created a fresh empty /Resources on the page, which SHADOWS the
+inherited one — a substitution on a dompdf page reported "cannot find XObject
+resource 'I1'" and lost the page's image and every font it drew with.
+`pageResourcesOf` reads with `getInheritable`; `ownPageResources` (for
+writes) starts the page's own dictionary as a copy of the inherited entries,
+so nothing already on the page stops resolving and nothing registered for
+one page reaches the others. All seven corpora experiment-identical.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
