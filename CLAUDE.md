@@ -4272,6 +4272,82 @@ writes) starts the page's own dictionary as a copy of the inherited entries,
 so nothing already on the page stops resolving and nothing registered for
 one page reaches the others. All seven corpora experiment-identical.
 
+### A fallback glyph is stroked up to the scan's stems; a traced one at half the width
+The user's edited contract showed "MAESTRA" appended to a scanned bold title
+visibly lighter than the letters beside it: the scan's stems measure 0.161 em
+(the face detector's own cue) and Helvetica-Bold's 0.138. `OcrTextItem.strokeRatio`
+keeps the detector's measurement of the run; `ocrStroke.ts` turns the
+difference against a per-face stem table (calibrated with
+`tools/ocr-calibrate/measure.mjs` — run `build-sample.mjs` first) into a line
+width, and the worker draws FALLBACK segments in render mode 2 with that
+width in the text's own colour (`strokeWidth` on `TextRunPart`/`addText`,
+`2 Tr`/`w` set per op inside BT). Traced glyphs get their own
+`tracedStrokeWidth`: an outline traced at the mass-conserving level renders
+crisp and lighter than the blurred stems it came from (0.148 against 0.172),
+and each traced glyph remembers the weight measured on the bitmap it was
+traced FROM (`strokeRatioOfImage`). At HALF the nominal width — potrace leaves
+many short segments and a round-joined stroke puffs every one, so 0.37pt
+took the title to 0.197 em where 0.185pt lands it on the scan's 0.172.
+
+### The patch covers the ink's HALO, measured
+Deleting "MINERA SHOUXIN PERÚ S.A." left the accent of the Ú on the page: the
+ink box stops at the caps and the fixed 12% pad did not reach two rows up.
+`measureHalo` (ocrSampling.ts) walks each edge of the box outward on a fresh
+220 DPI raster at bake time — faint rows (JPEG ringing, any visible tint) are
+always taken, sparse dark rows (an accent, a descender) are taken, dense dark
+rows (the next line) stop the walk, and up to two clean rows are looked
+across for a floating accent — and `item.halo` widens the patch in
+`patchRect` and in the partial redraw (top and bottom separately).
+
+### A stretch takes the weight of the letters it is GLUED to
+"Conste por el presente documento el CONTRATO DE "MEJORAMIENTO…"" is regular
+up to the quote and bold after it: one OCR line, one face verdict (bold), one
+scan face keyed by that style. Typing "CONTRATOS" traced the S from "SALA" in
+the bold half and drew it heavy inside a regular word. Every cell of the
+glyph cut carries its stem ratio (`cellStrokeRatio`, `SpanCut.cells[].weight`);
+`weightPlan` compares the face's glyph against the cells beside the change
+and lists disagreeing characters in `faceSkip` (the worker's `segmentRun`
+leaves them to the base-14 face; `measureRuns` honours the same list, or the
+stretch is measured at the wrong glyph's width). The base-14 face's weight
+comes from the detector run over a window of the neighbours' own ink
+(`measureRatio`, the six cells on the side the stretch is GLUED to — the bold
+quote after the space says nothing about the S), against the detector's
+calibrated bar; the per-cell ratios cannot decide this — quantised to a pixel
+of the em and light on any thin letter, they say "different", never "bold".
+A split-the-line's-weights heuristic was tried first and put the split in
+the wrong place for exactly that reason.
+
+### An appended run resets Tc — the page's stream leaves one in force
+Acrobat's OCR layer ends its stream with `-0.035 Tc`, and text state outlives
+ET: every object this editor appended inherited it, so each glyph's pen fell
+0.03pt short of its advance. An invisible head fitted to 150pt drew 149, and
+the extractor read the gap before the stretch as a space — "MSP-SIST-CS-202
+6-777", "CONTRATO S DE". `addTextRunToPage` and `addTextToPage` open with
+`0 Tc 0 Tw 0 Ts`. `tools/pdf-sweep/fit-check.mjs` draws a fitted run in node
+and measures it back (the CJK face is served from `public/` through a
+patched `fetch`; the worker reaches opentype.js through the `ot` shim so the
+SSR loader's `default` wrapping does not break it). The invisible head and
+tail are also fitted to within a hair (0.3pt) of the stretch where the text
+has NO space at that boundary, so the extracted advances meet; where it has
+one, the gap is kept to say so.
+
+### A run edited AGAIN after a bake blanks and covers its first bake
+The second edit patched the ORIGINAL ink box and blanked only invisible ops,
+so the first bake's visible stretch stayed on the page beside the new title
+and every extractor read both. `blankInvisibleText(…, all)` blanks every op
+whose origin lies under the edited rects (the patch covers them anyway), the
+rects include baked runs, and after a bake each run's ink box grows
+horizontally to what its patches painted (`PatchOp.item`, net of the pad —
+taking the padded rectangle would grow the box by a pad on every bake). A
+baked run's glyph cut is forgotten, so its second edit is a whole-run redraw
+from the face; with every glyph traced and stroked that reads as one weight.
+
+### `measureRuns` loads the CJK face before measuring
+The first Chinese edit on a page measured `exact: false` (the face was only
+ever loaded by the writers) and the partial redraw declined with "width
+unknown" — a whole line redrawn for one added ideograph. The handler awaits
+`ensureCjkFontFor` like `addText` does.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
