@@ -5303,10 +5303,23 @@ function findBtBlocksByPosition(
       if (carrying.length === 0) continue
       picked = carrying
     }
+    // A block that merely CARRIES the target is ranked by where inside it the
+    // target is drawn, not by its origin. A Print to PDF timesheet draws each
+    // row as one BT holding one TJ array, every row's array starting in the
+    // same column 150pt left of the clicked cell: measured from the origin
+    // every row tied, and the tie went to the first row in the stream — a
+    // drag on row two's "16:00:00" moved row ONE's, silently, while
+    // reporting success. `runDistanceToTarget` locates the run on real
+    // advances (the /W table for a CID font); a block whose run it cannot
+    // find keeps its origin distance, exactly as before.
+    const rankOf = (b: BtInfo): number => {
+      if (picked === runBlocks || (picked === near && near.length > 0) || exact) return distOf(b)
+      return runDistanceToTarget(b, targetBlock.text, pageIndex, stream, targetBlock, pageHeight) ?? distOf(b)
+    }
     candidates.push({
       blocks: picked,
       score: exact ? 2 : 1,
-      dist: Math.min(...picked.map(distOf)),
+      dist: Math.min(...picked.map(rankOf)),
       order: candidates.length
     })
   }
@@ -5994,7 +6007,18 @@ function replaceTextInContentStreamFontAware(
           // the NEXT row's copy, and the edit landed one row down. Only when
           // an op carrying the target is found — a block whose ops decode to
           // '?' keeps its origin distance rather than being dropped.
-          const runDist = opRunDistanceToTarget(block, normalizedTarget, pageIndex, stream, targetBlock, pageHeight)
+          //
+          // The RUN's position first, the op's START second. A Print to PDF
+          // timesheet draws each row as one BT holding one TJ array, and
+          // every row's array starts in the same column, 150pt left of the
+          // clicked cell: measured from the op's start every row of the table
+          // was 148pt away, they all fell into one 8pt bucket, and the tie
+          // went to the FIRST row in the stream — the edit meant for row two
+          // would have landed in row one. `runDistanceToTarget` locates the
+          // glyphs inside the array on real advances (the /W table for a CID
+          // font), so the row actually under the click measures zero.
+          const runDist = runDistanceToTarget(block, normalizedTarget, pageIndex, stream, targetBlock, pageHeight)
+            ?? opRunDistanceToTarget(block, normalizedTarget, pageIndex, stream, targetBlock, pageHeight)
           if (runDist !== null) dist = runDist
         }
         // Below every direct fuzzy score (>= 0.7): at equal distance a whole
@@ -7669,8 +7693,15 @@ function replaceInsideTjArray(
     // viewer advances a symbolic TrueType subset (the bilingual form draws
     // "Normal / Urgente / Urgente e Importante" as one such array inside a
     // SimSun block, and refusing it read as "could not find"). Two-byte codes
-    // read as bytes index garbage, and stay refused.
-    if (simpleInfo.encodingName === 'Unknown' && (encoding?.codeBytes ?? 1) !== 1) return null
+    // read as bytes index garbage, and stay refused — for a SIMPLE font. A
+    // Type0 font is always 'Unknown' here (its /Encoding is a CMap name) and
+    // its codes are two bytes by design; they are CIDs, and the /W table that
+    // computed `oldW` above is indexed by exactly those. This gate was
+    // written after the CID branch and, applied to Type0 as well, silently
+    // took back what that branch had opened: every Microsoft Print to PDF
+    // timesheet row — one TJ array per row, one CID subset holding digits and
+    // little else — refused any cell edit needing a letter the subset lacked.
+    if (!simpleInfo.isType0 && simpleInfo.encodingName === 'Unknown' && (encoding?.codeBytes ?? 1) !== 1) return null
     const avgAdvance = oldW / oldGlyphs
     if (!(avgAdvance >= 150 && avgAdvance <= 1500)) return null
     // Split the array around the run and draw the run in the substitute font.
@@ -7681,8 +7712,20 @@ function replaceInsideTjArray(
     return `${pre}] TJ /${subst.fontRef} ${subst.sizeStr} Tf ${newLiteral.literal} Tj ${restore}[${comp}${post}`
   }
 
+  // The same-font compensation reads whichever width table the font has.
+  // It read /Widths only, so a CID row (Print to PDF, one array per row) got
+  // NO kern after a keep-hex replacement and every later cell shifted by
+  // the width difference: "01-01-26" → "AREA" in the row's own subset moved
+  // the "8:00" and "16:00:00" beside it 8pt to the left. The codes of a
+  // keep-hex literal are CIDs, the same keys /W is indexed by.
   let comp = ''
-  if (oldKnown && simpleInfo?.widths) {
+  if (oldKnown && simpleInfo?.isType0 && simpleInfo.cidWidths) {
+    const cw = simpleInfo.cidWidths
+    const dw = simpleInfo.cidDefaultWidth ?? 1000
+    let newW = 0
+    for (const code of newLiteral.codes) newW += cw.get(code) ?? dw
+    comp = ` ${fmtNum(newW - oldW)} `
+  } else if (oldKnown && simpleInfo?.widths) {
     const w = simpleInfo.widths
     const fc = simpleInfo.firstChar
     let newW = 0, known = true
@@ -8010,12 +8053,21 @@ function runDistanceToTarget(
     const fr = op.fontRef && op.fontRef !== block.fontRef
       ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
       : { encoding: block.encoding, simpleInfo: getSimpleFontInfo(pageIndex, block.fontRef) }
-    const widths = fr.simpleInfo?.widths
+    // Whichever width table the font has — /Widths for a simple font, the
+    // descendant's /W for an Identity CID font (the table `showOpAdvance`
+    // and `replaceInsideTjArray` already read). Without the CID branch a
+    // Print to PDF row was measured as a whole op, which spans every cell.
+    const si = fr.simpleInfo
+    const advanceOf: ((code: number) => number | undefined) | null =
+      si?.isType0 && si.cidWidths
+        ? (code: number) => si.cidWidths!.get(code) ?? si.cidDefaultWidth ?? 1000
+        : si?.widths
+          ? (code: number) => si.widths![code - si.firstChar]
+          : null
 
     // Inside a TJ array the target can be one cell of a row, so the run is
     // located glyph by glyph rather than taken as the whole op.
-    if (op.kind === 'TJ' && widths) {
-      const fc = fr.simpleInfo!.firstChar
+    if (op.kind === 'TJ' && advanceOf) {
       const items = parseTjItems(op.raw, fr.encoding, fr.simpleInfo)
       let full = '', acc = 0, usable = true
       const xAt: number[] = []
@@ -8023,7 +8075,7 @@ function runDistanceToTarget(
         if (!it.isLiteral) { acc -= (it.value ?? 0); continue }
         if (it.decoded.length !== it.codes.length) { usable = false; break }
         for (let c = 0; c < it.decoded.length; c++) {
-          const cw = widths[it.codes[c] - fc]
+          const cw = advanceOf(it.codes[c])
           if (cw === undefined) { usable = false; break }
           xAt.push(acc); acc += cw; full += it.decoded[c]
         }
@@ -8044,7 +8096,10 @@ function runDistanceToTarget(
     const w = showOpAdvance(op, fr.encoding, fr.simpleInfo ?? null, state.tfSize, 0, 0)
     keep(gap(state.penX, state.penX + (w ?? 0)) + dy)
   }
-  return best
+  // In PAGE points, like every other distance the candidates are ranked by:
+  // the gaps above are in the block's own space, which a `0.75 0 0 0.75 cm`
+  // stream scales.
+  return best === null ? null : best * local.unitScale
 }
 
 interface TjSegmentHit {
