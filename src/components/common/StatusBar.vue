@@ -27,6 +27,45 @@
       <q-btn flat dense icon="chevron_right" size="xs" :disable="docStore.currentPage >= docStore.totalPages" @click="nextPage" />
       <q-separator vertical inset class="q-mx-sm" />
       <span>{{ docStore.fileSizeFormatted }}</span>
+      <!--
+        The document's digital signatures. A signed contract says nothing about
+        being signed anywhere else in this UI, and an edit breaks the signature
+        silently — so the chip states both: that the file is signed, and, once
+        `isModified`, that the edits have invalidated it. The list is as of the
+        open (see the store); the modified flag is what changes the chip.
+      -->
+      <template v-if="signatures.length">
+        <q-separator vertical inset class="q-mx-sm" />
+        <q-chip
+          dense square outline size="sm"
+          class="sig-chip q-ma-none"
+          :color="docStore.isModified ? 'amber-5' : 'teal-4'"
+          :icon="docStore.isModified ? 'gpp_bad' : 'verified_user'"
+          :label="sigLabel"
+          data-testid="signature-chip"
+        >
+          <q-tooltip anchor="top right" self="bottom right" max-width="360px" class="sig-tooltip">
+            <div class="text-weight-medium q-mb-xs">
+              {{ signatures.length }} digital signature{{ signatures.length === 1 ? '' : 's' }}
+              <span v-if="signers.length > 1"> · {{ signers.length }} signers</span>
+            </div>
+            <div v-for="(s, i) in tooltipRows" :key="i" class="sig-row">
+              <span>{{ s.name || 'Signer not stated' }}</span>
+              <span v-if="s.date" class="text-grey-5"> · {{ s.date }}</span>
+              <span v-if="s.reason" class="text-grey-5"> · {{ s.reason }}</span>
+              <span v-if="s.page >= 0" class="text-grey-5"> · p. {{ s.page + 1 }}</span>
+            </div>
+            <div v-if="signatures.length > tooltipRows.length" class="text-grey-5">
+              … and {{ signatures.length - tooltipRows.length }} more
+            </div>
+            <div class="q-mt-xs" :class="docStore.isModified ? 'text-amber-5' : 'text-grey-4'">
+              {{ docStore.isModified
+                ? 'The document has been edited: its digital signatures are no longer valid.'
+                : 'Editing the document will invalidate its digital signatures.' }}
+            </div>
+          </q-tooltip>
+        </q-chip>
+      </template>
     </template>
   </div>
 </template>
@@ -54,4 +93,44 @@ function prevPage() {
 function nextPage() {
   if (docStore.currentPage < docStore.totalPages) docStore.setPage(docStore.currentPage + 1)
 }
+
+// ---- digital signatures ----
+
+const signatures = computed(() => docStore.signatures)
+
+/** Distinct signer names — an Intellisign contract holds one /Sig per signer PER PAGE. */
+const signers = computed(() => {
+  const names = new Set<string>()
+  for (const s of signatures.value) if (s.name) names.add(s.name)
+  return [...names]
+})
+
+/** Short and honest: the one signer's name when there is exactly one, else a count. */
+const sigLabel = computed(() => {
+  if (docStore.isModified) return 'Signature invalidated by edits'
+  const n = signatures.value.length
+  if (signers.value.length === 1) return `Signed by ${signers.value[0]}`
+  return `Signed · ${n} signature${n === 1 ? '' : 's'}`
+})
+
+/** Newest first, capped: a 42-entry tooltip is a wall, not information. */
+const TOOLTIP_ROWS = 8
+const tooltipRows = computed(() => {
+  const rows = signatures.value.map(s => ({ ...s, date: s.date ? s.date.replace('T', ' ').replace(/[+-]\d\d:\d\d$|Z$/, '') : undefined }))
+  rows.sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''))
+  return rows.slice(0, TOOLTIP_ROWS)
+})
 </script>
+
+<style scoped>
+.sig-chip {
+  font-size: 11px;
+  height: 18px;
+  cursor: default;
+}
+.sig-row {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+</style>
