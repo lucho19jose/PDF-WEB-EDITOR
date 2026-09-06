@@ -11216,21 +11216,218 @@ function movePage(from: number, to: number): {
 // SEARCH
 // ==========================================
 
+/**
+ * Search is a LADDER, the way the edit matchers are: exact first, and each
+ * looser rung only when every tighter one found nothing ON THAT PAGE, so an
+ * exact hit is never diluted by fuzzy ones beside it.
+ *
+ *   1. MuPDF's own `page.search` — unchanged.
+ *   2. `foldForMatch` on both sides: case, ligatures (U+FB00–FB06 expanded,
+ *      which is how the extraction reads a pdfTeX "fi"), whitespace collapsed.
+ *   3. SPACE-FREE: every space removed from both sides. The extraction of an
+ *      OCR'd scan or of a line this editor re-encoded carries spaces the page
+ *      does not draw ("MSP-SIST-CS-202 5-004", "Cab rera"), and a user does not
+ *      know where they are.
+ *   4. Punctuation- and diacritic-tolerant: letters and digits only on both
+ *      sides — pdfTeX draws an accent as its own glyph ("tr´afico"), and a
+ *      scan's OCR drops or invents a dot or a hyphen.
+ *
+ * Rungs 2–4 run over ONE walk of the page's structured text: the folded forms
+ * are built once per page with a map from every folded character back to the
+ * glyph it came from, so a hit's quads still cover the glyphs the user is
+ * looking for. Hits are deduplicated by glyph range, one quad per line.
+ */
 function searchPage(pageIndex: number, needle: string, maxHits = 100): any[] {
   if (!needle) return []
   const page = pdfDoc.loadPage(pageIndex)
-  const results = page.search(needle, maxHits) as number[][][] // Quad[][]
-  page.destroy()
-  return results.map((quads) => {
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
-    for (const q of quads) {
-      for (let i = 0; i < q.length; i += 2) {
-        x0 = Math.min(x0, q[i]); x1 = Math.max(x1, q[i])
-        y0 = Math.min(y0, q[i + 1]); y1 = Math.max(y1, q[i + 1])
-      }
+  let results: number[][][]
+  try {
+    results = page.search(needle, maxHits) as number[][][] // Quad[][]
+  } finally {
+    page.destroy()
+  }
+  if (results.length > 0) {
+    return results.map((quads) => ({ pageIndex, quads, rect: quadsRect(quads) }))
+  }
+  return searchPageFolded(pageIndex, needle, maxHits)
+}
+
+function quadsRect(quads: number[][]): [number, number, number, number] {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+  for (const q of quads) {
+    for (let i = 0; i < q.length; i += 2) {
+      x0 = Math.min(x0, q[i]); x1 = Math.max(x1, q[i])
+      y0 = Math.min(y0, q[i + 1]); y1 = Math.max(y1, q[i + 1])
     }
-    return { pageIndex, quads, rect: [x0, y0, x1, y1] }
-  })
+  }
+  return [x0, y0, x1, y1]
+}
+
+/** One glyph of a page as the search ladder sees it. `line` groups the quads of a hit. */
+interface SearchGlyph { c: string; quad: number[] | null; line: number }
+
+/** A folded string plus, for each of its characters, the index of the glyph it came from. */
+interface FoldedText { text: string; map: number[] }
+
+/**
+ * The page's glyphs in extraction order. Lines are separated by a synthetic
+ * '\n' with no quad, so a hit can never bridge two lines without a whitespace
+ * boundary between them (rung 3 removes spaces, not newlines — it is the
+ * spaces INSIDE a token that lie, never the line break).
+ */
+function collectSearchGlyphs(pageIndex: number): SearchGlyph[] {
+  const page = pdfDoc.loadPage(pageIndex)
+  const stext = page.toStructuredText('preserve-whitespace')
+  const glyphs: SearchGlyph[] = []
+  let line = 0
+  try {
+    stext.walk({
+      onChar(c: string, _origin: number[], _font: any, _size: number, quad: number[]) {
+        glyphs.push({ c, quad: [quad[0], quad[1], quad[2], quad[3], quad[4], quad[5], quad[6], quad[7]], line })
+      },
+      endLine() {
+        if (glyphs.length && glyphs[glyphs.length - 1].c !== '\n') glyphs.push({ c: '\n', quad: null, line })
+        line++
+      }
+    })
+  } finally {
+    stext.destroy()
+    page.destroy()
+  }
+  return glyphs
+}
+
+/** Rung 2's form of the page: `foldForMatch` per glyph, with the back-map. */
+function foldGlyphs(glyphs: SearchGlyph[]): FoldedText {
+  let text = ''
+  const map: number[] = []
+  let pendingSpace = -1 // glyph index of the first whitespace of a run not yet emitted
+  for (let g = 0; g < glyphs.length; g++) {
+    const c = glyphs[g].c
+    if (/\s/.test(c)) { if (pendingSpace < 0) pendingSpace = g; continue }
+    if (pendingSpace >= 0 && text.length > 0) { text += ' '; map.push(pendingSpace) }
+    pendingSpace = -1
+    const folded = (LIGATURE_FOLD[c] ?? c).toLowerCase()
+    for (const fc of folded) { text += fc; map.push(g) }
+  }
+  return { text, map }
+}
+
+/** Rung 3's form: every space of a folded text removed, map carried along. */
+function stripSpaces(f: FoldedText): FoldedText {
+  let text = ''
+  const map: number[] = []
+  for (let i = 0; i < f.text.length; i++) {
+    if (f.text[i] === ' ') continue
+    text += f.text[i]; map.push(f.map[i])
+  }
+  return { text, map }
+}
+
+/**
+ * Rung 4's form: letters and digits ONLY, diacritics dropped (NFD, marks
+ * removed) — on both sides. The needle-side-only variant ("the needle's
+ * alphanumeric runs joined by `[^\p{L}\p{N}]*`") was written first and cannot
+ * find a pdfTeX accent: TeX draws the accent BEFORE its vowel, so the page reads
+ * "tr´afico" in extraction order and no order-preserving pattern over "tráfico"
+ * matches it. Stripping the page's non-alphanumerics too is what makes the
+ * accent, a line-end hyphen and OCR's stray punctuation all invisible.
+ */
+function alnumOnly(f: FoldedText): FoldedText {
+  let text = ''
+  const map: number[] = []
+  for (let i = 0; i < f.text.length; i++) {
+    const base = f.text[i].normalize('NFD').replace(/[^\p{L}\p{N}]+/gu, '')
+    for (const bc of base) { text += bc; map.push(f.map[i]) }
+  }
+  return { text, map }
+}
+
+/** Every non-overlapping occurrence of `sub` in `text`, as [start, end) index pairs. */
+function indexOfAll(text: string, sub: string, limit: number): [number, number][] {
+  const out: [number, number][] = []
+  if (!sub) return out
+  let from = 0
+  while (out.length < limit) {
+    const i = text.indexOf(sub, from)
+    if (i < 0) break
+    out.push([i, i + sub.length])
+    from = i + sub.length
+  }
+  return out
+}
+
+function searchPageFolded(pageIndex: number, needle: string, maxHits: number): any[] {
+  const glyphs = collectSearchGlyphs(pageIndex)
+  if (glyphs.length === 0) return []
+
+  const folded = foldGlyphs(glyphs)
+  const needle2 = foldForMatch(needle)
+  if (!needle2) return []
+
+  const rungs: (() => [number, number][] | null)[] = [
+    // 2. case-folded, ligatures expanded, whitespace collapsed
+    () => toGlyphRanges(indexOfAll(folded.text, needle2, maxHits), folded.map),
+    // 3. space-free — on BOTH sides: the page may carry a phantom space inside
+    //    a token the needle spells cleanly, so a spaceless needle still runs.
+    () => {
+      const needle3 = needle2.replace(/ /g, '')
+      if (!needle3) return null
+      const nospace = stripSpaces(folded)
+      return toGlyphRanges(indexOfAll(nospace.text, needle3, maxHits), nospace.map)
+    },
+    // 4. punctuation- and diacritic-tolerant: letters and digits only, both sides
+    () => {
+      const needle4 = alnumOnly({ text: needle2, map: [] }).text
+      if (!needle4) return null
+      const plain = alnumOnly(folded)
+      return toGlyphRanges(indexOfAll(plain.text, needle4, maxHits), plain.map)
+    }
+  ]
+
+  for (const rung of rungs) {
+    const ranges = rung()
+    if (ranges && ranges.length > 0) return rangesToHits(pageIndex, glyphs, ranges)
+  }
+  return []
+}
+
+/** Map [start, end) ranges of a folded string back to inclusive glyph ranges, deduplicated. */
+function toGlyphRanges(ranges: [number, number][], map: number[]): [number, number][] {
+  const seen = new Set<string>()
+  const out: [number, number][] = []
+  for (const [s, e] of ranges) {
+    if (e <= s) continue
+    const g0 = map[s], g1 = map[e - 1]
+    const key = `${g0}-${g1}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push([g0, g1])
+  }
+  return out
+}
+
+/** One quad per line a hit crosses — the union of its glyphs' quads on that line, as MuPDF's search reports. */
+function rangesToHits(pageIndex: number, glyphs: SearchGlyph[], ranges: [number, number][]): any[] {
+  const hits: any[] = []
+  for (const [g0, g1] of ranges) {
+    const perLine = new Map<number, [number, number, number, number]>()
+    for (let g = g0; g <= g1; g++) {
+      const q = glyphs[g].quad
+      if (!q) continue
+      const box = perLine.get(glyphs[g].line) ?? [Infinity, Infinity, -Infinity, -Infinity]
+      for (let i = 0; i < 8; i += 2) {
+        box[0] = Math.min(box[0], q[i]); box[2] = Math.max(box[2], q[i])
+        box[1] = Math.min(box[1], q[i + 1]); box[3] = Math.max(box[3], q[i + 1])
+      }
+      perLine.set(glyphs[g].line, box)
+    }
+    const quads: number[][] = []
+    for (const [x0, y0, x1, y1] of perLine.values()) quads.push([x0, y0, x1, y0, x0, y1, x1, y1])
+    if (quads.length === 0) continue
+    hits.push({ pageIndex, quads, rect: quadsRect(quads) })
+  }
+  return hits
 }
 
 function searchDocument(needle: string, maxHitsPerPage = 100): any[] {
