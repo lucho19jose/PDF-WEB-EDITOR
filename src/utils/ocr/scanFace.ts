@@ -1,6 +1,6 @@
 import * as opentype from 'opentype.js'
 import { init as potraceInit, potrace } from 'esm-potrace-wasm'
-import { cutGlyphs, cellBitmap, cellBitmapTraced, traceLevel, expectedAdvance, lastCutReason, type GlyphCutResult } from './glyphCut'
+import { cutGlyphs, cellBitmap, cellBitmapTraced, cellStrokeRatio, traceLevel, expectedAdvance, lastCutReason, type GlyphCutResult } from './glyphCut'
 import { commonAffix } from './partialRedraw'
 import type { OcrBox } from './ocrEngine'
 
@@ -33,6 +33,8 @@ export interface TracedGlyph {
   char: string
   path: opentype.Path
   advance: number
+  /** Stem over the em of the cell this glyph was traced from (`cellStrokeRatio`), when measurable. */
+  weight?: number
 }
 
 export interface ScanFace {
@@ -172,7 +174,10 @@ export async function traceRunIntoFace(
     // own spacing: a fixed twentieth set a heavy 35pt title visibly looser
     // than its neighbours.
     const advance = Math.round((cell.x1 - cell.x0) * scale + bearing * 2)
-    face.glyphs.set(cell.char, { char: cell.char, path, advance })
+    // The cell's own weight travels with the glyph: a line that changes
+    // weight midway must not lend a bold "S" to its regular half.
+    const weight = cellStrokeRatio(cut, cell) ?? undefined
+    face.glyphs.set(cell.char, { char: cell.char, path, advance, weight })
     added++
   }
   if (added) await rebuild(face)

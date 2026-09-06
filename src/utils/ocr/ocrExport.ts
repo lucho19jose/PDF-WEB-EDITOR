@@ -56,6 +56,8 @@ export interface TextOp {
    * ocrStroke.ts. Traced glyphs are never stroked.
    */
   strokeWidth?: number
+  /** Characters the scan face must not draw in this run (see `weightPlan`); the base-14 face takes them. */
+  faceSkip?: string
   /**
    * Ops sharing a group are ONE line — the invisible head, the visible stretch
    * and the invisible tail of a partial redraw — and the bake writes them as
@@ -258,7 +260,7 @@ export function planOcrExport(
     // head and tail keep the scan's own pixels. See partialRedraw.ts.
     const partial = !item.vertical ? partialFor?.(item) : null
     if (partial) {
-      const outcome = planPartial(item, { ...partial, fontName, color: plainColor(item.color), faceId: faceIdFor?.(item), strokeRatio: item.strokeRatio }, items, pageWidth)
+      const outcome = planPartial(item, { ...partial, fontName: partial.localFontName ?? fontName, color: plainColor(item.color), faceId: faceIdFor?.(item), strokeRatio: item.strokeRatio }, items, pageWidth)
       if ('mode' in outcome) {
         patches.push(...outcome.patches)
         images.push(...outcome.images)

@@ -15,6 +15,8 @@ export interface TextRunPart {
   fitWidth?: number
   /** Stroke the fallback glyphs (not the traced ones) by this many points, in the text's colour — weight matched to the scan. */
   strokeWidth?: number
+  /** Characters the scan face must not draw in this run; the base-14 face takes them. */
+  faceSkip?: string
 }
 
 export type WorkerRequest =
@@ -26,7 +28,7 @@ export type WorkerRequest =
   | { id: number; type: 'readContentStream'; data: { pageIndex: number } }
   | { id: number; type: 'writeContentStream'; data: { pageIndex: number; streamBytes: ArrayBuffer } }
   | { id: number; type: 'replaceText'; data: { pageIndex: number; blockId: string; newText: string } }
-  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number; faceId?: string; invisible?: boolean; strokeWidth?: number } }
+  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number; faceId?: string; invisible?: boolean; strokeWidth?: number; faceSkip?: string } }
   /** Several runs in ONE text object — the invisible head, the visible stretch and the invisible tail of a partial redraw — so extraction reads them as one line. */
   | { id: number; type: 'addTextRun'; data: { pageIndex: number; rotation?: number; parts: TextRunPart[]; tag?: string } }
   /** Blank every `/Tag BMC … EMC` section this editor wrote into the page (a searchable OCR layer being recognised again). */
@@ -37,7 +39,7 @@ export type WorkerRequest =
   /** A traced scan face (OpenType bytes) the worker keeps by id for `addText` runs that name it. */
   | { id: number; type: 'registerFace'; data: { faceId: string; bytes: ArrayBuffer } }
   /** The exact pen advance `addText` would give each run, in points — measured with the fonts that will draw it. */
-  | { id: number; type: 'measureRuns'; data: { runs: { text: string; fontSize: number; fontName: string; faceId?: string }[] } }
+  | { id: number; type: 'measureRuns'; data: { runs: { text: string; fontSize: number; fontName: string; faceId?: string; faceSkip?: string }[] } }
   | { id: number; type: 'transformTextBlock'; data: { pageIndex: number; blockId: string; dx: number; dy: number; sx: number; sy: number; anchorX: number; anchorY: number } }
   | { id: number; type: 'transformTextBlocks'; data: { pageIndex: number; ops: BlockTransformOp[] } }
   | { id: number; type: 'restyleTextBlocks'; data: { pageIndex: number; ops: BlockStyleOp[] } }

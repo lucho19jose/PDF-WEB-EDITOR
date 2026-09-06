@@ -1,6 +1,6 @@
 import type { OcrTextItem } from './ocrTypes'
 import type { RectT } from '@/engine/types'
-import type { GlyphCutResult } from './glyphCut'
+import { cellStrokeRatio, type GlyphCutResult } from './glyphCut'
 import type { PatchOp, TextOp, ImageOp } from './ocrExport'
 import { strokeWidthFor } from './ocrStroke'
 
@@ -33,8 +33,8 @@ import { strokeWidthFor } from './ocrStroke'
  */
 
 export interface SpanCut {
-  /** One per NON-SPACE character of the original text, in reading order. */
-  cells: { char: string; x0: number; x1: number; suspect: boolean }[]
+  /** One per NON-SPACE character of the original text, in reading order. `weight` is the cell's stem over the em (`cellStrokeRatio`). */
+  cells: { char: string; x0: number; x1: number; suspect: boolean; weight?: number }[]
   /** Fitted ink baseline: y(x) = yAtCentre + slope * (x - centreX). */
   baseline: { yAtCentre: number; slope: number; centreX: number }
   /** The em the cut measured, in points. */
@@ -56,6 +56,92 @@ export interface PartialContext {
   faceId?: string
   /** The scan's measured stem over the em; the fallback glyphs of the stretch are stroked up to it. */
   strokeRatio?: number
+  /** From `weightPlan`: characters the scan face must NOT draw for this stretch (their traced weight is the other half of the line's). */
+  faceSkip?: string
+  /** From `weightPlan`: the stretch's neighbours' weight over the line's median — scales `strokeRatio` to the local weight. */
+  weightScale?: number
+  /** From `weightPlan`: the base-14 face of the stretch's OWN weight, when it differs from the line's. */
+  localFontName?: string
+}
+
+/** The face detector's bold threshold (ocrFontDetect.ts): stems over this share of the em are bold. */
+const BOLD_STROKE = 0.115
+
+/**
+ * A line can change weight in the middle. "Conste por el presente documento
+ * el CONTRATO DE "MEJORAMIENTO…"" is regular up to the quote and bold after
+ * it, one OCR line, one face detection (bold — the heavier half has more
+ * ink), and one scan face keyed by that style: the "S" typed into "CONTRATOS"
+ * was traced from "SALA" in the bold half and drawn heavy inside a regular
+ * word. Which weight the stretch should have is what its NEIGHBOURS say —
+ * the cells on either side of the change, measured by `cellStrokeRatio` —
+ * and a face glyph whose own cell weight disagrees with them is skipped
+ * (the base-14 face then draws it, stroked to the neighbours' weight by
+ * `weightScale` × the line's `strokeRatio`). Null when the cut carries no
+ * weights or the neighbours cannot be measured.
+ */
+export function weightPlan(
+  item: OcrTextItem,
+  cut: SpanCut,
+  faceWeightOf?: (ch: string) => number | undefined,
+  /** The face detector's stroke ratio over the run's ink between two page x's, or null when it cannot be measured. */
+  measureRatio?: (x0: number, x1: number) => number | null
+): { faceSkip: string; weightScale: number; bold: boolean | null } | null {
+  const st = stretchOf(item)
+  if (!st || !st.text) return null
+  const cells = cut.cells
+  const n = cells.length
+  const weights = cells.filter(c => !c.suspect && c.weight).map(c => c.weight!)
+  if (weights.length < 3) return null
+  const median = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)]
+  const lineMedian = median(weights)
+  const near: number[] = []
+  for (let i = st.prefix - 1, k = 0; i >= 0 && k < 3; i--, k++) { const c = cells[i]; if (c && !c.suspect && c.weight) near.push(c.weight) }
+  for (let i = n - st.suffix, k = 0; i < n && k < 3; i++, k++) { const c = cells[i]; if (c && !c.suspect && c.weight) near.push(c.weight) }
+  if (!near.length || !(lineMedian > 0)) return null
+  const local = median(near)
+  let faceSkip = ''
+  if (faceWeightOf) {
+    for (const ch of new Set([...st.text])) {
+      if (ch === ' ') continue
+      const w = faceWeightOf(ch)
+      // A third apart is a weight, not a measurement: regular and bold stems
+      // differ by 60–70% of the regular one; one raster pixel on a 12pt em is 3%.
+      if (w !== undefined && Math.abs(w - local) > local * 0.3) faceSkip += ch
+    }
+  }
+  let weightScale = local / lineMedian
+  // The base-14 face's weight follows the neighbours too. The per-cell ratios
+  // above are quantised to a pixel of the em (0.036 at 9pt) and a thin letter
+  // reads light whatever its weight, so they can say "different" but not
+  // "bold". `measureRatio` is the face detector's OWN measurement over a
+  // window of the line's ink — the six cells before the change and the six
+  // after — on the same raster and threshold as the line's `strokeRatio`, so
+  // it compares with the detector's calibrated bold bar directly. Without it
+  // the verdict stays the line's (null).
+  let bold: boolean | null = null
+  if (measureRatio) {
+    const windows: number[] = []
+    const head = cells.slice(Math.max(0, st.prefix - 6), st.prefix).filter(c => !c.suspect)
+    const tail = cells.slice(n - st.suffix, Math.min(n, n - st.suffix + 6)).filter(c => !c.suspect)
+    // The side the stretch is GLUED to decides when only one is: an "S"
+    // typed onto "CONTRATO" belongs to that word, and the bold quote that
+    // follows the space after it says nothing about the S's weight.
+    const sides = st.prefix > 0 && st.suffix > 0 && st.spaceBefore !== st.spaceAfter
+      ? [st.spaceBefore ? tail : head]
+      : [head, tail]
+    for (const w of sides) {
+      if (w.length < 2) continue
+      const r = measureRatio(w[0].x0, w[w.length - 1].x1)
+      if (r !== null && r > 0) windows.push(r)
+    }
+    if (windows.length) {
+      const ratio = windows.reduce((s, x) => s + x, 0) / windows.length
+      bold = ratio >= BOLD_STROKE
+      if (item.strokeRatio) weightScale = ratio / item.strokeRatio
+    }
+  }
+  return { faceSkip, weightScale, bold }
 }
 
 export interface PartialPlan {
@@ -87,7 +173,7 @@ export function commonAffix(original: string[], edited: string[]): { prefix: num
 
 /** A glyph cut in raster pixels → the run's span geometry in points. */
 export function toSpanCut(cut: GlyphCutResult, toPt: number, originalText: string, source: SpanCut['source']): SpanCut {
-  const cells = cut.cells.map(c => ({ char: c.char, x0: c.x0 * toPt, x1: c.x1 * toPt, suspect: !!c.suspect }))
+  const cells = cut.cells.map(c => ({ char: c.char, x0: c.x0 * toPt, x1: c.x1 * toPt, suspect: !!c.suspect, weight: cellStrokeRatio(cut, c) ?? undefined }))
   const cx = cut.bin.x + cut.bin.w / 2
   const yAtCentre = cut.baselineAt(cx) * toPt
   const slope = (cut.baselineAt(cx + 100) - cut.baselineAt(cx)) / 100
@@ -267,7 +353,8 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
     ...(st.text.length ? [{
       text: st.text, x: penX, y: baselineY, fontSize: sizePt,
       fontName: ctx.fontName, color: ctx.color, rotation: 0, faceId: ctx.faceId, group: item.id,
-      strokeWidth: strokeWidthFor(ctx.strokeRatio, ctx.fontName, sizePt)
+      strokeWidth: strokeWidthFor(ctx.strokeRatio ? ctx.strokeRatio * (ctx.weightScale ?? 1) : undefined, ctx.fontName, sizePt),
+      faceSkip: ctx.faceSkip || undefined
     } as TextOp] : []),
     ...(tailStart !== null ? invisible(tailText, tailStart + tailShift - bearing, inkRight - tailStart + bearing) : [])
   ]

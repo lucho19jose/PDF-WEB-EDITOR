@@ -88,9 +88,10 @@ const OCR_RENDER_SCALE = 220 / 72
 /** The user said yes to sending a page image to the cloud, this session. */
 let cloudConsentGiven = false
 import { planOcrExport, base14 } from '@/utils/ocr/ocrExport'
-import { stretchOf, sizeOf } from '@/utils/ocr/partialRedraw'
+import { stretchOf, sizeOf, weightPlan } from '@/utils/ocr/partialRedraw'
 import { cropToPng } from '@/utils/ocr/pixelCrop'
 import { measureHalo } from '@/utils/ocr/ocrSampling'
+import { detectFace } from '@/utils/ocr/ocrFontDetect'
 import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
 import type { RecognizeDocumentOptions, RecognizeProgress } from '@/components/dialogs/OcrRecognizeDialog.vue'
 import { usePDFViewer } from '@/composables/usePDFViewer'
@@ -383,14 +384,40 @@ async function bakeOcrEdits(): Promise<number> {
     // it; the untouched words keep the scan's own pixels. The widths are
     // measured in one batched call per page.
     const candidates = page.items.filter(i => i.edited && !i.removed && !i.vertical && !i.baked && ocr.spanCutFor(i))
+    // Which weight the changed stretch should have is what its neighbours
+    // say (`weightPlan`): a face glyph traced from the other half of a line
+    // that changes weight midway is skipped, and the skip has to be known
+    // BEFORE the stretch is measured, or the width is that of the wrong glyph.
+    // One 220 DPI raster of the page as it is now serves the weight windows
+    // below and the ink halos further down.
+    const touched = page.items.filter(i => (i.edited || i.removed) && !i.baked)
+    const rasterCanvas = touched.length ? await renderForOcr(pageIndex, 220 / 72) : null
+    const hctx = rasterCanvas?.getContext('2d', { willReadFrequently: true }) ?? null
+    const k = rasterCanvas ? rasterCanvas.width / page.pageWidth : 0
+    const plans = new Map(candidates.map(item => {
+      const face = ocr.faceOf(pageIndex, styleKeyOf(item))
+      const cut = ocr.spanCutFor(item)!
+      const measureRatio = hctx ? (x0: number, x1: number) => {
+        const r = item.inkRect
+        const emPx = sizeOf(item, cut) * k
+        const cues = detectFace(hctx, { x: x0 * k, y: r.y * k, width: (x1 - x0) * k, height: r.height * k }, emPx, (r.y + r.height * 0.8) * k)
+        return cues.measured && cues.strokeRatio > 0 ? cues.strokeRatio : null
+      } : undefined
+      return [item.id, weightPlan(item, cut, ch => face?.glyphs.get(ch)?.weight, measureRatio)]
+    }))
+    if (import.meta.env.DEV) (window as any).__ocrWeightPlans = Object.fromEntries(plans)
+    const localFont = (item: OcrTextItem) => base14(item.fontFamily, plans.get(item.id)?.bold ?? item.bold, item.italic)
     const measured = await pdfEngine.measureRuns(candidates.map(item => {
       const cut = ocr.spanCutFor(item)!
-      return { text: stretchOf(item)?.text ?? '', fontSize: sizeOf(item, cut), fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item) }
+      return { text: stretchOf(item)?.text ?? '', fontSize: sizeOf(item, cut), fontName: localFont(item), faceId: faceIdFor(item), faceSkip: plans.get(item.id)?.faceSkip || undefined }
     }))
     const partialCtx = new Map(candidates.map((item, i) => [item.id, {
       cut: ocr.spanCutFor(item)!,
       stretchWidthPt: measured[i]?.exact ? measured[i].width : null,
-      allowShift: true
+      allowShift: true,
+      faceSkip: plans.get(item.id)?.faceSkip || undefined,
+      weightScale: plans.get(item.id)?.weightScale,
+      localFontName: localFont(item)
     }]))
     // And every edited run's FULL text, at 10pt, in the fonts that will draw
     // it — the whole-run redraw fits its size to the paper and to the run
@@ -405,18 +432,13 @@ async function bakeOcrEdits(): Promise<number> {
     // the caps, a bold letter's blurred fringe — read from the page as it is
     // now, so the patch covers it. Cut at the box, a deleted "PERÚ" left its
     // accent on the page as two grey rows above a clean rectangle.
-    const haloItems = page.items.filter(i => (i.edited || i.removed) && !i.baked && !i.halo)
-    if (haloItems.length) {
-      const canvas = await renderForOcr(pageIndex, 220 / 72)
-      const hctx = canvas?.getContext('2d', { willReadFrequently: true })
-      if (canvas && hctx) {
-        const k = canvas.width / page.pageWidth
-        const lum = (c: [number, number, number]) => 255 * (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
-        for (const item of haloItems) {
-          const r = item.inkRect
-          const h = measureHalo(hctx, { x: r.x * k, y: r.y * k, width: r.width * k, height: r.height * k }, lum(item.background), lum(item.color))
-          ocrStore.updateItem(item.id, { halo: { top: h.top / k, bottom: h.bottom / k, left: h.left / k, right: h.right / k } })
-        }
+    const haloItems = touched.filter(i => !i.halo)
+    if (haloItems.length && hctx && k > 0) {
+      const lum = (c: [number, number, number]) => 255 * (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+      for (const item of haloItems) {
+        const r = item.inkRect
+        const h = measureHalo(hctx, { x: r.x * k, y: r.y * k, width: r.width * k, height: r.height * k }, lum(item.background), lum(item.color))
+        ocrStore.updateItem(item.id, { halo: { top: h.top / k, bottom: h.bottom / k, left: h.left / k, right: h.right / k } })
       }
     }
     // `updateItem` replaces the page's item objects; plan from the fresh ones.
@@ -470,10 +492,10 @@ async function bakeOcrEdits(): Promise<number> {
         if (run.length > 1) {
           await pdfEngine.addTextRun(pageIndex, run.map(o => ({
             x: o.x, y: page.pageHeight - o.y, text: o.text, fontSize: o.fontSize, fontName: o.fontName,
-            color: o.color, faceId: o.faceId, invisible: o.invisible, fitWidth: o.fitWidth, strokeWidth: o.strokeWidth
+            color: o.color, faceId: o.faceId, invisible: o.invisible, fitWidth: o.fitWidth, strokeWidth: o.strokeWidth, faceSkip: o.faceSkip
           })), t.rotation)
         } else {
-          await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible, t.strokeWidth)
+          await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible, t.strokeWidth, t.faceSkip)
         }
         for (const o of run) if (!o.invisible) written++
         i = j

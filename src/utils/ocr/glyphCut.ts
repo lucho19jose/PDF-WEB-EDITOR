@@ -949,6 +949,32 @@ export function traceLevel(cut: Pick<GlyphCutResult, 'bin'>): number {
  * crosses the level, so a stem's edge is a line where a binarised pixel
  * edge is a staircase that the tracer keeps as bumps.
  */
+/**
+ * The stem thickness of one cell's ink over the em — the face detector's
+ * `strokeRatio` measured on a single letter. A line can change weight in the
+ * middle ("…documento el CONTRATO DE **"MEJORAMIENTO…"**"), and one figure
+ * for the line then describes neither half: an "S" typed into the regular
+ * half was traced from the bold half and stood out as pasted in. Null when
+ * the cell holds too little ink to say.
+ */
+export function cellStrokeRatio(cut: GlyphCutResult, cell: GlyphCell): number | null {
+  const m = cellMask(cut, cell, 0)
+  if (!m || !(cut.emPx > 0)) return null
+  const { on, w, h } = m
+  const runs: number[] = []
+  for (let yy = 0; yy < h; yy++) {
+    let run = 0
+    for (let xx = 0; xx <= w; xx++) {
+      const ink = xx < w && on[yy * w + xx] === 1
+      if (ink) run++
+      else if (run > 0) { runs.push(run); run = 0 }
+    }
+  }
+  const stems = runs.filter(r => r <= cut.emPx * 0.55).sort((a, b) => a - b)
+  if (stems.length < 4) return null
+  return stems[Math.floor(stems.length / 2)] / cut.emPx
+}
+
 export function cellBitmapTraced(
   cut: CutForCell,
   cell: GlyphCell,

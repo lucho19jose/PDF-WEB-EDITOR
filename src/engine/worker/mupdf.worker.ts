@@ -102,7 +102,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         const addResult = addTextToPage(
           req.data.pageIndex, req.data.x, req.data.y,
           req.data.text, req.data.fontSize, req.data.fontName, req.data.color,
-          req.data.rotation, req.data.faceId, req.data.invisible, req.data.strokeWidth
+          req.data.rotation, req.data.faceId, req.data.invisible, req.data.strokeWidth, req.data.faceSkip
         )
         respond({ id: req.id, type: 'success', data: addResult })
         break
@@ -135,7 +135,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 
       case 'measureRuns': {
         if (!mupdf) throw new Error('MuPDF not initialized')
-        respond({ id: req.id, type: 'success', data: { widths: req.data.runs.map(r => measureRunWidth(r.text, r.fontSize, r.fontName, r.faceId)) } })
+        respond({ id: req.id, type: 'success', data: { widths: req.data.runs.map(r => measureRunWidth(r.text, r.fontSize, r.fontName, r.faceId, r.faceSkip)) } })
         break
       }
 
@@ -2594,10 +2594,12 @@ function planTextEncoding(
  * Shared by `addTextToPage` (which draws them) and `measureRunWidth` (which
  * measures them), so what is measured is exactly what will be drawn.
  */
-function segmentRun(text: string, face: any | null): { text: string; traced: boolean }[] {
+function segmentRun(text: string, face: any | null, faceSkip?: string): { text: string; traced: boolean }[] {
   const segments: { text: string; traced: boolean }[] = []
   for (const ch of text) {
-    const traced = !!face && ch !== ' ' && face.encodeCharacter(ch.codePointAt(0)!) !== 0
+    // `faceSkip`: characters the face holds but must not draw here — traced
+    // from the other weight of a line that changes weight midway.
+    const traced = !!face && ch !== ' ' && !(faceSkip && faceSkip.includes(ch)) && face.encodeCharacter(ch.codePointAt(0)!) !== 0
     const last = segments[segments.length - 1]
     if (last && (last.traced === traced || ch === ' ')) last.text += ch
     else segments.push({ text: ch, traced })
@@ -2611,10 +2613,10 @@ function segmentRun(text: string, face: any | null): { text: string; traced: boo
  * character neither can hold (the CJK fallback) as one em with `exact: false`
  * — the partial redraw then declines rather than guess.
  */
-function measureRunWidth(text: string, fontSize: number, fontName: string, faceId?: string): { width: number; exact: boolean } {
+function measureRunWidth(text: string, fontSize: number, fontName: string, faceId?: string, faceSkip?: string): { width: number; exact: boolean } {
   const face = faceId ? scanFaces.get(faceId) : null
   let em = 0, exact = true
-  for (const seg of segmentRun(text, face)) {
+  for (const seg of segmentRun(text, face, faceSkip)) {
     if (seg.traced && face) {
       for (const ch of seg.text) {
         if (ch === ' ') { em += 0.3; continue }
@@ -2666,9 +2668,9 @@ function dropUnencodable(text: string): string {
 /** One CJK subset registered for a whole text object — see `sharedCjkFontFor`. */
 interface SharedCjk { refName: string; font: any }
 
-function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: string, faceId?: string, sharedCjk?: SharedCjk | null, strokeWidth?: number): { ops: string } | { error: string } {
+function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: string, faceId?: string, sharedCjk?: SharedCjk | null, strokeWidth?: number, faceSkip?: string): { ops: string } | { error: string } {
   const face = faceId ? scanFaces.get(faceId) : null
-  const segments = segmentRun(text, face)
+  const segments = segmentRun(text, face, faceSkip)
   const ops: string[] = []
   // Weight matching: a FALLBACK segment is filled and stroked (render mode 2)
   // so its stems come up to the scan's; a traced segment is the scan's own
@@ -2748,7 +2750,7 @@ function appendedTextMatrix(pageIndex: number, existingStream: string, x: number
  */
 function addTextRunToPage(
   pageIndex: number,
-  parts: { x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; faceId?: string; invisible?: boolean; fitWidth?: number; strokeWidth?: number }[],
+  parts: { x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; faceId?: string; invisible?: boolean; fitWidth?: number; strokeWidth?: number; faceSkip?: string }[],
   rotation = 0,
   tag?: string
 ): { success: boolean; error?: string } {
@@ -2765,7 +2767,7 @@ function addTextRunToPage(
       if (!part.text) continue
       let text = part.text
       const stroke = !part.invisible && part.strokeWidth && part.strokeWidth > 0 ? part.strokeWidth : 0
-      let built = buildShowOps(pageObj, text, part.fontSize, part.fontName, part.faceId, sharedCjk, stroke)
+      let built = buildShowOps(pageObj, text, part.fontSize, part.fontName, part.faceId, sharedCjk, stroke, part.faceSkip)
       if ('error' in built && part.invisible) {
         // An invisible run stands for the scan's own pixels, so a character
         // no face can hold costs nothing visible. Dropping it beats losing a
@@ -2835,7 +2837,9 @@ function addTextToPage(
   /** Render mode 3: no ink, text only — words a reader extracts while the scan's own pixels stay the picture. */
   invisible = false,
   /** Stroke the fallback glyphs by this many points in the text's colour — weight matched to the scan (ocrStroke.ts). */
-  strokeWidth?: number
+  strokeWidth?: number,
+  /** Characters the scan face must not draw here (traced from the other weight of the line). */
+  faceSkip?: string
 ): { success: boolean; error?: string } {
   if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
 
@@ -2853,7 +2857,7 @@ function addTextToPage(
     // WinAnsi in the base-14 face where it can — serializing raw Unicode with
     // "& 0xFF" would silently mangle €, smart quotes, dashes… — and to a
     // subset of the shipped CJK face for text WinAnsi cannot hold.
-    const built = buildShowOps(pageObj, text, fontSize, fontName, faceId, undefined, stroke)
+    const built = buildShowOps(pageObj, text, fontSize, fontName, faceId, undefined, stroke, faceSkip)
     if ('error' in built) { page.destroy(); return { success: false, error: built.error } }
     const showOps = built.ops
 
