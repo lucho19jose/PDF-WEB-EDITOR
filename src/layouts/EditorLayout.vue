@@ -272,10 +272,37 @@ function forgetOcr() {
  * the verdict, the runner (no "already has text" dialog — the caller has
  * proved the page is a scan) and whether one is already running.
  */
+/**
+ * The page's scan moved or changed under its recognised runs.
+ *
+ * A page-covering image dragged in the select tool takes its words with it:
+ * the runs are shifted by the same delta (their glyph cuts and the tracing
+ * raster are measured on the page and are dropped, to be made again on the
+ * next edit). Any other change to that image — resize, crop, a turn, a
+ * deletion — leaves nothing for the runs to describe, so the page's results
+ * go, and the status says so when unbaked edits went with them. Before this,
+ * a scan nudged by a few pixels kept its runs where they were, and every
+ * edited line was then patched and redrawn BESIDE its photographed words:
+ * the page showed each of them twice.
+ */
+function ocrScanMoved(pageIndex: number, dx: number, dy: number) {
+  if (!ocrStore.resultFor(pageIndex)) return
+  ocrStore.shiftPage(pageIndex, dx, dy)
+  ocr.forgetTraceRaster(pageIndex)
+  for (const item of ocrStore.itemsFor(pageIndex)) ocr.forgetSpanCut(item.id)
+}
+function ocrScanChanged(pageIndex: number) {
+  const hadEdits = ocrStore.clearPage(pageIndex)
+  ocr.forgetTraceRaster(pageIndex)
+  if (hadEdits) editorStore.setStatus('The scan changed — unsaved OCR edits on this page were discarded; recognise it again')
+}
+
 provide('ocrController', {
   isScanLike: isScanLikePage,
   recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG),
-  busy: ocr.busy
+  busy: ocr.busy,
+  scanMoved: ocrScanMoved,
+  scanChanged: ocrScanChanged
 })
 
 async function runOcrNow(pageIndex: number, lang: string) {

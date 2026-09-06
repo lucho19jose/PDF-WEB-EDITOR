@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { OcrPageResult, OcrTextItem } from '@/utils/ocr/ocrTypes'
+import type { OcrPageResult, OcrTextItem, OcrRect } from '@/utils/ocr/ocrTypes'
 
 /**
  * What OCR found, and what the user has since done to it.
@@ -129,6 +129,44 @@ export const useOcrStore = defineStore('ocr', () => {
     return null
   }
 
+  /**
+   * The page's scan was MOVED (the page-covering image dragged in the select
+   * tool), so every run measured on it moves with it — ink boxes, current
+   * boxes and word boxes alike. Left where they were, an edit's patch and
+   * replacement land beside the photographed words instead of on them, and
+   * the page shows every edited line twice.
+   */
+  function shiftPage(pageIndex: number, dx: number, dy: number) {
+    const page = pages.value.get(pageIndex)
+    if (!page || (!dx && !dy)) return
+    const mv = (r: OcrRect): OcrRect => ({ x: r.x + dx, y: r.y + dy, width: r.width, height: r.height })
+    const items = page.items.map(i => ({
+      ...i,
+      rect: mv(i.rect),
+      inkRect: mv(i.inkRect ?? i.rect),
+      words: i.words.map(mv),
+      symbols: i.symbols?.map(mv)
+    }))
+    const next = new Map(pages.value)
+    next.set(pageIndex, { ...page, items })
+    pages.value = next
+  }
+
+  /** One page's results are gone (its scan was resized, cropped, turned or deleted); returns whether unbaked edits went with them. */
+  function clearPage(pageIndex: number): boolean {
+    const page = pages.value.get(pageIndex)
+    if (!page) return false
+    const hadEdits = page.items.some(i => i.edited || i.removed)
+    const next = new Map(pages.value)
+    next.delete(pageIndex)
+    pages.value = next
+    if (selectedId.value && !selectedIn(selectedId.value)) selectedId.value = null
+    const verdicts = new Map(scanVerdicts.value)
+    verdicts.delete(pageIndex)
+    scanVerdicts.value = verdicts
+    return hadEdits
+  }
+
   /** Dropped when a different document is loaded — results belong to a file. */
   function clear() {
     pages.value = new Map()
@@ -139,6 +177,6 @@ export const useOcrStore = defineStore('ocr', () => {
 
   return {
     pages, selectedId, layerVisible, scanVerdicts, selected, hasEdits,
-    resultFor, itemsFor, editedItems, setResult, updateItem, removeItem, revertItem, clear
+    resultFor, itemsFor, editedItems, setResult, updateItem, removeItem, revertItem, shiftPage, clearPage, clear
   }
 })

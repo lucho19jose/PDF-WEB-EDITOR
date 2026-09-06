@@ -167,6 +167,14 @@ const editorStore = useEditorStore()
 const ocrStore = useOcrStore()
 const historyStore = useHistoryStore()
 const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
+/** The OCR side's ear for a scan that moved or changed under its recognised runs. */
+const ocrController = inject<{ scanMoved?: (pageIndex: number, dx: number, dy: number) => void; scanChanged?: (pageIndex: number) => void } | null>('ocrController', null)
+
+/** A picture covering half the paper or more IS the page's scan: its words live in it. */
+function coversPage(rect: RectT): boolean {
+  const w = Math.abs(rect[2] - rect[0]), h = Math.abs(rect[3] - rect[1])
+  return w * h >= Math.max(1, props.pdfWidth * props.pdfHeight) * 0.5
+}
 
 const annotations = ref<AnnotationInfo[]>([])
 const selectedIndex = ref<number | null>(null)
@@ -419,12 +427,22 @@ function liveImgRect(img: ContentImageInfo): RectT {
  */
 /**
  * On a page that is a SCAN, the page-filling image is the paper, not an
- * object. In the edit tool it must not take the click — the text overlay
- * underneath is what turns that click into recognition and an editor — so it
- * is made transparent to the pointer there. In the select tool it stays an
- * image: it can still be moved, resized or deleted like any other.
+ * object — in EVERY tool. In the edit tool it must not take the click (the
+ * text overlay underneath is what turns that click into recognition and an
+ * editor). In the select tool it used to stay an image, movable like any
+ * other, and that is how a contract came back with every edited line shown
+ * twice: a click on the page that wobbled a few pixels dragged the whole scan
+ * down, while the text and patches an earlier OCR edit had written into the
+ * content stream — "MAESTRA", the replaced paragraph line, the paper painted
+ * over a deleted title — stayed exactly where they were. On a scan the picture
+ * IS the page; nothing on it can be moved apart from the words written over
+ * it, so it is not offered as an object at all.
  */
-const scanPage = computed(() => ocrStore.scanVerdicts.get(docStore.currentPage - 1) === true)
+// A page already recognised is a scan whatever the cached verdict says: the
+// verdict is only asked for on a click in the edit tool, and a page recognised
+// through the OCR button never gets one.
+const scanPage = computed(() =>
+  ocrStore.scanVerdicts.get(docStore.currentPage - 1) === true || !!ocrStore.resultFor(docStore.currentPage - 1))
 // A twentieth of the page: a scan TILED into nine images (the supplier survey)
 // has no tile bigger than a ninth, and every tile is paper.
 const paperArea = computed(() => Math.max(1, props.pdfWidth * props.pdfHeight) * 0.05)
@@ -436,7 +454,7 @@ const scaledContentImgs = computed(() => contentImages.value
     return {
       id: img.id,
       area,
-      paper: scanPage.value && editorStore.currentTool === 'edit' && area >= paperArea.value,
+      paper: scanPage.value && area >= paperArea.value,
       style: {
         left: `${r[0] * scaleX.value}px`,
         top: `${r[1] * scaleY.value}px`,
@@ -534,8 +552,18 @@ async function commitImgRect(id: number, rect: RectT, verb: string) {
   const x0 = Math.max(-w * 0.9, Math.min(rect[0], props.pdfWidth - w * 0.1))
   const y0 = Math.max(-h * 0.9, Math.min(rect[1], props.pdfHeight - h * 0.1))
   const target: RectT = [x0, y0, x0 + w, y0 + h]
-  await annotOp(verb, () => pdfEngine.transformContentImage(
-    docStore.currentPage - 1, img.sourceKey, img.doOffset, img.name, target))
+  const pageIndex = docStore.currentPage - 1
+  let ok = false
+  await annotOp(verb, async () => {
+    ok = await pdfEngine.transformContentImage(pageIndex, img.sourceKey, img.doOffset, img.name, target)
+    return ok
+  })
+  // The page's scan carried its recognised words with it — or lost them.
+  if (ok && coversPage(img.rect)) {
+    const sameSize = Math.abs((img.rect[2] - img.rect[0]) - w) < 0.5 && Math.abs((img.rect[3] - img.rect[1]) - h) < 0.5
+    if (sameSize) ocrController?.scanMoved?.(pageIndex, target[0] - img.rect[0], target[1] - img.rect[1])
+    else ocrController?.scanChanged?.(pageIndex)
+  }
 }
 
 /**
@@ -1196,7 +1224,11 @@ function onMoveMove(e: MouseEvent) {
   if (!moveState.value) return
   moveState.value.dx = e.clientX - moveState.value.startX
   moveState.value.dy = e.clientY - moveState.value.startY
-  if (Math.abs(moveState.value.dx) > 2 || Math.abs(moveState.value.dy) > 2) moveState.value.moved = true
+  // A page-covering scan needs a deliberate drag: a click that wobbled by
+  // three pixels moved the whole page's picture, and every recognised run
+  // then sat beside its own words.
+  const slack = moveState.value.kind === 'cimg' && coversPage(moveState.value.rect as RectT) ? 8 : 2
+  if (Math.abs(moveState.value.dx) > slack || Math.abs(moveState.value.dy) > slack) moveState.value.moved = true
 }
 async function onMoveUp() {
   window.removeEventListener('mousemove', onMoveMove)
@@ -1299,6 +1331,7 @@ async function deleteSelected() {
       return ok > 0
     })
     if (ok < total) editorStore.setStatus(`Deleted ${ok} of ${total} — Ctrl+Z takes the whole deletion back`)
+    if (ok > 0 && imgs.some(img => coversPage(img.rect))) ocrController?.scanChanged?.(pageIndex)
     return
   }
 
@@ -1307,6 +1340,7 @@ async function deleteSelected() {
     if (!img) return
     selectedImgId.value = null
     await annotOp('Image deleted', () => pdfEngine.deleteContentImage(pageIndex, img.sourceKey, img.doOffset, img.name))
+    if (coversPage(img.rect)) ocrController?.scanChanged?.(pageIndex)
     return
   }
 
