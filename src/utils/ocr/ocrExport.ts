@@ -28,6 +28,8 @@ export interface PatchOp {
   color: [number, number, number]
   /** The run this patch belongs to: after the bake its ink box grows to what was painted. */
   item?: string
+  /** False for a rectangle that only reports where new letters went (a pure append covers no old ink) — not painted. */
+  paint?: boolean
 }
 
 export interface TextOp {

@@ -392,7 +392,11 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
     if (inkEnd > limit) return { reason: 'stretch would run into the next run' }
     return {
       mode: 'partial',
-      patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkEnd) + padX, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id }],
+      // A pure append covers no old ink — nothing to paint. On a textured
+      // ground (an identity card's strip) a flat patch there showed as a block
+      // behind the new letters, and it hid nothing. The rectangle is still
+      // reported (`paint: false`) so the run's box grows to the new letters.
+      patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkEnd) + padX, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id, paint: !!oldSpan }],
       images: [],
       texts: textOp()
     }
@@ -413,7 +417,8 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   if (dx <= Math.max(TOUCH_PT, gapAfter * 0.6) && dx >= -mayOpen) {
     return {
       mode: 'partial',
-      patches: [{ rect: [patchX0, ink.y - padTop, tailStart - padTail, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id }],
+      // An insertion the tail absorbs in place covers only the gap's paper.
+      patches: [{ rect: [patchX0, ink.y - padTop, tailStart - padTail, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id, paint: !!oldSpan }],
       images: [],
       texts: textOp()
     }

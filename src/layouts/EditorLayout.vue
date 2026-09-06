@@ -504,6 +504,7 @@ async function bakeOcrEdits(): Promise<number> {
       // page content whatever order they were made in, so a patch drawn as one
       // covered the replacement text and it came out with its start missing.
       for (const patch of plan.patches) {
+        if (patch.paint === false) continue
         await pdfEngine.fillRect(pageIndex, patch.rect, patch.color)
       }
       for (const [i, img] of plan.images.entries()) {
