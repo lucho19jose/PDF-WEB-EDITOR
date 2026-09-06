@@ -102,7 +102,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         const addResult = addTextToPage(
           req.data.pageIndex, req.data.x, req.data.y,
           req.data.text, req.data.fontSize, req.data.fontName, req.data.color,
-          req.data.rotation, req.data.faceId, req.data.invisible
+          req.data.rotation, req.data.faceId, req.data.invisible, req.data.strokeWidth
         )
         respond({ id: req.id, type: 'success', data: addResult })
         break
@@ -2666,14 +2666,20 @@ function dropUnencodable(text: string): string {
 /** One CJK subset registered for a whole text object — see `sharedCjkFontFor`. */
 interface SharedCjk { refName: string; font: any }
 
-function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: string, faceId?: string, sharedCjk?: SharedCjk | null): { ops: string } | { error: string } {
+function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: string, faceId?: string, sharedCjk?: SharedCjk | null, strokeWidth?: number): { ops: string } | { error: string } {
   const face = faceId ? scanFaces.get(faceId) : null
   const segments = segmentRun(text, face)
   const ops: string[] = []
+  // Weight matching: a FALLBACK segment is filled and stroked (render mode 2)
+  // so its stems come up to the scan's; a traced segment is the scan's own
+  // ink and is only filled. The caller sets the line width and stroke colour.
+  const stroked = strokeWidth && strokeWidth > 0
+  const fallbackTr = stroked ? '2 Tr ' : ''
+  const tracedTr = stroked ? '0 Tr ' : ''
   for (const seg of segments) {
     if (seg.traced && face) {
       const run = registerEmbeddedRun(pageObj, face, seg.text, 'FSCN')
-      if (run) { ops.push(`/${run.refName} ${fontSize} Tf <${run.hex}> Tj`); continue }
+      if (run) { ops.push(`${tracedTr}/${run.refName} ${fontSize} Tf <${run.hex}> Tj`); continue }
     }
     const winAnsi = encodeWinAnsiText(seg.text)
     if ('missing' in winAnsi) {
@@ -2686,7 +2692,7 @@ function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: st
           if (!gid) { hex = ''; break }
           hex += gid.toString(16).padStart(4, '0')
         }
-        if (hex) { ops.push(`/${sharedCjk.refName} ${fontSize} Tf <${hex}> Tj`); continue }
+        if (hex) { ops.push(`${fallbackTr}/${sharedCjk.refName} ${fontSize} Tf <${hex}> Tj`); continue }
       }
       const cjk = hasCjk(seg.text) ? registerCjkRun(pageObj, seg.text) : null
       if (!cjk) {
@@ -2695,9 +2701,9 @@ function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: st
           : ''
         return { error: `Characters not supported by ${fontName}: ${winAnsi.missing.join(', ')}${why}` }
       }
-      ops.push(`/${cjk.refName} ${fontSize} Tf <${cjk.hex}> Tj`)
+      ops.push(`${fallbackTr}/${cjk.refName} ${fontSize} Tf <${cjk.hex}> Tj`)
     } else {
-      ops.push(`/${ensureStandardFont(pageObj, fontName)} ${fontSize} Tf (${escapePdfString(winAnsi.bytes)}) Tj`)
+      ops.push(`${fallbackTr}/${ensureStandardFont(pageObj, fontName)} ${fontSize} Tf (${escapePdfString(winAnsi.bytes)}) Tj`)
     }
   }
   return { ops: ops.join('\n') }
@@ -2742,7 +2748,7 @@ function appendedTextMatrix(pageIndex: number, existingStream: string, x: number
  */
 function addTextRunToPage(
   pageIndex: number,
-  parts: { x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; faceId?: string; invisible?: boolean; fitWidth?: number }[],
+  parts: { x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; faceId?: string; invisible?: boolean; fitWidth?: number; strokeWidth?: number }[],
   rotation = 0,
   tag?: string
 ): { success: boolean; error?: string } {
@@ -2758,7 +2764,8 @@ function addTextRunToPage(
     for (const part of parts) {
       if (!part.text) continue
       let text = part.text
-      let built = buildShowOps(pageObj, text, part.fontSize, part.fontName, part.faceId, sharedCjk)
+      const stroke = !part.invisible && part.strokeWidth && part.strokeWidth > 0 ? part.strokeWidth : 0
+      let built = buildShowOps(pageObj, text, part.fontSize, part.fontName, part.faceId, sharedCjk, stroke)
       if ('error' in built && part.invisible) {
         // An invisible run stands for the scan's own pixels, so a character
         // no face can hold costs nothing visible. Dropping it beats losing a
@@ -2771,6 +2778,11 @@ function addTextRunToPage(
       if ('error' in built) { page.destroy(); return { success: false, error: built.error } }
       const tm = appendedTextMatrix(pageIndex, existingStream, part.x, part.y, rotation)
       const r = part.color?.[0] ?? 0, g = part.color?.[1] ?? 0, b = part.color?.[2] ?? 0
+      // Weight matching (see ocrStroke.ts): the fallback glyphs of this part
+      // are stroked in the text's own colour, round-joined so a stroked
+      // corner does not spike. Line width and stroke colour are graphics
+      // state inside the object's q/Q; the per-op `Tr` is set by buildShowOps.
+      const strokeState = stroke ? `${stroke.toFixed(3)} w 1 j 1 J ${r} ${g} ${b} RG\n` : ''
       // An invisible run stands for the scan's own words, whose letters are
       // not Helvetica's width: set at its natural advance it ended short of
       // the ink (or ran past it), and extraction read the difference as a
@@ -2781,7 +2793,7 @@ function addTextRunToPage(
         if (natural > 0) tz = Math.min(200, Math.max(50, (part.fitWidth / natural) * 100))
       }
       chunks.push(
-        `${part.invisible ? 3 : 0} Tr\n${tz.toFixed(2)} Tz\n${part.invisible ? '' : `${r} ${g} ${b} rg\n`}` +
+        `${part.invisible ? 3 : 0} Tr\n${tz.toFixed(2)} Tz\n${part.invisible ? '' : `${r} ${g} ${b} rg\n`}${strokeState}` +
         `${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${built.ops}`
       )
     }
@@ -2821,13 +2833,16 @@ function addTextToPage(
   /** A registered traced scan face: its glyphs draw the characters it has. */
   faceId?: string,
   /** Render mode 3: no ink, text only — words a reader extracts while the scan's own pixels stay the picture. */
-  invisible = false
+  invisible = false,
+  /** Stroke the fallback glyphs by this many points in the text's colour — weight matched to the scan (ocrStroke.ts). */
+  strokeWidth?: number
 ): { success: boolean; error?: string } {
   if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
 
   try {
     const page = pdfDoc.loadPage(pageIndex)
     const pageObj = page.getObject()
+    const stroke = !invisible && strokeWidth && strokeWidth > 0 ? strokeWidth : 0
 
     // 1–3. Fonts and show operators, one per SEGMENT. The run is cut into
     // maximal stretches the scan face can draw (glyphs traced from the page
@@ -2838,7 +2853,7 @@ function addTextToPage(
     // WinAnsi in the base-14 face where it can — serializing raw Unicode with
     // "& 0xFF" would silently mangle €, smart quotes, dashes… — and to a
     // subset of the shipped CJK face for text WinAnsi cannot hold.
-    const built = buildShowOps(pageObj, text, fontSize, fontName, faceId)
+    const built = buildShowOps(pageObj, text, fontSize, fontName, faceId, undefined, stroke)
     if ('error' in built) { page.destroy(); return { success: false, error: built.error } }
     const showOps = built.ops
 
@@ -2878,9 +2893,13 @@ function addTextToPage(
     const fmt = (n: number) => (Math.abs(n) < 1e-6 ? '0' : n.toFixed(4))
     // Render mode is text state and outlives ET, so an invisible block is
     // bracketed in q/Q or every block appended after it would draw nothing.
+    // A stroked block is bracketed too: line width, stroke colour and the
+    // render mode its ops set would otherwise outlive it.
     const newBlock = invisible
       ? `\nq\nBT\n3 Tr\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\nQ\n`
-      : `\nBT\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\n`
+      : stroke
+        ? `\nq\n${stroke.toFixed(3)} w 1 j 1 J ${r} ${g} ${b} RG\nBT\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\nQ\n`
+        : `\nBT\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\n`
 
     // 4. Append to content stream
     const combined = existingStream + newBlock

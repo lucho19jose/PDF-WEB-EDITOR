@@ -13,6 +13,8 @@ export interface TextRunPart {
   invisible?: boolean
   /** Stretch the run horizontally (`Tz`) so its advance equals this many points — an invisible run set over the scan's own ink. */
   fitWidth?: number
+  /** Stroke the fallback glyphs (not the traced ones) by this many points, in the text's colour — weight matched to the scan. */
+  strokeWidth?: number
 }
 
 export type WorkerRequest =
@@ -24,7 +26,7 @@ export type WorkerRequest =
   | { id: number; type: 'readContentStream'; data: { pageIndex: number } }
   | { id: number; type: 'writeContentStream'; data: { pageIndex: number; streamBytes: ArrayBuffer } }
   | { id: number; type: 'replaceText'; data: { pageIndex: number; blockId: string; newText: string } }
-  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number; faceId?: string; invisible?: boolean } }
+  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number; faceId?: string; invisible?: boolean; strokeWidth?: number } }
   /** Several runs in ONE text object — the invisible head, the visible stretch and the invisible tail of a partial redraw — so extraction reads them as one line. */
   | { id: number; type: 'addTextRun'; data: { pageIndex: number; rotation?: number; parts: TextRunPart[]; tag?: string } }
   /** Blank every `/Tag BMC … EMC` section this editor wrote into the page (a searchable OCR layer being recognised again). */

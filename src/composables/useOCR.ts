@@ -1114,6 +1114,7 @@ function createOCR() {
           italic: face.italic,
           color,
           background,
+          strokeRatio: cues.measured && cues.strokeRatio > 0 ? cues.strokeRatio : undefined,
           // A run split out of a line IS its own box, so there is nothing
           // left for it to be aligned within; only a whole line can say.
           align: run.length === allWords.length && line.paragraph

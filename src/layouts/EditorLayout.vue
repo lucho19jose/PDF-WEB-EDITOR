@@ -90,6 +90,7 @@ let cloudConsentGiven = false
 import { planOcrExport, base14 } from '@/utils/ocr/ocrExport'
 import { stretchOf, sizeOf } from '@/utils/ocr/partialRedraw'
 import { cropToPng } from '@/utils/ocr/pixelCrop'
+import { measureHalo } from '@/utils/ocr/ocrSampling'
 import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
 import type { RecognizeDocumentOptions, RecognizeProgress } from '@/components/dialogs/OcrRecognizeDialog.vue'
 import { usePDFViewer } from '@/composables/usePDFViewer'
@@ -400,7 +401,27 @@ async function bakeOcrEdits(): Promise<number> {
       text: item.text, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item)
     })))
     const widthAt10 = new Map(wholeItems.map((item, i) => [item.id, wholeMeasured[i]?.exact ? wholeMeasured[i].width : null]))
-    const plan = planOcrExport(page.items, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null)
+    // How far each edited run's ink reaches OUTSIDE its box — an accent over
+    // the caps, a bold letter's blurred fringe — read from the page as it is
+    // now, so the patch covers it. Cut at the box, a deleted "PERÚ" left its
+    // accent on the page as two grey rows above a clean rectangle.
+    const haloItems = page.items.filter(i => (i.edited || i.removed) && !i.baked && !i.halo)
+    if (haloItems.length) {
+      const canvas = await renderForOcr(pageIndex, 220 / 72)
+      const hctx = canvas?.getContext('2d', { willReadFrequently: true })
+      if (canvas && hctx) {
+        const k = canvas.width / page.pageWidth
+        const lum = (c: [number, number, number]) => 255 * (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+        for (const item of haloItems) {
+          const r = item.inkRect
+          const h = measureHalo(hctx, { x: r.x * k, y: r.y * k, width: r.width * k, height: r.height * k }, lum(item.background), lum(item.color))
+          ocrStore.updateItem(item.id, { halo: { top: h.top / k, bottom: h.bottom / k, left: h.left / k, right: h.right / k } })
+        }
+      }
+    }
+    // `updateItem` replaces the page's item objects; plan from the fresh ones.
+    const planItems = ocrStore.pages.get(pageIndex)?.items ?? page.items
+    const plan = planOcrExport(planItems, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null)
     modes[pageIndex] = plan.modes
     if (plan.patches.length === 0 && plan.texts.length === 0 && plan.images.length === 0) continue
 
@@ -449,10 +470,10 @@ async function bakeOcrEdits(): Promise<number> {
         if (run.length > 1) {
           await pdfEngine.addTextRun(pageIndex, run.map(o => ({
             x: o.x, y: page.pageHeight - o.y, text: o.text, fontSize: o.fontSize, fontName: o.fontName,
-            color: o.color, faceId: o.faceId, invisible: o.invisible, fitWidth: o.fitWidth
+            color: o.color, faceId: o.faceId, invisible: o.invisible, fitWidth: o.fitWidth, strokeWidth: o.strokeWidth
           })), t.rotation)
         } else {
-          await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible)
+          await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible, t.strokeWidth)
         }
         for (const o of run) if (!o.invisible) written++
         i = j

@@ -1,6 +1,7 @@
 import type { OcrTextItem } from './ocrTypes'
 import type { RectT } from '@/engine/types'
 import { planPartial, sizeOf, type PartialContext } from './partialRedraw'
+import { strokeWidthFor } from './ocrStroke'
 
 /**
  * Turning edited OCR runs into PDF operations.
@@ -49,6 +50,12 @@ export interface TextOp {
    * not change and puts their words back into the page this way.
    */
   invisible?: boolean
+  /**
+   * Stroke the glyphs the base-14 fallback draws by this many points (render
+   * mode 2, the text's own colour) so their stems match the scan's — see
+   * ocrStroke.ts. Traced glyphs are never stroked.
+   */
+  strokeWidth?: number
   /**
    * Ops sharing a group are ONE line — the invisible head, the visible stretch
    * and the invisible tail of a partial redraw — and the bake writes them as
@@ -117,11 +124,15 @@ function patchRect(item: OcrTextItem): RectT {
   const across = item.vertical ? ink.width : ink.height
   const padY = item.vertical ? Math.max(1, across * 0.15) : Math.max(1, across * 0.12)
   const padX = item.vertical ? Math.max(1, across * 0.12) : Math.max(1, across * 0.15)
+  // The ink measured OUTSIDE the box (an accent over the caps, a blurred
+  // fringe) is covered too, with a hair to spare — the fixed pad alone left
+  // the accent of a deleted "PERÚ" on the page.
+  const halo = item.halo
   return [
-    ink.x - padX,
-    ink.y - padY,
-    ink.x + ink.width + padX,
-    ink.y + ink.height + padY
+    ink.x - Math.max(padX, (halo?.left ?? 0) + 0.5),
+    ink.y - Math.max(padY, (halo?.top ?? 0) + 0.5),
+    ink.x + ink.width + Math.max(padX, (halo?.right ?? 0) + 0.5),
+    ink.y + ink.height + Math.max(padY, (halo?.bottom ?? 0) + 0.5)
   ]
 }
 
@@ -247,7 +258,7 @@ export function planOcrExport(
     // head and tail keep the scan's own pixels. See partialRedraw.ts.
     const partial = !item.vertical ? partialFor?.(item) : null
     if (partial) {
-      const outcome = planPartial(item, { ...partial, fontName, color: plainColor(item.color), faceId: faceIdFor?.(item) }, items, pageWidth)
+      const outcome = planPartial(item, { ...partial, fontName, color: plainColor(item.color), faceId: faceIdFor?.(item), strokeRatio: item.strokeRatio }, items, pageWidth)
       if ('mode' in outcome) {
         patches.push(...outcome.patches)
         images.push(...outcome.images)
@@ -275,7 +286,8 @@ export function planOcrExport(
         fontName,
         color: plainColor(item.color),
         rotation: 90,
-        faceId: faceIdFor?.(item)
+        faceId: faceIdFor?.(item),
+        strokeWidth: strokeWidthFor(item.strokeRatio, fontName, Number(item.fontSize))
       })
       continue
     }
@@ -299,15 +311,17 @@ export function planOcrExport(
     // the box (see `sizeOf`); the whole-run redraw then agrees with the
     // partial one and with the traced face's own proportions.
     const sized = partial ? { ...item, fontSize: sizeOf(item, partial.cut) } : item
+    const fontSize = Number(fitSize(sized, item.text, pageWidth, items, widthAt10))
     texts.push({
       text: String(item.text),
       x: Number(x),
       y: Number(baselineY),
-      fontSize: Number(fitSize(sized, item.text, pageWidth, items, widthAt10)),
+      fontSize,
       fontName,
       color: plainColor(item.color),
       rotation: 0,
-      faceId: faceIdFor?.(item)
+      faceId: faceIdFor?.(item),
+      strokeWidth: strokeWidthFor(item.strokeRatio, fontName, fontSize)
     })
   }
 

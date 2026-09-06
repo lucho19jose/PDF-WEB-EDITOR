@@ -2,6 +2,7 @@ import type { OcrTextItem } from './ocrTypes'
 import type { RectT } from '@/engine/types'
 import type { GlyphCutResult } from './glyphCut'
 import type { PatchOp, TextOp, ImageOp } from './ocrExport'
+import { strokeWidthFor } from './ocrStroke'
 
 /**
  * Redrawing only what the user CHANGED in a scanned run.
@@ -53,6 +54,8 @@ export interface PartialContext {
   fontName: string
   color: [number, number, number]
   faceId?: string
+  /** The scan's measured stem over the em; the fallback glyphs of the stretch are stroked up to it. */
+  strokeRatio?: number
 }
 
 export interface PartialPlan {
@@ -230,7 +233,13 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const penX = oldSpan ? oldSpan.x0 - bearing : (prefix > 0 ? headEnd + gapBefore - bearing : ink.x - bearing)
   const inkEnd = st.text.length ? penX + width - bearing : headEnd
   const baselineY = cut.baseline.yAtCentre + cut.baseline.slope * (penX - cut.baseline.centreX)
-  const padY = Math.max(1, ink.height * 0.12)
+  // The patch reaches at least as far as the ink measured OUTSIDE the box
+  // (an accent, a blurred fringe — `item.halo`), on the vertical axis where
+  // the head and tail cannot object; horizontally the pads stay tight, since
+  // a neighbouring word is what lies past the box's ends.
+  const halo = item.halo
+  const padTop = Math.max(1, ink.height * 0.12, (halo?.top ?? 0) + 0.5)
+  const padBottom = Math.max(1, ink.height * 0.12, (halo?.bottom ?? 0) + 0.5)
   const padX = Math.max(1, ink.height * 0.15)
   const padHead = prefix > 0 ? Math.min(1, Math.max(0.4, gapBefore / 2)) : padX
   const patchX0 = prefix > 0 ? headEnd + padHead : ink.x - padX
@@ -257,7 +266,8 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
     ...invisible(headText, cells[0].x0 - bearing, headEnd - cells[0].x0 + bearing),
     ...(st.text.length ? [{
       text: st.text, x: penX, y: baselineY, fontSize: sizePt,
-      fontName: ctx.fontName, color: ctx.color, rotation: 0, faceId: ctx.faceId, group: item.id
+      fontName: ctx.fontName, color: ctx.color, rotation: 0, faceId: ctx.faceId, group: item.id,
+      strokeWidth: strokeWidthFor(ctx.strokeRatio, ctx.fontName, sizePt)
     } as TextOp] : []),
     ...(tailStart !== null ? invisible(tailText, tailStart + tailShift - bearing, inkRight - tailStart + bearing) : [])
   ]
@@ -270,7 +280,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
     if (inkEnd > limit) return { reason: 'stretch would run into the next run' }
     return {
       mode: 'partial',
-      patches: [{ rect: [patchX0, ink.y - padY, Math.max(inkRight, inkEnd) + padX, ink.y + ink.height + padY], color: plain(item.background) }],
+      patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkEnd) + padX, ink.y + ink.height + padBottom], color: plain(item.background) }],
       images: [],
       texts: textOp()
     }
@@ -291,7 +301,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   if (dx <= Math.max(TOUCH_PT, gapAfter * 0.6) && dx >= -mayOpen) {
     return {
       mode: 'partial',
-      patches: [{ rect: [patchX0, ink.y - padY, tailStart - padTail, ink.y + ink.height + padY], color: plain(item.background) }],
+      patches: [{ rect: [patchX0, ink.y - padTop, tailStart - padTail, ink.y + ink.height + padBottom], color: plain(item.background) }],
       images: [],
       texts: textOp()
     }
@@ -305,11 +315,11 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   // old-span ink on the left and no neighbour's ink on the right.
   const padL = Math.min(1, Math.max(0.3, (oldSpan ? tailStart - oldSpan.x1 : gapAfter) / 2))
   const padR = Math.min(1.5, nextInk !== null ? Math.max(0, nextInk - inkRight) : 1.5)
-  const src: RectT = [tailStart - padL, ink.y - padY, inkRight + padR, ink.y + ink.height + padY]
+  const src: RectT = [tailStart - padL, ink.y - padTop, inkRight + padR, ink.y + ink.height + padBottom]
   const dst: RectT = [src[0] + dx, src[1], src[2] + dx, src[3]]
   return {
     mode: 'partial+shift',
-    patches: [{ rect: [patchX0, ink.y - padY, Math.max(inkRight, inkRight + dx) + padX, ink.y + ink.height + padY], color: plain(item.background) }],
+    patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkRight + dx) + padX, ink.y + ink.height + padBottom], color: plain(item.background) }],
     images: [{ srcRect: src, dstRect: dst }],
     texts: textOp(dx)
   }

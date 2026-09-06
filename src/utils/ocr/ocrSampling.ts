@@ -169,3 +169,92 @@ export function samplePatchColor(
   const b = samples.reduce((s, c) => s + c[2], 0) / samples.length
   return [r, g, b]
 }
+
+/**
+ * How far a run's ink reaches OUTSIDE its box, in canvas pixels on each side.
+ *
+ * The ink box is measured tight, and a scan's letters do not stop at it: the
+ * accent of "PERÚ" sits two rows above the caps, a bold letter's blurred edge
+ * a pixel or two past its stem. A patch cut at the box leaves those on the
+ * page as grey crumbs at the edge of a clean rectangle — the deleted line is
+ * gone and its accent still shows. Each edge walks outward while the rows
+ * (columns) still carry ink, and stops at the first clean one. Two things
+ * keep it from painting over a NEIGHBOUR:
+ *
+ * - A clean row ends the walk — but an accent floats: one or two clean rows
+ *   can separate it from the caps beneath. Up to `SKIP` clean rows are looked
+ *   across, and only ink found within them extends the walk.
+ * - Ink that is DENSE (over a fifth of the row) is a line of text, not a
+ *   fringe or an accent, and ends the walk without being taken.
+ *
+ * `paper` and `ink` are lumas 0–255; a pixel darker than a third of the way
+ * from paper to ink counts as ink.
+ */
+export function measureHalo(
+  ctx: CanvasRenderingContext2D,
+  rect: { x: number; y: number; width: number; height: number },
+  paper: number,
+  ink: number
+): { top: number; bottom: number; left: number; right: number } {
+  const none = { top: 0, bottom: 0, left: 0, right: 0 }
+  // Light-on-dark runs are not walked: the "ink" test below reads darkness.
+  if (!(paper > ink + 24)) return none
+  const x0 = Math.max(0, Math.floor(rect.x)), y0 = Math.max(0, Math.floor(rect.y))
+  const x1 = Math.min(ctx.canvas.width, Math.ceil(rect.x + rect.width))
+  const y1 = Math.min(ctx.canvas.height, Math.ceil(rect.y + rect.height))
+  const w = x1 - x0, h = y1 - y0
+  if (w < 2 || h < 2) return none
+  const limitY = Math.max(2, Math.round(h * 0.35)), limitX = Math.max(2, Math.round(h * 0.5))
+  const px0 = Math.max(0, x0 - limitX), py0 = Math.max(0, y0 - limitY)
+  const px1 = Math.min(ctx.canvas.width, x1 + limitX), py1 = Math.min(ctx.canvas.height, y1 + limitY)
+  const pw = px1 - px0, ph = py1 - py0
+  let data: Uint8ClampedArray
+  try { data = ctx.getImageData(px0, py0, pw, ph).data } catch (_) { return none }
+  // Two levels. FAINT is any visible tint on the paper (a scan's JPEG ringing
+  // around a bold letter reads 229 on 254 paper — invisible in the numbers,
+  // a grey line along the patch's edge to the eye); DARK is real ink, past a
+  // third of the way from paper to the text's colour.
+  const faintThr = paper - 12
+  const darkThr = paper - Math.max(12, (paper - ink) / 3)
+  const level = (x: number, y: number): 0 | 1 | 2 => {
+    const i = ((y - py0) * pw + (x - px0)) * 4
+    const l = luma(data[i], data[i + 1], data[i + 2])
+    return l < darkThr ? 2 : l < faintThr ? 1 : 0
+  }
+  const SKIP = 2
+  const DENSE = 0.2
+  // Walk one edge: `count(k)` is [faint, dark] pixel counts on the k-th row
+  // (column) outward, over `span` pixels; returns how many to take. A row of
+  // faint pixels only is fringe or ringing and is taken whatever its density;
+  // dark pixels are taken while sparse (an accent, a descender) and stop the
+  // walk once dense — that is the next line of text.
+  const walk = (limit: number, count: (k: number) => [number, number], span: number): number => {
+    let taken = 0, clean = 0
+    for (let k = 1; k <= limit; k++) {
+      const [faint, dark] = count(k)
+      if (faint === 0 && dark === 0) { clean++; if (clean > SKIP) break; continue }
+      if (dark > span * DENSE) break
+      taken = k
+      clean = 0
+    }
+    return taken
+  }
+  const rowInk = (y: number): [number, number] => {
+    if (y < py0 || y >= py1) return [0, 0]
+    let f = 0, d = 0
+    for (let x = x0; x < x1; x++) { const l = level(x, y); if (l === 2) d++; else if (l === 1) f++ }
+    return [f, d]
+  }
+  const colInk = (x: number, yLo: number, yHi: number): [number, number] => {
+    if (x < px0 || x >= px1) return [0, 0]
+    let f = 0, d = 0
+    for (let y = yLo; y < yHi; y++) { const l = level(x, y); if (l === 2) d++; else if (l === 1) f++ }
+    return [f, d]
+  }
+  const top = walk(limitY, k => rowInk(y0 - k), w)
+  const bottom = walk(limitY, k => rowInk(y1 - 1 + k), w)
+  const yLo = Math.max(py0, y0 - top), yHi = Math.min(py1, y1 + bottom)
+  const left = walk(limitX, k => colInk(x0 - k, yLo, yHi), yHi - yLo)
+  const right = walk(limitX, k => colInk(x1 - 1 + k, yLo, yHi), yHi - yLo)
+  return { top, bottom, left, right }
+}

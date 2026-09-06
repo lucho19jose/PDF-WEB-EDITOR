@@ -63,6 +63,19 @@ export interface OcrTextItem {
   color: [number, number, number]
   /** Sampled from the page around the line — what a patch must be painted with. */
   background: [number, number, number]
+  /**
+   * The scan's stem thickness over the em (the face detector's `strokeRatio`),
+   * when it could be measured. A fallback glyph drawn beside the scan's own
+   * letters is stroked up to it — see ocrStroke.ts.
+   */
+  strokeRatio?: number
+  /**
+   * How far the run's ink reaches OUTSIDE `inkRect`, in points, measured on
+   * the raster just before a bake: an accent above the caps, the blurred fringe
+   * of a bold letter. A patch that stops at the ink box leaves those on the
+   * page — the accent of "PERÚ" stayed as two grey rows over a deleted line.
+   */
+  halo?: { top: number; bottom: number; left: number; right: number }
 
   align: OcrAlign
   /** Degrees clockwise from horizontal, from the OCR baseline. */
