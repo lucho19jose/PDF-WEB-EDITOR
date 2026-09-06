@@ -1,4 +1,4 @@
-import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult, ImageOrient, ImageAlign } from './types'
+import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, SignatureInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult, ImageOrient, ImageAlign } from './types'
 import type { WorkerResponse, TextRunPart } from './worker/worker-protocol'
 
 /**
@@ -377,6 +377,11 @@ export class MuPDFBridge {
 
   async getAnnotations(pageIndex: number): Promise<{ annotations: AnnotationInfo[] }> {
     return this.send('getAnnotations', { pageIndex })
+  }
+
+  /** The document's digital signatures (/Sig fields) — read, not verified. */
+  async getSignatures(): Promise<{ signatures: SignatureInfo[] }> {
+    return this.send('getSignatures')
   }
 
   async addTextMarkup(pageIndex: number, markupType: MarkupType, quads: Quad[], color: [number, number, number], opacity?: number): Promise<{ success: boolean; index?: number; error?: string }> {

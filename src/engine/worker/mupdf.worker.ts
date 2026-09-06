@@ -15,6 +15,15 @@ import type {
 // MuPDF module — loaded dynamically to catch errors
 let mupdf: typeof import('mupdf') | null = null
 let pdfDoc: any = null // mupdf.PDFDocument
+/**
+ * Length of the bytes the current document was loaded from. A signature's
+ * /ByteRange is stated against the FILE, and whether its last range ends at
+ * the end of the file is what says nothing was appended after it — an
+ * incremental update (another signature, or an edit) leaves the earlier
+ * signature covering only a prefix. After a save→reload this is the saved
+ * length, and every signature then reads as partial, which is the truth.
+ */
+let loadedByteLength = 0
 
 // Font encoding cache: fontName → { unicodeToGlyph, glyphToUnicode, codeBytes } (null = no ToUnicode CMap)
 const fontEncodingCache = new Map<string, {
@@ -56,6 +65,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         simpleFontInfoCache.clear()
         invalidateContentSources()
         const bytes = new Uint8Array(req.data.bytes)
+        loadedByteLength = bytes.length
         pdfDoc = new mupdf.PDFDocument(bytes)
         const pageCount = pdfDoc.countPages()
         respond({ id: req.id, type: 'success', data: { pageCount } })
@@ -228,6 +238,11 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       case 'getAnnotations': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({ id: req.id, type: 'success', data: { annotations: listAnnotations(req.data.pageIndex) } })
+        break
+      }
+      case 'getSignatures': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: { signatures: getSignatures() } })
         break
       }
       case 'addTextMarkup': {
@@ -9317,6 +9332,171 @@ function colorArr(c: any): number[] {
 
 function safe<T>(fn: () => T, fallback: T): T {
   try { return fn() } catch { return fallback }
+}
+
+// ===== DIGITAL SIGNATURES =====
+
+/** Follow an indirect reference; null for a missing or /null object. */
+function derefObj(obj: any): any {
+  if (!obj || String(obj) === 'null') return null
+  try {
+    const r = obj.resolve ? obj.resolve() : obj
+    return (!r || String(r) === 'null') ? null : r
+  } catch { return null }
+}
+
+/** A text-string entry (/Name, /Reason, …) as JS text, or undefined when absent or not a string. */
+function sigString(dict: any, key: string): string | undefined {
+  const v = derefObj(safe(() => dict.get(key), null))
+  if (!v) return undefined
+  // asString() decodes PDFDocEncoding and UTF-16BE (with BOM) to text.
+  const s = safe(() => (v.isString && v.isString()) ? String(v.asString()) : '', '')
+  const t = s.replace(/\0/g, '').trim()
+  return t ? t : undefined
+}
+
+/** A resolved name object as its bare name without the slash, or undefined. */
+function nameOf(v: any): string | undefined {
+  if (!v) return undefined
+  const s = safe(() => (v.isName && v.isName()) ? String(v.asName()) : String(v).replace(/^\//, ''), '')
+  return s ? s : undefined
+}
+
+/** A name entry (/SubFilter, /FT) of a dictionary, or undefined. */
+function sigName(dict: any, key: string): string | undefined {
+  return nameOf(derefObj(safe(() => dict.get(key), null)))
+}
+
+/**
+ * A PDF date (`D:YYYYMMDDHHmmSSOHH'mm'`, every field after the year optional)
+ * as ISO 8601, keeping the offset the file states. Anything that does not
+ * parse is returned as it was — a wrong date is worse than an odd one.
+ */
+function pdfDateToIso(s: string): string {
+  const m = /^(?:D:)?(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?(?:([+\-Z])(\d{2})?'?(\d{2})?'?)?/.exec(s.trim())
+  if (!m) return s
+  const [, Y, Mo = '01', D = '01', h = '00', mi = '00', sec = '00', tzSign, tzH, tzM] = m
+  let iso = `${Y}-${Mo}-${D}T${h}:${mi}:${sec}`
+  if (tzSign === 'Z' || (tzSign && !tzH)) iso += 'Z'
+  else if (tzSign) iso += `${tzSign}${tzH}:${tzM ?? '00'}`
+  return iso
+}
+
+/** 0-based index of the page whose object is `pageRef`, or -1. */
+function pageIndexOfRef(pageRef: any): number {
+  const num = safe(() => (pageRef && pageRef.isIndirect && pageRef.isIndirect()) ? pageRef.asIndirect() : -1, -1)
+  if (num < 0) return -1
+  const n = safe(() => pdfDoc.countPages(), 0)
+  for (let i = 0; i < n; i++) {
+    const ref = safe(() => pdfDoc.findPage(i), null)
+    if (ref && safe(() => ref.isIndirect() && ref.asIndirect() === num, false)) return i
+  }
+  return -1
+}
+
+/**
+ * The document's digital signatures, read from the /V of every /Sig field —
+ * what each SAYS about itself (signer, reason, place, date, contact,
+ * SubFilter), which page its widget sits on, and whether its /ByteRange
+ * reaches the end of the loaded bytes. Nothing is verified: the editor's
+ * business is to tell the user a signature is THERE, and that an edit will
+ * break it, not to vouch for it.
+ *
+ * Two walks, because either can be missing: the pages' /Annots (a /Widget
+ * with /FT /Sig, the FT possibly inherited from a parent field — this is how
+ * Intellisign stamps its signatures) and the /AcroForm /Fields tree (a
+ * signature field with no widget, or a page whose /Annots was dropped).
+ * A field reached both ways is reported once, keyed by its /V object.
+ */
+function getSignatures(): any[] {
+  const out: any[] = []
+  const seen = new Set<string>()
+
+  const inheritable = (dict: any, key: string): any => {
+    let d = dict
+    for (let hop = 0; d && hop < 32; hop++) {
+      const v = derefObj(safe(() => d.get(key), null))
+      if (v) return v
+      d = derefObj(safe(() => d.get('Parent'), null))
+    }
+    return null
+  }
+
+  const describe = (field: any, page: number): void => {
+    const v = inheritable(field, 'V')
+    if (!v || !safe(() => v.isDictionary(), false)) return
+    const type = sigName(v, 'Type')
+    if (type && type !== 'Sig' && type !== 'DocTimeStamp') return
+    // One entry per signature dictionary: the same /V is reached through the
+    // page's widget AND through /AcroForm. Keyed by the /V object's number
+    // when it is indirect (it always is in practice), else by what it says.
+    const rawV = safe(() => field.get('V'), null)
+    const key = safe(() => (rawV && rawV.isIndirect && rawV.isIndirect()) ? `obj:${rawV.asIndirect()}` : '', '')
+      || `str:${sigString(v, 'Name') ?? ''}|${sigString(v, 'M') ?? ''}|${safe(() => String(v.get('ByteRange')), '')}`
+    if (seen.has(key)) return
+    seen.add(key)
+
+    let coversWholeDocument = false
+    const br = derefObj(safe(() => v.get('ByteRange'), null))
+    if (br && safe(() => br.isArray(), false)) {
+      const n = safe(() => br.length, 0)
+      if (n >= 2 && n % 2 === 0) {
+        const off = safe(() => Number(String(derefObj(br.get(n - 2)) ?? 'NaN')), NaN)
+        const len = safe(() => Number(String(derefObj(br.get(n - 1)) ?? 'NaN')), NaN)
+        // A trailing newline or two after %%EOF is common and is not an update.
+        if (Number.isFinite(off) && Number.isFinite(len)) coversWholeDocument = off + len >= loadedByteLength - 2
+      }
+    }
+
+    const dateRaw = sigString(v, 'M')
+    let pg = page
+    if (pg < 0) pg = pageIndexOfRef(safe(() => field.get('P'), null))
+    out.push({
+      name: sigString(v, 'Name'),
+      reason: sigString(v, 'Reason'),
+      location: sigString(v, 'Location'),
+      date: dateRaw ? pdfDateToIso(dateRaw) : undefined,
+      contactInfo: sigString(v, 'ContactInfo'),
+      subFilter: sigName(v, 'SubFilter'),
+      page: pg,
+      coversWholeDocument
+    })
+  }
+
+  // 1. Every page's /Annots: widgets whose (inherited) /FT is /Sig.
+  const pageCount = safe(() => pdfDoc.countPages(), 0)
+  for (let p = 0; p < pageCount; p++) {
+    const pageObj = derefObj(safe(() => pdfDoc.findPage(p), null))
+    const annots = derefObj(safe(() => pageObj?.get('Annots'), null))
+    if (!annots || !safe(() => annots.isArray(), false)) continue
+    const n = safe(() => annots.length, 0)
+    for (let i = 0; i < n; i++) {
+      const a = derefObj(safe(() => annots.get(i), null))
+      if (!a || !safe(() => a.isDictionary(), false)) continue
+      if (sigName(a, 'Subtype') !== 'Widget') continue
+      const ft = inheritable(a, 'FT')
+      if (!ft || nameOf(ft) !== 'Sig') continue
+      describe(a, p)
+    }
+  }
+
+  // 2. The /AcroForm /Fields tree, for signature fields no page's /Annots reaches.
+  const walkFields = (arr: any, depth: number): void => {
+    if (!arr || depth > 32 || !safe(() => arr.isArray(), false)) return
+    const n = safe(() => arr.length, 0)
+    for (let i = 0; i < n; i++) {
+      const f = derefObj(safe(() => arr.get(i), null))
+      if (!f || !safe(() => f.isDictionary(), false)) continue
+      const ft = inheritable(f, 'FT')
+      if (ft && nameOf(ft) === 'Sig') describe(f, -1)
+      walkFields(derefObj(safe(() => f.get('Kids'), null)), depth + 1)
+    }
+  }
+  const root = derefObj(safe(() => pdfDoc.getTrailer().get('Root'), null))
+  const acro = derefObj(safe(() => root?.get('AcroForm'), null))
+  walkFields(derefObj(safe(() => acro?.get('Fields'), null)), 0)
+
+  return out
 }
 
 /**

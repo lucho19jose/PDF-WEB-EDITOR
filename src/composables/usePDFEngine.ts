@@ -1,7 +1,7 @@
 import { ref, readonly } from 'vue'
 import { getMuPDFBridge } from '@/engine/bridge'
 import type { TextRunPart } from '@/engine/worker/worker-protocol'
-import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, ContentImageInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult, ImageOrient, ImageAlign } from '@/engine/types'
+import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, SignatureInfo, ContentImageInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult, ImageOrient, ImageAlign } from '@/engine/types'
 
 /**
  * Composable for interacting with the MuPDF editing engine.
@@ -343,6 +343,20 @@ export function usePDFEngine() {
     }
   }
 
+  /**
+   * The document's digital signatures, read (never verified) from its /Sig
+   * fields. Empty for an unsigned document — and on any failure, because a
+   * missing chip is a far smaller wrong than a document that will not open.
+   */
+  async function getSignatures(): Promise<SignatureInfo[]> {
+    try {
+      return (await bridge.getSignatures()).signatures
+    } catch (err: any) {
+      console.warn('[PDFEngine] getSignatures failed:', err.message)
+      return []
+    }
+  }
+
   function wrap(result: { success: boolean; error?: string }, ctx: string, pageIndex?: number): boolean {
     if (result.success) {
       if (pageIndex !== undefined) pageTextCache.delete(pageIndex)
@@ -560,6 +574,7 @@ export function usePDFEngine() {
     getPageSize,
     // annotations
     getAnnotations,
+    getSignatures,
     addTextMarkup,
     addShape,
     addInk,

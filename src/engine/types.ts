@@ -130,6 +130,30 @@ export interface AnnotationInfo {
 }
 
 /**
+ * One digital signature found in the document — the /V dictionary of a /Sig
+ * form field, read for what it SAYS, not verified. Everything but `page` and
+ * `coversWholeDocument` is optional: a signing service fills in what it likes.
+ */
+export interface SignatureInfo {
+  /** /Name — the signer, as the signing software wrote it. */
+  name?: string
+  /** /Reason */
+  reason?: string
+  /** /Location */
+  location?: string
+  /** /M, converted from the PDF date form to ISO 8601 (with the offset the file gave). */
+  date?: string
+  /** /ContactInfo */
+  contactInfo?: string
+  /** /SubFilter — adbe.pkcs7.detached, ETSI.CAdES.detached, … */
+  subFilter?: string
+  /** 0-based index of the page carrying the signature's widget; -1 when no page holds it. */
+  page: number
+  /** The last /ByteRange pair ends at the length of the bytes loaded — i.e. nothing was appended after this signature. */
+  coversWholeDocument: boolean
+}
+
+/**
  * One block's share of a batched transform.
  *
  * Moving a multi-block selection — and pushing whatever it would have landed

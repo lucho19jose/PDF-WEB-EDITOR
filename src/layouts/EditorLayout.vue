@@ -616,7 +616,16 @@ async function loadBytes(bytes: Uint8Array, name: string) {
     // and nothing ever asked again, so a freshly opened file had no clickable
     // objects until the tool was toggled. Bump again now the engine is ready.
     docStore.reloadBytes(bytes)
-    editorStore.setStatus(`${name} — ${pageCount} pages (ready)`)
+    // The document's digital signatures, as of the open. Read once here, not
+    // after each edit: every edit breaks all of them, and the status bar pairs
+    // this list with `isModified` to say so. An Intellisign contract carries
+    // one /Sig widget per signer per page, so the count can run to dozens.
+    const signatures = await pdfEngine.getSignatures()
+    docStore.setSignatures(signatures)
+    const signed = signatures.length
+      ? ` · ${signatures.length} digital signature${signatures.length === 1 ? '' : 's'} — editing will invalidate them`
+      : ''
+    editorStore.setStatus(`${name} — ${pageCount} pages (ready)${signed}`)
   } catch (err: any) {
     // It renders but cannot be edited — say exactly that instead of a bare
     // error, because the pages ARE on screen and the user can still print/save.

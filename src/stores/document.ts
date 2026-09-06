@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import type { SignatureInfo } from '@/engine/types'
 
 export const useDocumentStore = defineStore('document', () => {
   const loaded = ref(false)
@@ -21,6 +22,13 @@ export const useDocumentStore = defineStore('document', () => {
   const isModified = ref(false)
   const pdfBytes = ref<Uint8Array | null>(null)
   const renderVersion = ref(0)
+  /**
+   * The digital signatures the document carried WHEN IT WAS OPENED (read by
+   * the engine, never verified). Kept as of the open, not re-read after each
+   * edit: an edit breaks every one of them, and that is what `isModified`
+   * already says — the status bar pairs the two.
+   */
+  const signatures = ref<SignatureInfo[]>([])
 
   const fileSizeFormatted = computed(() => {
     if (!pdfBytes.value) return '0 KB'
@@ -35,9 +43,16 @@ export const useDocumentStore = defineStore('document', () => {
     pdfBytes.value = bytes
     currentPage.value = 1
     isModified.value = false
+    // The previous document's signatures must not describe this one for the
+    // moment before the engine has read its own.
+    signatures.value = []
     // A new document invalidates every overlay's cached geometry even when
     // currentPage/tool don't change (e.g. opening a 2nd PDF while on page 1)
     renderVersion.value++
+  }
+
+  function setSignatures(list: SignatureInfo[]) {
+    signatures.value = list
   }
 
   /** Reload bytes without resetting page/state — used after in-place editing */
@@ -76,12 +91,13 @@ export const useDocumentStore = defineStore('document', () => {
     scale.value = 1.5
     isModified.value = false
     pdfBytes.value = null
+    signatures.value = []
   }
 
   return {
     continuousScroll,
     loaded, fileName, totalPages, currentPage, scale,
-    isModified, pdfBytes, fileSizeFormatted, renderVersion,
-    setDocument, reloadBytes, setPage, setScale, markModified, markSaved, reset
+    isModified, pdfBytes, fileSizeFormatted, renderVersion, signatures,
+    setDocument, reloadBytes, setPage, setScale, markModified, markSaved, reset, setSignatures
   }
 })

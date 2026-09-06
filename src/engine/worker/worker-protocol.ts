@@ -1,4 +1,4 @@
-import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, ImageOrient, ImageAlign } from '../types'
+import type { PageTextData, Quad, Pt, RectT, AnnotationInfo, SignatureInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, ImageOrient, ImageAlign } from '../types'
 
 // Messages from main thread -> worker
 /** One run of an `addTextRun` text object: its own pen (bottom-left origin baseline), size, face and visibility. */
@@ -84,6 +84,8 @@ export type WorkerRequest =
   | { id: number; type: 'saveDocument' }
   /** Render a page through MuPDF at `scale` (1 = 72 DPI), /Rotate applied, as RGBA — for OCR rasters, where pdf.js takes minutes on some fax-encoded scans. */
   | { id: number; type: 'renderPixmap'; data: { pageIndex: number; scale: number } }
+  /** The document's digital signatures (/Sig fields), read but not verified. */
+  | { id: number; type: 'getSignatures' }
   | { id: number; type: 'destroy' }
 
 // Messages from worker -> main thread
@@ -92,4 +94,4 @@ export type WorkerResponse =
   | { id: number; type: 'error'; error: string; fatal?: boolean }
   | { id: number; type: 'progress'; progress: number }
 
-export type { PageTextData, Quad, Pt, RectT, AnnotationInfo, SearchHit, BlockTransformOp }
+export type { PageTextData, Quad, Pt, RectT, AnnotationInfo, SignatureInfo, SearchHit, BlockTransformOp }
