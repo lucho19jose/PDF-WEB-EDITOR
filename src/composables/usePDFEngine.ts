@@ -231,8 +231,8 @@ export function usePDFEngine() {
    * rects (top-left page points), so a baked replacement does not leave the
    * old words findable underneath it.
    */
-  async function blankInvisibleText(pageIndex: number, rects: [number, number, number, number][]): Promise<number> {
-    const r = await bridge.blankInvisibleText(pageIndex, rects)
+  async function blankInvisibleText(pageIndex: number, rects: [number, number, number, number][], all = false): Promise<number> {
+    const r = await bridge.blankInvisibleText(pageIndex, rects, all)
     if (r.blanked > 0) pageTextCache.delete(pageIndex)
     return r.blanked
   }

@@ -348,16 +348,35 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
     text, x, y: baselineY, fontSize: sizePt,
     fontName: ctx.fontName, color: ctx.color, rotation: 0, invisible: true, group: item.id, fitWidth
   }] : []
-  const textOp = (tailShift = 0): TextOp[] => [
-    ...invisible(headText, cells[0].x0 - bearing, headEnd - cells[0].x0 + bearing),
-    ...(st.text.length ? [{
-      text: st.text, x: penX, y: baselineY, fontSize: sizePt,
-      fontName: ctx.fontName, color: ctx.color, rotation: 0, faceId: ctx.faceId, group: item.id,
-      strokeWidth: strokeWidthFor(ctx.strokeRatio ? ctx.strokeRatio * (ctx.weightScale ?? 1) : undefined, ctx.fontName, sizePt),
-      faceSkip: ctx.faceSkip || undefined
-    } as TextOp] : []),
-    ...(tailStart !== null ? invisible(tailText, tailStart + tailShift - bearing, inkRight - tailStart + bearing) : [])
-  ]
+  // An extractor puts a SPACE wherever one glyph's advance ends a sixth of an
+  // em or more before the next begins. The invisible head is fitted to its
+  // ink, the stretch is placed a letter gap after that ink, and a scanned
+  // face's letter gap at 9pt is 2pt — "MSP-SIST-CS-2026-777" read back as
+  // "202 6-777". Where the text has NO space at the boundary, the invisible
+  // run is stretched (or started) to within a hair of the stretch, so the
+  // extracted advances meet; where it has one, the gap is left to say so.
+  const HAIR = 0.3
+  const stretchEnd = st.text.length ? penX + width : null
+  const textOp = (tailShift = 0): TextOp[] => {
+    const headX = cells[0].x0 - bearing
+    const joinHead = headText && !st.spaceBefore && (stretchEnd !== null || tailStart !== null)
+    const headTo = joinHead
+      ? (st.text.length ? penX : tailStart! + tailShift - bearing) - HAIR
+      : headEnd + bearing
+    const tailX = tailStart !== null
+      ? (!st.spaceAfter && stretchEnd !== null ? Math.min(tailStart + tailShift - bearing, stretchEnd + HAIR) : tailStart + tailShift - bearing)
+      : null
+    return [
+      ...invisible(headText, headX, Math.max(1, headTo - headX)),
+      ...(st.text.length ? [{
+        text: st.text, x: penX, y: baselineY, fontSize: sizePt,
+        fontName: ctx.fontName, color: ctx.color, rotation: 0, faceId: ctx.faceId, group: item.id,
+        strokeWidth: strokeWidthFor(ctx.strokeRatio ? ctx.strokeRatio * (ctx.weightScale ?? 1) : undefined, ctx.fontName, sizePt),
+        faceSkip: ctx.faceSkip || undefined
+      } as TextOp] : []),
+      ...(tailX !== null ? invisible(tailText, tailX, inkRight + tailShift - tailX) : [])
+    ]
+  }
 
   if (tailStart === null) {
     // No tail: an append or a deletion at the end. The stretch may grow past
@@ -367,7 +386,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
     if (inkEnd > limit) return { reason: 'stretch would run into the next run' }
     return {
       mode: 'partial',
-      patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkEnd) + padX, ink.y + ink.height + padBottom], color: plain(item.background) }],
+      patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkEnd) + padX, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id }],
       images: [],
       texts: textOp()
     }
@@ -388,7 +407,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   if (dx <= Math.max(TOUCH_PT, gapAfter * 0.6) && dx >= -mayOpen) {
     return {
       mode: 'partial',
-      patches: [{ rect: [patchX0, ink.y - padTop, tailStart - padTail, ink.y + ink.height + padBottom], color: plain(item.background) }],
+      patches: [{ rect: [patchX0, ink.y - padTop, tailStart - padTail, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id }],
       images: [],
       texts: textOp()
     }
@@ -406,7 +425,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const dst: RectT = [src[0] + dx, src[1], src[2] + dx, src[3]]
   return {
     mode: 'partial+shift',
-    patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkRight + dx) + padX, ink.y + ink.height + padBottom], color: plain(item.background) }],
+    patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkRight + dx) + padX, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id }],
     images: [{ srcRect: src, dstRect: dst }],
     texts: textOp(dx)
   }

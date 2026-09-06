@@ -223,8 +223,8 @@ export class MuPDFBridge {
   }
 
   /** Blank the invisible (3 Tr) show ops whose origin lies inside one of the rects (top-left page points). */
-  async blankInvisibleText(pageIndex: number, rects: [number, number, number, number][]): Promise<{ blanked: number }> {
-    return this.send('blankInvisibleText', { pageIndex, rects })
+  async blankInvisibleText(pageIndex: number, rects: [number, number, number, number][], all = false): Promise<{ blanked: number }> {
+    return this.send('blankInvisibleText', { pageIndex, rects, all })
   }
 
   /** Hand the worker a traced scan face to embed for runs that name it. */

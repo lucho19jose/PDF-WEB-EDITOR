@@ -3,6 +3,9 @@
 import type { WorkerRequest, WorkerResponse } from './worker-protocol'
 import { glyphNameToUnicode } from './glyphNames'
 import * as opentype from 'opentype.js'
+// opentype.js is CJS: the browser bundle gives the namespace itself, the
+// SSR loader (tools/pdf-sweep/node-harness.mjs) wraps it under `default`.
+const ot: any = (opentype as any).parse ? opentype : ((opentype as any).default ?? opentype)
 import type {
   TextBlock, TextChar, TextLine, PageTextData,
   BlockTransformOp, BlockStyleOp, BlockTransformResult, ContentImageInfo,
@@ -129,12 +132,17 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 
       case 'blankInvisibleText': {
         if (!pdfDoc) throw new Error('No document loaded')
-        respond({ id: req.id, type: 'success', data: blankInvisibleTextIn(req.data.pageIndex, req.data.rects) })
+        respond({ id: req.id, type: 'success', data: blankInvisibleTextIn(req.data.pageIndex, req.data.rects, 1, !!req.data.all) })
         break
       }
 
       case 'measureRuns': {
         if (!mupdf) throw new Error('MuPDF not initialized')
+        // The CJK face's advances are only exact once the face is loaded, and
+        // the first Chinese edit on a page measured BEFORE anything had loaded
+        // it: `exact: false`, and the partial redraw declined ("width unknown")
+        // — the whole line redrawn for one added ideograph.
+        await ensureCjkFontFor(req.data.runs.map(r => r.text).join(''))
         respond({ id: req.id, type: 'success', data: { widths: req.data.runs.map(r => measureRunWidth(r.text, r.fontSize, r.fontName, r.faceId, r.faceSkip)) } })
         break
       }
@@ -715,8 +723,15 @@ function markInvisibleBlocks(pageIndex: number, blocks: TextBlock[]): void {
  * Blanking keeps every other offset valid. Page stream only — a layer inside
  * a Form XObject is left alone (never seen from an OCR producer).
  */
-function blankInvisibleTextIn(pageIndex: number, rects: [number, number, number, number][], margin = 1): { blanked: number } {
-  const origins = collectShowOpOrigins(pageIndex).filter(o => o.invisible && o.source === 'page')
+function blankInvisibleTextIn(pageIndex: number, rects: [number, number, number, number][], margin = 1, all = false): { blanked: number } {
+  // `all`: the VISIBLE ops under the rects go too. A run edited a second time
+  // after a bake is patched over again, and the first bake's visible stretch
+  // (and its invisible head, in one object) would stay in the stream under
+  // the patch — hidden, and still read by every extractor: the title came
+  // back as "CONTRATO DE OBRA MAESTRA" AND "CONTRATO DE OBRA MAESTRA 2".
+  // Anything whose origin lies inside a rect is covered by the patch about to
+  // be painted there, so blanking it makes the text agree with the picture.
+  const origins = collectShowOpOrigins(pageIndex).filter(o => (all || o.invisible) && o.source === 'page')
   if (!origins.length || !rects.length) return { blanked: 0 }
   const inside = (o: ShowOpOrigin) => rects.some(([x0, y0, x1, y1]) =>
     o.x >= Math.min(x0, x1) - margin && o.x <= Math.max(x0, x1) + margin &&
@@ -2851,7 +2866,12 @@ function addTextRunToPage(
       )
     }
     if (!chunks.length) { page.destroy(); return { success: true } }
-    const body = `q\nBT\n${chunks.join('\n')}\nET\nQ`
+    // Character spacing, word spacing and rise are text state that outlives
+    // ET, and an appended object inherits whatever the page's stream left in
+    // force: Acrobat's OCR layer ends with `-0.035 Tc`, so every glyph's pen
+    // fell 0.03pt short of its advance — an invisible head fitted to 150pt
+    // drew 149 and the extractor read a space before the stretch.
+    const body = `q\nBT\n0 Tc 0 Tw 0 Ts\n${chunks.join('\n')}\nET\nQ`
     // A tagged block can be found and removed again (`removeMarkedContent`).
     const newBlock = tag ? `\n/${tag} BMC\n${body}\nEMC\n` : `\n${body}\n`
     const combined = existingStream + newBlock
@@ -2950,11 +2970,16 @@ function addTextToPage(
     // bracketed in q/Q or every block appended after it would draw nothing.
     // A stroked block is bracketed too: line width, stroke colour and the
     // render mode its ops set would otherwise outlive it.
+    // `0 Tc 0 Tw 0 Ts`: text state outlives ET and the page's own stream may
+    // leave a spacing in force (Acrobat's OCR layer ends with `-0.035 Tc`);
+    // inherited, it moved every pen 0.03pt short of its glyph. Bracketed in
+    // q/Q where the block already is; the plain block resets them too, and
+    // whatever follows it sets its own.
     const newBlock = invisible
-      ? `\nq\nBT\n3 Tr\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\nQ\n`
+      ? `\nq\nBT\n3 Tr\n0 Tc 0 Tw 0 Ts\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\nQ\n`
       : stroke
-        ? `\nq\n${stroke.toFixed(3)} w 1 j 1 J ${r} ${g} ${b} RG\nBT\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\nQ\n`
-        : `\nBT\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\n`
+        ? `\nq\n${stroke.toFixed(3)} w 1 j 1 J ${r} ${g} ${b} RG\nBT\n0 Tc 0 Tw 0 Ts\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\nQ\n`
+        : `\nBT\n0 Tc 0 Tw 0 Ts\n${r} ${g} ${b} rg\n${fmt(tm[0])} ${fmt(tm[1])} ${fmt(tm[2])} ${fmt(tm[3])} ${tm[4].toFixed(2)} ${tm[5].toFixed(2)} Tm\n${showOps}\nET\n`
 
     // 4. Append to content stream
     const combined = existingStream + newBlock
@@ -3032,7 +3057,7 @@ async function ensureCjkFontFor(text: string): Promise<void> {
         // on the stack", "Index bounds") and then embeds all 8 MB. A tiny
         // font is built per run from the glyph outlines instead, and THAT is
         // what MuPDF embeds — the same route the traced scan faces take.
-        cjkFont = opentype.parse(await res.arrayBuffer())
+        cjkFont = ot.parse(await res.arrayBuffer())
       } catch (err) {
         console.warn('[MuPDF Worker] CJK font unavailable:', err)
         cjkFont = null
@@ -3058,15 +3083,15 @@ function miniCjkFontFor(text: string): any | null {
     if (seen.has(cp)) continue
     const g = cjkFont.charToGlyph(ch)
     if (!g || g.index === 0) return null
-    seen.set(cp, new opentype.Glyph({ name: `uni${cp.toString(16).toUpperCase().padStart(4, '0')}`, unicode: cp, advanceWidth: g.advanceWidth, path: g.path }))
+    seen.set(cp, new ot.Glyph({ name: `uni${cp.toString(16).toUpperCase().padStart(4, '0')}`, unicode: cp, advanceWidth: g.advanceWidth, path: g.path }))
   }
   const space = cjkFont.charToGlyph(' ')
-  const notdef = new opentype.Glyph({ name: '.notdef', advanceWidth: Math.round(cjkFont.unitsPerEm * 0.5), path: new opentype.Path() })
+  const notdef = new ot.Glyph({ name: '.notdef', advanceWidth: Math.round(cjkFont.unitsPerEm * 0.5), path: new ot.Path() })
   const glyphs = [notdef, ...seen.values()]
   if (text.includes(' ') && space && space.index !== 0) {
-    glyphs.push(new opentype.Glyph({ name: 'space', unicode: 32, advanceWidth: space.advanceWidth, path: new opentype.Path() }))
+    glyphs.push(new ot.Glyph({ name: 'space', unicode: 32, advanceWidth: space.advanceWidth, path: new ot.Path() }))
   }
-  const mini = new opentype.Font({
+  const mini = new ot.Font({
     familyName: 'NotoSansSC', styleName: 'Regular',
     unitsPerEm: cjkFont.unitsPerEm, ascender: cjkFont.ascender, descender: cjkFont.descender, glyphs
   })

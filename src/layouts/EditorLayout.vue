@@ -364,6 +364,8 @@ async function bakeOcrEdits(): Promise<number> {
   let written = 0
   /** Per page, per edited item: how it was drawn — for the sweep (`window.__ocrBakeReport`). */
   const modes: Record<number, Record<string, string>> = {}
+  /** Per page, per item: the union of the patches painted for it — what its ink box becomes after the bake. */
+  const grownByPage = new Map<number, Map<string, [number, number, number, number]>>()
 
   for (const [pageIndex, page] of ocrStore.pages) {
     // The page's traced scan faces — one per style — embedded once per bake
@@ -445,6 +447,21 @@ async function bakeOcrEdits(): Promise<number> {
     const planItems = ocrStore.pages.get(pageIndex)?.items ?? page.items
     const plan = planOcrExport(planItems, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null)
     modes[pageIndex] = plan.modes
+    // What each run's ink box becomes: a stretch appended past the old ink,
+    // or a shifted tail, is painted OUTSIDE the box the recogniser read, and
+    // a second edit of the run has to patch and blank all of it — cut at the
+    // old box, the first bake's "MAESTRA" stayed on the page beside the new
+    // title, on screen and in every extractor.
+    const grown = new Map<string, [number, number, number, number]>()
+    for (const patch of plan.patches) {
+      if (!patch.item) continue
+      const [x0, y0, x1, y1] = patch.rect
+      const g = grown.get(patch.item)
+      grown.set(patch.item, g
+        ? [Math.min(g[0], x0), Math.min(g[1], y0), Math.max(g[2], x1), Math.max(g[3], y1)]
+        : [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)])
+    }
+    grownByPage.set(pageIndex, grown)
     if (plan.patches.length === 0 && plan.texts.length === 0 && plan.images.length === 0) continue
 
     // The scan's pixels for any tail that moves, read from a fresh render of
@@ -467,9 +484,11 @@ async function bakeOcrEdits(): Promise<number> {
       // partial), so the old ones would be found by search a second time.
       // Blank the layer's ops under each edited run first.
       const editedRects = page.items
-        .filter(i => (i.edited || i.removed) && !i.baked)
+        .filter(i => i.edited || i.removed)
         .map(i => [i.inkRect.x, i.inkRect.y, i.inkRect.x + i.inkRect.width, i.inkRect.y + i.inkRect.height] as [number, number, number, number])
-      if (editedRects.length) await pdfEngine.blankInvisibleText(pageIndex, editedRects).catch(() => 0)
+      // `all`: a run baked once and edited again has its FIRST bake's words
+      // under the new patch — visible ops that no reader should still find.
+      if (editedRects.length) await pdfEngine.blankInvisibleText(pageIndex, editedRects, true).catch(() => 0)
       // Into the content stream, not as an annotation: annotations paint over
       // page content whatever order they were made in, so a patch drawn as one
       // covered the replacement text and it came out with its start missing.
@@ -515,7 +534,24 @@ async function bakeOcrEdits(): Promise<number> {
     for (const [pageIndex, page] of ocrStore.pages) {
       if (page.items.some(i => i.edited || i.removed)) ocr.forgetTraceRaster(pageIndex)
       for (const item of page.items) {
-        if (item.edited || item.removed) { item.baked = true; ocr.forgetSpanCut(item.id) }
+        if (item.edited || item.removed) {
+          const g = grownByPage.get(pageIndex)?.get(item.id)
+          if (g) {
+            // Horizontally only, and net of the patch's own pad: a run's
+            // height never changes, and taking the padded rectangle as the
+            // box would grow it by a pad on every bake until it reached the
+            // lines above and below.
+            const r = item.inkRect
+            const pad = Math.max(1, r.height * 0.15)
+            const x0 = Math.min(r.x, g[0] + pad), x1 = Math.max(r.x + r.width, g[2] - pad)
+            item.inkRect = { x: x0, y: r.y, width: x1 - x0, height: r.height }
+            // The run's box follows its ink where the two still agreed; a run
+            // the user dragged keeps its own place.
+            if (Math.abs(item.rect.x - r.x) < 0.5 && Math.abs(item.rect.y - r.y) < 0.5) item.rect = { ...item.inkRect }
+          }
+          item.baked = true
+          ocr.forgetSpanCut(item.id)
+        }
         item.edited = false; item.removed = false; item.restyled = false; item.originalText = item.text
       }
     }

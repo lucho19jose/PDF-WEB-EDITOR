@@ -26,6 +26,8 @@ export interface PatchOp {
   /** Rectangle to paint over, in PDF page space (top-left origin). */
   rect: RectT
   color: [number, number, number]
+  /** The run this patch belongs to: after the bake its ink box grows to what was painted. */
+  item?: string
 }
 
 export interface TextOp {
@@ -249,7 +251,7 @@ export function planOcrExport(
     if (!item.edited && !item.removed) continue
 
     if (item.removed) {
-      patches.push({ rect: patchRect(item), color: plainColor(item.background) })
+      patches.push({ rect: patchRect(item), color: plainColor(item.background), item: item.id })
       modes[item.id] = 'removed'
       continue
     }
@@ -273,7 +275,7 @@ export function planOcrExport(
       modes[item.id] = 'whole'
     }
 
-    patches.push({ rect: patchRect(item), color: plainColor(item.background) })
+    patches.push({ rect: patchRect(item), color: plainColor(item.background), item: item.id })
 
     if (item.vertical) {
       // Rotated a quarter turn anti-clockwise, the glyphs' own "up" points LEFT
