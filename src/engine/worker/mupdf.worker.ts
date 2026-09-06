@@ -1327,7 +1327,7 @@ function getContentSources(pageIndex: number): ContentSource[] {
   let page: any = null
   try {
     page = pdfDoc.loadPage(pageIndex)
-    const pageRes = page.getObject().get('Resources')
+    const pageRes = pageResourcesOf(page.getObject())
     const seen = new Set<string>()
 
     const walk = (stream: string, resources: any, path: string, depth: number, parentCtm: Mat6) => {
@@ -1640,7 +1640,58 @@ function matInvert(m: Mat6): Mat6 | null {
 
 /** Resources for the source currently being edited. */
 function resolveResources(pageObj: any): any {
-  return activeResources ? activeResources.dict : pageObj.get('Resources')
+  return activeResources ? activeResources.dict : pageResourcesOf(pageObj)
+}
+
+/** JS null/undefined, or MuPDF's own null object. */
+function isNullObj(o: any): boolean {
+  return !o || String(o) === 'null'
+}
+
+/**
+ * The /Resources a page draws with — its own, or the ones it INHERITS.
+ *
+ * /Resources is inheritable through the page tree (PDF 32000-1 7.7.3.4), and
+ * dompdf/CPDF puts one dictionary on the /Pages node and none on any page.
+ * `pageObj.get('Resources')` then answers MuPDF's null object, whose `_doc`
+ * is null, and the `.get('Font')` that follows throws "Cannot read
+ * properties of null (reading '_fromPDFObjectKeep')" — 689 times in one
+ * sweep round. Every caller caught that and answered "no font", so on the
+ * whole dompdf family the ToUnicode, /Widths and glyph-availability reads
+ * were blind and a substitution could never be decided. `getInheritable`
+ * is the reader the page tree was designed for.
+ */
+function pageResourcesOf(pageObj: any): any {
+  const own = pageObj.get('Resources')
+  if (!isNullObj(own)) return own
+  try {
+    const inh = pageObj.getInheritable('Resources')
+    return isNullObj(inh) ? null : inh
+  } catch (_) {
+    return null
+  }
+}
+
+/**
+ * The page's OWN /Resources, for a write — created when the page has none.
+ *
+ * A fresh empty dictionary on a page that INHERITS its resources would shadow
+ * the inherited ones: every /F1 the page already draws with would resolve to
+ * nothing and its text would vanish, while a font registered into the shared
+ * /Pages dictionary instead would reach every page of the document. The new
+ * dictionary therefore starts as a shallow copy of what the page inherited.
+ */
+function ownPageResources(pageObj: any): any {
+  const own = pageObj.get('Resources')
+  if (!isNullObj(own)) return own
+  const dict = pdfDoc.newDictionary()
+  const inh = pageResourcesOf(pageObj)
+  if (inh) {
+    const r = inh.resolve?.() ?? inh
+    try { r.forEach((v: any, k: any) => dict.put(String(k).replace(/^\//, ''), v)) } catch (_) { /* leave empty */ }
+  }
+  pageObj.put('Resources', dict)
+  return dict
 }
 
 /** Cache-key prefix so page fonts and XObject fonts never collide. */
@@ -2543,7 +2594,7 @@ function planTextEncoding(
         try {
           const dict = activeResources
             ? (activeResources.dict.resolve?.() ?? activeResources.dict)
-            : (() => { const page = pdfDoc.loadPage(pageIndex); const r = page.getObject().get('Resources'); page.destroy(); return r })()
+            : (() => { const page = pdfDoc.loadPage(pageIndex); const r = ownPageResources(page.getObject()); page.destroy(); return r })()
           const fontRef = registerFontIn(dict, cjk, 'FCJK')
           if (fontRef) {
             console.log(`[MuPDF Worker] Substituting font ${block.fontRef} → NotoSansSC (/${fontRef}) for CJK`)
@@ -3100,11 +3151,7 @@ function registerEmbeddedRun(pageObj: any, font: any, text: string, prefix: stri
     const subsetFont = scratch.loadPage(0).getObject().get('Resources').get('Font').get('F1')
     const grafted = pdfDoc.graftObject(subsetFont)
 
-    let resources = pageObj.get('Resources')
-    if (!resources || resources.toString() === 'null') {
-      resources = pdfDoc.newDictionary()
-      pageObj.put('Resources', resources)
-    }
+    let resources = ownPageResources(pageObj)
     resources = resources.resolve()
     let fontDict = resources.get('Font')
     if (!fontDict || fontDict.toString() === 'null') {
@@ -3130,11 +3177,7 @@ function registerEmbeddedRun(pageObj: any, font: any, text: string, prefix: stri
 }
 
 function ensureStandardFont(pageObj: any, fontName: string): string {
-  let resources = pageObj.get('Resources')
-  if (!resources || resources.toString() === 'null') {
-    resources = pdfDoc.newDictionary()
-    pageObj.put('Resources', resources)
-  }
+  const resources = ownPageResources(pageObj)
   return ensureStandardFontInResources(resources.resolve(), fontName)
 }
 
@@ -8923,7 +8966,7 @@ function debugPageFonts(pageIndex: number): any {
   // Debug: check what's in the page object
   const pageObjStr = pageObj.toString()
 
-  const resources = pageObj.get('Resources')
+  const resources = pageResourcesOf(pageObj)
   const resourcesStr = resources ? resources.toString() : 'null'
 
   // Try resolving resources
@@ -9402,7 +9445,7 @@ function imageNamesOf(src: ContentSource, pageIndex: number): Set<string> {
     let resources: any = src.resources
     if (!resources) {
       page = pdfDoc.loadPage(pageIndex)
-      resources = page.getObject().get('Resources')
+      resources = pageResourcesOf(page.getObject())
     }
     const xo = resources?.resolve?.()?.get?.('XObject') ?? resources?.get?.('XObject')
     if (!xo || String(xo) === 'null') return names
@@ -9810,11 +9853,7 @@ function flattenAnnotationBehind(
     const ty = rect[1] - by0 * sy
 
     const pageObj = page.getObject()
-    let resources = pageObj.get('Resources')
-    if (!resources || String(resources) === 'null') {
-      resources = pdfDoc.newDictionary()
-      pageObj.put('Resources', resources)
-    }
+    let resources = ownPageResources(pageObj)
     resources = resources.resolve()
     let xobjects = resources.get('XObject')
     if (!xobjects || String(xobjects) === 'null') {
@@ -9872,11 +9911,7 @@ function drawImageInContent(
     image = new mupdf.Image(imageBytes)
     const imgRef = pdfDoc.addImage(image)
 
-    let resources = pageObj.get('Resources')
-    if (!resources || String(resources) === 'null') {
-      resources = pdfDoc.newDictionary()
-      pageObj.put('Resources', resources)
-    }
+    let resources = ownPageResources(pageObj)
     resources = resources.resolve()
     let xobjects = resources.get('XObject')
     if (!xobjects || String(xobjects) === 'null') {
@@ -10258,7 +10293,7 @@ function replaceContentImage(
 
     page = pdfDoc.loadPage(pageIndex)
     let resources: any = src.resources
-    if (!resources) resources = page.getObject().get('Resources')
+    if (!resources) resources = ownPageResources(page.getObject())
     resources = resources?.resolve ? resources.resolve() : resources
     if (!resources || String(resources) === 'null') {
       return { success: false, error: 'That image lives in a source with no resources' }
