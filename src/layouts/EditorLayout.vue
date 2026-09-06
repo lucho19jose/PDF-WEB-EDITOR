@@ -93,6 +93,7 @@ import { cropToPng } from '@/utils/ocr/pixelCrop'
 import { measureHalo } from '@/utils/ocr/ocrSampling'
 import { detectFace } from '@/utils/ocr/ocrFontDetect'
 import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
+import { snapItemsToTextLayer } from '@/utils/ocr/snapToLayer'
 import type { RecognizeDocumentOptions, RecognizeProgress } from '@/components/dialogs/OcrRecognizeDialog.vue'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
@@ -355,6 +356,14 @@ async function runOcrNow(pageIndex: number, lang: string) {
   let result: Awaited<ReturnType<typeof ocr.recognizePage>> = null
   try {
     result = await ocr.recognizePage(canvas, pageIndex, size.width, size.height, lang, true, engineId)
+    // The page's own text layer (Acrobat's, or this editor's bake) knows
+    // where the word gaps are; the recogniser only guesses, and on bold
+    // capitals it guessed "CONTRATODEOBRAMAESTRA". Where the two agree letter
+    // for letter, the run takes the layer's spacing.
+    if (result && result.items.length) {
+      const blocks = await pdfEngine.getTextBlocks(pageIndex).catch(() => [])
+      result = { ...result, items: snapItemsToTextLayer(result.items, blocks).items }
+    }
   } finally {
     stopProgress()
   }
