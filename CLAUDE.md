@@ -4164,6 +4164,61 @@ Three things measured wrong first:
 The layer's runs stay in the OCR store, so any line can be edited afterwards
 exactly as on a page recognised by hand.
 
+### A move is decided by where the target is DRAWN — four silent wrong-block moves
+Round 7 of the sweep found four moves that reported success and moved the
+wrong text, each a different way of letting text or stream order decide what
+only position can. All four reproduce in the node harness in seconds.
+
+- **A bucket tie fell to stream order.** Two consecutive e-mail lines
+  ("1) El proveedor…" / "2) El proveedor…", one BT each, 13pt apart) both
+  fuzzy-match at score 1 and both land in the 8pt bucket 0; the tie went to
+  `order`, which is the line ABOVE, and that is what moved. The candidate sort
+  now breaks a bucket tie on the run's DRAWN position first
+  (`runDistanceToTarget`, min over the candidate's blocks — a rotated
+  inventory sheet holds each of its two "CANTIDAD" cells in a different huge
+  BT whose origins are both 508pt from the click, so the block's origin says
+  nothing) and on the real distance second.
+- **`findTargetRun` took the first run that scored.** A Ghostscript timesheet
+  draws adjacent rows from ONE block and repeats the same activity in the same
+  column, so both copies scored alike and the row above moved. The x-overlap
+  test cannot see it (same column) and is only asked when every width is
+  known; runs are now ranked ROW first — `op.y` against the clicked box, 6
+  page points, the bar `findTargetSegment` already uses — then score. It ranks
+  rather than refuses, so where the row cannot be told the choice is what it
+  was.
+- **The exclusivity test was gated on the 1.4× size ratio.** A Ghostscript
+  letter draws "Atención: Oficina de Abastecimientos", two blank lines and the
+  body line from one BT under one Tm — 124 glyphs against a target of 87,
+  just under 1.4×+4 — so `governingTmIsExclusive` was never asked and six
+  blocks moved for a one-line drag. `holdsOtherText` (three glyphs of slack)
+  asks it whenever a governing Tm exists; a Tm that governs other text falls
+  to the Td bracket, then the segment shift, then a refusal. A block with no
+  governing Tm keeps the whole-block move it always had.
+- **A match made on '?' wildcards moved 15 blocks.** A Type3 font with no
+  ToUnicode decodes as "????259???2??…"; `wildcardIncludes` lets a '?' stand
+  for anything, so a 15-line block CONTAINED every target on the page.
+  `readsOnPlaceholders` refuses a non-exact move candidate whose KNOWN glyphs
+  carry less than half of the target (longest common subsequence). Judged
+  against the target, NOT as a share of the decode: a Corel block reads
+  "???????????????????TUBERIA EMT" because its `/Corel_OTF <<…>> DP` operand
+  literal is walked as text, and a ratio test refused a match that rested on
+  no wildcard at all — one experiment lost before the measure was changed.
+
+Measured on all seven corpora against same-day baselines: main 262/236 → 237,
+r2 439/393 → 396, r3 466/413 → 414, r4 462/416 → 416, r5 446/409 → 410,
+r6 551/502 → 502, r7 420/369 → 373 — ten gained, zero lost. Every changed row
+was read: eight `tm_rewrite_governing → td_bracket_run` rows go from TWO
+blocks touched to one (the "CONTRATO / ORDEN DE TRABAJO" template family,
+"Proyecto", a supplier form title), three `tj_segment_shift →
+td_bracket_run` rows are the same outcome to the point (the trailing space
+op stays behind in both, as it did before), and every gain is the
+"wrong copy of a repeated cell" class (geometry_error 0.02 → 0).
+
+**Known:** a label drawn as one-word BTs and repeated across three signature
+columns (r6/038, "Nombres y Apellidos – Sello") still tears — it did before,
+on a different word — because the line group holds all three copies and no
+join matches.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

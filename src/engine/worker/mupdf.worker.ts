@@ -3628,9 +3628,19 @@ function transformInSource(
       const blockLen = matchLength(block.decodedText)
       const targetLen = matchLength(targetBlock.text)
       const holdsMoreThanTarget = blockLen > targetLen * 1.4 + 4
+      // Any excess at all, not only a "material" one. The 1.4× slack decides
+      // which STRATEGY is tried first; it must not decide whether a Tm that
+      // provably positions other text may be rewritten. A Ghostscript letter
+      // draws "Atención: Oficina de Abastecimientos", two blank lines and the
+      // body line from one BT under one Tm: 124 glyphs against a target of
+      // 87, just under 1.4×+4, so the exclusivity test was never asked and
+      // the whole block moved — six blocks for a one-line drag, reported as
+      // success. Three glyphs of slack cover decode/extraction disagreements
+      // (a placeholder, an expanded ligature); a label is longer than that.
+      const holdsOtherText = blockLen > targetLen + 3
       const pureTranslate = sx === 1 && sy === 1
       const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
-      const run = (holdsMoreThanTarget && pureTranslate)
+      const run = (pureTranslate && (holdsMoreThanTarget || (holdsOtherText && !!governingRaw)))
         ? findTargetRun(block, targetBlock.text, pageIndex, local)
         : null
 
@@ -3647,8 +3657,16 @@ function transformInSource(
       // Whether it may be REWRITTEN is a different question. Rewriting a Tm
       // moves every show op it governs, so on a block that draws more than the
       // target it is only safe when the target's run is all it positions.
-      const tmRewritable = !holdsMoreThanTarget ||
-        (!!governingRaw && governingTmIsExclusive(block.content, governingRaw.index, run))
+      const tmExclusive = !!governingRaw && governingTmIsExclusive(block.content, governingRaw.index, run)
+      // With a governing Tm in hand, a block holding other text may only have
+      // that Tm rewritten when the Tm positions nothing but the target's run.
+      // Without one (Td-only blocks, the injected-Tm path) the whole-block
+      // move stands as it always did.
+      const tmRewritable = holdsMoreThanTarget
+        ? tmExclusive
+        : !(holdsOtherText && !!governingRaw && !tmExclusive)
+      /** The target must be moved on its own — the block's other text stays. */
+      const mustIsolate = holdsMoreThanTarget || (holdsOtherText && !tmRewritable)
 
       /**
        * Last chance before refusing: the target may not be a show OP at all,
@@ -3662,7 +3680,7 @@ function transformInSource(
        * Consulted ONLY where every other strategy has already given up, so no
        * move that works today can change.
        */
-      const seg = (holdsMoreThanTarget && pureTranslate && !(run && run.startsLine) && !tmRewritable)
+      const seg = (mustIsolate && pureTranslate && !(run && run.startsLine) && !tmRewritable)
         ? findTargetSegment(block, targetBlock, pageIndex, stream, pageHeight)
         : null
 
@@ -3671,7 +3689,7 @@ function transformInSource(
       // strategy moves OTHER text: rewriting the first Tm dragged a table's
       // header row when a cell 50pt below it was asked to move. Refuse the
       // block — a loud "could not find matching text" beats a silent wrong drag.
-      if (holdsMoreThanTarget && !(run && run.startsLine) && !seg && !tmRewritable) continue
+      if (mustIsolate && !(run && run.startsLine) && !seg && !tmRewritable) continue
 
       /** The page-space delta expressed in the text matrix's own space. */
       const inTmSpace = (): { tdx: number; tdy: number } => {
@@ -3694,7 +3712,7 @@ function transformInSource(
         newContent =
           block.content.slice(0, seg.op.start) + newRaw + block.content.slice(seg.op.end)
         usedStrategy ??= 'tj_segment_shift'
-      } else if (run && run.startsLine) {
+      } else if (run && run.startsLine && (holdsMoreThanTarget || !tmRewritable)) {
         // Td operands are multiplied by the TEXT matrix, so the delta has to be
         // expressed in Tm space — feeding it the CTM-space value moved this
         // block 5.9x too far on a page whose Tm scales by 0.17.
@@ -4329,7 +4347,7 @@ function findTargetRun(
    * other row of underscores — so once the first had been split out of the
    * array the other two both matched IT and were moved on top of it.
    */
-  local?: { x: number; xEnd: number } | null
+  local?: { x: number; xEnd: number; yLo?: number; yHi?: number; unitScale?: number } | null
 ): { start: number; end: number; startsLine: boolean } | null {
   const targetNorm = targetText.replace(/\s+/g, ' ').trim()
   if (!targetNorm) return null
@@ -4337,7 +4355,31 @@ function findTargetRun(
     (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
   if (ops.length === 0) return null
 
-  let best: { i: number; j: number; score: number } | null = null
+  // A run on the clicked ROW beats any run off it, whatever the text says. A
+  // Ghostscript timesheet draws consecutive rows from ONE block and repeats
+  // the same activity ("Revisión y generación de informes…") in the same
+  // column of adjacent rows; the text scan scored both copies alike and the
+  // first in the stream won — the row ABOVE moved while the row dragged
+  // stayed. The x overlap test below cannot see that (same column), and it is
+  // only asked when every width is known. The row test needs no widths:
+  // `op.y` is tracked in the block's own space, the space `local` reports the
+  // clicked box in, and 6 page points is the same bar `findTargetSegment`
+  // uses. It RANKS rather than refuses, so where the row cannot be told (no
+  // `local`, or every candidate off-row alike) the choice is what it was.
+  const rowGapOf = (y: number): number => {
+    if (!local || local.yLo === undefined || local.yHi === undefined) return 0
+    const g = y < local.yLo ? local.yLo - y : (y > local.yHi ? y - local.yHi : 0)
+    return g * (local.unitScale || 1)
+  }
+  const onRow = (gap: number) => gap <= 6
+  type RunPick = { i: number; j: number; score: number; rowGap: number }
+  const outranks = (a: RunPick, b: RunPick): boolean => {
+    if (onRow(a.rowGap) !== onRow(b.rowGap)) return onRow(a.rowGap)
+    if (a.score !== b.score) return a.score > b.score
+    return a.rowGap < b.rowGap
+  }
+
+  let best: RunPick | null = null
   for (let i = 0; i < ops.length; i++) {
     let acc = ''
     for (let j = i; j < ops.length; j++) {
@@ -4350,7 +4392,9 @@ function findTargetRun(
       let score = 0
       if (norm === targetNorm) score = 2
       else if (fuzzyTextMatch(norm, targetNorm)) score = ratio
-      if (score > 0 && (!best || score > best.score)) best = { i, j, score }
+      if (score <= 0) continue
+      const pick: RunPick = { i, j, score, rowGap: rowGapOf(ops[i].y) }
+      if (!best || outranks(pick, best)) best = pick
     }
   }
   if (!best) return null
@@ -5238,6 +5282,7 @@ function findBtBlocksByPosition(
       }
     }
     if (!isMatch) continue
+    if (!exact && readsOnPlaceholders(alongStream, normalizedTarget)) continue
 
     // Keep only the blocks sitting on the clicked text. A line group can hold
     // unrelated runs (a label and its value); transforming the whole group
@@ -5256,7 +5301,9 @@ function findBtBlocksByPosition(
     else if (exact) picked = lineBlocks
     else {
       const compact = (s: string) => foldForMatch(s).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
-      const carrying = lineBlocks.filter(b => wildcardIncludes(compact(b.decodedText), compact(normalizedTarget)))
+      const carrying = lineBlocks.filter(b =>
+        !readsOnPlaceholders(b.decodedText, normalizedTarget) &&
+        wildcardIncludes(compact(b.decodedText), compact(normalizedTarget)))
       if (carrying.length === 0) continue
       picked = carrying
     }
@@ -5274,7 +5321,7 @@ function findBtBlocksByPosition(
     const nd = block.decodedText.replace(/\s+/g, ' ').trim()
     if (!nd || nd.length < 2) continue
     const exact = nd === normalizedTarget
-    if (exact || fuzzyTextMatch(nd, normalizedTarget)) {
+    if (exact || (!readsOnPlaceholders(nd, normalizedTarget) && fuzzyTextMatch(nd, normalizedTarget))) {
       candidates.push({ blocks: [block], score: exact ? 2 : 1, dist: distOf(block), order: candidates.length })
     }
   }
@@ -5354,6 +5401,7 @@ function findBtBlocksByPosition(
       for (const block of allBlocks) {
         if (fontFiltered && targetFontRef && !blockUsesFont(block, targetFontRef)) continue
         if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) continue
+        if (readsOnPlaceholders(block.decodedText, normalizedTarget)) continue
         const d = Math.min(distOf(block), govDist(block), runDist(block))
         if (!(d <= onTarget * 2)) continue
         // A run INSIDE a TJ array is a third way in. A Ghostscript timesheet
@@ -5376,9 +5424,46 @@ function findBtBlocksByPosition(
   if (candidates.length === 0) return null
 
   const bucket = (d: number) => Number.isFinite(d) ? Math.round(d / 8) : Number.MAX_SAFE_INTEGER
+  // Inside one bucket the REAL distance still decides before anything textual
+  // or positional-in-the-stream does. Two consecutive lines of an e-mail
+  // ("1) El proveedor…" / "2) El proveedor…", one BT each, 13pt apart) both
+  // fuzzy-match the target at score 1 and both land in bucket 0 — the wrong
+  // one at 2.6pt (its baseline touches the target's box), the right one at
+  // 0 — and the tie fell to stream ORDER, which is the line above. Measured
+  // on a Skia print: the line above moved, the line asked for stayed.
+  const nearer = (a: number, b: number) =>
+    Number.isFinite(a) && Number.isFinite(b) ? a - b : 0
+  // Where the target is DRAWN inside the candidate, on real advances — the
+  // block's origin says nothing about that. A rotated inventory sheet draws
+  // its whole header from two huge BTs whose origins both sit 508pt from the
+  // click; each holds one of the two "CANTIDAD" cells of the row, and which
+  // block came first in the stream decided which cell moved. Measured only
+  // for a tie, and Infinity ("cannot say") loses to any known distance.
+  const runDistCache = new Map<number, number>()
+  const runDistOf = (c: Candidate): number => {
+    let d = runDistCache.get(c.order)
+    if (d === undefined) {
+      d = Infinity
+      for (const b of c.blocks) {
+        const r = runDistanceToTarget(b, targetBlock.text, pageIndex, stream, targetBlock, pageHeight)
+        if (r !== null && r < d) d = r
+      }
+      runDistCache.set(c.order, d)
+    }
+    return d
+  }
+  const nearerRun = (a: Candidate, b: Candidate) => {
+    const da = runDistOf(a), db = runDistOf(b)
+    if (da === db) return 0
+    if (!Number.isFinite(da)) return 1
+    if (!Number.isFinite(db)) return -1
+    return da - db
+  }
   candidates.sort((a, b) =>
     bucket(a.dist) - bucket(b.dist) ||
     b.score - a.score ||
+    nearerRun(a, b) ||
+    nearer(a.dist, b.dist) ||
     b.blocks.length - a.blocks.length || // prefer the fuller line match on a tie
     a.order - b.order
   )
@@ -6922,6 +7007,12 @@ function subsequenceSimilarity(candidate: string, target: string): number {
   const b = foldForMatch(target).replace(/\s/g, '')
   if (!a.length || !b.length) return 0
   if (a.length * b.length > 60000) return matchRatio(candidate, target)
+  return lcsLength(a, b) / Math.max(a.length, b.length)
+}
+
+/** Length of the longest common subsequence of two strings. */
+function lcsLength(a: string, b: string): number {
+  if (!a.length || !b.length) return 0
   let prev = new Uint16Array(b.length + 1)
   let cur = new Uint16Array(b.length + 1)
   for (let i = 1; i <= a.length; i++) {
@@ -6931,7 +7022,35 @@ function subsequenceSimilarity(candidate: string, target: string): number {
     }
     const t = prev; prev = cur; cur = t
   }
-  return prev[b.length] / Math.max(a.length, b.length)
+  return prev[b.length]
+}
+
+/**
+ * The decode's KNOWN glyphs carry less than half of the target — whatever
+ * matched, matched on '?' placeholders.
+ *
+ * `wildcardIncludes` lets a '?' stand for any character, so a 15-line block
+ * that decodes as "????259???2??2???8?…" (a Type3 font with no ToUnicode)
+ * CONTAINS every target on the page, and two moves on that page each dragged
+ * the whole block — 15 and 5 blocks — while reporting success. Only an EXACT
+ * match may admit such a decode; a wildcard or fuzzy one is refused and the
+ * page gets an honest "could not find matching text".
+ *
+ * Judged against the target, not as a share of the decode: a Corel block
+ * reads "???????????????????TUBERIA EMT" because its `/Corel_OTF <<…>> DP`
+ * operand literal is walked as text, and the 19 placeholders outnumber the
+ * 10 letters — yet the letters carry the whole target, so nothing about that
+ * match rests on a wildcard. A decode with no '?' at all is never in
+ * question.
+ */
+function readsOnPlaceholders(text: string, target: string): boolean {
+  if (!text.includes('?')) return false
+  const known = foldForMatch(text).replace(/[\s?]/g, '')
+  const t = foldForMatch(target).replace(/[\s?]/g, '')
+  if (!t.length) return false
+  if (!known.length) return true
+  if (known.length * t.length > 2_000_000) return false
+  return lcsLength(known, t) * 2 < t.length
 }
 
 /** Size-similarity of a candidate run to the target, ignoring case and '?'. */
