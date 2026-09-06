@@ -1,6 +1,6 @@
 import * as opentype from 'opentype.js'
 import { init as potraceInit, potrace } from 'esm-potrace-wasm'
-import { cutGlyphs, cellBitmap, cellBitmapTraced, cellStrokeRatio, traceLevel, expectedAdvance, lastCutReason, type GlyphCutResult } from './glyphCut'
+import { cutGlyphs, cellBitmap, cellBitmapTraced, cellStrokeRatio, strokeRatioOfImage, traceLevel, expectedAdvance, lastCutReason, type GlyphCutResult } from './glyphCut'
 import { commonAffix } from './partialRedraw'
 import type { OcrBox } from './ocrEngine'
 
@@ -174,9 +174,11 @@ export async function traceRunIntoFace(
     // own spacing: a fixed twentieth set a heavy 35pt title visibly looser
     // than its neighbours.
     const advance = Math.round((cell.x1 - cell.x0) * scale + bearing * 2)
-    // The cell's own weight travels with the glyph: a line that changes
-    // weight midway must not lend a bold "S" to its regular half.
-    const weight = cellStrokeRatio(cut, cell) ?? undefined
+    // The glyph's own weight travels with it, measured on the bitmap the
+    // outline was traced FROM (at its resolution) — what the glyph will draw
+    // — so a line that changes weight midway cannot lend a bold "S" to its
+    // regular half, and a traced run can be stroked up to the scan's stems.
+    const weight = strokeRatioOfImage(bmp.image, cut.emPx * bmp.res) ?? cellStrokeRatio(cut, cell) ?? undefined
     face.glyphs.set(cell.char, { char: cell.char, path, advance, weight })
     added++
   }

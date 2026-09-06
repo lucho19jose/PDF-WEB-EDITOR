@@ -199,9 +199,10 @@ export class MuPDFBridge {
     faceId?: string,
     invisible?: boolean,
     strokeWidth?: number,
-    faceSkip?: string
+    faceSkip?: string,
+    tracedStrokeWidth?: number
   ): Promise<{ success: boolean; error?: string }> {
-    return this.send('addText', { pageIndex, x, y, text, fontSize, fontName, color, rotation, faceId, invisible, strokeWidth, faceSkip })
+    return this.send('addText', { pageIndex, x, y, text, fontSize, fontName, color, rotation, faceId, invisible, strokeWidth, faceSkip, tracedStrokeWidth })
   }
 
   /**

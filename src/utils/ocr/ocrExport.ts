@@ -1,7 +1,7 @@
 import type { OcrTextItem } from './ocrTypes'
 import type { RectT } from '@/engine/types'
 import { planPartial, sizeOf, type PartialContext } from './partialRedraw'
-import { strokeWidthFor } from './ocrStroke'
+import { strokeWidthFor, tracedStrokeUpTo } from './ocrStroke'
 
 /**
  * Turning edited OCR runs into PDF operations.
@@ -58,6 +58,8 @@ export interface TextOp {
    * ocrStroke.ts. Traced glyphs are never stroked.
    */
   strokeWidth?: number
+  /** Stroke the TRACED glyphs by this many points — an outline traced at the mass-conserving level renders lighter than the scan's blurred stems. */
+  tracedStrokeWidth?: number
   /** Characters the scan face must not draw in this run (see `weightPlan`); the base-14 face takes them. */
   faceSkip?: string
   /**
@@ -240,7 +242,9 @@ export function planOcrExport(
   /** The span geometry and measured stretch width for an item, when the caller has them — enables the partial redraw. */
   partialFor?: (item: OcrTextItem) => Omit<PartialContext, 'fontName' | 'color' | 'faceId'> | null,
   /** The engine-measured width of an item's full text at 10pt in the fonts that will draw it, when the caller has it. */
-  widthAt10For?: (item: OcrTextItem) => number | null
+  widthAt10For?: (item: OcrTextItem) => number | null,
+  /** The median measured weight of the traced glyphs an item's text will use, when the caller has a face — they are stroked up to the scan's stems. */
+  tracedRatioFor?: (item: OcrTextItem) => number | null
 ): OcrExportPlan {
   const patches: PatchOp[] = []
   const images: ImageOp[] = []
@@ -291,7 +295,8 @@ export function planOcrExport(
         color: plainColor(item.color),
         rotation: 90,
         faceId: faceIdFor?.(item),
-        strokeWidth: strokeWidthFor(item.strokeRatio, fontName, Number(item.fontSize))
+        strokeWidth: strokeWidthFor(item.strokeRatio, fontName, Number(item.fontSize)),
+        tracedStrokeWidth: tracedStrokeUpTo(item.strokeRatio, tracedRatioFor?.(item) ?? undefined, Number(item.fontSize))
       })
       continue
     }
@@ -325,7 +330,8 @@ export function planOcrExport(
       color: plainColor(item.color),
       rotation: 0,
       faceId: faceIdFor?.(item),
-      strokeWidth: strokeWidthFor(item.strokeRatio, fontName, fontSize)
+      strokeWidth: strokeWidthFor(item.strokeRatio, fontName, fontSize),
+      tracedStrokeWidth: tracedStrokeUpTo(item.strokeRatio, tracedRatioFor?.(item) ?? undefined, fontSize)
     })
   }
 

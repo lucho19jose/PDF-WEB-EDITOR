@@ -17,6 +17,8 @@ export interface TextRunPart {
   strokeWidth?: number
   /** Characters the scan face must not draw in this run; the base-14 face takes them. */
   faceSkip?: string
+  /** Stroke the TRACED glyphs by this many points (they render lighter than the scan's blurred stems). */
+  tracedStrokeWidth?: number
 }
 
 export type WorkerRequest =
@@ -28,7 +30,7 @@ export type WorkerRequest =
   | { id: number; type: 'readContentStream'; data: { pageIndex: number } }
   | { id: number; type: 'writeContentStream'; data: { pageIndex: number; streamBytes: ArrayBuffer } }
   | { id: number; type: 'replaceText'; data: { pageIndex: number; blockId: string; newText: string } }
-  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number; faceId?: string; invisible?: boolean; strokeWidth?: number; faceSkip?: string } }
+  | { id: number; type: 'addText'; data: { pageIndex: number; x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; rotation?: number; faceId?: string; invisible?: boolean; strokeWidth?: number; faceSkip?: string; tracedStrokeWidth?: number } }
   /** Several runs in ONE text object — the invisible head, the visible stretch and the invisible tail of a partial redraw — so extraction reads them as one line. */
   | { id: number; type: 'addTextRun'; data: { pageIndex: number; rotation?: number; parts: TextRunPart[]; tag?: string } }
   /** Blank every `/Tag BMC … EMC` section this editor wrote into the page (a searchable OCR layer being recognised again). */

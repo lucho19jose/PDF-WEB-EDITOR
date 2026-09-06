@@ -961,18 +961,29 @@ export function cellStrokeRatio(cut: GlyphCutResult, cell: GlyphCell): number | 
   const m = cellMask(cut, cell, 0)
   if (!m || !(cut.emPx > 0)) return null
   const { on, w, h } = m
+  return strokeRatioOfMask(i => on[i] === 1, w, h, cut.emPx)
+}
+
+/** The same measure on a black-on-white bitmap — the one the tracer vectorises, at its own resolution. */
+export function strokeRatioOfImage(image: ImageData, emPx: number): number | null {
+  const d = image.data
+  return strokeRatioOfMask(i => d[i * 4] < 128, image.width, image.height, emPx)
+}
+
+function strokeRatioOfMask(isInk: (i: number) => boolean, w: number, h: number, emPx: number): number | null {
+  if (!(emPx > 0) || w < 1 || h < 1) return null
   const runs: number[] = []
   for (let yy = 0; yy < h; yy++) {
     let run = 0
     for (let xx = 0; xx <= w; xx++) {
-      const ink = xx < w && on[yy * w + xx] === 1
+      const ink = xx < w && isInk(yy * w + xx)
       if (ink) run++
       else if (run > 0) { runs.push(run); run = 0 }
     }
   }
-  const stems = runs.filter(r => r <= cut.emPx * 0.55).sort((a, b) => a - b)
+  const stems = runs.filter(r => r <= emPx * 0.55).sort((a, b) => a - b)
   if (stems.length < 4) return null
-  return stems[Math.floor(stems.length / 2)] / cut.emPx
+  return stems[Math.floor(stems.length / 2)] / emPx
 }
 
 export function cellBitmapTraced(

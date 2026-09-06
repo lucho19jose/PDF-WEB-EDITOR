@@ -2,7 +2,7 @@ import type { OcrTextItem } from './ocrTypes'
 import type { RectT } from '@/engine/types'
 import { cellStrokeRatio, type GlyphCutResult } from './glyphCut'
 import type { PatchOp, TextOp, ImageOp } from './ocrExport'
-import { strokeWidthFor } from './ocrStroke'
+import { strokeWidthFor, tracedStrokeUpTo } from './ocrStroke'
 
 /**
  * Redrawing only what the user CHANGED in a scanned run.
@@ -62,6 +62,8 @@ export interface PartialContext {
   weightScale?: number
   /** From `weightPlan`: the base-14 face of the stretch's OWN weight, when it differs from the line's. */
   localFontName?: string
+  /** From `weightPlan`: the median measured weight of the traced glyphs the stretch will use; they are stroked up to the scan's. */
+  tracedStrokeRatio?: number
 }
 
 /** The face detector's bold threshold (ocrFontDetect.ts): stems over this share of the em are bold. */
@@ -86,7 +88,7 @@ export function weightPlan(
   faceWeightOf?: (ch: string) => number | undefined,
   /** The face detector's stroke ratio over the run's ink between two page x's, or null when it cannot be measured. */
   measureRatio?: (x0: number, x1: number) => number | null
-): { faceSkip: string; weightScale: number; bold: boolean | null } | null {
+): { faceSkip: string; weightScale: number; bold: boolean | null; tracedRatio: number | null } | null {
   const st = stretchOf(item)
   if (!st || !st.text) return null
   const cells = cut.cells
@@ -101,6 +103,7 @@ export function weightPlan(
   if (!near.length || !(lineMedian > 0)) return null
   const local = median(near)
   let faceSkip = ''
+  const tracedWeights: number[] = []
   if (faceWeightOf) {
     for (const ch of new Set([...st.text])) {
       if (ch === ' ') continue
@@ -108,8 +111,10 @@ export function weightPlan(
       // A third apart is a weight, not a measurement: regular and bold stems
       // differ by 60–70% of the regular one; one raster pixel on a 12pt em is 3%.
       if (w !== undefined && Math.abs(w - local) > local * 0.3) faceSkip += ch
+      else if (w !== undefined) tracedWeights.push(w)
     }
   }
+  const tracedRatio = tracedWeights.length ? median(tracedWeights) : null
   let weightScale = local / lineMedian
   // The base-14 face's weight follows the neighbours too. The per-cell ratios
   // above are quantised to a pixel of the em (0.036 at 9pt) and a thin letter
@@ -141,7 +146,7 @@ export function weightPlan(
       if (item.strokeRatio) weightScale = ratio / item.strokeRatio
     }
   }
-  return { faceSkip, weightScale, bold }
+  return { faceSkip, weightScale, bold, tracedRatio }
 }
 
 export interface PartialPlan {
@@ -372,6 +377,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
         text: st.text, x: penX, y: baselineY, fontSize: sizePt,
         fontName: ctx.fontName, color: ctx.color, rotation: 0, faceId: ctx.faceId, group: item.id,
         strokeWidth: strokeWidthFor(ctx.strokeRatio ? ctx.strokeRatio * (ctx.weightScale ?? 1) : undefined, ctx.fontName, sizePt),
+        tracedStrokeWidth: tracedStrokeUpTo(ctx.strokeRatio ? ctx.strokeRatio * (ctx.weightScale ?? 1) : undefined, ctx.tracedStrokeRatio, sizePt),
         faceSkip: ctx.faceSkip || undefined
       } as TextOp] : []),
       ...(tailX !== null ? invisible(tailText, tailX, inkRight + tailShift - tailX) : [])

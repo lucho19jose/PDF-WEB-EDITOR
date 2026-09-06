@@ -105,7 +105,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         const addResult = addTextToPage(
           req.data.pageIndex, req.data.x, req.data.y,
           req.data.text, req.data.fontSize, req.data.fontName, req.data.color,
-          req.data.rotation, req.data.faceId, req.data.invisible, req.data.strokeWidth, req.data.faceSkip
+          req.data.rotation, req.data.faceId, req.data.invisible, req.data.strokeWidth, req.data.faceSkip, req.data.tracedStrokeWidth
         )
         respond({ id: req.id, type: 'success', data: addResult })
         break
@@ -2734,16 +2734,20 @@ function dropUnencodable(text: string): string {
 /** One CJK subset registered for a whole text object — see `sharedCjkFontFor`. */
 interface SharedCjk { refName: string; font: any }
 
-function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: string, faceId?: string, sharedCjk?: SharedCjk | null, strokeWidth?: number, faceSkip?: string): { ops: string } | { error: string } {
+function buildShowOps(pageObj: any, text: string, fontSize: number, fontName: string, faceId?: string, sharedCjk?: SharedCjk | null, strokeWidth?: number, faceSkip?: string, tracedStrokeWidth?: number): { ops: string } | { error: string } {
   const face = faceId ? scanFaces.get(faceId) : null
   const segments = segmentRun(text, face, faceSkip)
   const ops: string[] = []
   // Weight matching: a FALLBACK segment is filled and stroked (render mode 2)
-  // so its stems come up to the scan's; a traced segment is the scan's own
-  // ink and is only filled. The caller sets the line width and stroke colour.
-  const stroked = strokeWidth && strokeWidth > 0
-  const fallbackTr = stroked ? '2 Tr ' : ''
-  const tracedTr = stroked ? '0 Tr ' : ''
+  // by `strokeWidth` so its stems come up to the scan's, and a TRACED segment
+  // by `tracedStrokeWidth` — an outline traced at the mass-conserving level
+  // renders crisp and lighter than the scan's blurred stems. Each op sets its
+  // own line width (`w` is allowed inside BT); the caller sets the stroke
+  // colour. With neither width the ops are plain fills.
+  const stroked = !!(strokeWidth && strokeWidth > 0)
+  const tstroked = !!(tracedStrokeWidth && tracedStrokeWidth > 0)
+  const fallbackTr = stroked ? `2 Tr ${strokeWidth!.toFixed(3)} w ` : tstroked ? '0 Tr ' : ''
+  const tracedTr = tstroked ? `2 Tr ${tracedStrokeWidth!.toFixed(3)} w ` : stroked ? '0 Tr ' : ''
   for (const seg of segments) {
     if (seg.traced && face) {
       const run = registerEmbeddedRun(pageObj, face, seg.text, 'FSCN')
@@ -2816,7 +2820,7 @@ function appendedTextMatrix(pageIndex: number, existingStream: string, x: number
  */
 function addTextRunToPage(
   pageIndex: number,
-  parts: { x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; faceId?: string; invisible?: boolean; fitWidth?: number; strokeWidth?: number; faceSkip?: string }[],
+  parts: { x: number; y: number; text: string; fontSize: number; fontName: string; color?: [number, number, number]; faceId?: string; invisible?: boolean; fitWidth?: number; strokeWidth?: number; faceSkip?: string; tracedStrokeWidth?: number }[],
   rotation = 0,
   tag?: string
 ): { success: boolean; error?: string } {
@@ -2833,7 +2837,8 @@ function addTextRunToPage(
       if (!part.text) continue
       let text = part.text
       const stroke = !part.invisible && part.strokeWidth && part.strokeWidth > 0 ? part.strokeWidth : 0
-      let built = buildShowOps(pageObj, text, part.fontSize, part.fontName, part.faceId, sharedCjk, stroke, part.faceSkip)
+      const tstroke = !part.invisible && part.tracedStrokeWidth && part.tracedStrokeWidth > 0 ? part.tracedStrokeWidth : 0
+      let built = buildShowOps(pageObj, text, part.fontSize, part.fontName, part.faceId, sharedCjk, stroke, part.faceSkip, tstroke)
       if ('error' in built && part.invisible) {
         // An invisible run stands for the scan's own pixels, so a character
         // no face can hold costs nothing visible. Dropping it beats losing a
@@ -2850,7 +2855,7 @@ function addTextRunToPage(
       // are stroked in the text's own colour, round-joined so a stroked
       // corner does not spike. Line width and stroke colour are graphics
       // state inside the object's q/Q; the per-op `Tr` is set by buildShowOps.
-      const strokeState = stroke ? `${stroke.toFixed(3)} w 1 j 1 J ${r} ${g} ${b} RG\n` : ''
+      const strokeState = (stroke || tstroke) ? `${(stroke || tstroke).toFixed(3)} w 1 j 1 J ${r} ${g} ${b} RG\n` : ''
       // An invisible run stands for the scan's own words, whose letters are
       // not Helvetica's width: set at its natural advance it ended short of
       // the ink (or ran past it), and extraction read the difference as a
@@ -2910,14 +2915,18 @@ function addTextToPage(
   /** Stroke the fallback glyphs by this many points in the text's colour — weight matched to the scan (ocrStroke.ts). */
   strokeWidth?: number,
   /** Characters the scan face must not draw here (traced from the other weight of the line). */
-  faceSkip?: string
+  faceSkip?: string,
+  /** Stroke the traced glyphs by this many points. */
+  tracedStrokeWidth?: number
 ): { success: boolean; error?: string } {
   if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
 
   try {
     const page = pdfDoc.loadPage(pageIndex)
     const pageObj = page.getObject()
-    const stroke = !invisible && strokeWidth && strokeWidth > 0 ? strokeWidth : 0
+    const fallbackStroke = !invisible && strokeWidth && strokeWidth > 0 ? strokeWidth : 0
+    const tracedStroke = !invisible && tracedStrokeWidth && tracedStrokeWidth > 0 ? tracedStrokeWidth : 0
+    const stroke = fallbackStroke || tracedStroke
 
     // 1–3. Fonts and show operators, one per SEGMENT. The run is cut into
     // maximal stretches the scan face can draw (glyphs traced from the page
@@ -2928,7 +2937,7 @@ function addTextToPage(
     // WinAnsi in the base-14 face where it can — serializing raw Unicode with
     // "& 0xFF" would silently mangle €, smart quotes, dashes… — and to a
     // subset of the shipped CJK face for text WinAnsi cannot hold.
-    const built = buildShowOps(pageObj, text, fontSize, fontName, faceId, undefined, stroke, faceSkip)
+    const built = buildShowOps(pageObj, text, fontSize, fontName, faceId, undefined, fallbackStroke, faceSkip, tracedStroke)
     if ('error' in built) { page.destroy(); return { success: false, error: built.error } }
     const showOps = built.ops
 

@@ -419,8 +419,19 @@ async function bakeOcrEdits(): Promise<number> {
       allowShift: true,
       faceSkip: plans.get(item.id)?.faceSkip || undefined,
       weightScale: plans.get(item.id)?.weightScale,
-      localFontName: localFont(item)
+      localFontName: localFont(item),
+      tracedStrokeRatio: plans.get(item.id)?.tracedRatio ?? undefined
     }]))
+    // The whole-run redraw's traced glyphs are stroked up to the scan too:
+    // the median measured weight of the face glyphs the item's text will use.
+    const tracedRatioFor = (item: OcrTextItem): number | null => {
+      const face = ocr.faceOf(pageIndex, styleKeyOf(item))
+      if (!face) return null
+      const ws: number[] = []
+      for (const ch of new Set([...item.text])) { const w = face.glyphs.get(ch)?.weight; if (w) ws.push(w) }
+      if (!ws.length) return null
+      return [...ws].sort((a, b) => a - b)[Math.floor(ws.length / 2)]
+    }
     // And every edited run's FULL text, at 10pt, in the fonts that will draw
     // it — the whole-run redraw fits its size to the paper and to the run
     // beside it by this width, where an estimate of half an em per character
@@ -445,7 +456,7 @@ async function bakeOcrEdits(): Promise<number> {
     }
     // `updateItem` replaces the page's item objects; plan from the fresh ones.
     const planItems = ocrStore.pages.get(pageIndex)?.items ?? page.items
-    const plan = planOcrExport(planItems, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null)
+    const plan = planOcrExport(planItems, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null, tracedRatioFor)
     modes[pageIndex] = plan.modes
     // What each run's ink box becomes: a stretch appended past the old ink,
     // or a shifted tail, is painted OUTSIDE the box the recogniser read, and
@@ -511,10 +522,10 @@ async function bakeOcrEdits(): Promise<number> {
         if (run.length > 1) {
           await pdfEngine.addTextRun(pageIndex, run.map(o => ({
             x: o.x, y: page.pageHeight - o.y, text: o.text, fontSize: o.fontSize, fontName: o.fontName,
-            color: o.color, faceId: o.faceId, invisible: o.invisible, fitWidth: o.fitWidth, strokeWidth: o.strokeWidth, faceSkip: o.faceSkip
+            color: o.color, faceId: o.faceId, invisible: o.invisible, fitWidth: o.fitWidth, strokeWidth: o.strokeWidth, faceSkip: o.faceSkip, tracedStrokeWidth: o.tracedStrokeWidth
           })), t.rotation)
         } else {
-          await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible, t.strokeWidth, t.faceSkip)
+          await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible, t.strokeWidth, t.faceSkip, t.tracedStrokeWidth)
         }
         for (const o of run) if (!o.invisible) written++
         i = j

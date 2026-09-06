@@ -38,10 +38,40 @@ const MAX_EXTRA_EM = 0.05
  * scan's measured stem, or undefined when the face is already as heavy.
  */
 export function strokeWidthFor(strokeRatio: number | undefined, fontName: string, fontSize: number): number | undefined {
-  if (!strokeRatio || !(strokeRatio > 0) || !(fontSize > 0)) return undefined
-  const stem = FACE_STEM[fontName]
-  if (stem === undefined) return undefined
-  const extra = strokeRatio - stem
+  return strokeUpTo(strokeRatio, FACE_STEM[fontName], fontSize)
+}
+
+/**
+ * Stroke width in points that brings a face whose stems measure `have` (over
+ * the em) up to `target`, or undefined when there is nothing to add. Used for
+ * the base-14 faces (their stems from the table above) and for the TRACED
+ * glyphs: an outline traced at the mass-conserving level renders crisp, and
+ * measured the same way as the scan's blurred stems it comes out lighter —
+ * 0.148 em against 0.172 on a title — so beside a stroked fallback "M" the
+ * traced "AE" read thin. Both are brought to the scan's own measurement.
+ */
+export function strokeUpTo(target: number | undefined, have: number | undefined, fontSize: number): number | undefined {
+  if (!target || !(target > 0) || !(fontSize > 0) || have === undefined || !(have >= 0)) return undefined
+  const extra = target - have
   if (extra < MIN_EXTRA_EM) return undefined
   return Math.round(Math.min(extra, MAX_EXTRA_EM) * fontSize * 100) / 100
+}
+
+/**
+ * The same for a TRACED glyph, at half the nominal width. A traced outline is
+ * not a designed one: potrace leaves it with many short segments, and a
+ * round-joined stroke puffs every one of them, so the stems grow by about
+ * twice the line width. Measured on the contract's title (detector ratio at
+ * 220 DPI): traced unstroked 0.148, target 0.172, stroked at the nominal
+ * 0.37pt 0.197 — half the width lands on the target.
+ */
+export function tracedStrokeUpTo(target: number | undefined, have: number | undefined, fontSize: number): number | undefined {
+  if (!target || !(target > 0) || !(fontSize > 0) || have === undefined || !(have >= 0)) return undefined
+  const extra = target - have
+  // A lower floor than the base-14 case: the bitmap's ratio overstates what
+  // the traced outline renders at by about a hundredth of an em, so a
+  // difference the fallback rule would call noise is still a lighter glyph
+  // here — and the halved, round-joined stroke is gentle.
+  if (extra < 0.008) return undefined
+  return Math.round(Math.min(extra, MAX_EXTRA_EM) * fontSize * 50) / 100
 }
