@@ -7,7 +7,7 @@
   Header always set Cross-Origin-Opener-Policy "same-origin"
   Header always set Cross-Origin-Embedder-Policy "require-corp"
   # The models and fonts are large and never change under the same name.
-  <FilesMatch "\.(ort|onnx|otf|ttf|gz|wasm)$">
+  <FilesMatch "\.(ort|onnx|otf|ttf|gz|wasm|bcmap|pfb|icc)$">
     Header set Cache-Control "public, max-age=31536000, immutable"
   </FilesMatch>
   # tesseract.js's worker and its single-file WASM cores (public/tesseract/).

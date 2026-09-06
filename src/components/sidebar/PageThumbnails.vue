@@ -50,6 +50,7 @@
 <script setup lang="ts">
 import { ref, inject, watch, nextTick, onBeforeUnmount } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
+import { pdfjsDocumentOptions } from '@/composables/usePDFViewer'
 import { useDocumentStore } from '@/stores/document'
 
 const docStore = useDocumentStore()
@@ -130,7 +131,7 @@ async function ensureDoc(): Promise<any | null> {
   if (thumbDoc) return thumbDoc
   if (!docStore.pdfBytes) return null
   const token = renderToken
-  const task = pdfjsLib.getDocument({ data: docStore.pdfBytes.slice() })
+  const task = pdfjsLib.getDocument(pdfjsDocumentOptions(docStore.pdfBytes.slice()))
   const doc = await task.promise
   if (token !== renderToken) { await doc.destroy().catch(() => {}); return null }
   thumbDoc = doc
