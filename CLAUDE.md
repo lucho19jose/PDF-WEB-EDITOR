@@ -4376,6 +4376,23 @@ than burning its three retries. Measured with the headless-Chrome
 reproduction (`scratchpad/pw/edit-repro.mjs`: type into the inline editor,
 blur, hash the canvas): unchanged before, changed right after blur now.
 
+### On a scan the picture IS the page — it is never an object to drag
+A screenshot showed every edited line of the scanned contract page twice, the
+photographed words a few pixels from the patches and replacements written for
+them. In the select tool the page-covering scan image was an ordinary object,
+and a click that wobbled three pixels dragged the whole picture, while the
+text and patches an earlier OCR edit had written into the content stream
+("MAESTRA", the replaced paragraph line, the paper painted over a deleted
+title) and the recognised runs stayed where they were. The page-filling image
+of a scan page is `paper` in EVERY tool now (it was only in the edit tool),
+a recognised page counts as a scan whatever the cached verdict says, and a
+page-covering image needs an 8px drag before it counts as moved. Should one
+still move (a scan-like page without the verdict), `ocrController.scanMoved`
+shifts the page's runs with it and `scanChanged` drops them after a resize,
+crop or deletion, with a status line. The headless-Chrome reproduction is
+`scratchpad/pw/drag-scan.mjs`: a 20px drag on the scan's margin used to
+report "Image moved"; now the press lands on the marquee surface.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
