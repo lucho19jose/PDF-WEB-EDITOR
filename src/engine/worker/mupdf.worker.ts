@@ -2,6 +2,7 @@
 
 import type { WorkerRequest, WorkerResponse } from './worker-protocol'
 import { glyphNameToUnicode } from './glyphNames'
+import { readPkcs7Signer } from './pkcs7Signer'
 import * as opentype from 'opentype.js'
 // opentype.js is CJS: the browser bundle gives the namespace itself, the
 // SSR loader (tools/pdf-sweep/node-harness.mjs) wraps it under `default`.
@@ -9451,11 +9452,22 @@ function getSignatures(): any[] {
     const dateRaw = sigString(v, 'M')
     let pg = page
     if (pg < 0) pg = pageIndexOfRef(safe(() => field.get('P'), null))
+    // Neither Intellisign nor DocuSign writes /Name: the signer is in the
+    // Subject of the certificate inside /Contents. /Name wins when present —
+    // it is what the signing software chose to say — and the certificate
+    // fills in what the dictionary left out (name, organisation, the signing
+    // time when /M is absent). asByteString() gives the DECODED bytes for a
+    // hex string and a binary string alike, zero padding included.
+    const signer = readPkcs7Signer(safe(() => {
+      const c = derefObj(v.get('Contents'))
+      return (c && c.isString && c.isString()) ? c.asByteString() : null
+    }, null))
     out.push({
-      name: sigString(v, 'Name'),
+      name: sigString(v, 'Name') ?? signer?.commonName,
+      organisation: signer?.organisation,
       reason: sigString(v, 'Reason'),
       location: sigString(v, 'Location'),
-      date: dateRaw ? pdfDateToIso(dateRaw) : undefined,
+      date: dateRaw ? pdfDateToIso(dateRaw) : signer?.signingTime,
       contactInfo: sigString(v, 'ContactInfo'),
       subFilter: sigName(v, 'SubFilter'),
       page: pg,

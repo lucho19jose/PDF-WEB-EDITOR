@@ -135,13 +135,15 @@ export interface AnnotationInfo {
  * `coversWholeDocument` is optional: a signing service fills in what it likes.
  */
 export interface SignatureInfo {
-  /** /Name — the signer, as the signing software wrote it. */
+  /** /Name — the signer, as the signing software wrote it — or, when absent, the Subject CN of the signer's certificate in /Contents. */
   name?: string
+  /** Subject O (organisation) of the signer's certificate in /Contents, when it carries one. */
+  organisation?: string
   /** /Reason */
   reason?: string
   /** /Location */
   location?: string
-  /** /M, converted from the PDF date form to ISO 8601 (with the offset the file gave). */
+  /** /M, converted from the PDF date form to ISO 8601 (with the offset the file gave); the certificate's signingTime (UTC) when /M is absent. */
   date?: string
   /** /ContactInfo */
   contactInfo?: string

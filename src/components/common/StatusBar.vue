@@ -51,6 +51,7 @@
             </div>
             <div v-for="(s, i) in tooltipRows" :key="i" class="sig-row">
               <span>{{ s.name || 'Signer not stated' }}</span>
+              <span v-if="s.organisation && s.organisation !== s.name" class="text-grey-5"> · {{ s.organisation }}</span>
               <span v-if="s.date" class="text-grey-5"> · {{ s.date }}</span>
               <span v-if="s.reason" class="text-grey-5"> · {{ s.reason }}</span>
               <span v-if="s.page >= 0" class="text-grey-5"> · p. {{ s.page + 1 }}</span>
@@ -105,12 +106,19 @@ const signers = computed(() => {
   return [...names]
 })
 
-/** Short and honest: the one signer's name when there is exactly one, else a count. */
+/**
+ * Short and honest: the one signer's name when there is exactly one, else a
+ * count. The name is /Name when the signing software wrote one, else the
+ * Subject CN of the signer's certificate — for a service-sealed document
+ * (Intellisign, DocuSign) that is the SERVICE's certificate, so a 30-signature
+ * contract sealed by one certificate keeps its count beside the name.
+ */
 const sigLabel = computed(() => {
   if (docStore.isModified) return 'Signature invalidated by edits'
   const n = signatures.value.length
-  if (signers.value.length === 1) return `Signed by ${signers.value[0]}`
-  return `Signed · ${n} signature${n === 1 ? '' : 's'}`
+  const count = `${n} signature${n === 1 ? '' : 's'}`
+  if (signers.value.length === 1) return n === 1 ? `Signed by ${signers.value[0]}` : `Signed by ${signers.value[0]} · ${count}`
+  return `Signed · ${count}`
 })
 
 /** Newest first, capped: a 42-entry tooltip is a wall, not information. */
