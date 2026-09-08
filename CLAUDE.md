@@ -4544,6 +4544,81 @@ Measured (this session's baselines, node): marker sweep +8 gained, 0 lost over
 seven corpora; realistic sweep main 625, r2 1040, r3 1117, r4 1131, r5 1071,
 r6 1371, r7 990 operations — gained 16/36/43/38/33/32/35, lost 0.
 
+### A visual line spread over several blocks' OPS is one line
+A style run splits a paragraph line over three BTs on InDesign and Quicksand
+exports: the head is the LAST op of a block that also holds the two lines
+above, the bold word is a block of its own (drawn `2 Tr`), and the tail is the
+FIRST op of the block holding the lines below. No whole block and no run of
+whole blocks read as the target, so the head's block won as a fuzzy single
+block and the partial path wrote the whole replacement into its last op — the
+bold word and the tail stayed and the line read twice (cd 52 on a 78-character
+edit, and a delete that left half the line). A 4-heights legal form does the
+same with a clause number in its own fontless BT ahead of a two-line block:
+retyping "6. Conozco…" drew "6. 7. …" and deleting it left the "6.".
+
+Step 2c of the replace matcher gathers, from EVERY block, the ops on the
+target's row and, when their text across the page is exactly the target's
+(space-free), makes the line one candidate (`cross_block_line`): the leftmost
+member takes the replacement through the partial path against ITS share of
+the line, the other members' row ops are blanked in place. A block's later
+lines are placed by their own Td/T*, so blanking its first op moves nothing.
+Two things had to be right for the row test:
+
+- **The row is a BASELINE, not a box.** An 11pt line's box is nearly as tall
+  as its pitch, so the line above sat within a point of the box top and passed
+  a box test; the target's first glyph origin, mapped into the block's space,
+  is compared at 0.35 em.
+- **`T*` steps by a leading the block may never set.** `TL` is text state and
+  outlives ET; a form sets it once and every clause block inherits it. Tracked
+  from zero, every `T*` line reported the same y and a clause's second line
+  read as part of its first. `BtInfo.inheritedTL` replays TL/TD through q/Q
+  the way `fontStateAt` replays fonts and seeds `scanShowOps`.
+
+### A substitute face is fitted back to the width the original set
+Helvetica is wider than Calibri, Aptos, Arial Narrow or a condensed display
+face, and on a same-length edit the excess ran the line off the page: a
+Chrome-printed e-mail line lost its last four letters, a Word letterhead five,
+a datasheet title nine. `substituteTz` scales a substituted run with `Tz` to
+the original run's average advance times the new length — an append still
+grows the line, only the face's excess is taken back — floored at 0.72, and
+the scaling in force is put back after the run. Every substitute writer takes
+it (`rebuildBtContent`, the op window, the in-array split, and the trailing
+kern is measured at the scaled width); `textStateAtOp` multiplies advances by
+the Tz in force instead of refusing, so a second edit of such a run is not
+turned away. Measured side effect: the phantom spaces extraction used to
+invent inside a re-encoded run ("UÉDO JDP", "Alarc on") are gone, because the
+glyphs now sit where the original's did.
+
+### Smaller matcher truths from the same round
+- **A string inside an inline dictionary is not text.** `(es-PE)` in
+  `/Span <</Lang (es-PE)/MCID 23>> BDC` decoded as two CID glyphs and put "??"
+  ahead of every tagged block; Corel's `/Corel_OTF <<…>> DP` did the same with
+  nineteen. `blankInlineDicts` blanks `<<…>>` operands before the decoder's
+  literal walk. Those placeholders were what let containment fit a target into
+  the wrong block.
+- **An op that decodes to nothing but '?' is unreadable, not foreign.**
+  `narrowToChangedOps` kept it as "a glyph neither text had".
+- **Only a colour op that PRECEDES a show op governs a block's glyphs.** A
+  PDF24 order sets `1 1 1 sc` as the last thing in its "PROVEEDOR" block, for
+  the white text of the block after it; rewriting that op recoloured the
+  neighbour while the target stayed black.
+- **The move matcher reads a row space-free too** ("Código de Cliente:232900
+  - 2R.U.C.:…" against "Código de Cliente : 232900 - 2"), and a candidate
+  provably far from the click is dropped only when it is about the target's
+  size AND a near candidate exists — every candidate far means the distance
+  itself is suspect (an Excel export under `1 0 0 -1 0 0 Tm` measured its one
+  exact block 444pt away).
+- **A line group's clip is widened around the block that was REWRITTEN.**
+  The primary is not always the first block (a Wingdings tick leads, the
+  Calibri sentence takes the text) and Word clips each run separately.
+- **The blank guard tolerates an extraction transposition** ("defniido" for
+  a Word TOC's "definido"): a block whose glyphs are nearly all in the target,
+  in order, is not foreign.
+
+Measured (node, this session's baselines): realistic sweep gained 3/6/12/19/
+13/30/16 over main/r2…r7 on top of the first round, 0 lost; marker sweep
+against the session's HEAD: 7/2/4/3/4/15/3 gained, 0 lost.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

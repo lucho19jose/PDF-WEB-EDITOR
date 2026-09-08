@@ -49,6 +49,11 @@ globalThis.fetch = async (url) => {
     const b = fs.readFileSync(ROOT + '/public' + url)
     return { arrayBuffer: async () => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }
   }
+  // The CJK fallback face: served from public/ so the sweep takes the same path the browser does.
+  if (typeof url === 'string' && url.startsWith('/fonts/')) {
+    const b = fs.readFileSync(ROOT + '/public' + url)
+    return new Response(b, { status: 200 })
+  }
   return realFetch(url)
 }
 

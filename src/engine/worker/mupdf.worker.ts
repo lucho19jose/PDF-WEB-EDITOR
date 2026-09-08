@@ -2411,7 +2411,9 @@ function rebuildBtContent(
   hex = false,
   overrideSize?: number,
   overrideColorOp?: string | null,
-  inheritedTf?: string | null
+  inheritedTf?: string | null,
+  /** Horizontal scaling for a substituted face (see `substituteTz`), reset to 100 after the lines. */
+  tz?: number | null
 ): string {
   const tfMatch = content.match(/\/([A-Za-z0-9_.+-]+)\s+([\d.]+)\s+Tf/)
   // A block with no Tf of its own inherits font AND size from the graphics
@@ -2467,7 +2469,41 @@ function rebuildBtContent(
     ? (tfMatch ? `\n${tfMatch[0]}` : (inheritedTf ? `\n${inheritedTf}` : ''))
     : ''
 
-  return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${posPart}\n${tjParts.join('\n')}${restoreTf}\n`
+  // A block that sets its own Tz keeps it; only an untouched one gets the fit.
+  const useTz = tz && !/\sTz(?![A-Za-z0-9])/.test(maskStreamLiterals(content))
+  const tzOn = useTz ? `${fmtNum(tz * 100)} Tz\n` : ''
+  const tzOff = useTz ? `\n100 Tz` : ''
+
+  return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${posPart}\n${tzOn}${tjParts.join('\n')}${tzOff}${restoreTf}\n`
+}
+
+/**
+ * Horizontal scaling that brings a SUBSTITUTE face back to the width the
+ * original text set, as a fraction (0.72–0.97), or null when the substitute
+ * is already no wider than that.
+ *
+ * A base-14 face is nearly always wider than the face it stands in for —
+ * Helvetica for Calibri, Aptos or a condensed display face — and the extra
+ * width is where a same-length edit went wrong on every producer at once:
+ * a Chrome-printed e-mail line lost its last four letters past the page edge,
+ * a Word letterhead its last five, a datasheet title set in a condensed face
+ * nine. `Tz` scales the advance, the one thing a substitute cannot match on
+ * its own. The expected width is the original run's average advance times
+ * the new length, so an APPEND still grows the line and only the face's excess
+ * is taken back; a floor of 0.72 keeps the glyphs legible, and a scale within
+ * three percent of 1 is not worth an operator.
+ */
+function substituteTz(targetBlock: TextBlock | undefined, newText: string, fontName: string): number | null {
+  if (!targetBlock) return null
+  const oldLen = targetBlock.text.trim().length
+  const newLen = newText.trim().length
+  if (oldLen < 2 || newLen < 1 || !(targetBlock.width > 0) || !(targetBlock.fontSize > 0)) return null
+  const newWidth = measureEm(newText.trim(), fontName) * targetBlock.fontSize
+  if (!(newWidth > 0)) return null
+  const expected = targetBlock.width * (newLen / oldLen)
+  const tz = expected / newWidth
+  if (!Number.isFinite(tz) || tz >= 0.97) return null
+  return Math.max(0.72, tz)
 }
 
 type EncodingPlan =
@@ -4505,7 +4541,7 @@ function restyleInSource(
           continue
         }
         const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
-          (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+          (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
         const first = ops.findIndex(o => o.start === run.start)
         const lastIdx = ops.findIndex(o => o.end === run.end)
         if (first < 0 || lastIdx < 0) continue
@@ -4567,16 +4603,27 @@ function restyleInSource(
         }
         if (colorOp) {
           const original = lastFillColorIn(inner)
+          // Only a colour op that PRECEDES a show op governs this block's
+          // glyphs. A pdf24 order sets `1 1 1 sc` as the LAST thing in its
+          // "PROVEEDOR" block — for the white text of the block AFTER it — and
+          // rewriting that op recoloured the neighbour while the target,
+          // coloured from before the BT, stayed as it was.
+          const showOps = scanShowOps(inner, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+            (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+          const firstShow = showOps.length ? showOps[0].start : inner.length
+          const lastShow = showOps.length ? showOps[showOps.length - 1].start : inner.length
           const hits = [...maskStreamLiterals(inner).matchAll(/[\d.]+(?:\s+[\d.]+){0,3}\s+(?:rg|g|k|sc|scn)\b/g)]
+            .filter(h => h.index! < lastShow)
           for (const h of hits.reverse()) {
             inner = inner.slice(0, h.index!) + colorOp + inner.slice(h.index! + h[0].length)
           }
-          // Nothing to overwrite: this run inherits its colour from before the
-          // BT (Quartz sets `0.3 sc` outside it). The new one goes ahead of the
-          // text object, and the colour that WAS in force — read back through
-          // q/Q from the stream, or failing that the colour extraction reports
-          // for this very block — is put back after it.
-          if (hits.length === 0) colorPrefix = `${colorOp} `
+          // Nothing to overwrite ahead of the first glyph: this run inherits
+          // its colour from before the BT (Quartz sets `0.3 sc` outside it).
+          // The new one goes ahead of the text object, and the colour that WAS
+          // in force — read back through q/Q from the stream, or failing that
+          // the colour extraction reports for this very block — is put back
+          // after it.
+          if (!hits.some(h => h.index! < firstShow)) colorPrefix = `${colorOp} `
           const restore = original ?? fillColorStateAt(stream, block.start) ??
             `${fmtNum(targetBlock.color[0])} ${fmtNum(targetBlock.color[1])} ${fmtNum(targetBlock.color[2])} rg`
           restoreAfter.push(restore)
@@ -4729,7 +4776,7 @@ function findTargetRun(
   const targetNorm = targetText.replace(/\s+/g, ' ').trim()
   if (!targetNorm) return null
   const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
-    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
   if (ops.length === 0) return null
 
   // A run on the clicked ROW beats any run off it, whatever the text says. A
@@ -4832,7 +4879,7 @@ function findGoverningTm(
   if (!targetNorm) return null
 
   const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
-    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
   if (ops.length === 0) return null
 
   // Best contiguous run of show-ops whose text matches the target
@@ -5368,6 +5415,31 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
     }
     return found
   }
+  // Leading is text state like the font, and replayed the same way: `TL` and
+  // the `TD` that sets it as a side effect, saved and restored by q/Q.
+  const tlEvents: { at: number; tl: number }[] = []
+  {
+    const tlRe = /(-?[\d.]+)\s+TL(?![A-Za-z0-9])|(-?[\d.]+)\s+(-?[\d.]+)\s+TD(?![A-Za-z0-9])|(?<![A-Za-z0-9])[qQ](?![A-Za-z0-9])/g
+    let tl = 0
+    const stack: number[] = []
+    let e: RegExpExecArray | null
+    while ((e = tlRe.exec(masked)) !== null) {
+      const tok = e[0]
+      if (tok === 'q') { stack.push(tl); continue }
+      if (tok === 'Q') { if (stack.length) tl = stack.pop()!; tlEvents.push({ at: e.index, tl }); continue }
+      tl = e[1] !== undefined ? parseFloat(e[1]) : -parseFloat(e[3])
+      if (!Number.isFinite(tl)) tl = 0
+      tlEvents.push({ at: e.index, tl })
+    }
+  }
+  const leadingAt = (offset: number): number => {
+    let found = 0
+    for (const ev of tlEvents) {
+      if (ev.at > offset) break
+      found = ev.tl
+    }
+    return found
+  }
   /** Font in force at a stream offset, q/Q replayed. */
   const fontAt = (offset: number): string | null => fontStateAt(offset)?.name ?? null
   /** The whole Tf operator in force at a stream offset (`/TT1 11.04 Tf`), q/Q replayed. */
@@ -5461,6 +5533,7 @@ function scanBtBlocks(stream: string, pageIndex: number): BtInfo[] {
       fontRef,
       fonts,
       inheritedTf,
+      inheritedTL: leadingAt(start),
       yPos: origin.y,
       xPos: origin.x,
       hasPos: origin.hasPos,
@@ -5619,9 +5692,15 @@ function findBtBlocksByPosition(
   const foldedTarget = foldForMatch(normalizedTarget)
   const readsAs = (line: string) => {
     const foldedLine = foldForMatch(line)
+    // Space-free containment too: a row drawn as one BT reads
+    // "Código de Cliente:232900 - 2R.U.C.:…" against an extracted
+    // "Código de Cliente : 232900 - 2", and the spaces around the colon kept
+    // the only block holding the target out of the running — a copy of the
+    // label 650pt down the page was restyled instead.
     return fuzzyTextMatch(line, normalizedTarget) ||
       (foldedLine.length > 5 && foldedTarget.length > 5 &&
-       (wildcardIncludes(foldedLine, foldedTarget) || foldedTarget.includes(foldedLine)))
+       (wildcardIncludes(foldedLine, foldedTarget) || foldedTarget.includes(foldedLine) ||
+        foldedLine.replace(/\s+/g, '').includes(foldedTarget.replace(/\s+/g, ''))))
   }
   // NOT space-stripped on the containment leg, deliberately: compacting let a
   // line of a WRAPPED pdfTeX paragraph match, and the td-bracket then landed
@@ -5815,7 +5894,41 @@ function findBtBlocksByPosition(
     }
   }
 
+  // A candidate provably FAR from the click is another copy of the text, not
+  // the one the user pointed at — unless a run inside it sits on the click
+  // (a block whose origin is far from the cell it draws). Three copies of
+  // "Código de Cliente" 650pt from the click were the only candidates on a
+  // utility bill, and the nearest of them was restyled.
+  //
+  // Only for candidates about the TARGET's size — a whole-block or whole-line
+  // match. A paragraph block's origin is routinely a hundred points from the
+  // line inside it that is being dragged; capping those refused every
+  // td-bracket move on a TeX or Word page (measured: 24 moves lost).
+  //
+  // And only when a NEAR candidate exists to prefer. A block's measured
+  // distance can be wrong on its own — an Excel export draws each label under
+  // `1 0 0 -1 0 0 Tm` with per-glyph Td, and the one exact block for
+  // "Revisión externa" measured far — so where every candidate is far, the
+  // ranking stands as it always did.
+  const FAR = 96
+  const aboutTargetSize = (c: Candidate) =>
+    c.blocks.every(b => matchLength(b.decodedText) <= matchLength(normalizedTarget) * 1.4 + 4)
+  const anyNear = candidates.some(c => Number.isFinite(c.dist) && c.dist <= FAR)
+  for (let k = candidates.length - 1; k >= 0 && anyNear; k--) {
+    const c = candidates[k]
+    if (!Number.isFinite(c.dist) || c.dist <= FAR || !aboutTargetSize(c)) continue
+    const near = c.blocks.some(b => {
+      const r = runDistanceToTarget(b, targetBlock.text, pageIndex, stream, targetBlock, pageHeight)
+      return r !== null && r <= FAR
+    })
+    if (!near) candidates.splice(k, 1)
+  }
   if (candidates.length === 0) return null
+  if ((globalThis as any).__debugCandidates) {
+    for (const c of candidates) {
+      console.log(`[pos-cand] score=${c.score} dist=${Number.isFinite(c.dist) ? c.dist.toFixed(1) : '?'} blocks=${JSON.stringify(c.blocks.map(b => b.decodedText.slice(0, 40)))}`)
+    }
+  }
 
   const bucket = (d: number) => Number.isFinite(d) ? Math.round(d / 8) : Number.MAX_SAFE_INTEGER
   // Inside one bucket the REAL distance still decides before anything textual
@@ -5907,6 +6020,8 @@ interface BtInfo {
    * cannot become the inherited font of every block that follows.
    */
   inheritedTf?: string | null
+  /** The `TL` (leading) in force when the block opens, q/Q replayed — 0 when none was set. */
+  inheritedTL?: number
   yPos: number
   xPos: number
   /** The block carries at least one text-positioning operator (Tm/Td/TD/T*). */
@@ -6142,6 +6257,8 @@ function replaceTextInContentStreamFontAware(
   // not to be editable at all.
   interface Candidate {
     blocks: BtInfo[]; score: number; dist: number; line: boolean; partial?: boolean; order: number
+    /** Members of an op-level line assembled across blocks (Step 2c). */
+    cross?: CrossMember[]
     /**
      * Space-free tail of the target that is NOT drawn by this run — it lives
      * fused at the head of the block that follows the run, so it stays on the
@@ -6325,6 +6442,79 @@ function replaceTextInContentStreamFontAware(
     }
   }
 
+  // Step 2c: the visual line assembled from OPS across blocks.
+  //
+  // A style run splits a paragraph line over three BTs on InDesign and Quicksand
+  // exports: the line's head is the LAST op of a block that also holds the two
+  // lines above, the bold word is a block of its own, and the tail is the FIRST
+  // op of the block holding the lines below. No whole block and no run of whole
+  // blocks reads as the target, so the head's block won as a fuzzy single block
+  // and the partial path wrote the whole replacement into its last op — the
+  // bold word and the tail stayed, and the line read twice. A legal form does
+  // the same with a clause number in its own fontless BT ahead of a two-line
+  // block: retyping "6. Conozco…" drew "6. 7. …".
+  //
+  // The ops on the target's ROW are gathered from every block (the same row
+  // test `findTargetRun` applies), ordered across the page, and when their
+  // text is exactly the target's (space-free) the line is one candidate: the
+  // leftmost member takes the replacement through the partial path — which
+  // knows how to rewrite a window inside a block — and the others' row ops are
+  // blanked. A block's later lines are placed by their own Td/T*, so blanking
+  // its first op moves nothing. Ranked as an exact match; an exact whole-line
+  // group, when one exists, still wins on order.
+  if (pageHeight !== undefined && matchLength(normalizedTarget) >= 3) {
+    const tCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '')
+    const members: CrossMember[] = []
+    for (const block of allBlocks) {
+      if (!block.hasPos) continue
+      if (readsOnPlaceholders(block.decodedText, normalizedTarget)) continue
+      const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
+      if (!local) continue
+      const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+        (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
+      if (!ops.length) continue
+      // Against the target's BASELINE where extraction reports one: the box of
+      // an 11pt line is nearly as tall as the line pitch, so the line ABOVE
+      // sits within a point of the box top and passed a box test. A baseline
+      // is a line; the next one is a whole leading away.
+      const ctm0 = getFullCtmAtOffset(stream, block.start)
+      const det0 = ctm0[0] * ctm0[3] - ctm0[1] * ctm0[2]
+      const baseY = targetBlock.chars?.[0]?.origin?.[1]
+      let gapOf = (y: number) => (y < local.yLo ? local.yLo - y : (y > local.yHi ? y - local.yHi : 0)) * (local.unitScale || 1)
+      let rowBar = 6
+      if (baseY !== undefined && Number.isFinite(baseY) && Math.abs(det0) > 1e-9) {
+        const px = targetBlock.bbox[0], py = pageHeight - baseY
+        const ax = px - ctm0[4], ay = py - ctm0[5]
+        const localBase = (ay * ctm0[0] - ax * ctm0[1]) / det0
+        gapOf = (y: number) => Math.abs(y - localBase) * (local.unitScale || 1)
+        rowBar = Math.max(2.5, targetBlock.fontSize * 0.35)
+      }
+      const onRow = ops.map((o, k) => ({ o, k })).filter(({ o }) => gapOf(o.y) <= rowBar && o.decoded.trim().length > 0)
+      if (!onRow.length) continue
+      const first = onRow[0].k, last = onRow[onRow.length - 1].k
+      // The row's ops must be one contiguous stretch of the block.
+      if (ops.slice(first, last + 1).some(o => gapOf(o.y) > rowBar && o.decoded.trim().length > 0)) continue
+      const ctm = getFullCtmAtOffset(stream, block.start)
+      const o0 = ops[first]
+      const pageX = o0.x * ctm[0] + o0.y * ctm[2] + ctm[4]
+      members.push({ block, first, last, ops, pageX, text: ops.slice(first, last + 1).map(o => o.decoded).join('') })
+    }
+    if ((globalThis as any).__debugCandidates) {
+      for (const m of members) console.log(`[cross] member x=${m.pageX.toFixed(1)} ops ${m.first}..${m.last}/${m.ops.length} ${JSON.stringify(m.text.slice(0, 50))} block=${JSON.stringify(m.block.decodedText.slice(0, 30))}`)
+    }
+    if (members.length >= 2) {
+      members.sort((a, b) => a.pageX - b.pageX)
+      const joined = foldForMatch(members.map(m => m.text).join('')).replace(/\s+/g, '')
+      if ((globalThis as any).__debugCandidates) console.log(`[cross] joined=${JSON.stringify(joined.slice(0, 80))} target=${JSON.stringify(tCompact.slice(0, 80))}`)
+      if (joined === tCompact && members.some(m => m.first > 0 || m.last < m.ops.length - 1)) {
+        candidates.push({
+          blocks: members.map(m => m.block), score: 2, dist: 0,
+          line: false, cross: members, order: candidates.length
+        })
+      }
+    }
+  }
+
   // Step 3: single-block matching (for PDFs where each text block is one BT)
   const onClick = Math.max(6, targetBlock.height || 0)
   for (const block of allBlocks) {
@@ -6501,6 +6691,11 @@ function replaceTextInContentStreamFontAware(
   )
 
   const tried: string[] = []
+  if ((globalThis as any).__debugCandidates) {
+    for (const c of candidates) {
+      console.log(`[cand] ${c.partial ? 'P' : c.line ? 'L' : 'S'} score=${c.score.toFixed(2)} dist=${Number.isFinite(c.dist) ? c.dist.toFixed(1) : '?'} fused=${c.tailFused ?? ''} blocks=${JSON.stringify(c.blocks.map(b => b.decodedText.slice(0, 40)))}`)
+    }
+  }
   for (const c of candidates) {
     tried.push(`${c.partial ? 'P' : c.line ? 'L' : 'S'}${c.score.toFixed(2)}@${Number.isFinite(c.dist) ? c.dist.toFixed(0) : '?'}:${JSON.stringify(c.blocks.map(b => b.decodedText.slice(0, 12)).join('|'))}`)
     // A line group provably FAR from the click is never the line the user
@@ -6522,15 +6717,22 @@ function replaceTextInContentStreamFontAware(
       effNewText = newText.slice(0, end)
       if (!effNewText.trim() && newText.trim()) continue
     }
-    const result = c.partial
+    const result = c.cross
+      ? applyCrossBlockLine(stream, c.cross, effNewText, pageIndex, targetBlock, pageHeight, pageWidth)
+      : c.partial
       ? applyPartialBlockReplacement(stream, c.blocks[0], effNewText, pageIndex, targetBlock, pageHeight, pageWidth)
       : c.line
         ? applyLineReplacement(stream, c.blocks, effNewText, pageIndex, targetBlock, pageWidth, rotation)
         : applyBlockReplacement(stream, c.blocks, effNewText, pageIndex, targetBlock, pageWidth, pageHeight)
     if (result) {
       if (!('error' in result)) {
-        result.strategy = c.partial ? 'partial_block' : c.line ? 'line_group' : 'single_block'
-        result.anchorOffset = c.blocks[0].start
+        result.strategy = c.cross ? 'cross_block_line' : c.partial ? 'partial_block' : c.line ? 'line_group' : 'single_block'
+        // The block that was REWRITTEN, when the apply step says which: a
+        // line group's primary is not always its first block (a Wingdings
+        // tick leads the run, the Calibri sentence after it takes the text),
+        // and a Word cell's clip sits around each run separately — widening
+        // the tick's clip left the sentence's tail cut off.
+        result.anchorOffset ??= c.blocks[0].start
       }
       return result
     }
@@ -6652,7 +6854,8 @@ function applyBlockReplacement(
   } else if (plan.kind === 'keep-plain') {
     newContent = replaceTjInBlock(block.content, plan.byteLines[0], 'plain')
   } else {
-    newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf)
+    newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf,
+      plan.hex ? null : substituteTz(targetBlock, newText, plan.fontName))
     substitutedFont = plan.fontName
   }
 
@@ -6892,7 +7095,8 @@ function applyWrappedReplacement(
   } else if (plan.kind === 'keep-plain') {
     newContent = rebuildBtContent(block.content, plan.byteLines, null)
   } else {
-    newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf)
+    newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf,
+      plan.hex ? null : substituteTz(targetBlock, lines[0] ?? '', plan.fontName))
     substitutedFont = plan.fontName
   }
 
@@ -7069,7 +7273,13 @@ function applyLineReplacement(
     // away. The halved form is accepted alongside the raw one; `undouble`
     // demands EVERY character be paired, so it cannot fire on ordinary text.
     const tHalf = tFold ? (undouble(tFold) ?? '').replace(/\s+/g, '') : ''
-    const inTarget = (bf: string) => tFold.includes(bf) || (!!tHalf && tHalf.includes(bf))
+    // Extraction orders glyphs by position and a kerned pair can swap: Word's
+    // TOC entry "definido" is reported "defniido", the block's own decode says
+    // "definido", and the line group holding the right answer was refused for
+    // a foreign block. A block whose glyphs are (nearly) all in the target, in
+    // order, is not foreign.
+    const nearlyIn = (bf: string) => bf.length >= 6 && lcsLength(bf, tFold) >= bf.length - Math.max(1, Math.floor(bf.length / 8))
+    const inTarget = (bf: string) => tFold.includes(bf) || (!!tHalf && tHalf.includes(bf)) || nearlyIn(bf)
     if (tFold) {
       for (const b of contributing) {
         if (b === primary) continue
@@ -7120,7 +7330,8 @@ function applyLineReplacement(
         return narrowLineAndRetry() ?? { error: plan.error }
       }
       if (plan.kind === 'subst') {
-        newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf)
+        newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf,
+          plan.hex ? null : substituteTz(targetBlock, lines[0] ?? newText, plan.fontName))
         substitutedFont = plan.fontName
       } else if (lines.length > 1) {
         newContent = plan.kind === 'keep-hex'
@@ -7184,6 +7395,7 @@ function applyLineReplacement(
         stream: result,
         substitutedFont,
         lines: drawnLines,
+        anchorOffset: sorted[primaryIdx].start,
         applied,
         retags: [...retags.values()].map(t => ({
           start: shiftOffset(t.start, applied),
@@ -7723,6 +7935,13 @@ function decodeBtBlockText(
     return out
   }
 
+  // A string inside an inline dictionary operand is not a show string: the
+  // `(es-PE)` of `/Span <</Lang (es-PE)/MCID 23>> BDC` decoded as two CID
+  // glyphs and put "??" in front of every tagged block of a legal form, and
+  // Corel's `/Corel_OTF <<…>> DP` operand did the same with nineteen. Those
+  // placeholders were then matched, scored and, for a placeholder-only fit,
+  // able to win the wrong block. Blanked to spaces so every offset stands.
+  block = blankInlineDicts(block)
   let m: RegExpExecArray | null
   while ((m = litRe.exec(block)) !== null) {
     if (m[1] !== undefined) {
@@ -7760,6 +7979,31 @@ function decodeBtBlockText(
   return text
 }
 
+/** `<< … >>` operands (BDC/DP property lists) replaced by spaces, length preserved. */
+function blankInlineDicts(content: string): string {
+  if (!content.includes('<<')) return content
+  let out = ''
+  let i = 0
+  while (i < content.length) {
+    if (content.startsWith('<<', i)) {
+      let depth = 0
+      let j = i
+      while (j < content.length) {
+        if (content.startsWith('<<', j)) { depth++; j += 2; continue }
+        if (content.startsWith('>>', j)) { depth--; j += 2; if (depth === 0) break; continue }
+        j++
+      }
+      if (depth !== 0) { out += content.slice(i); break }
+      out += ' '.repeat(j - i)
+      i = j
+      continue
+    }
+    out += content[i]
+    i++
+  }
+  return out
+}
+
 interface ShowOpInfo {
   start: number
   end: number
@@ -7789,7 +8033,15 @@ function scanShowOps(
    * per cell run; decoding every op with the block's first font turned the
    * other fonts' cells into garbage that matched nothing.
    */
-  resolveFont?: (name: string) => { encoding: ReturnType<typeof getFontEncoding>; simpleInfo: SimpleFontInfo | null }
+  resolveFont?: (name: string) => { encoding: ReturnType<typeof getFontEncoding>; simpleInfo: SimpleFontInfo | null },
+  /**
+   * The `TL` in force when the block opens. Leading is text state and outlives
+   * ET, so a block that steps its lines with `T*` need not set it: a legal form
+   * sets `TL` once and every later clause block inherits it. Tracked from 0,
+   * every `T*` line of such a block reported the SAME y, and the second line
+   * of a clause was taken for part of the first.
+   */
+  initialLeading = 0
 ): ShowOpInfo[] {
   const re = new RegExp(
     // positioning operators (tracked, not collected)
@@ -7823,7 +8075,7 @@ function scanShowOps(
   let ma = 1, mb = 0, mc = 0, md = 1 // Tm matrix in force
   let ex = 0, ey = 0                 // Tm translation
   let ux = 0, uy = 0                 // accumulated line-space Td offsets
-  let leading = 0
+  let leading = initialLeading
   let curFont: string | null = null
   /**
    * Pen advance since the last POSITIONING operator, in unscaled text space —
@@ -8012,7 +8264,7 @@ function replaceInsideTjArray(
    * other cell keeps its font and its position. `newWidthKu` is the new run's
    * width in thousandths of the drawn size, measured on the substitute face.
    */
-  subst?: { fontRef: string; origFontRef: string | null; sizeStr: string; newWidthKu: number }
+  subst?: { fontRef: string; origFontRef: string | null; sizeStr: string; newWidthKu: number; tz?: number | null }
 ): string | null {
   if (op.kind !== 'TJ') return null
   const items = parseTjItems(op.raw, encoding, simpleInfo)
@@ -8227,9 +8479,12 @@ function replaceInsideTjArray(
     // Split the array around the run and draw the run in the substitute font.
     const pre = op.raw.slice(0, spliceStart).trimEnd()   // "[ …items-before"
     const post = op.raw.slice(spliceEnd).replace(/^\s*/, '') // "items-after… ] TJ"
-    const comp = `${fmtNum(subst.newWidthKu - oldW)} `
+    const tz = subst.tz ?? null
+    const comp = `${fmtNum(subst.newWidthKu * (tz ?? 1) - oldW)} `
     const restore = subst.origFontRef ? `/${subst.origFontRef} ${subst.sizeStr} Tf ` : ''
-    return `${pre}] TJ /${subst.fontRef} ${subst.sizeStr} Tf ${newLiteral.literal} Tj ${restore}[${comp}${post}`
+    const tzOn = tz ? `${fmtNum(tz * 100)} Tz ` : ''
+    const tzOff = tz ? ` 100 Tz` : ''
+    return `${pre}] TJ /${subst.fontRef} ${subst.sizeStr} Tf ${tzOn}${newLiteral.literal} Tj${tzOff} ${restore}[${comp}${post}`
   }
 
   // The same-font compensation reads whichever width table the font has.
@@ -8335,7 +8590,7 @@ function opRunDistanceToTarget(
   const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
   if (!local) return null
   const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
-    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
   let best: number | null = null
   for (const op of ops) {
     const of = op.decoded.replace(/\s+/g, '')
@@ -8422,7 +8677,10 @@ function textStateAtOp(
     }
     return v
   }
-  if (Math.abs(lastOperand('Tz', 100, at) - 100) > 1e-6) return null
+  // Horizontal scaling multiplies the advance; this engine writes it itself
+  // for substituted runs (see substituteTz), so a run set under it is still
+  // measurable and a second edit of such a run is not refused.
+  const tzAt = (off: number): number => lastOperand('Tz', 100, off) / 100
   const tc = lastOperand('Tc', 0, at)
   const tw = lastOperand('Tw', 0, at)
   const ts = lastOperand('Ts', 0, at)
@@ -8470,10 +8728,23 @@ function textStateAtOp(
       : { encoding: block.encoding, simpleInfo: getSimpleFontInfo(pageIndex, block.fontRef) }
     const w = showOpAdvance(op, fr.encoding, fr.simpleInfo, tfAt(op.start), tc, tw)
     if (w === null) return null
-    adv += w
+    adv += w * tzAt(op.start)
   }
 
   return { penX: ops[index].x + adv, tfSize, ts }
+}
+
+/** The `Tz` operand in force at `offset` inside a block's content (100 when it sets none). */
+function tzInForce(content: string, offset: number): number {
+  const masked = maskStreamLiterals(content)
+  const re = /(-?[\d.]+)\s+Tz(?![A-Za-z0-9])/g
+  let v = 100
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m.index > offset) break
+    v = parseFloat(m[1])
+  }
+  return Number.isFinite(v) ? v : 100
 }
 
 /**
@@ -8542,7 +8813,7 @@ function runDistanceToTarget(
   const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
   if (!local) return null
   const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
-    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
 
   const lo = Math.min(local.x, local.xEnd)
   const hi = Math.max(local.x, local.xEnd)
@@ -8662,7 +8933,7 @@ function findTargetSegment(
 
   const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
   const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
-    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
 
   let best: TjSegmentHit | null = null
   for (let i = 0; i < ops.length; i++) {
@@ -8890,7 +9161,13 @@ function narrowToChangedOps(
         // replaced word ("Quiz" → "SWEEPMARK") read as foreign and was kept,
         // which lost eight sweep experiments at once.
         const g = foldForMatch(dFree).replace(/\s/g, '')
-        const foreign = oldFree !== null && !newFree.includes(g) && !oldFree.includes(g)
+        // An op that decodes to nothing but placeholders is UNREADABLE, not
+        // foreign: the "6." of a numbered clause set in a font without a
+        // ToUnicode reads "?", was called a glyph neither text had, and was
+        // kept — so "6. Conozco…" retyped as "7. …" drew "6. 7. …", and its
+        // deletion left the "6." standing. Unreadable ops belong to the window.
+        const foreign = oldFree !== null && g.replace(/\?/g, '').length > 0 &&
+          !newFree.includes(g) && !oldFree.includes(g)
         if (!foreign) break
       } else {
         text = text.slice(consumed)
@@ -8957,6 +9234,69 @@ function preferredGlyphCodes(
  * positioned lines — e.g. a 4-line header box). Whole-block replacement in
  * that situation would wipe the sibling lines.
  */
+/** One block's share of a visual line assembled across blocks: its row ops [first..last]. */
+interface CrossMember {
+  block: BtInfo
+  first: number
+  last: number
+  ops: ShowOpInfo[]
+  pageX: number
+  text: string
+}
+
+/**
+ * Rewrite a visual line whose text is spread over several blocks' ops (see
+ * Step 2c of the replace matcher). The leftmost member takes the whole
+ * replacement through the partial path, matched against ITS share of the
+ * line; every other member's row ops are blanked in place.
+ */
+function applyCrossBlockLine(
+  stream: string,
+  members: CrossMember[],
+  newText: string,
+  pageIndex: number,
+  targetBlock: TextBlock,
+  pageHeight?: number,
+  pageWidth?: number
+): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
+  const primary = members[0]
+  const share: TextBlock = { ...targetBlock, text: primary.text }
+  const head = applyPartialBlockReplacement(stream, primary.block, newText, pageIndex, share, pageHeight, pageWidth)
+  if (!head || 'error' in head) return head
+  const delta = head.stream.length - stream.length
+  const newBlock = head.stream.slice(primary.block.start, primary.block.end + delta)
+
+  interface Splice { start: number; end: number; text: string }
+  const splices: Splice[] = [{ start: primary.block.start, end: primary.block.end, text: newBlock }]
+  for (const m of members.slice(1)) {
+    for (let k = m.first; k <= m.last; k++) {
+      const op = m.ops[k]
+      // Blanked, never cut: the operator stays so the pen and the line
+      // advances of ' and " are what they were.
+      const blank = buildShowOp(op.kind, op.isHex ? '<>' : '()', op.raw)
+      splices.push({ start: m.block.start + 2 + op.start, end: m.block.start + 2 + op.end, text: blank })
+    }
+  }
+  let out = stream
+  const applied: AppliedEdit[] = []
+  for (const sp of splices.sort((a, b) => b.start - a.start)) {
+    out = out.slice(0, sp.start) + sp.text + out.slice(sp.end)
+    applied.push({ start: sp.start, delta: sp.text.length - (sp.end - sp.start) })
+  }
+  return {
+    stream: out,
+    substitutedFont: head.substitutedFont,
+    lines: head.lines,
+    anchorOffset: primary.block.start,
+    applied,
+    retags: (head.retags ?? []).map(t => ({
+      start: shiftOffset(t.start, applied.filter(a => a.start !== primary.block.start)),
+      end: shiftOffset(t.end, applied.filter(a => a.start !== primary.block.start)),
+      text: t.text
+    }))
+  }
+}
+
 function applyPartialBlockReplacement(
   stream: string,
   block: BtInfo,
@@ -8968,7 +9308,7 @@ function applyPartialBlockReplacement(
 ): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   const simpleInfo = getSimpleFontInfo(pageIndex, block.fontRef)
   const ops = scanShowOps(block.content, block.encoding, simpleInfo,
-    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+    (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
   if (ops.length < 1) return null
 
   const targetNorm = targetBlock.text.replace(/\s+/g, ' ').trim()
@@ -9046,6 +9386,10 @@ function applyPartialBlockReplacement(
    * three characters or fewer — below that length the text carries almost no
    * identification, and above it the op scan has a corpus behind it.
    */
+  if ((globalThis as any).__debugCandidates) {
+    console.log(`[partial] target=${JSON.stringify(targetNorm.slice(0, 50))} local=${targetLocal ? `${targetLocal.x.toFixed(1)}..${targetLocal.xEnd.toFixed(1)} y ${targetLocal.yLo.toFixed(1)}..${targetLocal.yHi.toFixed(1)}` : 'null'} best=${best ? `${best.i}..${best.j} score=${best.score.toFixed(2)} dist=${best.dist.toFixed(1)}` : 'null'}`)
+    ops.forEach((o, k) => console.log(`[partial]   op${k} x=${o.x.toFixed(1)} y=${o.y.toFixed(1)} font=${o.fontRef ?? '-'} ${JSON.stringify(o.decoded.slice(0, 40))}`))
+  }
   if (best && targetLocal) {
     const gap = runGapToTarget(block, ops, best.i, best.j, pageIndex, targetLocal)
     // A SHORT target is held to the tight bar above: it identifies nothing on
@@ -9207,7 +9551,8 @@ function applyPartialBlockReplacement(
           fontRef: plan.fontRef,
           origFontRef: op.fontRef ?? block.fontRef,
           sizeStr: fmtNum(opSize),
-          newWidthKu: Math.round(measureEm(newText, plan.fontName) * 1000)
+          newWidthKu: Math.round(measureEm(newText, plan.fontName) * 1000),
+          tz: plan.hex ? null : substituteTz(targetBlock, newText, plan.fontName)
         })
         if (newRaw) substFont = plan.fontName
       } else {
@@ -9376,6 +9721,7 @@ function applyPartialBlockReplacement(
         if (!g) return ''
         newAdv += f.advanceGlyph(g) * stIn.tfSize
       }
+      newAdv *= substituteTz(targetBlock, winText, plan.fontName) ?? 1
     } else {
       return ''
     }
@@ -9428,7 +9774,12 @@ function applyPartialBlockReplacement(
             : block.fontRef
               ? ` /${block.fontRef} ${endSize} Tf`
               : (tfMatch ? ` /${tfMatch[1]} ${fallbackSize} Tf` : '')
-        repl = `/${plan.fontRef} ${drawSize} Tf ${buildShowOp(op.kind, substLiteral(plan), op.raw)}${wrapExtra}${restore}`
+        // The substitute's excess width is taken back with Tz (see
+        // substituteTz) and the scaling in force before the window put back.
+        const tzFit = plan.hex ? null : substituteTz(targetBlock, winText, plan.fontName)
+        const tzOn = tzFit ? `${fmtNum(tzFit * 100)} Tz ` : ''
+        const tzOff = tzFit ? ` ${fmtNum(tzInForce(block.content, op.start))} Tz` : ''
+        repl = `/${plan.fontRef} ${drawSize} Tf ${tzOn}${buildShowOp(op.kind, substLiteral(plan), op.raw)}${wrapExtra}${tzOff}${restore}`
         substitutedFont = plan.fontName
       }
     } else {

@@ -26,6 +26,16 @@ import { createEngine, ROOT } from './node-harness.mjs'
 
 const out = process.argv[2] || 'sweep-real-out.json'
 const only = process.env.ONLY
+// The CJK fallback face is fetched from `/fonts/*` by the worker; serve it from
+// public/ so the sweep exercises the same path the browser does.
+const realFetch = globalThis.fetch
+globalThis.fetch = async (url, init) => {
+  if (typeof url === 'string' && url.startsWith('/fonts/')) {
+    const b = fs.readFileSync(ROOT + '/public' + url)
+    return new Response(b, { status: 200 })
+  }
+  return realFetch(url, init)
+}
 const eng = await createEngine()
 console.log = () => {}; console.warn = () => {}; console.error = () => {}
 
