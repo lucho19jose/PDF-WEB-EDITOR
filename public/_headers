@@ -2,9 +2,17 @@
 #
 # Cross-origin isolation is REQUIRED: MuPDF and ONNX Runtime run in workers on
 # SharedArrayBuffer, which browsers only expose under these two headers.
+#
+# COEP is `credentialless` (not `require-corp`) so the Microsoft Clarity tag
+# (a cross-origin script from clarity.ms that sends no CORP/CORS header) can
+# load while the page stays cross-origin isolated. `credentialless` keeps
+# SharedArrayBuffer on Chromium and Firefox; Safari does not support it, so on
+# Safari the page is NOT isolated and MuPDF/ONNX may fail to start. If the
+# editor must work on Safari more than analytics must load, set this back to
+# `require-corp` (Clarity is then blocked).
 /*
   Cross-Origin-Opener-Policy: same-origin
-  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Embedder-Policy: credentialless
 
 # The models, fonts and WASM are large and never change under the same name.
 /paddle/*

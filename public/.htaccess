@@ -3,9 +3,15 @@
 # Cross-origin isolation is REQUIRED: MuPDF and ONNX Runtime run in workers on
 # SharedArrayBuffer, which browsers only expose under these two headers. The
 # dev and preview servers set them in vite.config.ts; production must too.
+#
+# COEP is `credentialless` (not `require-corp`) so the Microsoft Clarity tag
+# (cross-origin, no CORP/CORS header) can load while the page stays isolated.
+# credentialless keeps SharedArrayBuffer on Chromium/Firefox; Safari does not
+# support it, so on Safari MuPDF/ONNX may fail. Revert to require-corp if
+# Safari support matters more than analytics.
 <IfModule mod_headers.c>
   Header always set Cross-Origin-Opener-Policy "same-origin"
-  Header always set Cross-Origin-Embedder-Policy "require-corp"
+  Header always set Cross-Origin-Embedder-Policy "credentialless"
   # The models and fonts are large and never change under the same name.
   <FilesMatch "\.(ort|onnx|otf|ttf|gz|wasm|bcmap|pfb|icc)$">
     Header set Cache-Control "public, max-age=31536000, immutable"

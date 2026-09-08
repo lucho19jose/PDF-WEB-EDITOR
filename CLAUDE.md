@@ -4393,6 +4393,84 @@ crop or deletion, with a status line. The headless-Chrome reproduction is
 `scratchpad/pw/drag-scan.mjs`: a 20px drag on the scan's margin used to
 report "Image moved"; now the press lands on the marquee surface.
 
+### The editing assistant: a chat whose replies are engine calls
+`AssistantPanel` (right drawer, `smart_toy` toolbar button) sends the user's
+request to OpenAI with function-calling tools (`src/utils/assistant/`) and
+`createAssistant` (`src/composables/useAssistant.ts`) executes each tool call
+against the engine. Verified in the browser: "Cambia X por Y", a three-action
+request (delete + highlight + recolour), "Deshaz el último cambio", writing a
+bold red run under the last line, and on a scan: recognise, then edit an OCR
+run that bakes on save. Four things it has to do the app's way:
+
+- **It is built in `EditorLayout`**, with the layout's own `syncAfterEdit`,
+  `pushUndo`, page ops and OCR runner passed in, because a second copy of
+  the save→reload sequence would drift from the first. Every mutation is one
+  `enqueueOp`: engine call → `pushUndo()` (bytes are still pre-edit) →
+  `syncAfterEdit()`. A whole request holds a `beginTransaction()`; the `undo`
+  tool RELEASES it around `undo()`, which waits for transactions to settle
+  and would otherwise deadlock on its own.
+- **A reference the model sees is an ANCHOR**, `p1b12` → {page, text,
+  centre}, re-resolved from a fresh `getTextBlocks` before every call with
+  `findByAnchor`'s rule (same text, nearest centre, twins over 24pt rejected).
+  Block ids are renumbered by every reload, so the third action of a request
+  cannot use the id the first one saw. OCR runs (`p1r3`) keep their store id.
+- **The model sees the current page's listing before EVERY turn** (positions
+  in page space, top-left, points) as a transient system message, never in
+  the history: the listing is stale the moment an edit lands.
+- **A phrase that spans lines is edited with `replace_in_page`, not per line.**
+  Extraction splits a paragraph or table cell into one block per line, so a
+  phrase the user names ("MEJORAMIENTO DE LA SALA DE COMUNICACIONES" on the
+  SUPRA invoice) begins in one block and ends inside the next; a per-block
+  `replace_text` changed only the first and stranded "COMUNICACIONES".
+  `replace_in_page(page, find, replace)` (`replaceAllSpans`) locates the
+  phrase across the ordered units whitespace-insensitively, puts the
+  replacement in the first unit, trims the last to what followed the match,
+  empties the middle, and applies them in one save→reload back to front (or
+  per OCR run). It changes EVERY occurrence on the page by default and reports
+  the count — "change X to Y" on a name or date repeated through a form means
+  all of them (measured: the approval form had 4 copies of "PLAYA HERMOSA",
+  one split across two blocks and one mixed-case; a first-occurrence-only
+  replace changed one and falsely reported done). `occurrence:"first"`
+  restricts it. Matches are found once on the original text (a replacement
+  containing the search text cannot loop) and applied right to left.
+  `replace_text` stays for rewriting one whole listed block. A whole-document
+  change ("en todo el documento") goes through `replace_in_document(find,
+  replace)`, which edits every page in one call — text pages directly, scanned
+  pages by recognising them itself (capped per call so it stays responsive; a note says how to continue) — and returns a per-page
+  report; done by hand across tool rounds the model edited some pages,
+  recognised another, and declared it finished without editing that one
+  (measured: page 6 of contrato111 left unedited while it claimed "en todo el
+  documento"). **Known limitation:** where extraction merges an overlapping element into a block
+  (the SUPRA invoice's "NIUMEJORAMIENTO", a shuffle), the kept prefix collapses
+  its gap and can render glued ("NIUIMPROVEMENTS").
+- **`highlight_text` on a single word matches WHOLE words, not substrings.**
+  PDF search is substring-based, so highlighting "RUC" also lit it inside
+  "INFRAEST**RUC**TURA"; a match is kept only when the overlapping block holds
+  the word with non-letter/digit boundaries. Multi-word phrases skip the
+  filter (a substring-in-word is not a risk there).
+- **A scanned / OCR'd page is routed to the OCR flow, not `replaceText`.**
+  `pageMode` calls a page `scan` when its INVISIBLE text (a searchable OCR
+  layer — Acrobat's or this app's) carries more characters than its visible
+  text; `isScanLike` alone is not enough, because an Intellisign-signed
+  contract's visible stamps ("Intellisign ID…") give the page enough
+  characters and coverage to read as a text page while its whole body is
+  invisible (measured: contrato111 page 3, ~2000 invisible chars vs ~120
+  visible). `replaceText` on that layer changes nothing the reader sees and
+  usually fails to match. For a `scan` page `list_page_text`/`find_text`
+  return "call recognize_page(N)"; the model recognises it, edits the `r`
+  runs (`ocrStore.updateItem` + `traceItem`, as `OcrTextLayer.commitEdit`
+  does), and the change bakes on save. Verified on contrato111: pages 1-2
+  (real text) edit via the block path, pages 3+ (the scanned signed copy)
+  via OCR — "PLAYA HERMOSA" → "ISLA HERMOSA" bakes to real page text. An OCR
+  run rewrite that equals the current text reports a no-op so the model can
+  correct rather than seeing a false success.
+- **The key is the user's own**, in localStorage like Mistral's; a DEV build
+  seeds it from `.env.local` (`VITE_OPENAI_API_KEY`, gitignored) behind an
+  `import.meta.env.DEV` guard so the production bundle can never carry it
+  (checked: `grep sk- dist/assets/*.js` finds nothing). Consent is asked
+  once per session, as for Mistral. No SDK: `api.openai.com` sends CORS
+  headers, and COEP does not govern `fetch`.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
@@ -4404,9 +4482,15 @@ report "Image moved"; now the press lands on the marquee surface.
 gitignored and must not be shipped: delete `dist/_sweep` before upload). What
 production MUST provide, all of which `public/.htaccess` does for Apache:
 - **Cross-origin isolation headers** — `Cross-Origin-Opener-Policy:
-  same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on every
+  same-origin` and `Cross-Origin-Embedder-Policy: credentialless` on every
   response. Without them there is no SharedArrayBuffer and the workers lose
   their threads (ONNX Runtime falls back to one, MuPDF may fail to start).
+  COEP is `credentialless` (was `require-corp`) so the Microsoft Clarity
+  analytics tag — a cross-origin script that sends no CORP/CORS header — can
+  load while the page stays isolated. credentialless keeps SharedArrayBuffer
+  on Chromium and Firefox; **Safari does not support it**, so on Safari the
+  page is not isolated and the engines may fail — revert both header files to
+  `require-corp` if Safari support outweighs analytics.
 - **MIME types** for `.wasm` (application/wasm), `.mjs` (javascript), `.ort`
   (octet-stream), `.otf`, and `.traineddata.gz` served as-is (tesseract.js
   inflates it itself — a server that sets `Content-Encoding: gzip` on it
@@ -4422,7 +4506,7 @@ production MUST provide, all of which `public/.htaccess` does for Apache:
   the three `tesseract-core*-lstm.wasm.js` names must stay as shipped: the
   worker picks one by WASM feature detection. Serve `*.wasm.js` as
   JavaScript. The only network calls are the ones the user opts into
-  (Mistral OCR).
+  (Mistral OCR, and the editing assistant's OpenAI calls).
 
 ## Vite Config Notes
 - COEP/COOP headers needed for SharedArrayBuffer (WASM)

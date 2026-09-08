@@ -18,7 +18,7 @@ export default defineConfig({
     headers: {
       // Required for SharedArrayBuffer (needed by some WASM modules)
       'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp'
+      'Cross-Origin-Embedder-Policy': 'credentialless'
     }
   },
   preview: {
@@ -27,7 +27,7 @@ export default defineConfig({
       // The same isolation as the dev server: without it `vite preview` has no
       // SharedArrayBuffer, so MuPDF and ONNX Runtime lose their threads.
       'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp'
+      'Cross-Origin-Embedder-Policy': 'credentialless'
     }
   },
   optimizeDeps: {

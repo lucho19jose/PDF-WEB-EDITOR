@@ -29,6 +29,11 @@
       <PageThumbnails />
     </q-drawer>
 
+    <!-- Right Sidebar: the editing assistant (chat) -->
+    <q-drawer v-model="editorStore.assistantOpen" side="right" :width="380" bordered class="bg-grey-10">
+      <AssistantPanel />
+    </q-drawer>
+
     <!-- Main Content -->
     <q-page-container>
       <router-view />
@@ -103,6 +108,8 @@ import MainToolbar from '@/components/toolbar/MainToolbar.vue'
 import PageThumbnails from '@/components/sidebar/PageThumbnails.vue'
 import StatusBar from '@/components/common/StatusBar.vue'
 import FindBar from '@/components/toolbar/FindBar.vue'
+import AssistantPanel from '@/components/assistant/AssistantPanel.vue'
+import { createAssistant } from '@/composables/useAssistant'
 
 const $q = useQuasar()
 const docStore = useDocumentStore()
@@ -1420,6 +1427,25 @@ provide('recognizeProgress', recognizeProgress)
   ocrController: { isScanLike: isScanLikePage, recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG), busy: ocr.busy },
   bakeOcrEdits, runOcrOnPage, undo, redo, ocr, recognizeDocument, recognizeProgress
 }
+// The editing assistant is built HERE because every mutation it makes has to
+// go through this layout's own plumbing (undo snapshot, save→reload, the
+// page ops that act on the current page). The panel only renders it.
+const assistant = createAssistant({
+  pdfEngine, ocr,
+  syncAfterEdit, pushUndo, forgetOcr,
+  recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG),
+  isScanLike: isScanLikePage,
+  undo, rotatePage, deletePage, duplicatePage, insertBlankPage, movePage,
+  confirmCloud: () => new Promise<boolean>(resolve => {
+    $q.dialog({
+      title: 'Send the page text to OpenAI?',
+      message: 'The assistant sends the text of the page you are on and your messages to OpenAI, using your API key. Nothing else leaves the machine.',
+      ok: 'Send', cancel: true, persistent: true, dark: true
+    }).onOk(() => resolve(true)).onCancel(() => resolve(false)).onDismiss(() => resolve(false))
+  })
+})
+provide('assistant', assistant)
+;(window as any).__pdfHooks.assistant = assistant
 provide('openFile', openFile)
 provide('openPdfFile', openPdfFile)
 provide('mergePdfFile', mergePdfFile)

@@ -54,6 +54,21 @@ export const useEditorStore = defineStore('editor', () => {
   const ocrEngine = persistedRef<OcrEngineId>('ocrEngine', 'paddle')
   const mistralApiKey = persistedRef<string>('mistralApiKey', '')
 
+  /**
+   * The editing assistant (a chat panel that turns "cambia X por Y" into
+   * engine calls) talks to OpenAI with the user's own key. The key lives in
+   * localStorage like Mistral's; in a DEV build it is seeded from
+   * `.env.local` (gitignored) so the developer need not paste it. The seed
+   * is gated on DEV so the key can never be inlined into a production bundle.
+   */
+  const openaiApiKey = persistedRef<string>('openaiApiKey',
+    import.meta.env.DEV ? (import.meta.env.VITE_OPENAI_API_KEY ?? '') : '')
+  const openaiModel = persistedRef<string>('openaiModel', 'gpt-4o-mini')
+  /** Empty = the public API; a same-origin proxy URL when that is refused. */
+  const openaiEndpoint = persistedRef<string>('openaiEndpoint', '')
+  /** Whether the assistant drawer is open (right side). */
+  const assistantOpen = ref(false)
+
   const imagePlacement = ref<'above' | 'below'>('below')
   /**
    * How an inserted image sits with the text around it.
@@ -115,6 +130,7 @@ export const useEditorStore = defineStore('editor', () => {
   return {
     currentTool, statusMessage, fontFamily, fontSize, textColor,
     imagePlacement, imageWrap, imageWidthPct, reflowOnEdit, ocrMode, ocrEngine, mistralApiKey,
+    openaiApiKey, openaiModel, openaiEndpoint, assistantOpen,
     highlightColor, strokeColor, fillColor, fillEnabled, strokeWidth, opacity,
     isAnnotationTool, isMarkupTool, propertyContext,
     setTool, setStatus

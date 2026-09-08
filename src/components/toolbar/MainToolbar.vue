@@ -109,6 +109,13 @@
       <q-space />
 
       <q-btn flat dense icon="search" :disable="!docStore.loaded" @click="openFind" size="sm"><q-tooltip>Find (Ctrl+F)</q-tooltip></q-btn>
+      <q-btn
+        flat dense icon="smart_toy" size="sm"
+        :color="editorStore.assistantOpen ? 'primary' : undefined"
+        @click="editorStore.assistantOpen = !editorStore.assistantOpen"
+      >
+        <q-tooltip>Asistente: dile qué cambiar y lo edita</q-tooltip>
+      </q-btn>
     </q-toolbar>
 
     <!-- Context-sensitive properties row -->
