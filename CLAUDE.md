@@ -4858,6 +4858,61 @@ matcher taking the first thing that read right:
   puts the nearest match first, so the loop's "first that answers" is the
   nearest copy; sources with no match keep their origin order after.
 
+### Resize: the whole Tm scales, a run's own offsets scale, a multi-op run is measured as a run
+Four resize defects from the realistic sweep's "wrong size" rows, all
+reporting success:
+- **`tm_rewrite` scaled only a and d.** The scale acts on the matrix's output
+  (x' = a·x + c·y + e), so sx multiplies a AND c, sy b AND d. On a
+  quarter-turn Tm (`0 1 -1 0 e f`, a Ghostscript /Rotate form) a and d are
+  zero: the title's resize rewrote the Tm and changed nothing.
+- **A block's distance is its FIRST Tm's.** An Adobe letter draws a header
+  artifact and its footer in ONE BT — `( )Tj` at the top, the footer 735pt
+  below under a second Tm — so the footer's block ranked 728pt from a click
+  on the footer, and a copy of the same words in a nearer block took the
+  resize. `runDistanceToTarget` now measures a target that spans SEVERAL ops
+  as a run (`findTargetRun` + `runGapToTarget`) before falling back to the
+  origin.
+- **The Td/TD offsets INSIDE a bracketed run scale with it**, about the run's
+  start, and the closing Td takes back their growth too: "[(Empresa …
+  Huallaga)]TJ 13.056 0 Td ( )Tj 0.185 0 Td [(S.A.)]TJ" put "S.A." at its old
+  offset inside the wider "Huallaga" ("Hu Sa.Alla .ga"). A Tm inside the run
+  refuses the bracket (it would reset the line matrix). Tc/Tw in force
+  scale with the glyphs and the run's own last values are restored after it.
+- **Fragments are refused for a move or restyle.** `readsAs` and
+  `fuzzyTextMatch` both admit a block whose text is a SUBSTRING of the
+  target; an Adobe letter draws "… del Banco Interbank para …" as the tail of
+  one BT, "Banco Interbank " as its own and the head of a third, and the
+  middle word moved 20pt alone (and was recoloured alone, reported as
+  success). A candidate carrying under 85% of the target's characters, all
+  of them inside it, is skipped — in the line-group pass and the
+  single-block pass. Editing the whole visual line across the three blocks
+  (a cross-block move/restyle) is not implemented; "could not find" is the
+  honest answer until it is.
+
+### A substitute draws with its own spacing
+`Tc`/`Tw` are set for the face they were designed with. A datasheet
+letterspaces its condensed title with `0.075 Tc` (1.4pt a glyph at 19pt); the
+Helvetica that replaced the face is wider already, kept the spacing on top,
+and `substituteTz` — which measures glyphs alone — could not see it: the
+title ran 55pt past the paper's edge and read back two letters short on a Tz
+that "fitted" (the one viewer-sweep failure). `spacingResetFor` puts `0 Tc
+0 Tw` in front of a substituted run and the values back after it (they
+outlive the run) — the partial path's window, the in-array split and the
+rebuild alike. `textStateAtOp` reports `tc`/`tw` for it.
+
+### A target that BEGINS inside the previous cell is refused, not half-edited
+The op-window matcher can find only the TAIL of a target when its head is the
+end of a TJ array holding other cells: a pdf24 form draws "…87.64S/ … 2.79%"
+as one array and " DEBITO AUTOMATICO" as the next op, the window held the
+second op alone (score 0.76), the whole replacement was written into it, and
+the row read "2.79% 3.80% EFCJUP…" — the old percentage kept beside the new.
+`applyPartialBlockReplacement` now checks whether the window's text is a
+strict tail of the target whose missing head ends the previous op, and
+refuses with a message naming the head. Splitting the array's tail off and
+editing both pieces is not implemented. (The realistic sweep counts a refusal
+as `char_delta` 28 there — its expectation assumes the edit — while the page
+is untouched.)
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

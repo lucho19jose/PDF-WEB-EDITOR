@@ -2429,7 +2429,9 @@ function rebuildBtContent(
   overrideColorOp?: string | null,
   inheritedTf?: string | null,
   /** Horizontal scaling for a substituted face (see `substituteTz`), reset to 100 after the lines. */
-  tz?: number | null
+  tz?: number | null,
+  /** Spacing in force around the block (spacingForRebuild): a substitute draws under none, and the end state is put back. */
+  spacing?: { tcIn: number; twIn: number; tcOut: number; twOut: number } | null
 ): string {
   const tfMatch = content.match(/\/([A-Za-z0-9_.+-]+)\s+([\d.]+)\s+Tf/)
   // A block with no Tf of its own inherits font AND size from the graphics
@@ -2489,8 +2491,15 @@ function rebuildBtContent(
   const useTz = tz && !/\sTz(?![A-Za-z0-9])/.test(maskStreamLiterals(content))
   const tzOn = useTz ? `${fmtNum(tz * 100)} Tz\n` : ''
   const tzOff = useTz ? `\n100 Tz` : ''
+  // A substitute face draws with its own spacing (spacingResetFor); the
+  // block's own Tc/Tw operators are not re-emitted, so what it left in force
+  // is put back explicitly.
+  const spacingOn = newFontRef && spacing && (spacing.tcIn || spacing.twIn) ? `0 Tc 0 Tw\n` : ''
+  const spacingOff = newFontRef && spacing && (spacing.tcIn || spacing.twIn || spacing.tcOut || spacing.twOut)
+    ? `\n${fmtNum(spacing.tcOut)} Tc ${fmtNum(spacing.twOut)} Tw`
+    : ''
 
-  return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${posPart}\n${tzOn}${tjParts.join('\n')}${tzOff}${restoreTf}\n`
+  return `\n${colorPart ? colorPart + '\n' : ''}${tfPart}\n${posPart}\n${spacingOn}${tzOn}${tjParts.join('\n')}${tzOff}${spacingOff}${restoreTf}\n`
 }
 
 /**
@@ -3914,7 +3923,7 @@ function transformInSource(
       // it. 248 resizes across seven corpora were refused for lack of this:
       // pdf24, Ghostscript and TeX draw a whole page from one BT, so on those
       // producers no line could be resized at all.
-      let scaleRun: { start: number; end: number; fontName: string; size: number; tdx: number; tdy: number } | null = null
+      let scaleRun: { start: number; end: number; fontName: string; size: number; tdx: number; tdy: number; tc: number; tw: number } | null = null
       // …and for ONE CELL of a row drawn as a single TJ array, the shape a
       // Ghostscript or Print-to-PDF timesheet gives every row ("06-05-26
       // 16:00:00 18:00:00", cells separated by kerns): no run leads its line
@@ -3939,10 +3948,24 @@ function transformInSource(
             const state = first >= 0 ? textStateAtOp(block, ops, first, pageIndex) : null
             const fontName = first >= 0 ? (ops[first].fontRef ?? block.fontRef) : null
             // A Tf inside the run would be restored wrong; leave such runs alone.
-            const tfInside = /\s[\d.]+\s+Tf(?![A-Za-z0-9])/.test(maskedC.slice(r.start, r.end))
+            // So would a Tm: it resets the line matrix, so neither the bracket's
+            // Td nor the scaled offsets below would reach what follows it.
+            const tfInside = /\s[\d.]+\s+Tf(?![A-Za-z0-9])/.test(maskedC.slice(r.start, r.end)) ||
+              /(?:-?[\d.]+\s+){6}Tm(?![A-Za-z0-9])/.test(maskedC.slice(r.start, r.end))
             if ((globalThis as any).__debugCandidates) {
               console.log(`[scale] run=${r.start}..${r.end} first=${first} last=${lastIdx} follower=${followerResets} state=${state ? state.tfSize : null} font=${fontName} tfInside=${tfInside} ops=${ops.length}`)
             }
+            // Character and word spacing are unscaled text-space units, so a
+            // scaled run set under `-0.022 Tc` came out 1pt short of 1.25x its
+            // width and its own trailing pieces landed inside it. The values
+            // in force at the run's start are read off the masked content.
+            const spacingAt = (op: string): number => {
+              const re = new RegExp(`(-?[\\d.]+)\\s+${op}(?![A-Za-z0-9])`, 'g')
+              let v = 0, m: RegExpExecArray | null
+              while ((m = re.exec(maskedC)) !== null) { if (m.index > r.start) break; v = parseFloat(m[1]) }
+              return v
+            }
+            const tcAt = spacingAt('Tc'), twAt = spacingAt('Tw')
             if (first >= 0 && lastIdx >= first && followerResets && state && state.tfSize > 0 && fontName && !tfInside) {
               // The run grows from its own pen origin; the anchor is where the
               // user asked it to grow about. Both are in the CTM's user space.
@@ -3957,7 +3980,7 @@ function transformInSource(
                 if (Math.abs(det2) > 1e-9) { tdx = (dUx * d2 - dUy * c2) / det2; tdy = (dUy * a - dUx * b2) / det2 }
               }
               if (Number.isFinite(tdx) && Number.isFinite(tdy)) {
-                scaleRun = { start: r.start, end: r.end, fontName, size: state.tfSize, tdx, tdy }
+                scaleRun = { start: r.start, end: r.end, fontName, size: state.tfSize, tdx, tdy, tc: tcAt, tw: twAt }
               }
             }
           }
@@ -4029,11 +4052,50 @@ function transformInSource(
 
       let newContent: string
       if (scaleRun) {
+        // The Td/TD offsets INSIDE the run are in unscaled text space and
+        // place its later pieces — an Adobe letter's footer is
+        // "[(Empresa … Huallaga)]TJ 13.056 0 Td ( )Tj 0.185 0 Td [(S.A.)]TJ".
+        // Left alone, "S.A." landed at its old offset inside the now wider
+        // "Huallaga" and the footer read back "Hu Sa.Alla .ga". Scaling them
+        // with the glyphs keeps the pieces where the scale puts them, about
+        // the run's own start; the inverse Td after the run is the bracket's
+        // and needs no change (the line matrix is what it was before).
+        let inner = block.content.slice(scaleRun.start, scaleRun.end)
+        const maskedInner = maskStreamLiterals(inner)
+        const tdRe = /(-?[\d.]+)\s+(-?[\d.]+)\s+(Td|TD)(?![A-Za-z0-9])/g
+        const edits: { at: number; len: number; text: string }[] = []
+        let tm: RegExpExecArray | null
+        let sumDx = 0, sumDy = 0
+        while ((tm = tdRe.exec(maskedInner)) !== null) {
+          const ox = parseFloat(tm[1]), oy = parseFloat(tm[2])
+          sumDx += ox; sumDy += oy
+          edits.push({ at: tm.index, len: tm[0].length, text: `${fmtNum(ox * sx)} ${fmtNum(oy * sy)} ${tm[3]}` })
+        }
+        // Spacing set INSIDE the run scales too (it is in unscaled units).
+        const spRe = /(-?[\d.]+)\s+(Tc|Tw)(?![A-Za-z0-9])/g
+        // What the run leaves in force is restored after it: the last value
+        // the run itself set, else the one it began under.
+        let tcOut = scaleRun.tc, twOut = scaleRun.tw
+        let tcSet = false, twSet = false
+        while ((tm = spRe.exec(maskedInner)) !== null) {
+          const v = parseFloat(tm[1])
+          if (tm[2] === 'Tc') { tcOut = v; tcSet = true } else { twOut = v; twSet = true }
+          edits.push({ at: tm.index, len: tm[0].length, text: `${fmtNum(v * sx)} ${tm[2]}` })
+        }
+        edits.sort((a, b) => a.at - b.at)
+        for (const e of edits.reverse()) inner = inner.slice(0, e.at) + e.text + inner.slice(e.at + e.len)
+        const spacingIn = (scaleRun.tc ? ` ${fmtNum(scaleRun.tc * sx)} Tc` : '') + (scaleRun.tw ? ` ${fmtNum(scaleRun.tw * sx)} Tw` : '')
+        const spacingOut = (scaleRun.tc || tcSet ? ` ${fmtNum(tcOut)} Tc` : '') + (scaleRun.tw || twSet ? ` ${fmtNum(twOut)} Tw` : '')
+        // The line matrix leaves the run further along by the scaled offsets'
+        // growth; the closing Td takes that back too, so what follows the run
+        // lands exactly where it did.
+        const backX = -(scaleRun.tdx + sumDx * (sx - 1))
+        const backY = -(scaleRun.tdy + sumDy * (sy - 1))
         newContent =
           block.content.slice(0, scaleRun.start) +
-          ` ${fmtNum(scaleRun.tdx)} ${fmtNum(scaleRun.tdy)} Td /${scaleRun.fontName} ${fmtNum(scaleRun.size * sx)} Tf ` +
-          block.content.slice(scaleRun.start, scaleRun.end) +
-          ` /${scaleRun.fontName} ${fmtNum(scaleRun.size)} Tf ${fmtNum(-scaleRun.tdx)} ${fmtNum(-scaleRun.tdy)} Td ` +
+          ` ${fmtNum(scaleRun.tdx)} ${fmtNum(scaleRun.tdy)} Td /${scaleRun.fontName} ${fmtNum(scaleRun.size * sx)} Tf${spacingIn} ` +
+          inner +
+          ` /${scaleRun.fontName} ${fmtNum(scaleRun.size)} Tf${spacingOut} ${fmtNum(backX)} ${fmtNum(backY)} Td ` +
           block.content.slice(scaleRun.end)
         usedStrategy ??= 'td_bracket_scale_run'
       } else if (scaleSeg) {
@@ -4096,13 +4158,20 @@ function transformInSource(
         const e = parseFloat(tmMatch[5])
         const f = parseFloat(tmMatch[6])
 
-        // Apply transformation: scale around anchor then translate
+        // Apply transformation: scale around anchor then translate. The scale
+        // acts on the matrix's OUTPUT (x' = a·x + c·y + e, y' = b·x + d·y + f),
+        // so sx multiplies a AND c, sy multiplies b AND d. Scaling only a and
+        // d is right for an upright matrix and a no-op for a quarter-turn one
+        // (`0 1 -1 0 e f Tm`, a Ghostscript /Rotate form): its title's resize
+        // rewrote the Tm, reported success, and the title did not change.
         const newA = a * sx
+        const newB = bVal * sy
+        const newC = c * sx
         const newD = d * sy
         const newE = anchorXL + (e - anchorXL) * sx + dxL
         const newF = anchorYL + (f - anchorYL) * sy + dyL
 
-        const newTm = `${fmtNum(newA)} ${fmtNum(bVal)} ${fmtNum(c)} ${fmtNum(newD)} ${fmtNum(newE)} ${fmtNum(newF)} Tm`
+        const newTm = `${fmtNum(newA)} ${fmtNum(newB)} ${fmtNum(newC)} ${fmtNum(newD)} ${fmtNum(newE)} ${fmtNum(newF)} Tm`
         const at = tmSource.index
         newContent = block.content.slice(0, at) + newTm + block.content.slice(at + tmSource.text.length)
         usedStrategy ??= governing ? 'tm_rewrite_governing' : 'tm_rewrite_first'
@@ -5988,6 +6057,15 @@ function findBtBlocksByPosition(
     }
     if (!isMatch) continue
     if (!exact && readsOnPlaceholders(alongStream, normalizedTarget)) continue
+    // A group whose whole text is a FRAGMENT of the target is not the target:
+    // the rest of the line is drawn by other blocks, and moving or restyling
+    // the fragment alone tears the line. An Adobe letter draws "… del Banco
+    // Interbank para la recepción …" as the tail of one BT, "Banco Interbank "
+    // as its own, and the head of a third; the middle block matched by
+    // containment, moved 20pt on its own, and the recolour painted one word
+    // of the line red while reporting success. Runs assembled from several
+    // blocks (`runBlocks`) are exact and never come here; a block a glyph or
+    // two short of the target (a fused neighbour) is kept by the 85% bar.
 
     // Keep only the blocks sitting on the clicked text. A line group can hold
     // unrelated runs (a label and its value); transforming the whole group
@@ -6022,6 +6100,12 @@ function findBtBlocksByPosition(
     // reporting success. `runDistanceToTarget` locates the run on real
     // advances (the /W table for a CID font); a block whose run it cannot
     // find keeps its origin distance, exactly as before.
+    if (!exact && picked !== runBlocks) {
+      const compactOf = (t: string) => foldForMatch(t).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
+      const ct = compactOf(normalizedTarget)
+      const cp = compactOf(joinOf([...picked].sort((a, b) => posOf(a).x - posOf(b).x)))
+      if (cp.length < ct.length * 0.85 && ct.includes(cp)) continue
+    }
     const rankOf = (b: BtInfo): number => {
       if (picked === runBlocks || (picked === near && near.length > 0) || exact) return distOf(b)
       return runDistanceToTarget(b, targetBlock.text, pageIndex, stream, targetBlock, pageHeight) ?? distOf(b)
@@ -6041,6 +6125,16 @@ function findBtBlocksByPosition(
     if (!nd || nd.length < 2) continue
     const exact = nd === normalizedTarget
     if (exact || (!readsOnPlaceholders(nd, normalizedTarget) && fuzzyTextMatch(nd, normalizedTarget))) {
+      // A block whose text is a FRAGMENT of the target is not the target: the
+      // rest of the line is drawn by other blocks (an Adobe letter's bold
+      // "Banco Interbank " between the head and tail of its sentence), and
+      // moving or restyling the fragment alone tears the line. Refused unless
+      // it carries at least 85% of the target (a fused neighbour glyph).
+      if (!exact) {
+        const compactOf = (t: string) => foldForMatch(t).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
+        const ct = compactOf(normalizedTarget), cb = compactOf(nd)
+        if (cb.length < ct.length * 0.85 && ct.includes(cb)) continue
+      }
       candidates.push({ blocks: [block], score: exact ? 2 : 1, dist: distOf(block), order: candidates.length })
     }
   }
@@ -7121,7 +7215,7 @@ function applyBlockReplacement(
     newContent = replaceTjInBlock(block.content, plan.byteLines[0], 'plain')
   } else {
     newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf,
-      plan.hex ? null : substituteTz(targetBlock, newText, plan.fontName))
+      plan.hex ? null : substituteTz(targetBlock, newText, plan.fontName), spacingForRebuild(stream, block))
     substitutedFont = plan.fontName
   }
 
@@ -7417,7 +7511,7 @@ function applyWrappedReplacement(
     newContent = rebuildBtContent(block.content, plan.byteLines, null)
   } else {
     newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf,
-      plan.hex ? null : substituteTz(targetBlock, lines[0] ?? '', plan.fontName))
+      plan.hex ? null : substituteTz(targetBlock, lines[0] ?? '', plan.fontName), spacingForRebuild(stream, block))
     substitutedFont = plan.fontName
   }
 
@@ -7683,7 +7777,7 @@ function applyLineReplacement(
       }
       if (plan.kind === 'subst') {
         newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf,
-          plan.hex ? null : substituteTz(targetBlock, lines[0] ?? newText, plan.fontName))
+          plan.hex ? null : substituteTz(targetBlock, lines[0] ?? newText, plan.fontName), spacingForRebuild(stream, block))
         substitutedFont = plan.fontName
       } else if (lines.length > 1) {
         newContent = plan.kind === 'keep-hex'
@@ -8628,7 +8722,7 @@ function replaceInsideTjArray(
    * other cell keeps its font and its position. `newWidthKu` is the new run's
    * width in thousandths of the drawn size, measured on the substitute face.
    */
-  subst?: { fontRef: string; origFontRef: string | null; sizeStr: string; newWidthKu: number; tz?: number | null }
+  subst?: { fontRef: string; origFontRef: string | null; sizeStr: string; newWidthKu: number; tz?: number | null; spacing?: { tc: number; tw: number } }
 ): string | null {
   if (op.kind !== 'TJ') return null
   const items = parseTjItems(op.raw, encoding, simpleInfo)
@@ -8848,7 +8942,8 @@ function replaceInsideTjArray(
     const restore = subst.origFontRef ? `/${subst.origFontRef} ${subst.sizeStr} Tf ` : ''
     const tzOn = tz ? `${fmtNum(tz * 100)} Tz ` : ''
     const tzOff = tz ? ` 100 Tz` : ''
-    return `${pre}] TJ /${subst.fontRef} ${subst.sizeStr} Tf ${tzOn}${newLiteral.literal} Tj${tzOff} ${restore}[${comp}${post}`
+    const sp = spacingResetFor(subst.spacing?.tc ?? 0, subst.spacing?.tw ?? 0)
+    return `${pre}] TJ /${subst.fontRef} ${subst.sizeStr} Tf ${sp.on}${tzOn}${newLiteral.literal} Tj${tzOff}${sp.off} ${restore}[${comp}${post}`
   }
 
   // The same-font compensation reads whichever width table the font has.
@@ -9066,7 +9161,7 @@ function textStateAtOp(
   ops: ShowOpInfo[],
   index: number,
   pageIndex: number
-): { penX: number; tfSize: number; ts: number } | null {
+): { penX: number; tfSize: number; ts: number; tc: number; tw: number } | null {
   const masked = maskStreamLiterals(block.content)
   const at = ops[index].start
 
@@ -9135,7 +9230,60 @@ function textStateAtOp(
     adv += w * tzAt(op.start)
   }
 
-  return { penX: ops[index].x + adv, tfSize, ts }
+  return { penX: ops[index].x + adv, tfSize, ts, tc, tw }
+}
+
+/** The `Tc`/`Tw` in force at `offset` of a stream (q/Q replayed over the literal-masked copy). */
+function spacingStateAt(stream: string, offset: number): { tc: number; tw: number } {
+  const masked = maskStreamLiterals(stream)
+  let st = { tc: 0, tw: 0 }
+  const stack: { tc: number; tw: number }[] = []
+  const re = /(-?[\d.]+)\s+(Tc|Tw)(?![A-Za-z0-9])|(?<![A-Za-z0-9])[qQ](?![A-Za-z0-9])/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m.index >= offset) break
+    if (m[0] === 'q') { stack.push({ ...st }); continue }
+    if (m[0] === 'Q') { if (stack.length) st = stack.pop()!; continue }
+    if (m[2] === 'Tc') st = { ...st, tc: parseFloat(m[1]) }
+    else st = { ...st, tw: parseFloat(m[1]) }
+  }
+  return st
+}
+
+/**
+ * What a REBUILT block needs to know about spacing: the values in force when
+ * it begins (the substitute is drawn under zero) and the values in force
+ * when it ends (put back after the lines — the rebuild drops the block's own
+ * Tc/Tw operators, and what follows the block inherited them).
+ */
+function spacingForRebuild(stream: string, block: BtInfo): { tcIn: number; twIn: number; tcOut: number; twOut: number } {
+  const entering = spacingStateAt(stream, block.start)
+  const masked = maskStreamLiterals(block.content)
+  let tcOut = entering.tc, twOut = entering.tw
+  const re = /(-?[\d.]+)\s+(Tc|Tw)(?![A-Za-z0-9])/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m[2] === 'Tc') tcOut = parseFloat(m[1]); else twOut = parseFloat(m[1])
+  }
+  return { tcIn: entering.tc, twIn: entering.tw, tcOut, twOut }
+}
+
+/**
+ * `Tc`/`Tw` reset for a SUBSTITUTED run, and the restore after it.
+ *
+ * Character and word spacing are set for the face they were designed with. A
+ * datasheet letterspaces its condensed title with `0.075 Tc` (1.4pt a glyph
+ * at 19pt); the Helvetica that replaced the condensed face is wider already,
+ * kept the spacing on top, and `substituteTz` — which measures glyphs alone —
+ * could not see it: the title ran 55pt past the paper's edge and lost its last
+ * two letters, on a Tz that "fitted". The substitute draws with its own
+ * natural spacing; the values are put back after it, since they outlive the
+ * run. Empty when nothing is set.
+ */
+function spacingResetFor(tc: number, tw: number): { on: string; off: string } {
+  const on = (tc ? '0 Tc ' : '') + (tw ? '0 Tw ' : '')
+  const off = (tc ? ` ${fmtNum(tc)} Tc` : '') + (tw ? ` ${fmtNum(tw)} Tw` : '')
+  return { on, off }
 }
 
 /** The `Tz` operand in force at `offset` inside a block's content (100 when it sets none). */
@@ -9295,6 +9443,22 @@ function runDistanceToTarget(
 
     const w = showOpAdvance(op, fr.encoding, fr.simpleInfo ?? null, state.tfSize, 0, 0)
     keep(gap(penA, penA + (w ?? 0)) + dy)
+  }
+  // No single op holds the target: it may span SEVERAL (an Adobe letter's
+  // footer is "[(E)3 (m)…]TJ 0 Tc 13.056 0 Td ( )Tj … [(S)-16 (.A)…]TJ").
+  // Without this the block fell back to its ORIGIN distance — that footer
+  // shares its BT with a header artifact 735pt above it — and a copy of the
+  // same words in a nearer block took the resize.
+  if (best === null) {
+    const r = findTargetRun(block, targetText, pageIndex, local)
+    if (r) {
+      const i = ops.findIndex(o => o.start === r.start)
+      const j = ops.findIndex(o => o.end === r.end)
+      if (i >= 0 && j >= i) {
+        const g = runGapToTarget(block, ops, i, j, pageIndex, local)
+        if (g !== null) best = g
+      }
+    }
   }
   // In PAGE points, like every other distance the candidates are ranked by:
   // the gaps above are in the block's own space, which a `0.75 0 0 0.75 cm`
@@ -9912,6 +10076,26 @@ function applyPartialBlockReplacement(
     console.log(`[partial] target=${JSON.stringify(targetNorm.slice(0, 50))} local=${targetLocal ? `${targetLocal.x.toFixed(1)}..${targetLocal.xEnd.toFixed(1)} y ${targetLocal.yLo.toFixed(1)}..${targetLocal.yHi.toFixed(1)}` : 'null'} best=${best ? `${best.i}..${best.j} score=${best.score.toFixed(2)} dist=${best.dist.toFixed(1)}` : 'null'}`)
     ops.forEach((o, k) => console.log(`[partial]   op${k} x=${o.x.toFixed(1)} y=${o.y.toFixed(1)} font=${o.fontRef ?? '-'} ${JSON.stringify(o.decoded.slice(0, 40))}`))
   }
+  // The target may BEGIN inside the previous op — the tail of a TJ array
+  // holding other cells — and continue in the window found. A pdf24 form
+  // draws "…87.64S/ … 2.79%" as one array and " DEBITO AUTOMATICO" as the
+  // next op: the window held the second op alone (score 0.76), the whole
+  // replacement was written into it, and the row read "2.79% 3.80% EFCJUP…"
+  // — the old percentage kept beside the new one. Editing such a split run
+  // (splitting the array's tail off and taking both) is not implemented;
+  // refusing is honest, and lets another source or path answer.
+  if (best && best.i > 0) {
+    const free = (t: string) => foldForMatch(t).replace(/\s+/g, '')
+    const tFree = free(targetNorm)
+    const wFree = free(ops.slice(best.i, best.j + 1).map(o => o.decoded).join(''))
+    if (wFree.length > 0 && wFree.length < tFree.length * 0.9 && tFree.endsWith(wFree)) {
+      const head = tFree.slice(0, tFree.length - wFree.length)
+      const prev = free(ops[best.i - 1].decoded)
+      if (head.length >= 2 && prev.endsWith(head) && prev.length > head.length) {
+        return { error: `The text begins inside the previous cell of the row ("${head.slice(0, 20)}"); edit that cell together with it` }
+      }
+    }
+  }
   if (best && targetLocal) {
     const gap = runGapToTarget(block, ops, best.i, best.j, pageIndex, targetLocal)
     // A SHORT target is held to the tight bar above: it identifies nothing on
@@ -10083,7 +10267,8 @@ function applyPartialBlockReplacement(
           origFontRef: op.fontRef ?? block.fontRef,
           sizeStr: fmtNum(opSize),
           newWidthKu: Math.round(measureEm(newText, plan.fontName) * 1000),
-          tz: plan.hex ? null : substituteTz(targetBlock, newText, plan.fontName)
+          tz: plan.hex ? null : substituteTz(targetBlock, newText, plan.fontName),
+          spacing: (() => { const i = ops.indexOf(op); const st = i >= 0 ? textStateAtOp(block, ops, i, pageIndex) : null; return { tc: st?.tc ?? 0, tw: st?.tw ?? 0 } })()
         })
         if (newRaw) substFont = plan.fontName
       } else {
@@ -10329,7 +10514,8 @@ function applyPartialBlockReplacement(
         const tzFit = plan.hex ? null : substituteTz(targetBlock, winText, plan.fontName)
         const tzOn = tzFit ? `${fmtNum(tzFit * 100)} Tz ` : ''
         const tzOff = tzFit ? ` ${fmtNum(tzInForce(block.content, op.start))} Tz` : ''
-        repl = `/${plan.fontRef} ${drawSize} Tf ${tzOn}${buildShowOp(op.kind, substLiteral(plan), op.raw)}${wrapExtra}${tzOff}${restore}`
+        const sp = spacingResetFor(stateIn?.tc ?? 0, stateIn?.tw ?? 0)
+        repl = `/${plan.fontRef} ${drawSize} Tf ${sp.on}${tzOn}${buildShowOp(op.kind, substLiteral(plan), op.raw)}${wrapExtra}${tzOff}${sp.off}${restore}`
         substitutedFont = plan.fontName
       }
     } else {
