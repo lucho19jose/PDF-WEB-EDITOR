@@ -4934,6 +4934,38 @@ bottom-left one the caller states) and `transformTextBlock`/
 deliberately not the bar — a heading may run into it on purpose — the paper
 is; one point of slack for rounding.
 
+### Small matcher truths from the checkbox rows, the bilingual line and the Adobe footer
+- **A narrowed line's retry targets the MIDDLE's share.** `narrowLineAndRetry`
+  passed the whole line as the target, and `substituteTz` fits a substitute to
+  the target's width per character: a bilingual line ("本手册介绍了 Intellisign
+  平台…") is ten points a character where its Latin word is five, Helvetica
+  for the word needed no squeeze, and its last glyph landed on the ideograph
+  beside it ("Joufmmjtjh平o"). `shareOfTarget` cuts the share from the
+  target's own glyphs (text with its spacing, the width they occupy, the line
+  kept as `wrapRef`).
+- **A SHORT target (2–5 characters) is admitted to containment when a run
+  carrying it sits on the click.** `readsAs` demands six; a permit form draws
+  its second and later "SI NO SI NO" rows inside ONE block that spans the
+  form, so the only candidate for a click on row 2 was row 1's four-block
+  pair, 5.5pt above — and that row moved, on two producers.
+- **Runs are found space-FREE.** Extraction fuses adjacent cells ("SI" and
+  "NO" read back as "SINO") while the array holds a space glyph between:
+  `findTargetRun` accepts space-free equality, and `runDistanceToTarget` /
+  `findTargetSegment` find occurrences space-free and map them back to the
+  array's character positions, start and end.
+- **The move ranking's bucket is the target's height (3..8pt).** With a flat
+  8pt bucket the row above (4.3pt from a 6.6pt box) tied the right row and
+  won on score.
+- **A run never STARTS with a blank op.** An Adobe letter's BT opens with the
+  header artifact's `( )Tj` under a 12-scale Tm and only then sets the
+  footer's 6.48-scale Tm; a window that began at that space put the footer's
+  run before its own Tm, the delta converted through the wrong matrix, and
+  the move landed at 54% of the ask (its resize interleaved "Hualla ga").
+  `findGoverningTm` and `findTargetRun` skip blank leading ops — unless the
+  target itself begins with whitespace (" N° de Servicio", " Tasa 18% ", a
+  blank cell), where the space is part of what was clicked: skipping it
+  unconditionally lost twelve moves and resizes on four producers.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

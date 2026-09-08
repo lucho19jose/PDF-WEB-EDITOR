@@ -3938,6 +3938,9 @@ function transformInSource(
         ? { index: governing.index, text: governing.text }
         : (fallback ? { index: fallback.index!, text: fallback[0] } : null)
       const tmMatch = tmSource ? tmSource.text.match(tmRegex) : null
+      if ((globalThis as any).__debugCandidates) {
+        console.log(`[tm] block@${block.start} governing=${governingRaw ? JSON.stringify(governingRaw.text) : null} fallback=${fallback ? JSON.stringify(fallback[0]) : null}`)
+      }
 
       // Whether it may be REWRITTEN is a different question. Rewriting a Tm
       // moves every show op it governs, so on a block that draws more than the
@@ -5114,17 +5117,27 @@ function findTargetRun(
   }
 
   let best: RunPick | null = null
+  // Space-FREE equality too: extraction fuses adjacent cells ("SI" and "NO"
+  // a few points apart read back as one "SINO"), and the run that draws them
+  // holds a space glyph between. Compared with spaces kept, a form-wide block
+  // never yielded that run, and the only candidate left for a click on its
+  // second checkbox row was the first row's four-block pair — which moved.
+  const targetFree = targetNorm.replace(/\s+/g, '')
   for (let i = 0; i < ops.length; i++) {
+    // A run never starts with a blank op (see findGoverningTm).
+    // (Unless the target itself BEGINS with whitespace — " N° de Servicio", a blank cell — then the space is part of what was clicked and the run keeps it.)
+    if (!ops[i].decoded.trim() && !/^\s/.test(targetText)) continue
     let acc = ''
     for (let j = i; j < ops.length; j++) {
       acc += ops[j].decoded
       const norm = acc.replace(/\s+/g, ' ').trim()
       if (norm.length > targetNorm.length * 1.5 + 8) break
       if (!norm) continue
+      const freeEqual = norm.replace(/\s+/g, '') === targetFree
       const ratio = matchRatio(norm, targetNorm)
-      if (ratio < 0.7) continue
+      if (ratio < 0.7 && !freeEqual) continue
       let score = 0
-      if (norm === targetNorm) score = 2
+      if (norm === targetNorm || freeEqual) score = 2
       else if (fuzzyTextMatch(norm, targetNorm)) score = ratio
       if (score <= 0) continue
       const pick: RunPick = { i, j, score, rowGap: rowGapOf(ops[i].y) }
@@ -5197,6 +5210,13 @@ function findGoverningTm(
   let runStart = -1
   let bestScore = 0
   for (let i = 0; i < ops.length; i++) {
+    // A run never STARTS with a blank op. An Adobe letter's BT opens with the
+    // header artifact's `( )Tj` under a 12-scale Tm and only then sets the
+    // footer's 6.48-scale Tm; a window that began at that space located the
+    // footer's run BEFORE its own Tm, the delta was converted through the
+    // wrong matrix, and the move landed at 54% of the ask.
+    // (Unless the target itself BEGINS with whitespace — " N° de Servicio", a blank cell — then the space is part of what was clicked and the run keeps it.)
+    if (!ops[i].decoded.trim() && !/^\s/.test(targetText)) continue
     let acc = ''
     for (let j = i; j < ops.length; j++) {
       acc += ops[j].decoded
@@ -6105,6 +6125,27 @@ function findBtBlocksByPosition(
     let exact = orders.some(o => o === normalizedTarget || o.replace(/\s+/g, '') === targetFree)
     let isMatch = exact || orders.some(readsAs)
     let runBlocks: BtInfo[] | null = null
+    // A SHORT target (2-5 characters) is admitted to containment only when a
+    // run carrying it SITS on the click — text that short identifies nothing
+    // on its own, which is why `readsAs` demands six. A permit form draws its
+    // second and later "SI NO SI NO" rows inside ONE block that spans the
+    // form; refused here, the only candidate left for a click on row 2 was
+    // row 1's four-block pair, 5.5pt above, and that row moved.
+    if (!isMatch && targetFree.length >= 2 && targetFree.length <= 5) {
+      const compactOf = (t: string) => foldForMatch(t).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
+      const ct = compactOf(normalizedTarget)
+      if (ct.length >= 2 && lineBlocks.some(b => {
+        if (!compactOf(b.decodedText).includes(ct)) return false
+        const rd = runDistanceToTarget(b, targetBlock.text, pageIndex, stream, targetBlock, pageHeight)
+        if ((globalThis as any).__debugCandidates) console.log(`[pos-short] block@${b.start} runDist=${rd} onTarget=${onTarget}`)
+        return (rd ?? Infinity) <= onTarget
+      })) {
+        isMatch = true
+      }
+    }
+    if ((globalThis as any).__debugCandidates) {
+      console.log(`[pos-line] n=${lineBlocks.length} exact=${exact} match=${isMatch} dist=${Math.min(...lineBlocks.map(distOf)).toFixed(1)} join=${JSON.stringify(acrossPage.slice(0, 50))}`)
+    }
 
     // A contiguous RUN of the line's blocks. Extraction merges adjacent cells —
     // "SI" and "NO" a few points apart read back as one "SINO" block — and no
@@ -6358,7 +6399,13 @@ function findBtBlocksByPosition(
     }
   }
 
-  const bucket = (d: number) => Number.isFinite(d) ? Math.round(d / 8) : Number.MAX_SAFE_INTEGER
+  // The bucket is the target's own height (3..8pt), not a flat 8: a permit
+  // form's checkbox rows are 10.5pt apart with 6.6pt boxes, so the row
+  // ABOVE the click sat 4.3pt from the box — inside an 8pt bucket with the
+  // right row at 0 — and its exact four-block pair outranked the form-wide
+  // block that carries the clicked row by score. Body text keeps ~7pt.
+  const bucketSize = Math.min(8, Math.max(3, (targetBlock.height || 8) * 0.6))
+  const bucket = (d: number) => Number.isFinite(d) ? Math.round(d / bucketSize) : Number.MAX_SAFE_INTEGER
   // Inside one bucket the REAL distance still decides before anything textual
   // or positional-in-the-stream does. Two consecutive lines of an e-mail
   // ("1) El proveedor…" / "2) El proveedor…", one BT each, 13pt apart) both
@@ -7621,6 +7668,37 @@ function lineRefuse(where: string): null {
   if ((globalThis as any).__debugCandidates) console.log(`[line] refused at ${where}`)
   return null
 }
+/**
+ * The part of `targetBlock` whose (space-free) text is `needle`, as a block of
+ * its own: the same glyphs' text with its spacing, the width they occupy, and
+ * the line kept as `wrapRef` for the wrap calibration. The target itself when
+ * the needle cannot be located in its glyphs.
+ */
+function shareOfTarget(targetBlock: TextBlock, needle: string): TextBlock {
+  const chars = targetBlock.chars || []
+  const needleFree = needle.replace(/\s+/g, '')
+  if (!needleFree || chars.length === 0) return targetBlock
+  const idx: number[] = []
+  let free = ''
+  chars.forEach((ch, i) => { if (ch.c.trim()) { idx.push(i); free += ch.c } })
+  const k = free.indexOf(needleFree)
+  if (k < 0) return targetBlock
+  const from = idx[k], to = idx[k + needleFree.length - 1]
+  if (from === undefined || to === undefined) return targetBlock
+  const sel = chars.slice(from, to + 1)
+  const xs = sel.flatMap(ch => ch.quad ? [ch.quad[0], ch.quad[2], ch.quad[4], ch.quad[6]] : [])
+  if (!xs.length) return targetBlock
+  const x0 = Math.min(...xs), x1 = Math.max(...xs)
+  return {
+    ...targetBlock,
+    text: sel.map(ch => ch.c).join(''),
+    x: x0, width: x1 - x0,
+    bbox: [x0, targetBlock.bbox[1], x1, targetBlock.bbox[3]],
+    chars: sel,
+    wrapRef: { text: targetBlock.text, width: targetBlock.width }
+  }
+}
+
 function applyLineReplacement(
   stream: string,
   lineBlocksIn: BtInfo[],
@@ -7768,8 +7846,16 @@ function applyLineReplacement(
     const spaces = sorted.filter(b => !contributes(b) && b.hasPos &&
       readCmp(b, first) > 0 && (!nextTail || readCmp(b, nextTail) < 0))
     const run = [...middle, ...spaces].sort((x, y) => x.start - y.start)
+    // The retry's target is the MIDDLE's share of the line, not the whole
+    // line: `substituteTz` fits a substitute to the target's width per
+    // character, and a bilingual line ("本手册介绍了 Intellisign 平台…") is
+    // ten points a character where its Latin word is five — measured against
+    // the line, Helvetica for the word needed no squeeze, and its last glyph
+    // landed on the ideograph beside it ("Joufmmjtjh平o"). The share is cut
+    // from the target's own glyphs, so its width is what the word occupies.
+    const share = targetBlock ? shareOfTarget(targetBlock, middle.map(b => b.decodedText).join('')) : targetBlock
     return applyLineReplacement(stream, run, middleText,
-      pageIndex, targetBlock, pageWidth, rotation)
+      pageIndex, share, pageWidth, rotation)
   }
 
   // Every block here except the primary gets blanked, so refuse when the run
@@ -9476,10 +9562,16 @@ function runDistanceToTarget(
 
   let best: number | null = null
   const keep = (d: number) => { if (best === null || d < best) best = d }
+  // Space-FREE throughout: extraction fuses adjacent cells ("SI" and "NO"
+  // read back as "SINO") while the array that draws them holds a space
+  // glyph or a kern between — compared with spaces kept, the form-wide block
+  // holding the clicked row measured as "not here" and the nearest OTHER row
+  // took the move.
+  const targetFree = targetNorm.replace(/\s+/g, '')
 
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i]
-    if (!op.decoded.includes(targetNorm)) continue
+    if (!op.decoded.replace(/\s+/g, '').includes(targetFree)) continue
     const dy = yGap(local.across(op.x, op.y))
     const state = textStateAtOp(block, ops, i, pageIndex)
     if (!state) { keep(dy); continue }   // position known only to the line
@@ -9518,12 +9610,16 @@ function runDistanceToTarget(
         if (!usable) break
       }
       if (usable) {
-        let p = full.indexOf(targetNorm)
+        const freeIdx: number[] = []
+        let fullFree = ''
+        for (let c = 0; c < full.length; c++) { if (full[c].trim()) { freeIdx.push(c); fullFree += full[c] } }
+        let p = fullFree.indexOf(targetFree)
         while (p !== -1) {
-          const x0 = penA + xAt[p] * state.tfSize / 1000
-          const x1 = penA + (xAt[p + targetNorm.length - 1] ?? xAt[p]) * state.tfSize / 1000
+          const i0 = freeIdx[p], i1 = freeIdx[p + targetFree.length - 1] ?? i0
+          const x0 = penA + xAt[i0] * state.tfSize / 1000
+          const x1 = penA + xAt[i1] * state.tfSize / 1000
           keep(gap(x0, x1) + dy)
-          p = full.indexOf(targetNorm, p + 1)
+          p = fullFree.indexOf(targetFree, p + 1)
         }
         continue
       }
@@ -9601,6 +9697,7 @@ function findTargetSegment(
 ): TjSegmentHit | null {
   const targetNorm = targetBlock.text.replace(/\s+/g, ' ').trim()
   if (targetNorm.length < 2) return null
+  const targetFree = targetNorm.replace(/\s+/g, '')
 
   const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
   const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
@@ -9610,7 +9707,7 @@ function findTargetSegment(
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i]
     if (op.kind !== 'TJ') continue
-    if (!op.decoded.includes(targetNorm)) continue
+    if (!op.decoded.replace(/\s+/g, '').includes(targetFree)) continue
     // The op must sit on the clicked ROW. The occurrence chooser below
     // compares horizontal position only, which cannot tell one row of a table
     // from another: a Ghostscript timesheet repeats "16:00" in the same
@@ -9673,9 +9770,18 @@ function findTargetSegment(
     }
     if (!usable) continue
 
-    const occ: number[] = []
-    let p = full.indexOf(targetNorm)
-    while (p !== -1) { occ.push(p); p = full.indexOf(targetNorm, p + 1) }
+    // Occurrences are found space-FREE (see runDistanceToTarget) and mapped
+    // back to the array's own character positions, start and END.
+    const freeIdx: number[] = []
+    let fullFree = ''
+    for (let c = 0; c < full.length; c++) { if (full[c].trim()) { freeIdx.push(c); fullFree += full[c] } }
+    const occ: { start: number; end: number }[] = []
+    let p = fullFree.indexOf(targetFree)
+    while (p !== -1) {
+      const st = freeIdx[p], en = freeIdx[p + targetFree.length - 1]
+      if (st !== undefined && en !== undefined) occ.push({ start: st, end: en })
+      p = fullFree.indexOf(targetFree, p + 1)
+    }
     // Boundary-aligned only: the run must start at a literal's first character
     // and end at a literal's last. Anything else splits a literal in half, and
     // the array would be corrupt rather than merely wrong.
@@ -9686,8 +9792,8 @@ function findTargetSegment(
     // be recoloured, resized or moved. The splice takes the whole literal, so
     // such a space travels with the run; nothing visible marks where it was.
     const aligned = occ.filter(o => {
-      const a = charItem[o]
-      const b = charItem[o + targetNorm.length - 1]
+      const a = charItem[o.start]
+      const b = charItem[o.end]
       if (!a || !b) return false
       const aLit = items[a.item].decoded, bLit = items[b.item].decoded
       const headOk = a.charInItem === 0 || /^\s*$/.test(aLit.slice(0, a.charInItem))
@@ -9706,27 +9812,27 @@ function findTargetSegment(
       const clickedRel = (local.aLo - penA) * 1000 / state.tfSize
       let bestD = Infinity
       for (const o of aligned) {
-        const d = Math.abs(clickedRel - xAt[o])
+        const d = Math.abs(clickedRel - xAt[o.start])
         if (d < bestD) { bestD = d; chosen = o }
       }
       err = bestD * state.tfSize / 1000
       // Never move a copy the user did not point at. Half the run's own width
       // is the widest a click can miss by and still plainly mean this one.
-      const runW = (xAt[chosen + targetNorm.length - 1] - xAt[chosen]) * state.tfSize / 1000
+      const runW = (xAt[chosen.end] - xAt[chosen.start]) * state.tfSize / 1000
       if (err > Math.max(12, runW * 0.5)) continue
     } else if (aligned.length > 1) {
       // Repeated text and no position to tell the copies apart.
       continue
     }
 
-    const first = charItem[chosen]
-    const last = charItem[chosen + targetNorm.length - 1]
+    const first = charItem[chosen.start]
+    const last = charItem[chosen.end]
     // The run's extent is the WHOLE of the literals it spans (their end
     // spaces included, since the splice takes them), so a scale's
     // compensating kern accounts for every glyph that grows.
-    let i0 = chosen
+    let i0 = chosen.start
     while (i0 > 0 && charItem[i0 - 1].item === first.item) i0--
-    let i1 = chosen + targetNorm.length - 1
+    let i1 = chosen.end
     while (i1 + 1 < charItem.length && charItem[i1 + 1].item === last.item) i1++
     // The space-only literals right after the run travel WITH it, small kerns
     // between included — the rule `replaceInsideTjArray` follows for the same
