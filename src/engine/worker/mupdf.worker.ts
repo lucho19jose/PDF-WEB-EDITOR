@@ -3681,8 +3681,12 @@ function transformTextBlock(
       return { success: false, error: `Block ${blockId} not found` }
     }
 
-    // Text may live in the page stream or in a Form XObject it invokes.
-    for (const src of getContentSources(pageIndex)) {
+    // Text may live in the page stream or in a Form XObject it invokes —
+    // nearest form first, as the replace path searches: an iLovePDF catalogue
+    // draws "CHAT GPT:" in a page-sized form and again in a nested cell form,
+    // and the first source that answered was the page-sized one, whose copy
+    // sat 110pt from the click. It moved, silently, reporting success.
+    for (const src of sourcesByMatch(pageIndex, targetBlock, pageHeightOf(pageIndex))) {
       const done = withSource(src, () => transformInSource(
         src, pageIndex, targetBlock, dx, dy, sx, sy, anchorX, anchorY))
       if (done) return done
@@ -3752,8 +3756,9 @@ function transformTextBlocks(
 
     let outcome: { success: boolean; error?: string; strategy?: string; clipAdjusted?: boolean } | null = null
     try {
-      // Text may live in the page stream or in a Form XObject it invokes.
-      for (const src of getContentSources(pageIndex)) {
+      // Text may live in the page stream or in a Form XObject it invokes
+      // (nearest form first — see transformTextBlock).
+      for (const src of sourcesByMatch(pageIndex, targetBlock, pageHeightOf(pageIndex))) {
         outcome = withSource(src, () => transformInSource(
           src, pageIndex, targetBlock, op.dx, op.dy, op.sx, op.sy, op.anchorX, op.anchorY))
         if (outcome) break
@@ -4267,7 +4272,7 @@ function restyleTextBlocks(
 
     let outcome: { success: boolean; error?: string; strategy?: string; lines?: number; baselineDrop?: number } | null = null
     try {
-      for (const src of getContentSources(pageIndex)) {
+      for (const src of sourcesByMatch(pageIndex, targetBlock, pageHeightOf(pageIndex))) {
         outcome = withSource(src, () => restyleInSource(src, pageIndex, targetBlock, op))
         if (outcome) break
       }
@@ -5375,6 +5380,48 @@ function governingTmIsExclusive(
  * click meant. The page source is left first because a page-level match
  * already wins today, so nothing that works can change.
  */
+/**
+ * The content sources ordered by how near each one's position MATCH sits to
+ * the clicked text — for the paths that take the first source that answers.
+ *
+ * Ordering forms by their invocation origin is not enough: an iLovePDF
+ * catalogue draws the same "CHAT GPT:" label in several nested cell forms and
+ * once more in the page-sized form that holds them, and whichever form was
+ * searched first answered with ITS copy — the page-sized one 110pt from the
+ * click in document order, a nearer-by-origin cell form 284pt from it in
+ * origin order. Each source is asked where its match lies first; the source
+ * whose match is nearest goes first, sources with no match keep their
+ * origin order after them, and the loop's "first that answers" then IS the
+ * nearest copy. A source's scan is cached, so asking twice is cheap.
+ */
+function sourcesByMatch(
+  pageIndex: number,
+  targetBlock: TextBlock,
+  pageHeight: number
+): ReturnType<typeof getContentSources> {
+  const ordered = sourcesNearestFirst(pageIndex, targetBlock, pageHeight)
+  if (ordered.length <= 1) return ordered
+  const ranked = ordered.map((src, i) => {
+    let d = Infinity
+    try {
+      const hit = withSource(src, () => findBtBlocksByPosition(src.stream, pageIndex, targetBlock, null, pageHeight || undefined))
+      if (hit && hit.length && lastPositionMatchDist !== null) d = lastPositionMatchDist
+      else if (hit && hit.length) d = 1e6
+    } catch (_) { d = Infinity }
+    return { src, i, d }
+  })
+  ranked.sort((a, b) => (a.d - b.d) || (a.i - b.i))
+  if ((globalThis as any).__debugCandidates) {
+    console.log(`[sources-by-match] ${ranked.map(r => `${r.src.key}@${Number.isFinite(r.d) ? r.d.toFixed(0) : '-'}`).join(' ')}`)
+  }
+  return ranked.map(r => r.src)
+}
+
+/** The page's height in points, or 0 when it cannot be read (the ordering then treats every form as equally near). */
+function pageHeightOf(pageIndex: number): number {
+  try { return getPageSize(pageIndex).height } catch (_) { return 0 }
+}
+
 function sourcesNearestFirst(
   pageIndex: number,
   targetBlock: TextBlock,
@@ -5390,7 +5437,11 @@ function sourcesNearestFirst(
     const py = pageHeight - m[5]
     return Math.hypot(px - cx, py - cy)
   }
-  return [...all].sort((a, b) => distOf(a) - distOf(b))
+  const sorted = [...all].sort((a, b) => distOf(a) - distOf(b))
+  if ((globalThis as any).__debugCandidates) {
+    console.log(`[sources] ${sorted.map(s => `${s.key}@${distOf(s).toFixed(0)}`).join(' ')}`)
+  }
+  return sorted
 }
 
 function expandClipForTransform(
@@ -5768,6 +5819,14 @@ function findMatchingBtBlocks(
  * the nearest one wins. Comparing raw Tm values against a page-space bbox — as
  * this used to — is wrong for any file that scales or flips text with a `cm`.
  */
+/**
+ * How near the last `findBtBlocksByPosition` winner sat to the clicked text,
+ * in page points (origin distance, or the drawn run's when that is known and
+ * nearer) — what `sourcesByMatch` ranks the content sources on. Infinity
+ * when the position could not be told, null when nothing matched.
+ */
+let lastPositionMatchDist: number | null = null
+
 function findBtBlocksByPosition(
   stream: string,
   pageIndex: number,
@@ -5775,6 +5834,7 @@ function findBtBlocksByPosition(
   targetFontRef: string | null,
   pageHeight?: number
 ): BtInfo[] | null {
+  lastPositionMatchDist = null
   // Position matching needs a text-space origin; skip blocks without any
   // positioning operator at all (they draw at the identity origin).
   const allBlocks = scanBtBlocks(stream, pageIndex).filter(b => b.hasPos)
@@ -5892,8 +5952,16 @@ function findBtBlocksByPosition(
     // A contiguous RUN of the line's blocks. Extraction merges adjacent cells —
     // "SI" and "NO" a few points apart read back as one "SINO" block — and no
     // whole-line join matches that. Same search the replace matcher runs.
+    //
+    // EVERY such run is a candidate, not the first. A permit form draws
+    // "SI NO SI NO" on one line as four one-word BTs, two checkbox pairs a
+    // column apart: taking the first pair that read "SINO" made the LEFT pair
+    // the only candidate for a click on the right one, and the drag moved the
+    // wrong pair — 66pt off, reported as success. Each run is ranked by its
+    // own distance like any other candidate.
     if (!isMatch && lineBlocks.length > 1) {
-      outer:
+      const runs: BtInfo[][] = []
+      const seen = new Set<string>()
       for (const sorted of [byX, [...lineBlocks].sort((a, b) => a.start - b.start)]) {
         for (let i = 0; i < sorted.length; i++) {
           let acc = ''
@@ -5902,13 +5970,21 @@ function findBtBlocksByPosition(
             const norm = acc.replace(/\s+/g, ' ').trim()
             if (norm.length > normalizedTarget.length * 1.5 + 8) break
             if (norm === normalizedTarget || norm.replace(/\s+/g, '') === targetFree) {
-              runBlocks = sorted.slice(i, j + 1)
-              exact = true; isMatch = true
-              break outer
+              const run = sorted.slice(i, j + 1)
+              const key = run.map(b => b.start).sort((a, b) => a - b).join(',')
+              if (!seen.has(key)) { seen.add(key); runs.push(run) }
+              break
             }
           }
         }
       }
+      if (runs.length > 1) {
+        for (const run of runs) {
+          candidates.push({ blocks: run, score: 2, dist: Math.min(...run.map(distOf)), order: candidates.length })
+        }
+        continue
+      }
+      if (runs.length === 1) { runBlocks = runs[0]; exact = true; isMatch = true }
     }
     if (!isMatch) continue
     if (!exact && readsOnPlaceholders(alongStream, normalizedTarget)) continue
@@ -6156,6 +6232,10 @@ function findBtBlocksByPosition(
   // single-block match outranks the line group carrying the same space, so
   // doing it per candidate never reached the one that wins.
   const won = candidates[0].blocks
+  {
+    const d = candidates[0].dist, r = runDistOf(candidates[0])
+    lastPositionMatchDist = Math.min(Number.isFinite(d) ? d : Infinity, Number.isFinite(r) ? r : Infinity)
+  }
   // Only when the TARGET itself carries that space. Extraction merges a
   // trailing space into the block it belongs to, so "BANCO DE CRÉDITO " ends
   // in one and its space block is part of the run; "Sonido" does not, and the

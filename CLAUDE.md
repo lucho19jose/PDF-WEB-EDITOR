@@ -4836,6 +4836,28 @@ moved 16pt sideways with the advance added to x).
 Measured on the form: the cell edits, moves by exactly the delta asked and
 resizes anchored at its own corner.
 
+### Every run of a line is a MOVE candidate, and the nearest form is searched first
+Two silent wrong moves from the marker sweep's "landed off" rows, each a
+matcher taking the first thing that read right:
+- **The run search in `findBtBlocksByPosition` stopped at the first window.**
+  A permit form draws "SI NO SI NO" on one line as four one-word BTs — two
+  checkbox pairs a column apart — so the LEFT pair was the only candidate for
+  a click on the right one, and the drag moved the wrong pair, 66pt off,
+  reporting success. Every window that reads as the target is now its own
+  candidate, ranked by its own distance like any other; a single window
+  behaves exactly as before.
+- **The move and restyle paths searched content sources in DOCUMENT order**
+  and returned on the first that answered. An iLovePDF catalogue draws
+  "CHAT GPT:" in several nested cell forms and once more in the page-sized
+  form that holds them; the page-sized one answered first with a copy 110pt
+  from the click, and that copy moved. Ordering the forms by their invocation
+  ORIGIN (as the replace path does) was tried first and swapped one wrong
+  copy for another: a cell form nearer by origin answered with its copy 284pt
+  away. `sourcesByMatch` asks every source where its position match lies
+  (`lastPositionMatchDist`, the winner's origin or drawn-run distance) and
+  puts the nearest match first, so the loop's "first that answers" is the
+  nearest copy; sources with no match keep their origin order after.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
