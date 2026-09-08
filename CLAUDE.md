@@ -4966,6 +4966,22 @@ is; one point of slack for rounding.
   blank cell), where the space is part of what was clicked: skipping it
   unconditionally lost twelve moves and resizes on four producers.
 
+### Every EXACT window of a line is a candidate, and a run on another row is refused
+- The replace matcher kept ONE best window per line group, so the first
+  exact window won even when a second exact window sat where the click was.
+  A pdf24 order's date row is [":" (left column) … "10/04/2026" … ":" (right
+  column)] in stream order: the first exact window paired the date with the
+  LEFT column's colon 470 units away, that group measured 344pt from the
+  click, and the row BELOW — the same date with its own colon — won at 10pt
+  and lost its colon to a delete meant for the row above. Every exact window
+  is its own candidate now, ranked by its own distance.
+- `findTargetRun` only PREFERRED an on-row run; with no on-row single-op run
+  it handed the recolour and the edit of an invoice's "1,630.00" to the
+  grand total one row below (the clicked row's copy sits inside a TJ array
+  with the unit price). A run whose row gap exceeds the box's height and a
+  half (never under 6pt) is refused, and the segment path then finds the
+  copy inside the row's array.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

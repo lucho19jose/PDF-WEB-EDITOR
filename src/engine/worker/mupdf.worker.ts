@@ -5145,6 +5145,17 @@ function findTargetRun(
     }
   }
   if (!best) return null
+  // A run provably on ANOTHER row is not the run: an invoice draws "1,630.00"
+  // three times — unit price and total on the clicked row inside ONE array,
+  // and the grand total one row below as its own op — and the ranking, which
+  // only prefers an on-row run, handed the recolour and the edit to the row
+  // below when no on-row single-op run existed. Refused, the segment path
+  // finds the copy inside the row's array. The bar is the box's own height
+  // and a half (never under 6pt), so a baseline's ordinary slack still passes.
+  if (local) {
+    const boxH = (local.cHi - local.cLo) * (local.unitScale || 1)
+    if (best.rowGap > Math.max(6, boxH * 1.5)) return null
+  }
 
   // Does the winning run actually sit on the clicked text? Measured on real
   // advances, so it is only asked when every width is known; where it cannot be
@@ -6833,6 +6844,15 @@ function replaceTextInContentStreamFontAware(
 
     let best: { blocks: BtInfo[]; score: number } | null = null
     let bestFused: { blocks: BtInfo[]; coverage: number; rest: string } | null = null
+    // EVERY exact window is a candidate, each ranked by its own distance. A
+    // pdf24 order's date row is [":" (left column) … "10/04/2026" … ":"
+    // (right column)] in stream order, so the first exact window paired the
+    // date with the LEFT column's colon 470 units away; the group then
+    // measured 344pt from the click, and the row BELOW — the same date, its
+    // own colon — won at 10pt and lost its colon to a delete meant for the
+    // row above. (The move matcher learned the same rule for "SI NO SI NO".)
+    const exacts: BtInfo[][] = []
+    const exactSeen = new Set<string>()
     const tFree = normalizedTarget.replace(/\s+/g, '')
     for (const sorted of orderings) {
       for (let i = 0; i < sorted.length; i++) {
@@ -6869,6 +6889,11 @@ function replaceTextInContentStreamFontAware(
           // sameCharacters). The run still COVERS the target, so it scores
           // above any fragment of it but below a match that reads in order.
           else if (sameCharacters(norm, normalizedTarget)) score = 1.5
+          if (score === 2) {
+            const run = trimBlankEnds(sorted.slice(i, j + 1))
+            const key = run.map(b => b.start).sort((a, b) => a - b).join(',')
+            if (!exactSeen.has(key)) { exactSeen.add(key); exacts.push(run) }
+          }
           if (score > 0 && (!best || score > best.score)) {
             best = { blocks: trimBlankEnds(sorted.slice(i, j + 1)), score }
           }
@@ -6907,7 +6932,11 @@ function replaceTextInContentStreamFontAware(
       }
     }
 
-    if (best) {
+    if (exacts.length) {
+      for (const run of exacts) {
+        candidates.push({ blocks: run, score: 2, dist: distOf(run[0]), line: true, order: candidates.length })
+      }
+    } else if (best) {
       candidates.push({
         blocks: best.blocks, score: best.score,
         dist: distOf(best.blocks[0]), line: true, order: candidates.length
@@ -7188,7 +7217,7 @@ function replaceTextInContentStreamFontAware(
   const tried: string[] = []
   if ((globalThis as any).__debugCandidates) {
     for (const c of candidates) {
-      console.log(`[cand] ${c.partial ? 'P' : c.line ? 'L' : 'S'} score=${c.score.toFixed(2)} dist=${Number.isFinite(c.dist) ? c.dist.toFixed(1) : '?'} fused=${c.tailFused ?? ''} blocks=${JSON.stringify(c.blocks.map(b => b.decodedText.slice(0, 40)))}`)
+      console.log(`[cand] ${c.partial ? 'P' : c.line ? 'L' : 'S'} score=${c.score.toFixed(2)} dist=${Number.isFinite(c.dist) ? c.dist.toFixed(1) : '?'} fused=${c.tailFused ?? ''} blocks=${JSON.stringify(c.blocks.map(b => b.decodedText.slice(0, 40)))} at=${c.blocks.map(b => `${b.start}@${b.xPos.toFixed(1)},${b.yPos.toFixed(1)}`).join(' ')}`)
     }
   }
   for (const c of candidates) {
