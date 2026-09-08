@@ -5792,10 +5792,16 @@ function findBtBlocksByPosition(
     // "Código de Cliente : 232900 - 2", and the spaces around the colon kept
     // the only block holding the target out of the running — a copy of the
     // label 650pt down the page was restyled instead.
+    // Accent marks stripped as well as spaces — the containment leg of the
+    // replace matcher does the same, and a pdfTeX paragraph draws every
+    // accent as its own glyph before or after its letter ("segmentacio´n"),
+    // which read as a different word from the one extraction reports.
+    const compactLine = foldedLine.replace(/\s+/g, '').replace(ACCENT_MARKS, '')
+    const compactTarget = foldedTarget.replace(/\s+/g, '').replace(ACCENT_MARKS, '')
     return fuzzyTextMatch(line, normalizedTarget) ||
       (foldedLine.length > 5 && foldedTarget.length > 5 &&
        (wildcardIncludes(foldedLine, foldedTarget) || foldedTarget.includes(foldedLine) ||
-        foldedLine.replace(/\s+/g, '').includes(foldedTarget.replace(/\s+/g, ''))))
+        (compactTarget.length > 5 && compactLine.includes(compactTarget))))
   }
   // NOT space-stripped on the containment leg, deliberately: compacting let a
   // line of a WRAPPED pdfTeX paragraph match, and the td-bracket then landed

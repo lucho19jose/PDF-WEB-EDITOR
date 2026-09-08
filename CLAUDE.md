@@ -4608,6 +4608,10 @@ glyphs now sit where the original's did.
   size AND a near candidate exists — every candidate far means the distance
   itself is suspect (an Excel export under `1 0 0 -1 0 0 Tm` measured its one
   exact block 444pt away).
+- **The move matcher's space-free containment strips accent marks too**, as the
+  replace matcher's containment leg does: a pdfTeX paragraph draws every
+  accent as its own glyph ("segmentacio´n"), and without it no line of a TeX
+  paragraph could be moved, resized or recoloured.
 - **A line group's clip is widened around the block that was REWRITTEN.**
   The primary is not always the first block (a Wingdings tick leads, the
   Calibri sentence takes the text) and Word clips each run separately.
