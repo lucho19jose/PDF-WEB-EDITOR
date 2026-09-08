@@ -5319,27 +5319,42 @@ function maskStreamLiterals(stream: string): string {
  */
 function getBlockOrigin(masked: string): { x: number; y: number; hasPos: boolean; hasTm: boolean } {
   const re = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm\b|(-?[\d.]+)\s+(-?[\d.]+)\s+(Td|TD)\b|(-?[\d.]+)\s+TL\b|T\*|\)\s*(?:Tj|TJ|'|")|>\s*(?:Tj|TJ|'|")|\]\s*TJ/g
-  let x = 0, y = 0, leading = 0
+  // Td, TD and T* move the LINE matrix, whose operands live in the space the
+  // Tm MATRIX defines — the same composition `scanShowOps` applies. Adding
+  // them straight onto the translation is only right while that matrix is
+  // the identity: an Excel export draws every label under `1 0 0 -1 0 0 Tm`
+  // and places it with `18 -376 Td`, so its origin read as y = -376 where the
+  // page has it at +376, and the one exact block for "Revisión externa"
+  // measured 444pt from the click. Under `12 0 0 12 x y Tm` (Quartz,
+  // Distiller — the scale in the matrix, `1 Tf`) a `0 -1.2 Td` is a line, not
+  // a point. Accumulated in line space and pushed through the matrix; for an
+  // identity Tm the arithmetic is what it was.
+  let a = 1, b = 0, c = 0, d = 1, e = 0, f = 0
+  let ux = 0, uy = 0, leading = 0
   let hasPos = false, hasTm = false
   let m: RegExpExecArray | null
   while ((m = re.exec(masked)) !== null) {
     if (m[1] !== undefined) {            // Tm — absolute line matrix
-      x = parseFloat(m[5]); y = parseFloat(m[6])
+      a = parseFloat(m[1]); b = parseFloat(m[2]); c = parseFloat(m[3]); d = parseFloat(m[4])
+      e = parseFloat(m[5]); f = parseFloat(m[6])
+      ux = 0; uy = 0
       hasPos = true; hasTm = true
       continue
     }
     if (m[7] !== undefined) {            // Td / TD — relative to the line matrix
-      x += parseFloat(m[7]); y += parseFloat(m[8])
+      ux += parseFloat(m[7]); uy += parseFloat(m[8])
       if (m[9] === 'TD') leading = -parseFloat(m[8])
       hasPos = true
       continue
     }
     if (m[10] !== undefined) { leading = parseFloat(m[10]); continue } // TL
-    if (m[0] === 'T*') { y -= leading; hasPos = true; continue }
+    if (m[0] === 'T*') { uy -= leading; hasPos = true; continue }
     // First show-text op — the pen is where the block starts drawing.
     // ' and " carry an implicit T*, but the block still starts on this line.
     break
   }
+  const x = ux * a + uy * c + e
+  const y = ux * b + uy * d + f
   return { x, y, hasPos, hasTm }
 }
 

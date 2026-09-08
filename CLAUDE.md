@@ -4619,6 +4619,17 @@ Measured (node, this session's baselines): realistic sweep gained 3/6/12/19/
 13/30/16 over main/r2…r7 on top of the first round, 0 lost; marker sweep
 against the session's HEAD: 7/2/4/3/4/15/3 gained, 0 lost.
 
+### A block's origin is its Td pushed THROUGH the Tm matrix
+`getBlockOrigin` added Td/TD/T* straight onto the Tm translation, which is
+only right while the matrix is the identity — the same composition
+`scanShowOps` had already been taught. An Excel export draws every label under
+`1 0 0 -1 0 0 Tm` and places it with `18 -376 Td`, so its origin read as
+y = -376 where the page has it at +376: the one exact block for "Revisión
+externa" measured 444pt from the click, and a Qt service report's title lines
+grouped wrongly. Under a scaled Tm (`12 0 0 12 x y Tm`, `1 Tf`) a `0 -1.2 Td`
+is a line, not a point. Sweeps: experiment-identical except the Qt/Excel
+files, where cross-block and single-block edits became clean line groups.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
