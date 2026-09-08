@@ -4661,6 +4661,32 @@ has. Measured: 150 resizes gained, two "lost" that were a clause number in its
 own block no longer scaling with the clause (a cross-block resize is not
 implemented), marker sweep identical.
 
+### At equal score the REAL distance decides, and an unnameable glyph is neither foreign nor a neighbour's
+Three small matcher truths from the realistic sweep's last damage rows:
+
+- **Inside one 8pt bucket, equal scores fall to the real distance before the
+  line/single preference.** An itext invoice repeats "$ 0.00" on rows 11pt
+  apart; the exact line group of the row ABOVE the click (3.4pt from the box)
+  outranked the exact single block sitting ON it (0.0pt) and the wrong row was
+  deleted with every character count intact. The move matcher already had
+  this rule; the replace matcher did not.
+- **A block whose decode is nothing but control characters is not foreign.** A
+  bullet from a symbol subset without a ToUnicode reads as U+0001; the line
+  guard called it a foreign word and refused every bulleted line of a utility
+  bill. Control-only decodes are skipped like blanks and '?' placeholders.
+- **…and one BEYOND the target's right edge is another cell's.** The run for
+  "• www.bn.com.pe" took the second column's bullet as its last member and
+  rewriting the line blanked it. `applyLineReplacement` drops an unreadable
+  block whose origin lies past the target's box.
+
+Tried and reverted in the same round: retagging `/ActualText` only on spans
+that already carry one. A Chrome-printed statement's compensation kern makes
+MuPDF place the retagged words as a zero-width phantom at the end of the line
+above ("Expediente : …" read twice), but tagged Word, PowerPoint and SAP pages
+read their text from the tag with NO prior ActualText — 28 edits across three
+corpora lost their words the moment the retag was withheld. The phantom stays
+a known limitation.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

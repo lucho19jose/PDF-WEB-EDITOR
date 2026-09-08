@@ -433,7 +433,16 @@ function vetCells(bin: Bin, cells: GlyphCell[], chars: string[]): GlyphCell[] | 
   {
     const wantOf = (c: GlyphCell) => expectedAdvance(c.char) / totalE * totalW
     const thinChar = (c: GlyphCell) => /[iljtfrI.,;:'!|1]/.test(c.char)
-    const wide = cells.map(c => !thinChar(c) && (c.x1 - c.x0) > wantOf(c) * 1.6 && (c.x1 - c.x0) - wantOf(c) > 3)
+    // A THIN character's cell holding a whole letter is a fused cell as much
+    // as a wide letter's is: on a bilingual payment slip the full-width colon
+    // of "COD PAGO ： 415701" took the "O" before it (22px against a want of
+    // 8) after a piece of the "码" ahead of the Latin had taken the "C"'s
+    // cell, and with thin cells exempt from `wide` the sliver had nothing to
+    // pair with — every Latin glyph of the run went into the face one letter
+    // off, and the baked line read "CC0 DPC 0 441574".
+    const wide = cells.map(c => thinChar(c)
+      ? ((c.x1 - c.x0) > wantOf(c) * 2.5 && (c.x1 - c.x0) - wantOf(c) > 3)
+      : ((c.x1 - c.x0) > wantOf(c) * 1.6 && (c.x1 - c.x0) - wantOf(c) > 3))
     const sliver = cells.map(c => !thinChar(c) && wantOf(c) > 2 && (c.x1 - c.x0) < wantOf(c) * 0.35)
     // Within a dozen cells: a shift runs from the fused cell to the sliver
     // that absorbs it, and on the title that was nine letters. Paired with a
@@ -505,8 +514,17 @@ function vetCells(bin: Bin, cells: GlyphCell[], chars: string[]): GlyphCell[] | 
     const want = expectedAdvance(c.char) / totalE * totalW
     return want > 2 && (c.x1 - c.x0) < want * 0.35
   }
-  if (cells.length > 2 && (sliver(0) || sliver(cells.length - 1))) {
-    return refuse('the first or last cell is a sliver — the cut is misaligned')
+  // A change of SCRIPT inside the run is an end as well. The ideographs of a
+  // bilingual line are cut by the gap merge and the Latin letters after them
+  // by the width fit, and where the merge leaves a piece of the last
+  // ideograph over, that piece takes the first Latin cell — the same shift
+  // as a rule at the box's edge, only in the middle of the run, where the
+  // end test could not see it ("付款代码 COD PAGO ： 415701" cut its "C" as
+  // an 11px sliver of "码" and shifted every letter after it).
+  const boundary = (i: number) => i > 0 && CJK.test(cells[i - 1].char) !== CJK.test(cells[i].char)
+  const atEdge = (i: number) => i === 0 || i === cells.length - 1 || boundary(i) || (i + 1 < cells.length && boundary(i + 1))
+  if (cells.length > 2 && cells.some((_, i) => atEdge(i) && sliver(i))) {
+    return refuse('a cell at an end of the run, or at a script change inside it, is a sliver — the cut is misaligned')
   }
   // A fifth: suspect cells are never traced anyway, so the bar is about
   // whether the REST can be trusted. Measured on 22 files, honest runs came

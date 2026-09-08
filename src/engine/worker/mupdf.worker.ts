@@ -6784,9 +6784,15 @@ function replaceTextInContentStreamFontAware(
   // match, and so the comparator stays a valid total order. Candidates with no
   // usable position keep their discovery order at the end.
   const bucket = (d: number) => Number.isFinite(d) ? Math.round(d / 8) : Number.MAX_SAFE_INTEGER
+  // At equal score inside one bucket the REAL distance decides before the
+  // line/single preference: an itext invoice repeats "$ 0.00" on three rows
+  // 11pt apart, and the row ABOVE the click (3.4pt from the box, an exact
+  // line group) outranked the exact single block sitting ON it (0.0pt) — the
+  // wrong row was deleted, silently, with every character count intact.
   candidates.sort((a, b) =>
     bucket(a.dist) - bucket(b.dist) ||
     b.score - a.score ||
+    ((Number.isFinite(a.dist) && Number.isFinite(b.dist) && Math.abs(a.dist - b.dist) > 0.5) ? a.dist - b.dist : 0) ||
     (b.line ? 1 : 0) - (a.line ? 1 : 0) ||
     a.order - b.order
   )
@@ -7214,15 +7220,42 @@ function applyWrappedReplacement(
  * Apply replacement across multiple BT blocks on the same line.
  * Put new text in the first substantial block, blank text in all others.
  */
+/** Debug-visible refusal for the line path (`globalThis.__debugCandidates`). */
+function lineRefuse(where: string): null {
+  if ((globalThis as any).__debugCandidates) console.log(`[line] refused at ${where}`)
+  return null
+}
 function applyLineReplacement(
   stream: string,
-  lineBlocks: BtInfo[],
+  lineBlocksIn: BtInfo[],
   newText: string,
   pageIndex: number,
   targetBlock?: TextBlock,
   pageWidth?: number,
   rotation = 0
 ): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
+  // A block that reads as nothing a font can NAME (a bullet from a symbol
+  // subset decodes to a control character) and sits BEYOND the target's
+  // right edge is another cell's, not this line's: a utility bill lists its
+  // banks' sites in two columns, the run for "• www.bn.com.pe" took the
+  // second column's bullet as its last member, and rewriting the line
+  // blanked it — the neighbour lost its bullet. Only unreadable blocks are
+  // dropped, and only past the target: a block the target's text includes
+  // lies inside its box by construction.
+  const lineBlocks = (() => {
+    if (!targetBlock) return lineBlocksIn
+    let pageHeight: number | undefined
+    try { pageHeight = getPageSize(pageIndex).height } catch (_) { pageHeight = undefined }
+    if (pageHeight === undefined) return lineBlocksIn
+    const unreadable = (b: BtInfo) => !foldForMatch(b.decodedText).replace(/\s+/g, '').replace(/[\p{C}]/gu, '')
+    return lineBlocksIn.filter(b => {
+      if (!unreadable(b) || !b.hasPos) return true
+      const local = blockLocalPoint(stream, b, targetBlock, pageHeight)
+      if (!local) return true
+      const hi = Math.max(local.x, local.xEnd)
+      return !(b.xPos > hi + 2 / (local.unitScale || 1))
+    })
+  })()
   // Sort by position in stream (ascending)
   const sorted = [...lineBlocks].sort((a, b) => a.start - b.start)
 
@@ -7239,7 +7272,7 @@ function applyLineReplacement(
   // the right of where the line begins. Stream order remains the tiebreak and
   // the fallback when any position is unknown.
   const contributing = sorted.filter(contributes)
-  if (contributing.length === 0) return null
+  if (contributing.length === 0) return lineRefuse('L7248')
   // "Starts the line" follows the page's reading direction: min x upright,
   // along the content Y axis when the paper is turned (min y for /Rotate 90,
   // max for 270), reversed x for 180.
@@ -7273,7 +7306,7 @@ function applyLineReplacement(
    * each pass strictly shrinks the run or stops.
    */
   const narrowLineAndRetry = (fontChangeOnly = false): ReturnType<typeof applyLineReplacement> => {
-    if (!contributing.every(b => b.hasPos)) return null
+    if (!contributing.every(b => b.hasPos)) return lineRefuse('L7282')
     const reading = [...contributing].sort(readCmp)
     // Consume a block's space-free text from newText at `pos` forward (or
     // `end` backward); null = the block's text is not there, i.e. the edit
@@ -7282,7 +7315,7 @@ function applyLineReplacement(
       let p = pos
       for (let k = 0; k < bf.length; k++) {
         while (p < newText.length && /\s/.test(newText[p])) p++
-        if (p >= newText.length || newText[p] !== bf[k]) return null
+        if (p >= newText.length || newText[p] !== bf[k]) return lineRefuse('L7291')
         p++
       }
       return p
@@ -7291,7 +7324,7 @@ function applyLineReplacement(
       let p = end
       for (let k = bf.length - 1; k >= 0; k--) {
         while (p > 0 && /\s/.test(newText[p - 1])) p--
-        if (p <= 0 || newText[p - 1] !== bf[k]) return null
+        if (p <= 0 || newText[p - 1] !== bf[k]) return lineRefuse('L7300')
         p--
       }
       return p
@@ -7307,7 +7340,7 @@ function applyLineReplacement(
       if (p === null) break
       end = p; tail--
     }
-    if (head === 0 && tail === reading.length) return null // nothing to drop
+    if (head === 0 && tail === reading.length) return lineRefuse('L7316') // nothing to drop
     if (fontChangeOnly) {
       // Proactive form: drop an untouched end only when it is set in a
       // DIFFERENT font from the block the change begins in. Word draws a
@@ -7323,10 +7356,10 @@ function applyLineReplacement(
       const tailDiffers = tail < reading.length && fontOf(reading[tail]) !== fontOf(reading[tail - 1])
       if (!headDiffers) { head = 0; pos = 0 }
       if (!tailDiffers) { tail = reading.length; end = newText.length }
-      if (head === 0 && tail === reading.length) return null
+      if (head === 0 && tail === reading.length) return lineRefuse('L7332')
     }
     const middleText = newText.slice(pos, end).trim()
-    if (!middleText) return null
+    if (!middleText) return lineRefuse('L7335')
     // The middle keeps its whitespace-only blocks: `reading` holds only the
     // contributing ones, and a retry on those alone left Word's per-space BTs
     // standing between the rewritten words at their old positions —
@@ -7355,7 +7388,7 @@ function applyLineReplacement(
     // being able to read the text.
     const runGlyphs = sorted.reduce((n, b) => n + estimateGlyphCount(b.content), 0)
     const targetLen = targetBlock.text.replace(/\s+/g, ' ').trim().length
-    if (targetLen > 0 && runGlyphs > targetLen * 2.5 + 16) return null
+    if (targetLen > 0 && runGlyphs > targetLen * 2.5 + 16) return lineRefuse('L7364')
 
     // Every non-primary block here gets BLANKED — so every one of them must
     // be part of the target. A fuzzy run happily picks up a stray glyph from
@@ -7385,8 +7418,12 @@ function applyLineReplacement(
       for (const b of contributing) {
         if (b === primary) continue
         const bf = foldForMatch(b.decodedText).replace(/\s+/g, '')
-        if (!bf || bf.includes('?')) continue
-        if (!inTarget(bf)) return null
+        // A decode of nothing but control or format characters is a glyph the
+        // font cannot NAME (a bullet from a symbol subset without a ToUnicode
+        // reads as U+0001), not a foreign word: "• www.bn.com.pe" on a
+        // utility bill was refused for its own bullet.
+        if (!bf || bf.includes('?') || !bf.replace(/[\p{C}]/gu, '')) continue
+        if (!inTarget(bf)) return lineRefuse('L7395 foreign=' + JSON.stringify(bf))
       }
       // The PRIMARY too, when the run has other members: it is REWRITTEN, so
       // glyphs of its own that the target never named are deleted just as
@@ -7396,7 +7433,7 @@ function applyLineReplacement(
       // primary IS the match the scorer accepted.
       if (contributing.length > 1) {
         const pf = foldForMatch(primary.decodedText).replace(/\s+/g, '')
-        if (pf && !pf.includes('?') && !inTarget(pf)) return null
+        if (pf && !pf.includes('?') && pf.replace(/[\p{C}]/gu, '') && !inTarget(pf)) return lineRefuse('L7405')
       }
     }
   }
