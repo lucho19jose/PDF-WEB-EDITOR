@@ -3687,7 +3687,14 @@ function transformLeavesPaper(
   let w = 0, h = 0
   try { const sz = getPageSize(pageIndex); w = sz.width; h = sz.height } catch (_) { return null }
   if (!(w > 0 && h > 0)) return null
-  const [x0, y0, x1, y1] = targetBlock.bbox
+  // The INK's extent, not the bbox's: extraction folds a trailing space into
+  // the block, and a space past the edge costs nothing.
+  let [x0, y0, x1, y1] = targetBlock.bbox
+  const vis = (targetBlock.chars || []).filter(ch => ch.c.trim().length > 0 && ch.quad)
+  if (vis.length) {
+    const xs = vis.flatMap(ch => [ch.quad[0], ch.quad[2], ch.quad[4], ch.quad[6]])
+    x0 = Math.min(...xs); x1 = Math.max(...xs)
+  }
   const ay = h - anchorY   // anchor in top-left space
   const nx0 = anchorX + (x0 - anchorX) * sx + dx, nx1 = anchorX + (x1 - anchorX) * sx + dx
   const ny0 = ay + (y0 - ay) * sy - dy, ny1 = ay + (y1 - ay) * sy - dy
