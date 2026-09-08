@@ -6596,16 +6596,26 @@ function replaceTextInContentStreamFontAware(
       // The row's ops must be one contiguous stretch of the block.
       if (ops.slice(first, last + 1).some(o => gapOf(o.y) > rowBar && o.decoded.trim().length > 0)) continue
       const ctm = getFullCtmAtOffset(stream, block.start)
-      const o0 = ops[first]
+      const rowOps = ops.slice(first, last + 1)
+      // Read ACROSS the page inside the member too: a pdf24 form draws a
+      // row's value before its label ("419600" then "付款代码 COD PAGO : "),
+      // and the stream-order join of a block no whole-block pass can see was
+      // the only reading anything compared against.
+      const byX = [...rowOps].sort((a, b) => a.x - b.x)
+      const o0 = byX[0]
       const pageX = o0.x * ctm[0] + o0.y * ctm[2] + ctm[4]
-      members.push({ block, first, last, ops, pageX, text: ops.slice(first, last + 1).map(o => o.decoded).join('') })
+      members.push({ block, first, last, ops, pageX, text: rowOps.map(o => o.decoded).join(''), readText: byX.map(o => o.decoded).join('') })
     }
     if ((globalThis as any).__debugCandidates) {
       for (const m of members) console.log(`[cross] member x=${m.pageX.toFixed(1)} ops ${m.first}..${m.last}/${m.ops.length} ${JSON.stringify(m.text.slice(0, 50))} block=${JSON.stringify(m.block.decodedText.slice(0, 30))}`)
     }
-    if (members.length >= 2) {
+    // One member suffices when its row ops are OUT of reading order and the
+    // block holds other rows: no whole-block or containment pass can read
+    // that row, and the partial path can write it (at its leftmost op).
+    const reordered = members.length === 1 && members[0].text.replace(/\s+/g, '') !== members[0].readText.replace(/\s+/g, '')
+    if (members.length >= 2 || reordered) {
       members.sort((a, b) => a.pageX - b.pageX)
-      const joined = foldForMatch(members.map(m => m.text).join('')).replace(/\s+/g, '')
+      const joined = foldForMatch(members.map(m => m.readText).join('')).replace(/\s+/g, '')
       if ((globalThis as any).__debugCandidates) console.log(`[cross] joined=${JSON.stringify(joined.slice(0, 80))} target=${JSON.stringify(tCompact.slice(0, 80))}`)
       if (joined === tCompact && members.some(m => m.first > 0 || m.last < m.ops.length - 1)) {
         candidates.push({
@@ -7951,7 +7961,13 @@ function detectBlockEncoding(block: string): 'hex' | 'plain' {
 }
 
 // String literal with one nesting level (PDF allows balanced unescaped parens)
-const STR_LIT_SRC = String.raw`\((?:\\.|[^()\\]|\((?:\\.|[^()\\])*\))*\)`
+// `\\[\s\S]`, not `\\.`: a backslash before a NEWLINE is a line continuation
+// inside a PDF string, and `.` does not match a newline. dompdf wraps every
+// long paragraph string that way — "(Declaro que he recibido … bajo m\\<LF>i
+// resguardo…)" — so those literals were never seen as strings at all: the
+// block decoded without them, and every paragraph line of the inventory form
+// reported "could not find matching text".
+const STR_LIT_SRC = String.raw`\((?:\\[\s\S]|[^()\\]|\((?:\\[\s\S]|[^()\\])*\))*\)`
 // Hex string; the spec allows interior whitespace
 const HEX_LIT_SRC = String.raw`<[0-9A-Fa-f\s]*>`
 
@@ -8120,15 +8136,21 @@ function decodeBtBlockText(
 /** `<< … >>` operands (BDC/DP property lists) replaced by spaces, length preserved. */
 function blankInlineDicts(content: string): string {
   if (!content.includes('<<')) return content
+  // Located on the literal-MASKED copy: a binary plain string can hold the
+  // bytes "<<" (a pdf24 form's subset-coded strings do), and scanning the raw
+  // content blanked from there to the next ">>" — real show ops gone, and
+  // the rest of the block decoded as a wall of one ideograph. The mask
+  // preserves length, so the ranges map back one to one.
+  const masked = maskStreamLiterals(content)
   let out = ''
   let i = 0
   while (i < content.length) {
-    if (content.startsWith('<<', i)) {
+    if (masked.startsWith('<<', i)) {
       let depth = 0
       let j = i
-      while (j < content.length) {
-        if (content.startsWith('<<', j)) { depth++; j += 2; continue }
-        if (content.startsWith('>>', j)) { depth--; j += 2; if (depth === 0) break; continue }
+      while (j < masked.length) {
+        if (masked.startsWith('<<', j)) { depth++; j += 2; continue }
+        if (masked.startsWith('>>', j)) { depth--; j += 2; if (depth === 0) break; continue }
         j++
       }
       if (depth !== 0) { out += content.slice(i); break }
@@ -9379,7 +9401,10 @@ interface CrossMember {
   last: number
   ops: ShowOpInfo[]
   pageX: number
+  /** The row ops' text in STREAM order — what the partial path's window scan will see. */
   text: string
+  /** The same ops read across the page, left to right. */
+  readText: string
 }
 
 /**
@@ -9732,8 +9757,19 @@ function applyPartialBlockReplacement(
   const planFor = (at: number, text: string) => planLinesFor(at, [text])
 
   let winI = best.i, winJ = best.j, winText = newText
-  let plan = planFor(winI, winText)
-  if (plan.kind === 'error' || plan.kind === 'subst') {
+  // The op the new text is written INTO is the leftmost of the window, not
+  // the first in the stream: a pdf24 form draws a row's value before its
+  // label, and writing the line at the value's op put the label's words in
+  // the value's column. When the window reads in order the two coincide.
+  const leftmostOf = (i: number, j: number): number => {
+    let k = i
+    const rowTol = Math.max(2, (targetBlock.fontSize || 8) * 0.6)
+    for (let m = i + 1; m <= j; m++) if (ops[m].x < ops[k].x - 0.5 && Math.abs(ops[m].y - ops[k].y) < rowTol) k = m
+    return k
+  }
+  const reorderedWindow = leftmostOf(winI, winJ) !== winI
+  let plan = planFor(reorderedWindow ? leftmostOf(winI, winJ) : winI, winText)
+  if (!reorderedWindow && (plan.kind === 'error' || plan.kind === 'subst')) {
     // The run as a whole is not encodable in any one face — or only in a
     // SUBSTITUTE one. Before accepting either, stop trying to re-encode the
     // ops the edit never touched — see narrowToChangedOps. A substitution is
@@ -9750,8 +9786,8 @@ function applyPartialBlockReplacement(
         winI = narrowed.i; winJ = narrowed.j; winText = narrowed.text; plan = retry
       }
     }
-    if (plan.kind === 'error') return { error: plan.error }
   }
+  if (plan.kind === 'error') return { error: plan.error }
 
   // A window that no longer fits its line is WRAPPED, the way the rebuild path
   // wraps a whole block: this path used to draw in place only, so appending a
@@ -9763,7 +9799,8 @@ function applyPartialBlockReplacement(
   // where the block's Tm carries no scale (Td operands live in that space).
   let wrapLines: string[] | null = null
   let wrapDx = 0, wrapLead = 0
-  if (pageWidth && winText.length > 0 && !/\n/.test(winText) && targetBlock.fontSize > 0) {
+  const writeIdx = reorderedWindow ? leftmostOf(winI, winJ) : winI
+  if (!reorderedWindow && pageWidth && winText.length > 0 && !/\n/.test(winText) && targetBlock.fontSize > 0) {
     const stIn0 = textStateAtOp(block, ops, winI, pageIndex)
     const next = ops[winJ + 1]
     const betweenNext = next ? maskStreamLiterals(block.content).slice(ops[winJ].end, next.start) : ''
@@ -9869,14 +9906,14 @@ function applyPartialBlockReplacement(
     if (!isFinite(delta) || Math.abs(delta) < 0.05) return ''
     return ` [${fmtNum(delta * 1000 / endSize)}] TJ`
   }
-  const kern = wrapLines ? '' : trailingKern()
+  const kern = wrapLines || reorderedWindow ? '' : trailingKern()
 
   let content = block.content
   let substitutedFont: string | undefined
   for (let k = winJ; k >= winI; k--) {
     const op = ops[k]
     let repl: string
-    if (k === winI) {
+    if (k === writeIdx) {
       if (plan.kind === 'keep-hex') {
         repl = buildShowOp(op.kind, `<${plan.hexLines[0]}>`, op.raw) + wrapExtra
       } else if (plan.kind === 'keep-plain') {
@@ -9900,11 +9937,11 @@ function applyPartialBlockReplacement(
         const tfMatch = block.content.match(/\/([^\s<>[\]()/%]+)\s+([\d.]+)\s+Tf/)
         const inheritedSize = block.inheritedTf?.match(/([\d.]+)\s+Tf\s*$/)?.[1]
         const fallbackSize = tfMatch ? tfMatch[2] : (inheritedSize ?? '12')
-        const stateIn = textStateAtOp(block, ops, winI, pageIndex)
-        const stateOut = winJ === winI ? stateIn : textStateAtOp(block, ops, winJ, pageIndex)
+        const stateIn = textStateAtOp(block, ops, writeIdx, pageIndex)
+        const stateOut = writeIdx === winJ ? stateIn : textStateAtOp(block, ops, reorderedWindow ? writeIdx : winJ, pageIndex)
         const drawSize = stateIn?.tfSize ? fmtNum(stateIn.tfSize) : fallbackSize
         const endSize = stateOut?.tfSize ? fmtNum(stateOut.tfSize) : fallbackSize
-        const endFont = ops[winJ].fontRef
+        const endFont = ops[reorderedWindow ? writeIdx : winJ].fontRef
         const restore = endFont
           ? ` /${endFont} ${endSize} Tf`
           : block.inheritedTf
@@ -9935,7 +9972,7 @@ function applyPartialBlockReplacement(
   // with the block's text as it now reads: the replaced run's new text plus
   // every untouched op's own.
   const spanText = ops.map((o, k) =>
-    k === winI ? winText : (k > winI && k <= winJ ? '' : o.decoded)).join('')
+    k === writeIdx ? winText : (k >= winI && k <= winJ ? '' : o.decoded)).join('')
   const tag = retagSpanActualText(stream, block.start, spanText.trim(), block.end)
 
   return {

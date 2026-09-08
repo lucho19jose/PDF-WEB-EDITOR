@@ -4687,6 +4687,32 @@ read their text from the tag with NO prior ActualText — 28 edits across three
 corpora lost their words the moment the retag was withheld. The phantom stays
 a known limitation.
 
+### A string literal may wrap with a backslash-NEWLINE, and a row may be drawn value-first
+Round 8 (the 50 Downloads PDFs never swept, mostly dompdf and pdf24 forms):
+
+- **`STR_LIT_SRC` matched `\.`, and `.` does not match a newline.** A backslash
+  before an end-of-line is a line continuation inside a PDF string, and dompdf
+  wraps every long paragraph string that way — "(Declaro que he recibido …
+  bajo m\<LF>i resguardo…)". Those literals were never seen as strings: the
+  block decoded without them and every paragraph line of the inventory form
+  reported "could not find matching text". `\[\s\S]` now.
+- **`blankInlineDicts` must look at the literal-MASKED copy.** A pdf24 form's
+  subset-coded plain strings hold the bytes `<<`; scanning the raw content
+  blanked from there to the next `>>` — real show ops gone and the rest of
+  the block decoded as a wall of one ideograph. (My own defect from two
+  rounds earlier, caught by the new corpus.)
+- **A row drawn value-first is read across the page.** pdf24 draws "419600"
+  before "付款代码 COD PAGO : " inside one BT, so no in-order reading of the
+  block held the target. Step 2c now reads a member's row ops by x as well,
+  admits a SINGLE member when its ops are out of reading order, and the
+  partial path writes the new text into the LEFTMOST op of the window
+  (`leftmostOf`, same-row within 0.6 em) — written at the first op in stream
+  order the label's words landed in the value's column.
+
+`tools/pdf-sweep/stage-round.mjs <folder> <round>` stages everything not yet
+in any manifest without touching the main corpus. Round 8: realistic 771 ops
+724 → 730, marker 317 ops 275 → 281, rounds 2–7 identical.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
