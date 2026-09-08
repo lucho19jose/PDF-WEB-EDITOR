@@ -4876,8 +4876,17 @@ reporting success:
   start, and the closing Td takes back their growth too: "[(Empresa …
   Huallaga)]TJ 13.056 0 Td ( )Tj 0.185 0 Td [(S.A.)]TJ" put "S.A." at its old
   offset inside the wider "Huallaga" ("Hu Sa.Alla .ga"). A Tm inside the run
-  refuses the bracket (it would reset the line matrix). Tc/Tw in force
-  scale with the glyphs and the run's own last values are restored after it.
+  is scaled the way the block's own Tm is — matrix by the scale,
+  translation about the anchor — and the offsets after it scale on their own
+  (they are multiplied by that matrix); the closing restores the last inner
+  Tm as it was plus the offsets that followed. A Tf inside scales too and
+  the face it leaves in force is restored at its original size. Microsoft
+  Print to PDF draws a date as "0" + `… Tm` + "7/01/2026"; refusing the Tm
+  let the segment path take the same date one row UP (a flat 6pt row bar
+  admitted a baseline 5.4pt outside an 8.5pt box in a 12pt-pitch table —
+  `findTargetSegment`'s bar is a third of the box's height now, 2..6pt).
+  Tc/Tw in force scale with the glyphs and the run's own last values are
+  restored after it.
 - **Fragments are refused for a move or restyle.** `readsAs` and
   `fuzzyTextMatch` both admit a block whose text is a SUBSTRING of the
   target; an Adobe letter draws "… del Banco Interbank para …" as the tail of
@@ -4912,6 +4921,18 @@ refuses with a message naming the head. Splitting the array's tail off and
 editing both pieces is not implemented. (The realistic sweep counts a refusal
 as `char_delta` 28 there — its expectation assumes the edit — while the page
 is untouched.)
+
+### A move or resize that would leave the PAPER is refused
+Text drawn past the page's edge is neither visible, printable nor findable —
+it is lost, while the operation reports success. The realistic sweep's
+largest damage cluster was exactly this: 164 resizes of full-width lines at
+1.25x, and the moves that pushed a line's last glyphs off the right edge.
+`transformLeavesPaper` projects the block's bbox through the requested
+transform (in the bbox's top-left space, the anchor converted from the
+bottom-left one the caller states) and `transformTextBlock`/
+`transformTextBlocks` refuse with a message naming the edge. The margin is
+deliberately not the bar — a heading may run into it on purpose — the paper
+is; one point of slack for rounding.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates

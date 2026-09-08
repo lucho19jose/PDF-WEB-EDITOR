@@ -3671,6 +3671,34 @@ function replaceTextInStream(
  * sx, sy: scale factors (1.0 = no change)
  * anchorX, anchorY: anchor point in PDF Tm coords (used for scaling)
  */
+/**
+ * Would the transform carry the block past the PAPER's edge? Text drawn
+ * there is neither visible, printable nor findable — it is lost, while the
+ * operation reports success. The realistic sweep's largest damage cluster
+ * (164 resizes of full-width lines, and the moves that clipped a line's last
+ * glyphs) was exactly this. The margin is not the bar — a heading may run
+ * into it on purpose — the paper is. In the top-left space the bbox uses,
+ * with the anchor converted from the bottom-left one the caller states.
+ */
+function transformLeavesPaper(
+  pageIndex: number, targetBlock: TextBlock,
+  dx: number, dy: number, sx: number, sy: number, anchorX: number, anchorY: number
+): string | null {
+  let w = 0, h = 0
+  try { const sz = getPageSize(pageIndex); w = sz.width; h = sz.height } catch (_) { return null }
+  if (!(w > 0 && h > 0)) return null
+  const [x0, y0, x1, y1] = targetBlock.bbox
+  const ay = h - anchorY   // anchor in top-left space
+  const nx0 = anchorX + (x0 - anchorX) * sx + dx, nx1 = anchorX + (x1 - anchorX) * sx + dx
+  const ny0 = ay + (y0 - ay) * sy - dy, ny1 = ay + (y1 - ay) * sy - dy
+  const slack = 1
+  if (Math.max(nx0, nx1) > w + slack) return 'right'
+  if (Math.min(nx0, nx1) < -slack) return 'left'
+  if (Math.max(ny0, ny1) > h + slack) return 'bottom'
+  if (Math.min(ny0, ny1) < -slack) return 'top'
+  return null
+}
+
 function transformTextBlock(
   pageIndex: number,
   blockId: string,
@@ -3688,6 +3716,10 @@ function transformTextBlock(
     const targetBlock = pageData.blocks.find(b => b.id === blockId)
     if (!targetBlock) {
       return { success: false, error: `Block ${blockId} not found` }
+    }
+    const edge = transformLeavesPaper(pageIndex, targetBlock, dx, dy, sx, sy, anchorX, anchorY)
+    if (edge) {
+      return { success: false, error: `The text would run past the ${edge} edge of the page${sx !== 1 || sy !== 1 ? ' at this size' : ''} — it would be cut off there` }
     }
 
     // Text may live in the page stream or in a Form XObject it invokes —
@@ -3753,6 +3785,11 @@ function transformTextBlocks(
     const targetBlock = pageData.blocks.find(b => b.id === op.blockId)
     if (!targetBlock) {
       results.push({ blockId: op.blockId, success: false, error: `Block ${op.blockId} not found` })
+      continue
+    }
+    const edge = transformLeavesPaper(pageIndex, targetBlock, op.dx, op.dy, op.sx, op.sy, op.anchorX, op.anchorY)
+    if (edge) {
+      results.push({ blockId: op.blockId, success: false, error: `The text would run past the ${edge} edge of the page${op.sx !== 1 || op.sy !== 1 ? ' at this size' : ''} — it would be cut off there` })
       continue
     }
 
@@ -3950,8 +3987,8 @@ function transformInSource(
             // A Tf inside the run would be restored wrong; leave such runs alone.
             // So would a Tm: it resets the line matrix, so neither the bracket's
             // Td nor the scaled offsets below would reach what follows it.
-            const tfInside = /\s[\d.]+\s+Tf(?![A-Za-z0-9])/.test(maskedC.slice(r.start, r.end)) ||
-              /(?:-?[\d.]+\s+){6}Tm(?![A-Za-z0-9])/.test(maskedC.slice(r.start, r.end))
+            // A Tf or a Tm INSIDE the run is scaled with it (below).
+            const tfInside = false
             if ((globalThis as any).__debugCandidates) {
               console.log(`[scale] run=${r.start}..${r.end} first=${first} last=${lastIdx} follower=${followerResets} state=${state ? state.tfSize : null} font=${fontName} tfInside=${tfInside} ops=${ops.length}`)
             }
@@ -4062,14 +4099,55 @@ function transformInSource(
         // and needs no change (the line matrix is what it was before).
         let inner = block.content.slice(scaleRun.start, scaleRun.end)
         const maskedInner = maskStreamLiterals(inner)
-        const tdRe = /(-?[\d.]+)\s+(-?[\d.]+)\s+(Td|TD)(?![A-Za-z0-9])/g
         const edits: { at: number; len: number; text: string }[] = []
         let tm: RegExpExecArray | null
+        // An absolute Tm INSIDE the run (Microsoft Print to PDF draws a date as
+        // "0" + `… Tm` + "7/01/2026") is scaled the way the block's own Tm
+        // is: the matrix by the scale, its translation about the anchor. The
+        // Td/TD offsets AFTER it are multiplied by that matrix and so scale on
+        // their own; only the offsets BEFORE the first inner Tm are scaled
+        // here. After the run the line matrix is put back to the last inner
+        // Tm as it WAS, plus the offsets that followed it, so what comes next
+        // lands where it did.
+        const tmRe = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm(?![A-Za-z0-9])/g
+        let firstTmAt = -1
+        let lastTm: string | null = null, lastTmEnd = -1
+        while ((tm = tmRe.exec(maskedInner)) !== null) {
+          if (firstTmAt < 0) firstTmAt = tm.index
+          const a = parseFloat(tm[1]), b = parseFloat(tm[2]), c = parseFloat(tm[3]), d = parseFloat(tm[4])
+          const e = parseFloat(tm[5]), f = parseFloat(tm[6])
+          const ne = anchorXL + (e - anchorXL) * sx + dxL
+          const nf = anchorYL + (f - anchorYL) * sy + dyL
+          edits.push({ at: tm.index, len: tm[0].length, text: `${fmtNum(a * sx)} ${fmtNum(b * sy)} ${fmtNum(c * sx)} ${fmtNum(d * sy)} ${fmtNum(ne)} ${fmtNum(nf)} Tm` })
+          lastTm = inner.slice(tm.index, tm.index + tm[0].length)
+          lastTmEnd = tm.index + tm[0].length
+        }
+        const tdRe = /(-?[\d.]+)\s+(-?[\d.]+)\s+(Td|TD)(?![A-Za-z0-9])/g
         let sumDx = 0, sumDy = 0
+        let afterDx = 0, afterDy = 0
         while ((tm = tdRe.exec(maskedInner)) !== null) {
           const ox = parseFloat(tm[1]), oy = parseFloat(tm[2])
+          if (firstTmAt >= 0 && tm.index > firstTmAt) {
+            if (tm.index > lastTmEnd) { afterDx += ox; afterDy += oy }
+            continue
+          }
           sumDx += ox; sumDy += oy
           edits.push({ at: tm.index, len: tm[0].length, text: `${fmtNum(ox * sx)} ${fmtNum(oy * sy)} ${tm[3]}` })
+        }
+        // A Tf inside the run (the same face set again, or another) scales
+        // with it, and the font it leaves in force is what the closing Tf
+        // restores — at its own original size. Matched on the masked copy (a
+        // Tf inside a string is not one); the name is blanked there, so it is
+        // read back from the raw text at the same offset.
+        const tfRe = /\/\s+([\d.]+)\s+Tf(?![A-Za-z0-9])/g
+        let endFont = scaleRun.fontName, endSize = scaleRun.size
+        while ((tm = tfRe.exec(maskedInner)) !== null) {
+          const raw = inner.slice(tm.index, tm.index + tm[0].length)
+          const rm = raw.match(/^\/([^\s<>\[\]()/%]+)\s+([\d.]+)\s+Tf/)
+          if (!rm) continue
+          const name = rm[1], size = parseFloat(rm[2])
+          endFont = name; endSize = size
+          edits.push({ at: tm.index, len: tm[0].length, text: `/${name} ${fmtNum(size * sx)} Tf` })
         }
         // Spacing set INSIDE the run scales too (it is in unscaled units).
         const spRe = /(-?[\d.]+)\s+(Tc|Tw)(?![A-Za-z0-9])/g
@@ -4091,11 +4169,14 @@ function transformInSource(
         // lands exactly where it did.
         const backX = -(scaleRun.tdx + sumDx * (sx - 1))
         const backY = -(scaleRun.tdy + sumDy * (sy - 1))
+        const closing = lastTm
+          ? ` ${lastTm} ${fmtNum(afterDx)} ${fmtNum(afterDy)} Td `
+          : ` ${fmtNum(backX)} ${fmtNum(backY)} Td `
         newContent =
           block.content.slice(0, scaleRun.start) +
           ` ${fmtNum(scaleRun.tdx)} ${fmtNum(scaleRun.tdy)} Td /${scaleRun.fontName} ${fmtNum(scaleRun.size * sx)} Tf${spacingIn} ` +
           inner +
-          ` /${scaleRun.fontName} ${fmtNum(scaleRun.size)} Tf${spacingOut} ${fmtNum(backX)} ${fmtNum(backY)} Td ` +
+          ` /${endFont} ${fmtNum(endSize)} Tf${spacingOut}${closing}` +
           block.content.slice(scaleRun.end)
         usedStrategy ??= 'td_bracket_scale_run'
       } else if (scaleSeg) {
@@ -9533,7 +9614,13 @@ function findTargetSegment(
     if (local) {
       const oc = local.across(op.x, op.y)
       const yGap = oc < local.cLo ? local.cLo - oc : (oc > local.cHi ? oc - local.cHi : 0)
-      if (yGap * (local.unitScale || 1) > 6) continue
+      // A flat 6pt let the row ABOVE through: an invoice repeats "07/01/2026"
+      // in two rows 12pt apart with 8.5pt boxes, so the upper copy's baseline
+      // sat 5.4pt outside the clicked box and was taken — resized and lifted
+      // 3pt, in the wrong row. The bar follows the box: a third of its height,
+      // never under 2pt nor over the old 6.
+      const bar = Math.min(6, Math.max(2, (targetBlock.height || 0) * 0.35))
+      if (yGap * (local.unitScale || 1) > bar) continue
     }
 
     const fr = op.fontRef && op.fontRef !== block.fontRef
