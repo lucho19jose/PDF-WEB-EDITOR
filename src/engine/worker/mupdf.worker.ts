@@ -3960,8 +3960,14 @@ function transformInSource(
         if (!scaleRun && Math.abs(sx - sy) < 0.02) {
           const sh = findTargetSegment(block, targetBlock, pageIndex, stream, pageHeight)
           if (sh && sh.fontName && Number.isFinite(sh.runAdvance)) {
-            const ox = sh.penX + sh.runOffset * sh.tfSize / 1000
-            const oy = sh.opY
+            // The run's origin is the op's origin plus the pen's advance ALONG
+            // the line — the block's reading direction, which a quarter-turn
+            // Tm puts along local y (measured: a rotated form's cell resized
+            // in place moved 16pt sideways when the advance was added to x).
+            const adv = (sh.penX - sh.op.x) + sh.runOffset * sh.tfSize / 1000
+            const dir = local?.dir ?? [1, 0]
+            const ox = sh.op.x + dir[0] * adv
+            const oy = sh.op.y + dir[1] * adv
             const dUx = (ox - anchorXL) * (sx - 1) + dxL
             const dUy = (oy - anchorYL) * (sy - 1) + dyL
             let tdx = dUx, tdy = dUy
@@ -4913,7 +4919,7 @@ function findTargetRun(
    * other row of underscores — so once the first had been split out of the
    * array the other two both matched IT and were moved on top of it.
    */
-  local?: { x: number; xEnd: number; yLo?: number; yHi?: number; unitScale?: number } | null
+  local?: LocalFrame | null
 ): { start: number; end: number; startsLine: boolean } | null {
   const targetNorm = targetText.replace(/\s+/g, ' ').trim()
   if (!targetNorm) return null
@@ -4983,9 +4989,10 @@ function findTargetRun(
         else width += w
       }
       if (known) {
-        const lo = Math.min(local.x, local.xEnd) - 2
-        const hi = Math.max(local.x, local.xEnd) + 2
-        if (!(state.penX < hi && lo < state.penX + width)) return null
+        const lo = local.aLo - 2
+        const hi = local.aHi + 2
+        const penA = local.along(ops[best.i].x, ops[best.i].y) + (state.penX - ops[best.i].x)
+        if (!(penA < hi && lo < penA + width)) return null
       }
     }
   }
@@ -8798,12 +8805,36 @@ function replaceInsideTjArray(
  * anything once the page-space bbox has been pushed back through the CTM the
  * block draws under.
  */
+/**
+ * The clicked box in a block's own space, plus the block's READING direction.
+ *
+ * Every test that asks "does this run sit on the click" reasons along two
+ * axes: ALONG the line (where the pen advances, where an array may start well
+ * before the cell it draws) and ACROSS it (another baseline is another line).
+ * Those are the local x and y only while the block's Tm is upright. A pdf24
+ * fund-request form draws each invoice row under `0 1 -1 0 e f Tm` — a
+ * quarter turn — so its pen advances along local Y; judged on x, an array
+ * that started 65pt BEFORE its "F015-…" cell along the line read as 65pt off
+ * it ACROSS lines, and every cell of every row refused. `along`/`across`
+ * project a point onto the text axes; for an upright Tm they are x and y
+ * exactly, so nothing changes where the old arithmetic was right.
+ */
+interface LocalFrame {
+  x: number; y: number; xEnd: number; yLo: number; yHi: number; unitScale: number
+  /** Unit vector of the text x-axis in the block's local space. */
+  dir: [number, number]
+  /** The clicked box projected onto the text axes: along the line, across it. */
+  aLo: number; aHi: number; cLo: number; cHi: number
+  along: (x: number, y: number) => number
+  across: (x: number, y: number) => number
+}
+
 function blockLocalPoint(
   stream: string,
   block: BtInfo,
   targetBlock: TextBlock,
   pageHeight?: number
-): { x: number; y: number; xEnd: number; yLo: number; yHi: number; unitScale: number } | null {
+): LocalFrame | null {
   if (pageHeight === undefined) return null
   const ctm = getFullCtmAtOffset(stream, block.start)
   const det = ctm[0] * ctm[3] - ctm[1] * ctm[2]
@@ -8832,13 +8863,28 @@ function blockLocalPoint(
     }
   }
   const xLo = Math.min(...xs), xHi = Math.max(...xs)
+  // The text x-axis in local space is the Tm's (a, b); no Tm, or an upright
+  // one, is exactly (1, 0) so the projections ARE x and y.
+  let dir: [number, number] = [1, 0]
+  const tm = maskStreamLiterals(block.content).match(/(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm(?![A-Za-z0-9])/)
+  if (tm) {
+    const a = parseFloat(tm[1]), b = parseFloat(tm[2])
+    const len = Math.hypot(a, b)
+    if (len > 1e-9 && !(Math.abs(b) < 1e-6 && a > 0)) dir = [a / len, b / len]
+  }
+  const along = dir[0] === 1 && dir[1] === 0 ? (x: number, _y: number) => x : (x: number, y: number) => x * dir[0] + y * dir[1]
+  const across = dir[0] === 1 && dir[1] === 0 ? (_x: number, y: number) => y : (x: number, y: number) => -x * dir[1] + y * dir[0]
+  const as = xs.map((x, i) => along(x, ys[i])), cs = xs.map((x, i) => across(x, ys[i]))
   return {
     x: xLo, y: (Math.min(...ys) + Math.max(...ys)) / 2, xEnd: xHi,
     yLo: Math.min(...ys), yHi: Math.max(...ys),
     // One local unit in PAGE points — multiply a local-frame distance by this
     // before comparing it against page-frame ones (a 0.12-scaled stream's
     // local distances are 8x the page's).
-    unitScale: Math.sqrt(Math.abs(det))
+    unitScale: Math.sqrt(Math.abs(det)),
+    dir,
+    aLo: Math.min(...as), aHi: Math.max(...as), cLo: Math.min(...cs), cHi: Math.max(...cs),
+    along, across
   }
 }
 
@@ -8873,8 +8919,9 @@ function opRunDistanceToTarget(
     const of = op.decoded.replace(/\s+/g, '')
     if (!of) continue
     if (!(of.includes(tFree) || (of.length >= 3 && tFree.includes(of)))) continue
-    const dx = op.x < local.x ? local.x - op.x : (op.x > local.xEnd ? op.x - local.xEnd : 0)
-    const dy = op.y < local.yLo ? local.yLo - op.y : (op.y > local.yHi ? op.y - local.yHi : 0)
+    const oa = local.along(op.x, op.y), oc = local.across(op.x, op.y)
+    const dx = oa < local.aLo ? local.aLo - oa : (oa > local.aHi ? oa - local.aHi : 0)
+    const dy = oc < local.cLo ? local.cLo - oc : (oc > local.cHi ? oc - local.cHi : 0)
     const d = Math.hypot(dx, dy) * local.unitScale
     if (best === null || d < best) best = d
   }
@@ -9038,7 +9085,7 @@ function runGapToTarget(
   from: number,
   to: number,
   pageIndex: number,
-  local: { x: number; xEnd: number; yLo: number; yHi: number }
+  local: LocalFrame
 ): number | null {
   const state = textStateAtOp(block, ops, from, pageIndex)
   if (!state) return null
@@ -9052,11 +9099,14 @@ function runGapToTarget(
     if (w === null) return null
     width += w
   }
-  const lo = Math.min(local.x, local.xEnd), hi = Math.max(local.x, local.xEnd)
-  const x0 = state.penX, x1 = state.penX + width
+  const lo = local.aLo, hi = local.aHi
+  // The pen advances ALONG the line from the op's origin (penX − op.x is the
+  // advance textStateAtOp accumulated before this op).
+  const penA = local.along(ops[from].x, ops[from].y) + (state.penX - ops[from].x)
+  const x0 = penA, x1 = penA + width
   const xGap = x1 < lo ? lo - x1 : (x0 > hi ? x0 - hi : 0)
-  const y = ops[from].y
-  const yGap = y < local.yLo ? local.yLo - y : (y > local.yHi ? y - local.yHi : 0)
+  const c = local.across(ops[from].x, ops[from].y)
+  const yGap = c < local.cLo ? local.cLo - c : (c > local.cHi ? c - local.cHi : 0)
   return xGap + yGap * 3
 }
 
@@ -9092,9 +9142,9 @@ function runDistanceToTarget(
   const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
     (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
 
-  const lo = Math.min(local.x, local.xEnd)
-  const hi = Math.max(local.x, local.xEnd)
-  /** Gap between a run's x span and the clicked one — zero when they overlap. */
+  const lo = local.aLo
+  const hi = local.aHi
+  /** Gap between a run's span along the line and the clicked one — zero when they overlap. */
   const gap = (x0: number, x1: number) => x1 < lo ? lo - x1 : (x0 > hi ? x0 - hi : 0)
   /**
    * How far the baseline falls OUTSIDE the clicked box, weighted.
@@ -9106,7 +9156,7 @@ function runDistanceToTarget(
    * two rows of a form are twelve points apart vertically and hundreds
    * horizontally.
    */
-  const yGap = (y: number) => (y < local.yLo ? local.yLo - y : (y > local.yHi ? y - local.yHi : 0)) * 3
+  const yGap = (c: number) => (c < local.cLo ? local.cLo - c : (c > local.cHi ? c - local.cHi : 0)) * 3
 
   let best: number | null = null
   const keep = (d: number) => { if (best === null || d < best) best = d }
@@ -9114,9 +9164,11 @@ function runDistanceToTarget(
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i]
     if (!op.decoded.includes(targetNorm)) continue
-    const dy = yGap(op.y)
+    const dy = yGap(local.across(op.x, op.y))
     const state = textStateAtOp(block, ops, i, pageIndex)
     if (!state) { keep(dy); continue }   // position known only to the line
+    /** Where the op's pen starts, along the line. */
+    const penA = local.along(op.x, op.y) + (state.penX - op.x)
 
     const fr = op.fontRef && op.fontRef !== block.fontRef
       ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
@@ -9152,8 +9204,8 @@ function runDistanceToTarget(
       if (usable) {
         let p = full.indexOf(targetNorm)
         while (p !== -1) {
-          const x0 = state.penX + xAt[p] * state.tfSize / 1000
-          const x1 = state.penX + (xAt[p + targetNorm.length - 1] ?? xAt[p]) * state.tfSize / 1000
+          const x0 = penA + xAt[p] * state.tfSize / 1000
+          const x1 = penA + (xAt[p + targetNorm.length - 1] ?? xAt[p]) * state.tfSize / 1000
           keep(gap(x0, x1) + dy)
           p = full.indexOf(targetNorm, p + 1)
         }
@@ -9162,7 +9214,7 @@ function runDistanceToTarget(
     }
 
     const w = showOpAdvance(op, fr.encoding, fr.simpleInfo ?? null, state.tfSize, 0, 0)
-    keep(gap(state.penX, state.penX + (w ?? 0)) + dy)
+    keep(gap(penA, penA + (w ?? 0)) + dy)
   }
   // In PAGE points, like every other distance the candidates are ranked by:
   // the gaps above are in the block's own space, which a `0.75 0 0 0.75 cm`
@@ -9235,7 +9287,8 @@ function findTargetSegment(
     // tracked in the block's own space by `scanShowOps`, the same space
     // `blockLocalPoint` reports the target's span in.
     if (local) {
-      const yGap = op.y < local.yLo ? local.yLo - op.y : (op.y > local.yHi ? op.y - local.yHi : 0)
+      const oc = local.across(op.x, op.y)
+      const yGap = oc < local.cLo ? local.cLo - oc : (oc > local.cHi ? oc - local.cHi : 0)
       if (yGap * (local.unitScale || 1) > 6) continue
     }
 
@@ -9311,7 +9364,8 @@ function findTargetSegment(
     let chosen = aligned[0]
     let err = 0
     if (local) {
-      const clickedRel = (local.x - state.penX) * 1000 / state.tfSize
+      const penA = local.along(op.x, op.y) + (state.penX - op.x)
+      const clickedRel = (local.aLo - penA) * 1000 / state.tfSize
       let bestD = Infinity
       for (const o of aligned) {
         const d = Math.abs(clickedRel - xAt[o])
@@ -9894,13 +9948,21 @@ function applyPartialBlockReplacement(
      */
     const arrayTooFar = (o: ShowOpInfo): boolean => {
       if (!targetLocal) return false
-      const hi = Math.max(targetLocal.x, targetLocal.xEnd)
-      const xGap = o.x > hi ? o.x - hi : 0
-      const yGap = o.y < targetLocal.yLo ? targetLocal.yLo - o.y
-        : (o.y > targetLocal.yHi ? o.y - targetLocal.yHi : 0)
+      // Along the line and across it — the block's text axes, not local x/y
+      // (see LocalFrame): under a quarter-turn Tm the pen advances along y.
+      const oa = targetLocal.along(o.x, o.y), oc = targetLocal.across(o.x, o.y)
+      const xGap = oa > targetLocal.aHi ? oa - targetLocal.aHi : 0
+      const yGap = oc < targetLocal.cLo ? targetLocal.cLo - oc
+        : (oc > targetLocal.cHi ? oc - targetLocal.cHi : 0)
       return xGap + yGap * 3 > Math.max(24, (targetBlock.height || 0) * 3)
     }
 
+    if ((globalThis as any).__debugCandidates) {
+      for (const o of ops) {
+        if (o.kind !== 'TJ' || !o.decoded.replace(/\s+/g, '').includes(targetNorm.replace(/\s+/g, ''))) continue
+        console.log(`[array] op@${o.start} x=${o.x.toFixed(1)} y=${o.y.toFixed(1)} tooFar=${arrayTooFar(o)} local=${targetLocal ? `${targetLocal.x.toFixed(1)}..${targetLocal.xEnd.toFixed(1)} y${targetLocal.yLo.toFixed(1)}..${targetLocal.yHi.toFixed(1)}` : null} "${o.decoded.slice(0, 40)}"`)
+      }
+    }
     // Candidate arrays containing the target, nearest clicked position first
     const candidates = ops
       // Space-FREE on both sides: the gap between two cells is a KERN, so the
@@ -9912,8 +9974,9 @@ function applyPartialBlockReplacement(
         !arrayTooFar(o))
       .sort((a, b) => {
         if (!targetLocal) return 0
-        const da = Math.abs(a.x - targetLocal.x) + Math.abs(a.y - targetLocal.y) * 4
-        const db = Math.abs(b.x - targetLocal.x) + Math.abs(b.y - targetLocal.y) * 4
+        const cMid = (targetLocal.cLo + targetLocal.cHi) / 2
+        const da = Math.abs(targetLocal.along(a.x, a.y) - targetLocal.aLo) + Math.abs(targetLocal.across(a.x, a.y) - cMid) * 4
+        const db = Math.abs(targetLocal.along(b.x, b.y) - targetLocal.aLo) + Math.abs(targetLocal.across(b.x, b.y) - cMid) * 4
         return da - db
       })
 

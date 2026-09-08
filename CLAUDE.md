@@ -4812,6 +4812,30 @@ Measured across the seven text corpora: realistic sweep +75 gained, 1 lost
 experiment-identical to before this batch (3046/2811); ocr4 OCR sweep
 0.922 → 0.936 average re-read similarity with the OCR code untouched.
 
+### "On the click" is judged ALONG the line and ACROSS it — the block's axes, not local x/y
+Every run-position test (`runDistanceToTarget`, `runGapToTarget`,
+`opRunDistanceToTarget`, `findTargetSegment`'s row and occurrence choice,
+`findTargetRun`'s overlap check, the partial path's `arrayTooFar`) reasoned in
+local x and y: the pen advances along x, another baseline is a step in y, and
+an array may START well before the cell it draws — but only to the left of
+it. That is true only while the block's Tm is upright. pdf24's fund-request
+form draws each invoice row under `0 1 -1 0 e f Tm`, a quarter turn, so the
+pen advances along local Y: the array holding "F015-00344345" started 65pt
+before the cell ALONG the line and was measured as 65pt off it ACROSS lines,
+`arrayTooFar` refused it, and every cell of every row on that page reported
+"could not find matching text" — while the same rows' edits on the upright
+page 1 worked. `LocalFrame` (what `blockLocalPoint` returns) now carries the
+block's reading direction from its Tm (`dir`), the clicked box projected onto
+it (`aLo..aHi` along, `cLo..cHi` across) and the two projections; an op's pen
+position along the line is its origin projected plus the advance
+`textStateAtOp` accumulated. For an upright Tm the projections are x and y
+exactly, so nothing changes where the old arithmetic was right. The segment
+scale's origin follows the same direction (an in-place resize on that page
+moved 16pt sideways with the advance added to x).
+
+Measured on the form: the cell edits, moves by exactly the delta asked and
+resizes anchored at its own corner.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
