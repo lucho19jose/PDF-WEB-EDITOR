@@ -4630,6 +4630,18 @@ grouped wrongly. Under a scaled Tm (`12 0 0 12 x y Tm`, `1 Tf`) a `0 -1.2 Td`
 is a line, not a point. Sweeps: experiment-identical except the Qt/Excel
 files, where cross-block and single-block edits became clean line groups.
 
+### A colour change on a block that holds MORE than its target stays on the run; a resize of such a block is refused
+`restyleInSource` took the whole-block path for any block under the 1.4x glyph
+slack, so an itextsharp table header drawing "Num. Activo" and the cells beside
+it in one BT recoloured the row (the sweep's collateral count found 22 such).
+Provable containment (`provablyHoldsMore`, the same test the replace path
+delegates on) now sends it to the run-scoped rewrite however small the excess.
+A SCALE has only whole-block strategies (the run and segment paths translate),
+so `transformInSource` refuses to resize a block that provably holds other text
+rather than scale the neighbours with it — four sweep "successes" that had
+touched two blocks each became honest refusals, and a utility bill's row
+("Código de Cliente : 232900 - 2  R.U.C.: …") stopped running off the page.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

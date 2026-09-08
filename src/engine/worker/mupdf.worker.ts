@@ -3878,6 +3878,13 @@ function transformInSource(
         : !(holdsOtherText && !!governingRaw && !tmExclusive)
       /** The target must be moved on its own — the block's other text stays. */
       const mustIsolate = holdsMoreThanTarget || (holdsOtherText && !tmRewritable)
+      // A SCALE has only whole-block strategies (the run and segment paths are
+      // pure translations), so a block that draws other text cannot be
+      // resized without resizing that text too: a utility bill's row BT
+      // ("Código de Cliente : 232900 - 2  R.U.C.: …") was scaled whole, three
+      // cells grew and the row ran off the page. Refuse instead — the loud
+      // "could not find" beats a silent resize of the neighbours.
+      if (!pureTranslate && (holdsMoreThanTarget || (targetBlock && provablyHoldsMore(block, targetBlock)))) continue
 
       /**
        * Last chance before refusing: the target may not be a show OP at all,
@@ -4223,6 +4230,20 @@ function dropBaselineInBlock(inner: string, stream: string, blockStart: number, 
   return inner.slice(0, hit.index) + rewritten + inner.slice(hit.index + hit[0].length)
 }
 
+/**
+ * The block's decode contains the target and something visible besides —
+ * however small the excess. An itextsharp table header draws "Num. Activo"
+ * and the cells beside it in one BT under the 1.4x glyph slack, so a colour
+ * change on the one header recoloured the row (the sweep's collateral count
+ * caught 22 such). Same test `applyBlockReplacement` uses to delegate.
+ */
+function provablyHoldsMore(block: BtInfo, targetBlock: TextBlock): boolean {
+  const dFree = block.decodedText.replace(/\s+/g, '')
+  const tFree = targetBlock.text.replace(/\s+/g, '')
+  return !!tFree && dFree !== tFree && !dFree.includes('?') &&
+    dFree.includes(tFree) && dFree.replace(tFree, '').length > 0
+}
+
 /** Fill-colour operators, with the colour space a `sc`/`scn` reads against. */
 const FILL_COLOR_OP_RE = /(-?[\d.]+(?:\s+-?[\d.]+){0,3})\s+(rg|g|k|sc|scn)(?![A-Za-z0-9])|\/[ ]*\s+scn(?![A-Za-z0-9])|\/[ ]*\s+cs(?![A-Za-z0-9])/g
 
@@ -4506,7 +4527,8 @@ function restyleInSource(
         }
         inner = rebuildBtContent(block.content, [enc.bytes], newFontRef, false, sizeOverride, colorOp, block.inheritedTf)
         usedStrategy ??= 'rebuild_font'
-      } else if (matchLength(block.decodedText) > matchLength(targetBlock.text) * 1.4 + 4) {
+      } else if (matchLength(block.decodedText) > matchLength(targetBlock.text) * 1.4 + 4 ||
+                 provablyHoldsMore(block, targetBlock)) {
         // ONE LINE of a block that draws several. The size and colour ops in
         // such a block are per line, or set once for the whole of it, and
         // rewriting them all restyles every line: a LaTeX title shares its BT
