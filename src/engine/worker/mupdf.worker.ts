@@ -3884,7 +3884,57 @@ function transformInSource(
       // ("Código de Cliente : 232900 - 2  R.U.C.: …") was scaled whole, three
       // cells grew and the row ran off the page. Refuse instead — the loud
       // "could not find" beats a silent resize of the neighbours.
-      if (!pureTranslate && (holdsMoreThanTarget || (targetBlock && provablyHoldsMore(block, targetBlock)))) continue
+      //
+      // Except for ONE LINE of it, when the scale is uniform and the run leads
+      // its line with nothing pen-relative after it — a heading, a table label,
+      // a paragraph line. Then the run is bracketed exactly as a translation is
+      // (a Td and its inverse) and its size set with Tf and restored after; the
+      // Td also carries the run to where a scale about the user's anchor puts
+      // it. 248 resizes across seven corpora were refused for lack of this:
+      // pdf24, Ghostscript and TeX draw a whole page from one BT, so on those
+      // producers no line could be resized at all.
+      let scaleRun: { start: number; end: number; fontName: string; size: number; tdx: number; tdy: number } | null = null
+      if (!pureTranslate && (holdsMoreThanTarget || provablyHoldsMore(block, targetBlock))) {
+        if (Math.abs(sx - sy) < 0.02) {
+          const r = findTargetRun(block, targetBlock.text, pageIndex, local)
+          if (r && r.startsLine) {
+            const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+              (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
+            const first = ops.findIndex(o => o.start === r.start)
+            const lastIdx = ops.findIndex(o => o.end === r.end)
+            const next = lastIdx >= 0 ? ops[lastIdx + 1] : undefined
+            const maskedC = maskStreamLiterals(block.content)
+            const between = next && lastIdx >= 0 ? maskedC.slice(ops[lastIdx].end, next.start) : ''
+            const followerResets = !next || next.kind === 'quote' || next.kind === 'dquote' ||
+              /(^|[^A-Za-z])(Td|TD|Tm|T\*)(?![A-Za-z])/.test(between)
+            const state = first >= 0 ? textStateAtOp(block, ops, first, pageIndex) : null
+            const fontName = first >= 0 ? (ops[first].fontRef ?? block.fontRef) : null
+            // A Tf inside the run would be restored wrong; leave such runs alone.
+            const tfInside = /\s[\d.]+\s+Tf(?![A-Za-z0-9])/.test(maskedC.slice(r.start, r.end))
+            if ((globalThis as any).__debugCandidates) {
+              console.log(`[scale] run=${r.start}..${r.end} first=${first} last=${lastIdx} follower=${followerResets} state=${state ? state.tfSize : null} font=${fontName} tfInside=${tfInside} ops=${ops.length}`)
+            }
+            if (first >= 0 && lastIdx >= first && followerResets && state && state.tfSize > 0 && fontName && !tfInside) {
+              // The run grows from its own pen origin; the anchor is where the
+              // user asked it to grow about. Both are in the CTM's user space.
+              const px = ops[first].x, py = ops[first].y
+              const dUx = (px - anchorXL) * (sx - 1) + dxL
+              const dUy = (py - anchorYL) * (sy - 1) + dyL
+              let tdx = dUx, tdy = dUy
+              if (tmMatch) {
+                const a = parseFloat(tmMatch[1]), b2 = parseFloat(tmMatch[2])
+                const c2 = parseFloat(tmMatch[3]), d2 = parseFloat(tmMatch[4])
+                const det2 = a * d2 - b2 * c2
+                if (Math.abs(det2) > 1e-9) { tdx = (dUx * d2 - dUy * c2) / det2; tdy = (dUy * a - dUx * b2) / det2 }
+              }
+              if (Number.isFinite(tdx) && Number.isFinite(tdy)) {
+                scaleRun = { start: r.start, end: r.end, fontName, size: state.tfSize, tdx, tdy }
+              }
+            }
+          }
+        }
+        if (!scaleRun) continue
+      }
 
       /**
        * Last chance before refusing: the target may not be a show OP at all,
@@ -3907,7 +3957,7 @@ function transformInSource(
       // strategy moves OTHER text: rewriting the first Tm dragged a table's
       // header row when a cell 50pt below it was asked to move. Refuse the
       // block — a loud "could not find matching text" beats a silent wrong drag.
-      if (mustIsolate && !(run && run.startsLine) && !seg && !tmRewritable) continue
+      if (!scaleRun && mustIsolate && !(run && run.startsLine) && !seg && !tmRewritable) continue
 
       /** The page-space delta expressed in the text matrix's own space. */
       const inTmSpace = (): { tdx: number; tdy: number } => {
@@ -3923,7 +3973,15 @@ function transformInSource(
       }
 
       let newContent: string
-      if (seg) {
+      if (scaleRun) {
+        newContent =
+          block.content.slice(0, scaleRun.start) +
+          ` ${fmtNum(scaleRun.tdx)} ${fmtNum(scaleRun.tdy)} Td /${scaleRun.fontName} ${fmtNum(scaleRun.size * sx)} Tf ` +
+          block.content.slice(scaleRun.start, scaleRun.end) +
+          ` /${scaleRun.fontName} ${fmtNum(scaleRun.size)} Tf ${fmtNum(-scaleRun.tdx)} ${fmtNum(-scaleRun.tdy)} Td ` +
+          block.content.slice(scaleRun.end)
+        usedStrategy ??= 'td_bracket_scale_run'
+      } else if (seg) {
         const { tdx, tdy } = inTmSpace()
         const newRaw = shiftInsideTjArray(seg, tdx, tdy)
         if (!newRaw) continue

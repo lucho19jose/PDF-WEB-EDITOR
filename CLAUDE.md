@@ -4642,6 +4642,21 @@ rather than scale the neighbours with it — four sweep "successes" that had
 touched two blocks each became honest refusals, and a utility bill's row
 ("Código de Cliente : 232900 - 2  R.U.C.: …") stopped running off the page.
 
+### One line of a shared block can be RESIZED, not only moved
+A scale had only whole-block strategies — the run and segment paths are pure
+translations — so every resize of a line inside a block that draws more was
+refused: 248 across seven corpora, because pdf24, Ghostscript and TeX draw a
+whole page from one BT and on those producers no line could be resized at all.
+`td_bracket_scale_run` treats a uniform scale the way `td_bracket_run` treats a
+move: the line-leading run is bracketed with a `Td` and its inverse (the Td also
+carries it to where a scale about the user's anchor puts it, converted into Tm
+space), and its size is set with `/F size×s Tf` in front and the original put
+back after. Gated on a run that leads its line with nothing pen-relative after
+it and no `Tf` inside, the shape a heading, a table label or a paragraph line
+has. Measured: 150 resizes gained, two "lost" that were a clause number in its
+own block no longer scaling with the clause (a cross-block resize is not
+implemented), marker sweep identical.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations
