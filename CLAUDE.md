@@ -4894,9 +4894,17 @@ reporting success:
   middle word moved 20pt alone (and was recoloured alone, reported as
   success). A candidate carrying under 85% of the target's characters, all
   of them inside it, is skipped — in the line-group pass and the
-  single-block pass. Editing the whole visual line across the three blocks
-  (a cross-block move/restyle) is not implemented; "could not find" is the
-  honest answer until it is.
+  single-block pass. A move, resize or restyle of such a line then goes
+  through `crossBlockTransform` / `crossBlockRestyle`: `findCrossBlockLine`
+  (the replace matcher's Step 2c, extracted) assembles the members, each is
+  addressed as its own SHARE of the target (`shareOfTarget`), so a member
+  takes whichever per-block strategy fits it, and the source is put back
+  untouched when any member refuses. Each member's write goes into the
+  document, and a ContentSource holds the stream it was made with — the next
+  member must start from a FRESH one (`getContentSources` again), or its
+  rewrite starts from the original and undoes the last: measured, three
+  members, three "successes", one moved. On the Adobe letter the whole
+  "… del Banco Interbank para …" line now moves and recolours as one.
 
 ### A substitute draws with its own spacing
 `Tc`/`Tw` are set for the face they were designed with. A datasheet

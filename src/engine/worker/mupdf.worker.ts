@@ -3739,6 +3739,9 @@ function transformTextBlock(
         src, pageIndex, targetBlock, dx, dy, sx, sy, anchorX, anchorY))
       if (done) return done
     }
+    // A line drawn by several blocks, each member by its own share.
+    const cross = crossBlockTransform(pageIndex, targetBlock, dx, dy, sx, sy, anchorX, anchorY)
+    if (cross) return cross
     return { success: false, error: 'Could not find matching text in content stream' }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
@@ -3816,6 +3819,7 @@ function transformTextBlocks(
           src, pageIndex, targetBlock, op.dx, op.dy, op.sx, op.sy, op.anchorX, op.anchorY))
         if (outcome) break
       }
+      if (!outcome) outcome = crossBlockTransform(pageIndex, targetBlock, op.dx, op.dy, op.sx, op.sy, op.anchorX, op.anchorY)
     } catch (err: any) {
       outcome = { success: false, error: err.message || String(err) }
     }
@@ -4436,6 +4440,7 @@ function restyleTextBlocks(
         outcome = withSource(src, () => restyleInSource(src, pageIndex, targetBlock, op))
         if (outcome) break
       }
+      if (!outcome) outcome = crossBlockRestyle(pageIndex, targetBlock, op)
     } catch (err: any) {
       outcome = { success: false, error: err.message || String(err) }
     }
@@ -6971,65 +6976,12 @@ function replaceTextInContentStreamFontAware(
   // its first op moves nothing. Ranked as an exact match; an exact whole-line
   // group, when one exists, still wins on order.
   if (pageHeight !== undefined && matchLength(normalizedTarget) >= 3) {
-    const tCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '')
-    const members: CrossMember[] = []
-    for (const block of allBlocks) {
-      if (!block.hasPos) continue
-      if (readsOnPlaceholders(block.decodedText, normalizedTarget)) continue
-      const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
-      if (!local) continue
-      const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
-        (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
-      if (!ops.length) continue
-      // Against the target's BASELINE where extraction reports one: the box of
-      // an 11pt line is nearly as tall as the line pitch, so the line ABOVE
-      // sits within a point of the box top and passed a box test. A baseline
-      // is a line; the next one is a whole leading away.
-      const ctm0 = getFullCtmAtOffset(stream, block.start)
-      const det0 = ctm0[0] * ctm0[3] - ctm0[1] * ctm0[2]
-      const baseY = targetBlock.chars?.[0]?.origin?.[1]
-      let gapOf = (y: number) => (y < local.yLo ? local.yLo - y : (y > local.yHi ? y - local.yHi : 0)) * (local.unitScale || 1)
-      let rowBar = 6
-      if (baseY !== undefined && Number.isFinite(baseY) && Math.abs(det0) > 1e-9) {
-        const px = targetBlock.bbox[0], py = pageHeight - baseY
-        const ax = px - ctm0[4], ay = py - ctm0[5]
-        const localBase = (ay * ctm0[0] - ax * ctm0[1]) / det0
-        gapOf = (y: number) => Math.abs(y - localBase) * (local.unitScale || 1)
-        rowBar = Math.max(2.5, targetBlock.fontSize * 0.35)
-      }
-      const onRow = ops.map((o, k) => ({ o, k })).filter(({ o }) => gapOf(o.y) <= rowBar && o.decoded.trim().length > 0)
-      if (!onRow.length) continue
-      const first = onRow[0].k, last = onRow[onRow.length - 1].k
-      // The row's ops must be one contiguous stretch of the block.
-      if (ops.slice(first, last + 1).some(o => gapOf(o.y) > rowBar && o.decoded.trim().length > 0)) continue
-      const ctm = getFullCtmAtOffset(stream, block.start)
-      const rowOps = ops.slice(first, last + 1)
-      // Read ACROSS the page inside the member too: a pdf24 form draws a
-      // row's value before its label ("419600" then "付款代码 COD PAGO : "),
-      // and the stream-order join of a block no whole-block pass can see was
-      // the only reading anything compared against.
-      const byX = [...rowOps].sort((a, b) => a.x - b.x)
-      const o0 = byX[0]
-      const pageX = o0.x * ctm[0] + o0.y * ctm[2] + ctm[4]
-      members.push({ block, first, last, ops, pageX, text: rowOps.map(o => o.decoded).join(''), readText: byX.map(o => o.decoded).join('') })
-    }
-    if ((globalThis as any).__debugCandidates) {
-      for (const m of members) console.log(`[cross] member x=${m.pageX.toFixed(1)} ops ${m.first}..${m.last}/${m.ops.length} ${JSON.stringify(m.text.slice(0, 50))} block=${JSON.stringify(m.block.decodedText.slice(0, 30))}`)
-    }
-    // One member suffices when its row ops are OUT of reading order and the
-    // block holds other rows: no whole-block or containment pass can read
-    // that row, and the partial path can write it (at its leftmost op).
-    const reordered = members.length === 1 && members[0].text.replace(/\s+/g, '') !== members[0].readText.replace(/\s+/g, '')
-    if (members.length >= 2 || reordered) {
-      members.sort((a, b) => a.pageX - b.pageX)
-      const joined = foldForMatch(members.map(m => m.readText).join('')).replace(/\s+/g, '')
-      if ((globalThis as any).__debugCandidates) console.log(`[cross] joined=${JSON.stringify(joined.slice(0, 80))} target=${JSON.stringify(tCompact.slice(0, 80))}`)
-      if (joined === tCompact && members.some(m => m.first > 0 || m.last < m.ops.length - 1)) {
-        candidates.push({
-          blocks: members.map(m => m.block), score: 2, dist: 0,
-          line: false, cross: members, order: candidates.length
-        })
-      }
+    const members = findCrossBlockLine(stream, pageIndex, targetBlock, pageHeight, allBlocks)
+    if (members) {
+      candidates.push({
+        blocks: members.map(m => m.block), score: 2, dist: 0,
+        line: false, cross: members, order: candidates.length
+      })
     }
   }
 
@@ -10161,6 +10113,161 @@ interface CrossMember {
  * replacement through the partial path, matched against ITS share of the
  * line; every other member's row ops are blanked in place.
  */
+/**
+ * The visual line the target is DRAWN on, assembled from the row ops of every
+ * block that holds part of it — the members ordered across the page, only
+ * when their text is exactly the target's (space-free) and at least one
+ * member holds more than its share (a whole-block line is the line-group
+ * matchers' business). Null when the line cannot be assembled. See the note
+ * at Step 2c of the replace matcher, which found it; the move and restyle
+ * paths use it as their last resort (`crossBlockTransform`, `crossBlockRestyle`).
+ */
+function findCrossBlockLine(
+  stream: string,
+  pageIndex: number,
+  targetBlock: TextBlock,
+  pageHeight: number,
+  allBlocks: BtInfo[]
+): CrossMember[] | null {
+  const normalizedTarget = targetBlock.text.replace(/\s+/g, ' ').trim()
+  if (matchLength(normalizedTarget) < 3) return null
+  const tCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '')
+  const members: CrossMember[] = []
+    for (const block of allBlocks) {
+      if (!block.hasPos) continue
+      if (readsOnPlaceholders(block.decodedText, normalizedTarget)) continue
+      const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
+      if (!local) continue
+      const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+        (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }), block.inheritedTL ?? 0)
+      if (!ops.length) continue
+      // Against the target's BASELINE where extraction reports one: the box of
+      // an 11pt line is nearly as tall as the line pitch, so the line ABOVE
+      // sits within a point of the box top and passed a box test. A baseline
+      // is a line; the next one is a whole leading away.
+      const ctm0 = getFullCtmAtOffset(stream, block.start)
+      const det0 = ctm0[0] * ctm0[3] - ctm0[1] * ctm0[2]
+      const baseY = targetBlock.chars?.[0]?.origin?.[1]
+      let gapOf = (y: number) => (y < local.yLo ? local.yLo - y : (y > local.yHi ? y - local.yHi : 0)) * (local.unitScale || 1)
+      let rowBar = 6
+      if (baseY !== undefined && Number.isFinite(baseY) && Math.abs(det0) > 1e-9) {
+        const px = targetBlock.bbox[0], py = pageHeight - baseY
+        const ax = px - ctm0[4], ay = py - ctm0[5]
+        const localBase = (ay * ctm0[0] - ax * ctm0[1]) / det0
+        gapOf = (y: number) => Math.abs(y - localBase) * (local.unitScale || 1)
+        rowBar = Math.max(2.5, targetBlock.fontSize * 0.35)
+      }
+      const onRow = ops.map((o, k) => ({ o, k })).filter(({ o }) => gapOf(o.y) <= rowBar && o.decoded.trim().length > 0)
+      if (!onRow.length) continue
+      const first = onRow[0].k, last = onRow[onRow.length - 1].k
+      // The row's ops must be one contiguous stretch of the block.
+      if (ops.slice(first, last + 1).some(o => gapOf(o.y) > rowBar && o.decoded.trim().length > 0)) continue
+      const ctm = getFullCtmAtOffset(stream, block.start)
+      const rowOps = ops.slice(first, last + 1)
+      // Read ACROSS the page inside the member too: a pdf24 form draws a
+      // row's value before its label ("419600" then "付款代码 COD PAGO : "),
+      // and the stream-order join of a block no whole-block pass can see was
+      // the only reading anything compared against.
+      const byX = [...rowOps].sort((a, b) => a.x - b.x)
+      const o0 = byX[0]
+      const pageX = o0.x * ctm[0] + o0.y * ctm[2] + ctm[4]
+      members.push({ block, first, last, ops, pageX, text: rowOps.map(o => o.decoded).join(''), readText: byX.map(o => o.decoded).join('') })
+    }
+    if ((globalThis as any).__debugCandidates) {
+      for (const m of members) console.log(`[cross] member x=${m.pageX.toFixed(1)} ops ${m.first}..${m.last}/${m.ops.length} ${JSON.stringify(m.text.slice(0, 50))} block=${JSON.stringify(m.block.decodedText.slice(0, 30))}`)
+    }
+    // One member suffices when its row ops are OUT of reading order and the
+    // block holds other rows: no whole-block or containment pass can read
+    // that row, and the partial path can write it (at its leftmost op).
+    const reordered = members.length === 1 && members[0].text.replace(/\s+/g, '') !== members[0].readText.replace(/\s+/g, '')
+    if (!(members.length >= 2 || reordered)) return null
+    members.sort((a, b) => a.pageX - b.pageX)
+    const joined = foldForMatch(members.map(m => m.readText).join('')).replace(/\s+/g, '')
+    if ((globalThis as any).__debugCandidates) console.log(`[cross] joined=${JSON.stringify(joined.slice(0, 80))} target=${JSON.stringify(tCompact.slice(0, 80))}`)
+    if (joined === tCompact && members.some(m => m.first > 0 || m.last < m.ops.length - 1)) return members
+    return null
+}
+
+/**
+ * Move or resize a line drawn by SEVERAL blocks — the head of the sentence as
+ * the last op of one BT, a bold word as its own, the tail as the first op of
+ * a third — one member at a time, each addressed as its own SHARE of the
+ * target (shareOfTarget: the member's glyphs' text, box and width), so every
+ * member takes whichever per-block strategy fits it (a Td bracket for a line
+ * of a taller block, a Tm rewrite for a whole block). All or nothing: the
+ * source is put back as it was when any member refuses, because a line with
+ * one moved word is worse than a line that did not move.
+ */
+function crossBlockTransform(
+  pageIndex: number, targetBlock: TextBlock,
+  dx: number, dy: number, sx: number, sy: number, anchorX: number, anchorY: number
+): { success: boolean; error?: string; strategy?: string; clipAdjusted?: boolean } | null {
+  const pageHeight = pageHeightOf(pageIndex)
+  if (!(pageHeight > 0)) return null
+  for (const src of sourcesNearestFirst(pageIndex, targetBlock, pageHeight)) {
+    const members = withSource(src, () => findCrossBlockLine(src.stream, pageIndex, targetBlock, pageHeight, scanBtBlocks(src.stream, pageIndex)))
+    if (!members) continue
+    const original = src.stream
+    let clipAdjusted = false
+    let failed: string | null = null
+    for (const m of members) {
+      const share = shareOfTarget(targetBlock, m.readText)
+      if (share === targetBlock) { failed = 'a member could not be located in the target'; break }
+      // Each member's write goes into the document; a ContentSource holds
+      // the stream it was made with, so the next member must start from a
+      // FRESH one or its rewrite starts from the original and undoes the
+      // last (measured: three members, three "successes", one moved).
+      const cur = getContentSources(pageIndex).find(x => x.key === src.key)
+      if (!cur) { failed = 'the content source disappeared'; break }
+      const r = withSource(cur, () => transformInSource(cur, pageIndex, share, dx, dy, sx, sy, anchorX, anchorY))
+      if ((globalThis as any).__debugCandidates) console.log(`[cross-move] share=${JSON.stringify(share.text.slice(0, 40))} box=${share.bbox.map(v => v.toFixed(1)).join(',')} -> ${JSON.stringify(r)}`)
+      if (!r || !r.success) { failed = r?.error ?? 'a member of the line could not be moved'; break }
+      clipAdjusted = clipAdjusted || !!r.clipAdjusted
+    }
+    if (failed) {
+      // Put the source back exactly as it was.
+      const bytes = new Uint8Array(original.length)
+      for (let i = 0; i < original.length; i++) bytes[i] = original.charCodeAt(i) & 0xFF
+      src.write(bytes)
+      invalidateContentSources(pageIndex)
+      return { success: false, error: `The line is drawn by ${members.length} blocks and one of them refused: ${failed}` }
+    }
+    return { success: true, strategy: (src.key === 'page' ? '' : src.key + ':') + `cross_block_line(${members.length})`, clipAdjusted }
+  }
+  return null
+}
+
+/** `crossBlockTransform` for a restyle: every member takes the same op. */
+function crossBlockRestyle(
+  pageIndex: number, targetBlock: TextBlock, op: BlockStyleOp
+): { success: boolean; error?: string; strategy?: string; lines?: number; baselineDrop?: number } | null {
+  const pageHeight = pageHeightOf(pageIndex)
+  if (!(pageHeight > 0)) return null
+  for (const src of sourcesNearestFirst(pageIndex, targetBlock, pageHeight)) {
+    const members = withSource(src, () => findCrossBlockLine(src.stream, pageIndex, targetBlock, pageHeight, scanBtBlocks(src.stream, pageIndex)))
+    if (!members) continue
+    const original = src.stream
+    let failed: string | null = null
+    for (const m of members) {
+      const share = shareOfTarget(targetBlock, m.readText)
+      if (share === targetBlock) { failed = 'a member could not be located in the target'; break }
+      const cur = getContentSources(pageIndex).find(x => x.key === src.key)   // fresh after the last write
+      if (!cur) { failed = 'the content source disappeared'; break }
+      const r = withSource(cur, () => restyleInSource(cur, pageIndex, share, op))
+      if (!r || !r.success) { failed = r?.error ?? 'a member of the line could not be restyled'; break }
+    }
+    if (failed) {
+      const bytes = new Uint8Array(original.length)
+      for (let i = 0; i < original.length; i++) bytes[i] = original.charCodeAt(i) & 0xFF
+      src.write(bytes)
+      invalidateContentSources(pageIndex)
+      return { success: false, error: `The line is drawn by ${members.length} blocks and one of them refused: ${failed}` }
+    }
+    return { success: true, strategy: (src.key === 'page' ? '' : src.key + ':') + `cross_block_line(${members.length})`, lines: 1, baselineDrop: 0 }
+  }
+  return null
+}
+
 function applyCrossBlockLine(
   stream: string,
   members: CrossMember[],
