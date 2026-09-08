@@ -4990,6 +4990,13 @@ is; one point of slack for rounding.
   half (never under 6pt) is refused, and the segment path then finds the
   copy inside the row's array.
 
+### The OCR editor is one line, so its textarea must not soft-wrap
+A textarea soft-wraps whatever the stylesheet's `white-space` says. The OCR
+editor is sized to the run's box, a long title wrapped inside it, and End (or
+a click past the fold) put the caret at the end of the first VISUAL line:
+typing appended mid-run — "Compra-Venta XYde Repuestos" in the headless
+scan smoke. `wrap="off"` on the textarea; the run is one line.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

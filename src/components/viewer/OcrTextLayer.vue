@@ -46,11 +46,17 @@
       <div v-if="item.edited" class="ocr-replacement" :style="item.textStyle">{{ item.text }}</div>
     </div>
 
-    <!-- In-place editor, positioned and turned the same way as its run. -->
+    <!-- In-place editor, positioned and turned the same way as its run.
+         wrap="off": a run is ONE line, and a textarea soft-wraps whatever the
+         stylesheet's white-space says — a long title wrapped inside its box,
+         so End (and a click past the fold) put the caret at the end of the
+         first VISUAL line and typed text landed mid-run ("Compra-Venta XYde
+         Repuestos"). -->
     <textarea
       v-if="editing"
       ref="editorRef"
       v-model="draft"
+      wrap="off"
       class="ocr-editor"
       :style="editorStyle"
       @keydown.escape.prevent="cancelEdit"
