@@ -4713,6 +4713,105 @@ Round 8 (the 50 Downloads PDFs never swept, mostly dompdf and pdf24 forms):
 in any manifest without touching the main corpus. Round 8: realistic 771 ops
 724 → 730, marker 317 ops 275 → 281, rounds 2–7 identical.
 
+### One cell of a shared-array row can be RESIZED, with the row held still
+`transformTextBlock` had two resize strategies, both whole-run: rewrite the
+block's Tm, or bracket a line-leading run with a Td and a bigger Tf
+(`td_bracket_scale_run`). A cell of a row drawn as ONE TJ array — every row
+of a Ghostscript or Print-to-PDF timesheet ("06-05-26 16:00:00 18:00:00",
+cells separated by kerns), a pdf24 form's "DPTO:" — leads no line and shares
+its Tm with the whole page, so 84 resizes across the corpora were refused
+with "could not find matching text" while the same cell MOVED and EDITED
+fine. `scaleInsideTjArray` is `shiftInsideTjArray` with a size: the array is
+split around the run, the middle op set under `/F size×s Tf` and the original
+restored after it, and the TRAILING kern cancels the displacement AND the
+run's extra advance (`runAdvance × (s − 1)`, in thousandths), so every later
+cell of the row draws exactly where it did. The segment is found by
+`findTargetSegment`, the same row-aware chooser the move uses, and the hit now
+carries what a scale needs (font name, pen x, op y, run offset and advance).
+Measured: "16:00" 5.7 → 7.1pt, "DPTO:" 7.0 → 8.7pt, "CODIGO" 6.4 → 7.9pt,
+each anchored at its own bottom-left with its neighbours unmoved.
+
+### A bake is an undo point
+`bakeOcrEdits` wrote patches and text into the document with no snapshot, so
+Ctrl+Z after a save that baked a scanned page's edits did nothing — or, with an
+earlier text edit on the stack, jumped PAST the bake to that edit's snapshot
+and took both away in one press (the headless scan-flow smoke,
+`scratchpad/pw/ui-ocr.mjs`, still read the baked text after the undo). One
+`pushUndo()` before the first write covers every page baked in that pass:
+`docStore.pdfBytes` is the pre-bake document until `syncAfterEdit` at the end.
+
+### A line that still fits on the PAPER is not wrapped
+A wrap with Reflow off draws the continuation across the next line, and with
+it on leaves one word on a line of its own — either way a mess for what is,
+on most lines, a few points of overflow. Retyping a full-width line with
+letters a little wider than the old ones wrapped its last word onto the line
+beneath on a Quartz and a dompdf paragraph, and extraction read the two
+interleaved. `layoutReplacementLines` and `wrapWindowText` now draw on ONE
+line whatever the margin says while the text fits between the block's left
+edge and the paper's edge less `PAPER_EDGE_SLACK`; only what cannot fit on
+the paper wraps, at the margin room as before.
+
+Two measurement defects sat under the same symptom:
+- **A substitute draws with its own metrics.** The stand-in is calibrated
+  against the width the block occupies today, which is right while the
+  block's own font keeps the text and wrong when a base-14 face takes it: a
+  Century Schoolbook paragraph retyped into Times-Roman measured 589pt with
+  the wide-calibrated stand-in and draws at 422. `substituteFaceFor` plans
+  the single line first (find-or-create, so nothing registers twice) and the
+  wrap measures in that face uncalibrated; the partial path passes its own
+  plan's face.
+- **A cross-block share calibrates against the LINE.** `applyCrossBlockLine`
+  hands the partial path a share whose text is one member's ("6.") and whose
+  width is the whole line's (460pt): 38 points per em, clamped to 2, and an
+  appended line wrapped into three at half the page. `TextBlock.wrapRef`
+  carries the line's text and width for the calibration.
+
+### A space at a literal's end is not a boundary, and a segment takes a size too
+`findTargetSegment` accepted an occurrence only when the target began at a
+literal's first character and ended at its last. A Ghostscript form draws its
+two signature labels as one array of `(FIRMA FINANZAS )` literals, trailing
+space included, so the target's last letter sat one short of the literal's end
+and the label could not be recoloured, resized or moved — "could not find
+matching text" on a block whose text plainly contained it. Space glyphs at
+either end of the literal are now stepped over; the splice takes the whole
+literal, so the space travels with the run (nothing visible marks where it
+was), and the hit's `runOffset`/`runAdvance` span the literals in full so a
+scale's compensating kern counts every glyph that grows.
+
+The restyle path's segment branch refused a size change outright ("the row's
+advances would change under it"); it goes through `scaleInsideTjArray` now,
+with the colour, when there is one, set before the scaled `Tf` and restored
+after (`tf_scale_segment` / `restyle_segment`). Measured on the Ghostscript
+form: the right-hand label recolours, grows to 8.7pt, moves and takes a font
+size, each leaving the left-hand copy at its own x.
+
+### A substitute is measured UNDER its Tz, and a segment carries its trailing space
+Two more things the wrap measurement had to get right once it measured a
+substitute in the substitute's own face, each found by the realistic sweep
+losing a row it used to pass:
+- **The writers squeeze a wide substitute with `Tz`** (`substituteTz`, floor
+  0.72) to the width the old text had. Measured uncompressed, Helvetica-Bold
+  for a Calibri e-mail line came out 15% too wide, wrapped, and the tail was
+  drawn across the line beneath — eight LibreOffice/Word e-mail and letter
+  lines across four corpora. `layoutReplacementLines` and `wrapMeasure` apply
+  the same `substituteTz` to the same text, so what is measured is what is
+  drawn.
+- **The untouched PREFIX of a narrowed window stays in the block's own font**,
+  so its width is measured with the calibrated stand-in whatever face draws
+  the window; measuring it in the substitute put the continuation's start in
+  the wrong column.
+- **A segment's trailing space travels with it.** `findTargetSegment` now
+  absorbs the space-only literals right after the run (small kerns between
+  included, a kern past `KERN_SPACE` being a column jump), the rule
+  `replaceInsideTjArray` already follows: left at the old pen position the
+  space lands INSIDE a scaled or shifted run, and extraction read a resized
+  "Atención: " back as "Atención :".
+
+Measured across the seven text corpora: realistic sweep +75 gained, 1 lost
+(a Canva doubled-draw line whose earlier pass was luck), marker sweep
+experiment-identical to before this batch (3046/2811); ocr4 OCR sweep
+0.922 → 0.936 average re-read similarity with the OCR code untouched.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

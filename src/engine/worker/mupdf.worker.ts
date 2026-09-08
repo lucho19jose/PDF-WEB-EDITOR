@@ -970,6 +970,22 @@ const LINE_CLUSTER_PT = 3
 const PAGE_RIGHT_MARGIN = 20
 
 /**
+ * A line that still fits on the PAPER is not wrapped, however far past the
+ * right margin it reaches; this is what must stay clear of the page's edge.
+ *
+ * A wrap with the Reflow toggle off draws the continuation across the next
+ * line, and with it on the paragraph is left with one word on a line of its
+ * own — either way a mess, for an overflow that on most lines is a few
+ * points. Retyping a full-width line with letters a little wider than the old
+ * ones ("volutpat" → "wpmvuqbu") wrapped its last word onto the line beneath
+ * on a Quartz and a dompdf paragraph, and extraction read the two interleaved.
+ * Text that fits between the block's left edge and the paper's edge, less this
+ * slack, is drawn on ONE line; only what cannot fit on the paper wraps, and
+ * that is what the margin room decides as before.
+ */
+const PAPER_EDGE_SLACK = 2
+
+/**
  * How far replacement text may run from `x` before it has to wrap;
  * `Infinity` means this text must NOT be wrapped at all.
  *
@@ -3894,6 +3910,14 @@ function transformInSource(
       // pdf24, Ghostscript and TeX draw a whole page from one BT, so on those
       // producers no line could be resized at all.
       let scaleRun: { start: number; end: number; fontName: string; size: number; tdx: number; tdy: number } | null = null
+      // …and for ONE CELL of a row drawn as a single TJ array, the shape a
+      // Ghostscript or Print-to-PDF timesheet gives every row ("06-05-26
+      // 16:00:00 18:00:00", cells separated by kerns): no run leads its line
+      // there, so `scaleRun` never applies, and 84 resizes across the corpora
+      // refused for it. The run is found as a segment, exactly as a move finds
+      // it, and `scaleInsideTjArray` grows it in place with the row's other
+      // cells held where they are.
+      let scaleSeg: { hit: TjSegmentHit; tdx: number; tdy: number } | null = null
       if (!pureTranslate && (holdsMoreThanTarget || provablyHoldsMore(block, targetBlock))) {
         if (Math.abs(sx - sy) < 0.02) {
           const r = findTargetRun(block, targetBlock.text, pageIndex, local)
@@ -3933,7 +3957,27 @@ function transformInSource(
             }
           }
         }
-        if (!scaleRun) continue
+        if (!scaleRun && Math.abs(sx - sy) < 0.02) {
+          const sh = findTargetSegment(block, targetBlock, pageIndex, stream, pageHeight)
+          if (sh && sh.fontName && Number.isFinite(sh.runAdvance)) {
+            const ox = sh.penX + sh.runOffset * sh.tfSize / 1000
+            const oy = sh.opY
+            const dUx = (ox - anchorXL) * (sx - 1) + dxL
+            const dUy = (oy - anchorYL) * (sy - 1) + dyL
+            let tdx = dUx, tdy = dUy
+            if (tmMatch) {
+              const a = parseFloat(tmMatch[1]), b2 = parseFloat(tmMatch[2])
+              const c2 = parseFloat(tmMatch[3]), d2 = parseFloat(tmMatch[4])
+              const det2 = a * d2 - b2 * c2
+              if (Math.abs(det2) > 1e-9) { tdx = (dUx * d2 - dUy * c2) / det2; tdy = (dUy * a - dUx * b2) / det2 }
+            }
+            if ((globalThis as any).__debugCandidates) {
+              console.log(`[scale-seg] op=${sh.op.start} run=${sh.spliceStart}..${sh.spliceEnd} font=${sh.fontName} size=${sh.tfSize} adv=${sh.runAdvance} td=${tdx.toFixed(2)},${tdy.toFixed(2)}`)
+            }
+            if (Number.isFinite(tdx) && Number.isFinite(tdy)) scaleSeg = { hit: sh, tdx, tdy }
+          }
+        }
+        if (!scaleRun && !scaleSeg) continue
       }
 
       /**
@@ -3957,7 +4001,7 @@ function transformInSource(
       // strategy moves OTHER text: rewriting the first Tm dragged a table's
       // header row when a cell 50pt below it was asked to move. Refuse the
       // block — a loud "could not find matching text" beats a silent wrong drag.
-      if (!scaleRun && mustIsolate && !(run && run.startsLine) && !seg && !tmRewritable) continue
+      if (!scaleRun && !scaleSeg && mustIsolate && !(run && run.startsLine) && !seg && !tmRewritable) continue
 
       /** The page-space delta expressed in the text matrix's own space. */
       const inTmSpace = (): { tdx: number; tdy: number } => {
@@ -3981,6 +4025,12 @@ function transformInSource(
           ` /${scaleRun.fontName} ${fmtNum(scaleRun.size)} Tf ${fmtNum(-scaleRun.tdx)} ${fmtNum(-scaleRun.tdy)} Td ` +
           block.content.slice(scaleRun.end)
         usedStrategy ??= 'td_bracket_scale_run'
+      } else if (scaleSeg) {
+        const newRaw = scaleInsideTjArray(scaleSeg.hit, sx, scaleSeg.tdx, scaleSeg.tdy)
+        if (!newRaw) continue
+        newContent =
+          block.content.slice(0, scaleSeg.hit.op.start) + newRaw + block.content.slice(scaleSeg.hit.op.end)
+        usedStrategy ??= 'tj_segment_scale'
       } else if (seg) {
         const { tdx, tdy } = inTmSpace()
         const newRaw = shiftInsideTjArray(seg, tdx, tdy)
@@ -4598,25 +4648,37 @@ function restyleInSource(
         // back after its last. Nothing outside the run changes.
         const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
         const run = findTargetRun(block, targetBlock.text, pageIndex, local)
+        if ((globalThis as any).__debugCandidates) {
+          console.log(`[restyle] block@${block.start} run=${run ? `${run.start}..${run.end} line=${run.startsLine}` : null} local=${local ? `${local.x.toFixed(1)} y${local.yLo.toFixed(1)}..${local.yHi.toFixed(1)}` : null}`)
+        }
         if (!run) {
           // Not a run of ops but a run of glyphs INSIDE one TJ array — a
           // Ghostscript or Print-to-PDF table row, every cell a kern apart.
           // The array is split around the segment and the colour set between
           // the pieces; the pen is where it was, so nothing else moves. A
-          // size change cannot be done this way (the row's advances would
-          // change under it) and is refused rather than applied to the row.
-          if (sizeRatio !== null || !colorOp) continue
+          // size change goes through `scaleInsideTjArray`, which grows the
+          // segment in place and cancels its extra advance with a kern so the
+          // row's later cells stay put (it used to be refused here).
+          if (sizeRatio === null && !colorOp) continue
           const seg = findTargetSegment(block, targetBlock, pageIndex, stream, pageHeight)
+          if ((globalThis as any).__debugCandidates) console.log(`[restyle]   seg=${seg ? `${seg.spliceStart}..${seg.spliceEnd} font=${seg.fontName} size=${seg.tfSize}` : null}`)
           if (!seg) continue
-          const raw = seg.op.raw
-          const pre = raw.slice(0, seg.spliceStart).trimEnd()
-          const mid = raw.slice(seg.spliceStart, seg.spliceEnd)
-          const post = raw.slice(seg.spliceEnd).replace(/^\s*/, '')
           const restore = lastFillColorIn(block.content, seg.op.end) ?? fillColorStateAt(stream, block.start) ??
             `${fmtNum(targetBlock.color[0])} ${fmtNum(targetBlock.color[1])} ${fmtNum(targetBlock.color[2])} rg`
-          const newRaw = `${pre}] TJ ${colorOp} [${mid}] TJ ${restore} [${post}`
+          let newRaw: string | null
+          if (sizeRatio !== null) {
+            newRaw = scaleInsideTjArray(seg, sizeRatio, 0, 0, colorOp ? { before: colorOp, after: restore } : undefined)
+            if (!newRaw) continue
+            usedStrategy ??= colorOp ? 'restyle_segment' : 'tf_scale_segment'
+          } else {
+            const raw = seg.op.raw
+            const pre = raw.slice(0, seg.spliceStart).trimEnd()
+            const mid = raw.slice(seg.spliceStart, seg.spliceEnd)
+            const post = raw.slice(seg.spliceEnd).replace(/^\s*/, '')
+            newRaw = `${pre}] TJ ${colorOp} [${mid}] TJ ${restore} [${post}`
+            usedStrategy ??= 'color_rewrite_segment'
+          }
           inner = block.content.slice(0, seg.op.start) + newRaw + block.content.slice(seg.op.end)
-          usedStrategy ??= 'color_rewrite_segment'
           splices.push({ start: block.start, end: block.end, text: `BT${inner}ET` })
           continue
         }
@@ -6939,7 +7001,7 @@ function applyBlockReplacement(
   // right margin forces. Anything past one goes down the rebuild path, which is
   // the only one that can emit a second line at all.
   const laidOut = targetBlock && pageWidth && newText.length > 0
-    ? layoutReplacementLines(newText, targetBlock, pageWidth)
+    ? layoutReplacementLines(newText, targetBlock, pageWidth, 1, substituteFaceFor(pageIndex, block, newText, targetBlock))
     : [newText]
 
   if (laidOut.length > 1 && targetBlock) {
@@ -7090,35 +7152,79 @@ function wrapToWidth(text: string, maxEm: number, faceName: string, hardEm = Num
  * `sizeRatio` is how much the font is growing, for the restyle path: the room
  * has to be measured at the size the text will BE, not the size it was.
  */
+/**
+ * The base-14 face a one-line replacement would be DRAWN in, or undefined when
+ * the block's own font keeps it (or a CJK subset takes it). Planned on the
+ * single line so the wrap can be measured in the face that will draw it;
+ * `ensureStandardFont` is find-or-create, so the plan made again on the
+ * wrapped lines registers nothing twice.
+ */
+function substituteFaceFor(
+  pageIndex: number,
+  block: Parameters<typeof planTextEncoding>[1],
+  newText: string,
+  targetBlock: TextBlock | undefined
+): string | undefined {
+  if (!targetBlock || !newText) return undefined
+  try {
+    const pre = planTextEncoding(pageIndex, block, [newText], targetBlock)
+    return pre.kind === 'subst' && !pre.hex ? pre.fontName : undefined
+  } catch (_) {
+    return undefined
+  }
+}
+
 function layoutReplacementLines(
   newText: string,
   targetBlock: TextBlock,
   pageWidth: number,
-  sizeRatio = 1
+  sizeRatio = 1,
+  drawnFace?: string
 ): string[] {
   const available = wrapRoomFor(pageWidth, targetBlock.x, targetBlock)
   if (!(available > 0)) return newText.split('\n')
 
-  const face = pickSubstituteFont(null, targetBlock)
+  // When the text will be DRAWN in a base-14 substitute, that face's own
+  // metrics are the truth and no calibration applies: a Quartz paragraph in
+  // Century Schoolbook retyped into Times-Roman measured 589pt with the
+  // stand-in calibrated to the wide original — and 422pt as it would really
+  // draw — so its last word was wrapped onto the line beneath for nothing.
+  const substitute = drawnFace && measureFace(drawnFace) ? drawnFace : null
+  const face = substitute ?? pickSubstituteFont(null, targetBlock)
   const size = Math.max(targetBlock.fontSize * sizeRatio, 0.01)
 
   // The face measured with is a base-14 stand-in for whatever the page really
   // uses, so it is calibrated against the one width known for certain: what this
   // block ACTUALLY occupies today. Clamped, because a wild ratio means the
   // stand-in was a bad guess and the raw metrics are the better bet.
-  const referenceEm = measureEm(targetBlock.text, face)
-  const raw = referenceEm > 0.01 && targetBlock.width > 0.01 && targetBlock.fontSize > 0.01
-    ? targetBlock.width / (referenceEm * targetBlock.fontSize)
+  const refText = targetBlock.wrapRef?.text ?? targetBlock.text
+  const refWidth = targetBlock.wrapRef?.width ?? targetBlock.width
+  const referenceEm = measureEm(refText, face)
+  const raw = referenceEm > 0.01 && refWidth > 0.01 && targetBlock.fontSize > 0.01
+    ? refWidth / (referenceEm * targetBlock.fontSize)
     : 1
-  const calibration = Math.min(Math.max(raw, 0.5), 2)
+  // A substitute wider than the face it replaces is squeezed with `Tz` to the
+  // width the old text had (substituteTz, floor 0.72) — the same call the
+  // writers make — so what is measured here is what will be drawn. Uncompressed
+  // Helvetica-Bold for a Calibri e-mail line measured 15% too wide, wrapped,
+  // and the tail was drawn across the line beneath.
+  const calibration = substitute
+    ? (substituteTz(targetBlock, newText, substitute) ?? 1)
+    : Math.min(Math.max(raw, 0.5), 2)
 
   const maxEm = available / (size * calibration)
   const hardEm = Math.max(maxEm, (pageWidth - targetBlock.x) / (size * calibration))
+  const paperEm = Math.max(maxEm, (pageWidth - targetBlock.x - PAPER_EDGE_SLACK) / (size * calibration))
 
   const out: string[] = []
   for (const para of newText.split('\n')) {
     if (para.length === 0) { out.push(''); continue }
-    out.push(...wrapToWidth(para, maxEm, face, hardEm))
+    // Fits on the paper: one line, whatever the margin says (PAPER_EDGE_SLACK).
+    const fitsPaper = measureEm(para, face) <= paperEm
+    if ((globalThis as any).__debugCandidates) {
+      console.log(`[wrap] em=${measureEm(para, face).toFixed(2)} max=${maxEm.toFixed(2)} paper=${paperEm.toFixed(2)} hard=${hardEm.toFixed(2)} cal=${calibration.toFixed(3)} face=${face} avail=${available} x=${targetBlock.x} w=${targetBlock.width}`)
+    }
+    out.push(...wrapToWidth(para, fitsPaper ? paperEm : maxEm, face, hardEm))
   }
   return out
 }
@@ -7132,25 +7238,36 @@ function layoutReplacementLines(
  * base-14 stand-in calibrated against the width the block occupies today).
  */
 /** The stand-in face and the page points one em of it measures, calibrated to this block. */
-function wrapMeasure(targetBlock: TextBlock): { face: string; unit: number } | null {
-  const face = pickSubstituteFont(null, targetBlock)
+function wrapMeasure(targetBlock: TextBlock, drawnFace?: string, text?: string): { face: string; unit: number } | null {
+  // A base-14 substitute draws with its own metrics — under the `Tz` the
+  // writers give it (substituteTz), which needs the text.
+  const substitute = drawnFace && measureFace(drawnFace) ? drawnFace : null
+  const face = substitute ?? pickSubstituteFont(null, targetBlock)
   const size = Math.max(targetBlock.fontSize, 0.01)
-  const referenceEm = measureEm(targetBlock.text, face)
-  const raw = referenceEm > 0.01 && targetBlock.width > 0.01
-    ? targetBlock.width / (referenceEm * size)
+  // A share of a cross-block line calibrates against the LINE (wrapRef): its
+  // own text is one member's, its width the whole line's.
+  const refText = targetBlock.wrapRef?.text ?? targetBlock.text
+  const refWidth = targetBlock.wrapRef?.width ?? targetBlock.width
+  const referenceEm = measureEm(refText, face)
+  const raw = referenceEm > 0.01 && refWidth > 0.01
+    ? refWidth / (referenceEm * size)
     : 1
-  const unit = size * Math.min(Math.max(raw, 0.5), 2)
+  const unit = size * (substitute
+    ? ((text ? substituteTz(targetBlock, text, substitute) : null) ?? 1)
+    : Math.min(Math.max(raw, 0.5), 2))
   return unit > 0 ? { face, unit } : null
 }
 
-function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number, windowPageX: number): string[] | null {
-  const m = wrapMeasure(targetBlock)
+function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number, windowPageX: number, drawnFace?: string): string[] | null {
+  const m = wrapMeasure(targetBlock, drawnFace, text)
   if (!m) return null
   const { face, unit } = m
   const roomFirst = wrapRoomFor(pageWidth, windowPageX, targetBlock)
   const roomRest = wrapRoomFor(pageWidth, targetBlock.x, targetBlock)
   if (!(roomRest > 0) || !(unit > 0)) return null
-  if (measureEm(text, face) * unit <= Math.max(roomFirst, 0)) return null
+  // On the paper on one line: no wrap at all (PAPER_EDGE_SLACK).
+  const paperFirst = Math.max(roomFirst, pageWidth - windowPageX - PAPER_EDGE_SLACK)
+  if (measureEm(text, face) * unit <= Math.max(paperFirst, 0)) return null
   const words = text.split(/\s+/).filter(Boolean)
   let first = ''
   let k = 0
@@ -7461,7 +7578,7 @@ function applyLineReplacement(
     if (i === primaryIdx) {
       // Primary block: insert the new text, word-wrapped if it won't fit the line
       const lines = targetBlock && pageWidth && newText.length > 0
-        ? layoutReplacementLines(newText, targetBlock, pageWidth)
+        ? layoutReplacementLines(newText, targetBlock, pageWidth, 1, substituteFaceFor(pageIndex, block, newText, targetBlock))
         : [newText]
       drawnLines = lines.length
 
@@ -9063,6 +9180,16 @@ interface TjSegmentHit {
   ts: number
   /** How far the chosen occurrence sits from the click, in points. */
   err: number
+  /** Resource name of the font in force at the op — what a size change must restore. */
+  fontName: string | null
+  /** Where the op's pen starts, in the block's local space. */
+  penX: number
+  /** The op's line y in the same space. */
+  opY: number
+  /** The run's start inside the array, in thousandths of the drawn size. */
+  runOffset: number
+  /** The run's own advance (inner kerns included), in thousandths. */
+  runAdvance: number
 }
 
 /**
@@ -9161,10 +9288,20 @@ function findTargetSegment(
     // Boundary-aligned only: the run must start at a literal's first character
     // and end at a literal's last. Anything else splits a literal in half, and
     // the array would be corrupt rather than merely wrong.
+    // Space glyphs at a literal's ends are not a boundary crossed: a
+    // Ghostscript form draws its two signature labels as one array of
+    // `(FIRMA FINANZAS )` literals, and the trailing space put the target's
+    // last character one short of the literal's end — so neither label could
+    // be recoloured, resized or moved. The splice takes the whole literal, so
+    // such a space travels with the run; nothing visible marks where it was.
     const aligned = occ.filter(o => {
       const a = charItem[o]
       const b = charItem[o + targetNorm.length - 1]
-      return a && b && a.charInItem === 0 && b.charInItem === items[b.item].decoded.length - 1
+      if (!a || !b) return false
+      const aLit = items[a.item].decoded, bLit = items[b.item].decoded
+      const headOk = a.charInItem === 0 || /^\s*$/.test(aLit.slice(0, a.charInItem))
+      const tailOk = b.charInItem === bLit.length - 1 || /^\s*$/.test(bLit.slice(b.charInItem + 1))
+      return headOk && tailOk
     })
     if (!aligned.length) continue
 
@@ -9192,13 +9329,41 @@ function findTargetSegment(
 
     const first = charItem[chosen]
     const last = charItem[chosen + targetNorm.length - 1]
+    // The run's extent is the WHOLE of the literals it spans (their end
+    // spaces included, since the splice takes them), so a scale's
+    // compensating kern accounts for every glyph that grows.
+    let i0 = chosen
+    while (i0 > 0 && charItem[i0 - 1].item === first.item) i0--
+    let i1 = chosen + targetNorm.length - 1
+    while (i1 + 1 < charItem.length && charItem[i1 + 1].item === last.item) i1++
+    // The space-only literals right after the run travel WITH it, small kerns
+    // between included — the rule `replaceInsideTjArray` follows for the same
+    // reason. Left where they were, a scaled or shifted run leaves its own
+    // trailing space standing at the old pen position, now INSIDE the run:
+    // nothing visible, but extraction orders glyphs by x and read a resized
+    // "Atención: " back as "Atención :". A kern past KERN_SPACE is a column
+    // jump and the space beyond it belongs to the next cell.
+    let endItem = last.item
+    for (let k = last.item + 1; k < items.length; k++) {
+      const it = items[k]
+      if (!it.isLiteral) { if (Math.abs(it.value ?? 0) > KERN_SPACE) break; continue }
+      if (it.decoded.length > 0 && /^\s*$/.test(it.decoded)) { endItem = k; continue }
+      break
+    }
+    while (i1 + 1 < charItem.length && charItem[i1 + 1].item <= endItem) i1++
+    const lastW = advanceOf(items[charItem[i1].item].codes[charItem[i1].charInItem])
     const hit: TjSegmentHit = {
       op,
       spliceStart: items[first.item].start,
-      spliceEnd: items[last.item].end,
+      spliceEnd: items[endItem].end,
       tfSize: state.tfSize,
       ts: state.ts,
-      err
+      err,
+      fontName: op.fontRef ?? block.fontRef ?? null,
+      penX: state.penX,
+      opY: op.y,
+      runOffset: xAt[i0],
+      runAdvance: (xAt[i1] + (Number.isFinite(lastW) ? lastW : 0)) - xAt[i0]
     }
     if (!best || hit.err < best.err) best = hit
   }
@@ -9240,6 +9405,62 @@ function shiftInsideTjArray(hit: TjSegmentHit, tdx: number, tdy: number): string
   parts.push(`[${lead}${mid}] TJ`)
   if (rise) parts.push(`${fmtNum(hit.ts)} Ts`)
   parts.push(`[${trail}${post}`)
+  return parts.join(' ')
+}
+
+/**
+ * Resize a run of glyphs inside a TJ array by `sx` about its own origin, and
+ * displace it by (tdx, tdy) in text space — the two together are what a scale
+ * about the user's anchor comes to.
+ *
+ * The same three-op split as `shiftInsideTjArray`, with the size set by `Tf`
+ * around the middle op and restored after it. What makes a scale different
+ * from a shift is the pen: the run now advances by `sx` times what it did, so
+ * the ops after it would land that much further along — a row's later cells
+ * shoved right by the growth of one. The trailing kern therefore cancels the
+ * displacement AND the extra advance, so everything after the run draws
+ * exactly where it always did; the run itself simply grows over its
+ * neighbour's space, as one cell of a table does when it is resized in
+ * Acrobat.
+ *
+ * Text rise and the two Tf are stated outside the arrays, kerns inside them,
+ * each in the size then in force: the lead kern is drawn at the scaled size,
+ * the trailing one at the restored size.
+ */
+function scaleInsideTjArray(
+  hit: TjSegmentHit,
+  sx: number,
+  tdx: number,
+  tdy: number,
+  wrap?: { before: string; after: string }
+): string | null {
+  if (!Number.isFinite(hit.tfSize) || hit.tfSize <= 0 || !hit.fontName) return null
+  if (!Number.isFinite(tdx) || !Number.isFinite(tdy) || !Number.isFinite(sx) || sx <= 0) return null
+  if (!Number.isFinite(hit.runAdvance)) return null
+
+  const raw = hit.op.raw
+  const pre = raw.slice(0, hit.spliceStart).trimEnd()
+  const mid = raw.slice(hit.spliceStart, hit.spliceEnd)
+  const post = raw.slice(hit.spliceEnd).replace(/^\s*/, '')
+
+  const scaled = hit.tfSize * sx
+  // Displace by tdx at the SCALED size; put the pen back at the original one,
+  // by the displacement plus the growth of the run's own advance.
+  const lead = -tdx * 1000 / scaled
+  const trail = tdx * 1000 / hit.tfSize + hit.runAdvance * (sx - 1)
+  const leadS = Math.abs(lead) > 1e-4 ? `${fmtNum(lead)} ` : ''
+  const trailS = Math.abs(trail) > 1e-4 ? `${fmtNum(trail)} ` : ''
+  const rise = Math.abs(tdy) > 1e-4
+
+  const parts = [`${pre}] TJ`]
+  if (wrap) parts.push(wrap.before)
+  parts.push(`/${hit.fontName} ${fmtNum(scaled)} Tf`)
+  if (rise) parts.push(`${fmtNum(hit.ts + tdy)} Ts`)
+  parts.push(`[${leadS}${mid}] TJ`)
+  parts.push(`/${hit.fontName} ${fmtNum(hit.tfSize)} Tf`)
+  if (rise) parts.push(`${fmtNum(hit.ts)} Ts`)
+  if (wrap) parts.push(wrap.after)
+  parts.push(`[${trailS}${post}`)
   return parts.join(' ')
 }
 
@@ -9423,7 +9644,11 @@ function applyCrossBlockLine(
   pageWidth?: number
 ): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   const primary = members[0]
-  const share: TextBlock = { ...targetBlock, text: primary.text }
+  // The share's text is the primary member's, its geometry the whole line's;
+  // `wrapRef` keeps the wrap calibration honest about that (measured: "6."
+  // against a 460pt line gave 38 points per em, clamped to 2 — and the
+  // appended line wrapped at half the page).
+  const share: TextBlock = { ...targetBlock, text: primary.text, wrapRef: { text: targetBlock.text, width: targetBlock.width } }
   const head = applyPartialBlockReplacement(stream, primary.block, newText, pageIndex, share, pageHeight, pageWidth)
   if (!head || 'error' in head) return head
   const delta = head.stream.length - stream.length
@@ -9827,11 +10052,18 @@ function applyPartialBlockReplacement(
       // The window starts where the untouched head of the NEW text ends —
       // narrowing slices the new text from the front, so winText is its suffix.
       const prefixNew = newText.slice(0, Math.max(0, newText.length - winText.length))
+      // Measured in the face that will DRAW the window: a substitute's own
+      // metrics, uncalibrated — the stand-in calibrated to a narrow original
+      // (Arial Narrow → Helvetica) measured the line half again too wide and
+      // wrapped it into three.
+      const drawnFace = plan.kind === 'subst' && !plan.hex ? plan.fontName : undefined
+      // The prefix the narrowing left alone stays in the block's own font: it
+      // is measured with the calibrated stand-in, whatever draws the window.
       const m = wrapMeasure(targetBlock)
       const prefixPage = m ? measureEm(prefixNew, m.face) * m.unit : 0
       const scale = targetBlock.fontSize / stIn0.tfSize
       const windowPageX = targetBlock.x + prefixPage
-      const wrapped = m ? wrapWindowText(winText, targetBlock, pageWidth, windowPageX) : null
+      const wrapped = m ? wrapWindowText(winText, targetBlock, pageWidth, windowPageX, drawnFace) : null
       if (wrapped && wrapped.length > 1) {
         const retry = planLinesFor(winI, wrapped)
         if (retry.kind !== 'error') {

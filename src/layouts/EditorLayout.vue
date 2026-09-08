@@ -404,6 +404,14 @@ async function bakeOcrEdits(): Promise<number> {
   const settled = ocr.settleTraces()
   const slow = setTimeout(() => editorStore.setStatus("Finishing the scan's letterforms..."), 800)
   try { await settled } finally { clearTimeout(slow) }
+  // The bake is an edit of the document like any other and gets its own undo
+  // point. It had none: Ctrl+Z after a save that baked a scanned page's edits
+  // either did nothing or — with an earlier text edit on the stack — jumped
+  // PAST the bake to that edit's snapshot, taking both away in one press.
+  // `docStore.pdfBytes` is still the pre-bake document here (it is only
+  // replaced by `syncAfterEdit` at the end), so one snapshot covers every
+  // page baked in this pass.
+  pushUndo()
   let written = 0
   /** Per page, per edited item: how it was drawn — for the sweep (`window.__ocrBakeReport`). */
   const modes: Record<number, Record<string, string>> = {}

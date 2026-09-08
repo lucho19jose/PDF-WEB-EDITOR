@@ -35,6 +35,13 @@ export interface TextBlock {
    * be seen — so the UI treats the page as a scan and never offers it.
    */
   invisible?: boolean
+  /**
+   * What the wrap measurement calibrates its stand-in face against when this
+   * block is a SHARE of a wider line (one member of a cross-block line):
+   * the line's own text and width. Without it the member's short text is
+   * calibrated against the whole line's width and every em measures double.
+   */
+  wrapRef?: { text: string; width: number }
 }
 
 export interface TextChar {
