@@ -4471,6 +4471,79 @@ run that bakes on save. Four things it has to do the app's way:
   once per session, as for Mistral. No SDK: `api.openai.com` sends CORS
   headers, and COEP does not govern `fetch`.
 
+### A restyle RESTORES what the block left in force — it never wraps in q/Q
+Recolouring one line of a Chrome-printed work order turned five lines of the
+numbered list under it into glyph garbage (637 characters changed by a colour
+change), and on a PDF24 slip a line vanished with "cannot draw text since font
+and size not set". The restyled block was wrapped in `q … Q` so its new colour
+and size could not leak into later blocks, and the `Q` did more than that: it
+discarded the `Tf` and colour the block had SET for the fontless blocks after
+it. `stateRestoreAfterBlock` puts the block's original last `Tf` and fill colour
+back after `ET` (`fillColorStateAt` replays colour through q/Q the way
+`fontStateAt` replays fonts; `lastFillColorIn` reads the block's own). Restoring
+beats resetting, the same rule `rebuildBtContent` follows.
+
+Three more things the realistic sweep (`tools/pdf-sweep/sweep-real.mjs`: same-
+width edits, deletes, appends, resizes, recolours, page-2 edits — 7300
+operations over the seven corpora, a fresh document before every one) found in
+the same path, each measured on its file:
+
+- **Colour is set for the target's RUN, not for every op in its block.** A
+  LaTeX title shares one BT with the abstract and the body column; replacing
+  every colour op in the block turned the abstract red while the title — set
+  by an op BEFORE the BT — stayed black. `color_rewrite_run` brackets the run
+  (`findTargetRun`) with the new colour and what was in force at its end;
+  `color_rewrite_segment` does the same INSIDE a TJ array (a Ghostscript or
+  Print-to-PDF table row: "18:00", "DPTO:"), splitting the array around the
+  cell as the segment move does. A size change on a segment is refused. The
+  sweep's recolour experiment now counts OTHER blocks that turned red, which
+  is what exposed twenty "successes" that had recoloured a whole row.
+- **A containment match that rests on placeholders identifies nothing.** A
+  Corel datasheet block reads "???????????????????Propiedades mecánicas…"
+  (its `/Corel_OTF <<…>> DP` operand walked as text) and nineteen '?' matched
+  "AZUFRE:0.045%Máximo" exactly; that block sat nearer the click than the
+  right one, so the composition row's recolour landed on the mechanical table
+  below it. `readsOnPlaceholders` judges the whole decode by LCS and is lenient
+  on a long block; `wildcardRestsOnPlaceholders` looks at the best ALIGNED fit
+  and refuses one that is more than half '?'. Both containment passes use it.
+- **A block the position matcher cannot see is reached through containment.**
+  An Adobe guía draws its whole form as ONE BT; `findContainingBlockNear`
+  (the replace matcher's containment leg, nearest run first) hands it to the
+  run-scoped rewrite.
+
+### A wrapped continuation never lands on another table row, and a word is broken only past the paper
+`wrapRoom` refused to wrap a cell within three em of the margin, a bar
+measured on two files; a third cell sat half a point past it. On an itext
+invoice "$ 0.00" had 23pt of room against a 22.5pt bar, so appending a word
+wrapped it onto the totals row beneath ("ok" drawn across the next "$ 0.00"),
+and a dompdf inventory broke a status word mid-letters ("SWEEPMA" / "RK27")
+onto the row below. `continuationLineIsTaken` reads the SHAPE of a table row —
+a neighbour of two or more glyphs on the target's own row to its left, and text
+already in the band one leading below across the room the wrap would use — and
+`wrapRoomFor` answers "one line" for it. Prose has neither, so paragraphs wrap
+exactly as before; a bullet glyph is not a neighbour. `currentPageBlocks` is
+what the wrap looks at, set by the replace and restyle entry points.
+
+`wrapToWidth` used to break any word wider than its line by characters, and on
+a PDF24 header cell that cut a date: "27/13/3137" came back "27/13/31" with
+"37" on the next row. A word is now kept whole while it still fits on the
+PAPER (`hardEm`, the room to the page edge) and broken only past it — a few
+points into the margin is visible and right, a word cut in two is neither. The
+op-window path's first-line break follows the same rule.
+
+### Two BTs with a positional gap join with no space — compare space-free
+dompdf and PDF24 draw an inventory row as "LENOVO" and "M70s Gen 6 Desktop…"
+in two BTs with nothing between them; extraction reports the line with a
+space. The line-group join read "LENOVOM70s…", was no exact match, the second
+block alone won as a fuzzy single block, and deleting the line left "LENOVO"
+standing (six characters, on forty forms of one template). Both matchers now
+accept a space-FREE equality as exact, in the replace matcher's line runs and
+the move matcher's whole-line and contiguous-run tests.
+
+Measured (this session's baselines, node): marker sweep +8 gained, 0 lost over
+seven corpora; realistic sweep main 625, r2 1040, r3 1117, r4 1131, r5 1071,
+r6 1371, r7 990 operations — gained 16/36/43/38/33/32/35, lost 0.
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

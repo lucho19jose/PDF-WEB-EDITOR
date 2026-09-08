@@ -994,6 +994,63 @@ function wrapRoom(pageWidth: number, x: number, fontSize: number): number {
 }
 
 /**
+ * The blocks of the page being edited, as extraction reported them — set by
+ * the operations that rewrite text (`replaceTextInStream`, `restyleTextBlocks`)
+ * so the wrap decision can look at the target's NEIGHBOURS.
+ */
+let currentPageBlocks: TextBlock[] | null = null
+
+/**
+ * Is the line a wrapped continuation would land on already taken by a
+ * different cell?
+ *
+ * `wrapRoom` refuses to wrap a cell within three em of the right margin, and
+ * that bar was measured on two files; a third cell sat half a point past it.
+ * On an itext invoice "$ 0.00" at 569pt of 612 had 23pt of room against a
+ * 22.5pt bar, so appending a word wrapped it — and the continuation line, one
+ * leading down, is exactly the NEXT ROW of the totals table: "ok" was drawn
+ * across the "$ 0.00" of the row beneath. A dompdf inventory did the same
+ * with a status cell, breaking the word mid-letters ("SWEEPMA" / "RK27")
+ * onto the row below.
+ *
+ * The shape that identifies a table or form row is geometric, not a distance:
+ * the target has a neighbour of two or more glyphs on ITS OWN ROW to the left
+ * (the label, the previous cell) and the band one leading below it, across
+ * the room the wrap would use, already holds text. Prose has neither — the
+ * next line of a paragraph starts at the same left edge with nothing beside
+ * the target — so a paragraph keeps wrapping exactly as before, and with the
+ * Reflow toggle its lines are pushed. A bullet glyph does not count as a
+ * neighbour: it is one character, and a bulleted paragraph is prose.
+ *
+ * Such a cell draws on ONE line instead, toward the right; a few points into
+ * the gutter is invisible, where a tail on the next row is a wrong row.
+ */
+function continuationLineIsTaken(target: TextBlock, x: number, room: number): boolean {
+  const blocks = currentPageBlocks
+  if (!blocks || !Number.isFinite(room)) return false
+  const [tx0, ty0, , ty1] = target.bbox
+  const h = Math.max(target.height, target.fontSize, 1)
+  const cy = (ty0 + ty1) / 2
+  const visible = (b: TextBlock) => b !== target && b.id !== target.id && b.text.replace(/\s+/g, '').length >= 2
+  const rowNeighbour = blocks.some(b => visible(b) && b.bbox[2] <= tx0 + 1 &&
+    Math.abs((b.bbox[1] + b.bbox[3]) / 2 - cy) < h * 0.6)
+  if (!rowNeighbour) return false
+  const step = Math.max(target.fontSize, 1) * LINE_LEADING
+  const bandTop = ty1
+  const bandBottom = ty1 + step + h * 0.5
+  const x1 = x + room
+  return blocks.some(b => visible(b) && b.bbox[0] < x1 && b.bbox[2] > x &&
+    Math.min(b.bbox[3], bandBottom) - Math.max(b.bbox[1], bandTop) > h * 0.3)
+}
+
+/** `wrapRoom` for a specific block: `Infinity` (draw on one line) when its continuation line is taken. */
+function wrapRoomFor(pageWidth: number, x: number, target: TextBlock): number {
+  const room = wrapRoom(pageWidth, x, target.fontSize)
+  if (!Number.isFinite(room)) return room
+  return continuationLineIsTaken(target, x, room) ? Number.POSITIVE_INFINITY : room
+}
+
+/**
  * Leading given to lines this engine emits, as a multiple of the font size.
  * Mirrored by `lineStep` in TextBlockOverlay — see the note at `tdStep`.
  */
@@ -3323,6 +3380,7 @@ function replaceTextInStream(
 
   try {
     const pageData = extractPageText(pageIndex)
+    currentPageBlocks = pageData.blocks
     let targetBlock = pageData.blocks.find(b => b.id === blockId)
     if (!targetBlock) {
       return { success: false, error: `Block ${blockId} not found` }
@@ -3406,7 +3464,7 @@ function replaceTextInStream(
       // so they are collected and applied together, highest offset first.
       // Two passes over the same region is how a clip rectangle ended up
       // spliced through the middle of an /ActualText.
-      const pending: SpanRetag[] = [...(outcome.retags ?? [])]
+      const pending: SpanRetag[] = [...((globalThis as any).__noRetag ? [] : (outcome.retags ?? []))]
       if (outcome.anchorOffset !== undefined && newText.length > 0) {
         const oldLen = Math.max(targetBlock.text.trim().length, 1)
         const avgCharWidth = targetBlock.width / oldLen
@@ -3621,6 +3679,7 @@ function transformTextBlocks(
       applied: 0
     }
   }
+  currentPageBlocks = pageData.blocks
 
   const results: BlockTransformResult[] = []
   let applied = 0
@@ -4030,6 +4089,7 @@ function restyleTextBlocks(
       applied: 0
     }
   }
+  currentPageBlocks = pageData.blocks
 
   const results: BlockTransformResult[] = []
   let applied = 0
@@ -4127,6 +4187,108 @@ function dropBaselineInBlock(inner: string, stream: string, blockStart: number, 
   return inner.slice(0, hit.index) + rewritten + inner.slice(hit.index + hit[0].length)
 }
 
+/** Fill-colour operators, with the colour space a `sc`/`scn` reads against. */
+const FILL_COLOR_OP_RE = /(-?[\d.]+(?:\s+-?[\d.]+){0,3})\s+(rg|g|k|sc|scn)(?![A-Za-z0-9])|\/[ ]*\s+scn(?![A-Za-z0-9])|\/[ ]*\s+cs(?![A-Za-z0-9])/g
+
+/**
+ * The fill colour in force at `offset`, as the operator text that would put it
+ * back (`/CS17 cs 0 0 0 1 scn`, `0.2 g`), q/Q replayed — or null when nothing
+ * before that point set one.
+ *
+ * Colour is graphics state, like the font `fontStateAt` replays: a `Q` after
+ * an edited block hands whatever follows the colour saved at the `q`, and a
+ * block that set no colour of its own inherits whatever was in force before
+ * it, which is what an edit that changes the colour has to restore afterwards.
+ */
+function fillColorStateAt(stream: string, offset: number): string | null {
+  const masked = maskStreamLiterals(stream)
+  type ColorState = { cs: string | null; op: string | null }
+  let state: ColorState = { cs: null, op: null }
+  const stack: ColorState[] = []
+  const re = new RegExp(FILL_COLOR_OP_RE.source + '|(?<![A-Za-z0-9])[qQ](?![A-Za-z0-9])', 'g')
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m.index >= offset) break
+    const tok = m[0]
+    if (tok === 'q') { stack.push({ ...state }); continue }
+    if (tok === 'Q') { if (stack.length) state = stack.pop()!; continue }
+    const raw = stream.slice(m.index, m.index + tok.length)
+    if (/\scs$/.test(tok)) state = { ...state, cs: raw }
+    else state = { ...state, op: raw }
+  }
+  if (!state.op) return null
+  return (/(?:sc|scn)$/.test(state.op) && state.cs) ? `${state.cs} ${state.op}` : state.op
+}
+
+/** The last fill-colour operator inside `content` before `before`, as restore text, or null. */
+function lastFillColorIn(content: string, before = content.length): string | null {
+  const masked = maskStreamLiterals(content)
+  let cs: string | null = null
+  let op: string | null = null
+  const re = new RegExp(FILL_COLOR_OP_RE.source, 'g')
+  let m: RegExpExecArray | null
+  while ((m = re.exec(masked)) !== null) {
+    if (m.index >= before) break
+    const raw = content.slice(m.index, m.index + m[0].length)
+    if (/\scs$/.test(m[0])) cs = raw
+    else op = raw
+  }
+  if (!op) return null
+  return (/(?:sc|scn)$/.test(op) && cs) ? `${cs} ${op}` : op
+}
+
+/**
+ * What a rewritten block must leave in force for the blocks AFTER it: the
+ * last `Tf` and the last fill colour the ORIGINAL block set, verbatim.
+ *
+ * A restyled block used to be wrapped in `q`/`Q` so its new size and colour
+ * could not leak into later blocks. The `Q` did more than that: it also threw
+ * away the state the block had set for them. A Chrome print of a work order
+ * sets its font inside one BT and draws the numbered list under it as
+ * fontless blocks; recolouring the one line put the `Q` between them, the
+ * list inherited the font from before the `q`, and five lines rendered as
+ * glyph garbage — 637 characters changed by a colour change. A PDF24 slip
+ * lost a line outright ("cannot draw text since font and size not set").
+ * Restoring beats resetting: put back exactly what the block used to leave.
+ */
+function stateRestoreAfterBlock(content: string): string {
+  const parts: string[] = []
+  const tfs = [...content.matchAll(/\/[A-Za-z0-9_.+-]+\s+[\d.]+\s+Tf(?![A-Za-z0-9])/g)]
+  if (tfs.length) parts.push(tfs[tfs.length - 1][0])
+  const color = lastFillColorIn(content)
+  if (color) parts.push(color)
+  return parts.length ? ` ${parts.join(' ')} ` : ''
+}
+
+/**
+ * The BT block that CONTAINS the target and draws it nearest the click, or
+ * null — the containment leg of the replace matcher, for callers that only
+ * need one block to work inside.
+ */
+function findContainingBlockNear(
+  stream: string,
+  pageIndex: number,
+  targetBlock: TextBlock,
+  pageHeight: number
+): BtInfo | null {
+  const normalizedTarget = targetBlock.text.replace(/\s+/g, ' ').trim()
+  const targetCompact = foldForMatch(normalizedTarget).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
+  if (targetCompact.length < 2) return null
+  const onTarget = Math.max(6, targetBlock.height || 0)
+  let best: { block: BtInfo; dist: number } | null = null
+  for (const block of scanBtBlocks(stream, pageIndex)) {
+    if (!block.hasPos) continue
+    const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
+    if (!(decodedCompact.length > targetCompact.length && wildcardIncludes(decodedCompact, targetCompact))) continue
+    if (wildcardRestsOnPlaceholders(decodedCompact, targetCompact)) continue
+    if (readsOnPlaceholders(block.decodedText, normalizedTarget)) continue
+    const dist = runDistanceToTarget(block, normalizedTarget, pageIndex, stream, targetBlock, pageHeight)
+    if (dist === null || dist > onTarget * 2) continue
+    if (!best || dist < best.dist) best = { block, dist }
+  }
+  return best?.block ?? null
+}
+
 function restyleInSource(
   src: ContentSource,
   pageIndex: number,
@@ -4156,7 +4318,15 @@ function restyleInSource(
 
     const targetFontRef = findMatchingFontRef(targetBlock.fontName, fontRefToBaseName)
     const pageHeight = getPageSize(pageIndex).height
-    const matchedBlocks = findBtBlocksByPosition(stream, pageIndex, targetBlock, targetFontRef, pageHeight)
+    let matchedBlocks = findBtBlocksByPosition(stream, pageIndex, targetBlock, targetFontRef, pageHeight)
+    // A whole form drawn as ONE BT (an Adobe guía: 3150 bytes of cells in a
+    // single text object) matches nothing by position, while the replace
+    // matcher reaches its cells through containment. The run-scoped rewrite
+    // below can restyle one line of such a block, so give it the block.
+    if (!matchedBlocks || matchedBlocks.length === 0) {
+      const holder = findContainingBlockNear(stream, pageIndex, targetBlock, pageHeight)
+      matchedBlocks = holder ? [holder] : null
+    }
     if (!matchedBlocks || matchedBlocks.length === 0) return null
 
     // The face is registered once for the whole op, not per BT block: every
@@ -4212,7 +4382,7 @@ function restyleInSource(
      * surgical Tf rewrite cannot produce a second line.
      */
     const pageWidth = getPageSize(pageIndex).width
-    const available = wrapRoom(pageWidth, targetBlock.x, targetBlock.fontSize)
+    const available = wrapRoomFor(pageWidth, targetBlock.x, targetBlock)
     const overflows = sizeRatio !== null && sizeRatio > 1 &&
       targetBlock.width * sizeRatio > available && available > 0
     let drawnLines = 1
@@ -4271,7 +4441,7 @@ function restyleInSource(
         inner = dropBaselineInBlock(inner, stream, block.start, baselineDrop)
         drawnLines = Math.max(drawnLines, wrapped.length)
         usedStrategy ??= 'tf_scale_wrapped'
-        splices.push({ start: block.start, end: block.end, text: `q${colorPrefix} BT${inner}ET Q` })
+        splices.push({ start: block.start, end: block.end, text: `q${colorPrefix} BT${inner}ET Q${stateRestoreAfterBlock(block.content)}` })
         continue
       }
 
@@ -4300,8 +4470,84 @@ function restyleInSource(
         }
         inner = rebuildBtContent(block.content, [enc.bytes], newFontRef, false, sizeOverride, colorOp, block.inheritedTf)
         usedStrategy ??= 'rebuild_font'
+      } else if (matchLength(block.decodedText) > matchLength(targetBlock.text) * 1.4 + 4) {
+        // ONE LINE of a block that draws several. The size and colour ops in
+        // such a block are per line, or set once for the whole of it, and
+        // rewriting them all restyles every line: a LaTeX title shares its BT
+        // with the abstract and the body column, and a colour change on the
+        // title turned the abstract red while the title — coloured by an op
+        // BEFORE the BT — stayed black. The target's RUN is bracketed instead:
+        // the new state goes in front of its first show op, and what was in
+        // force at its end (in the ORIGINAL content, or before the BT) is put
+        // back after its last. Nothing outside the run changes.
+        const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
+        const run = findTargetRun(block, targetBlock.text, pageIndex, local)
+        if (!run) {
+          // Not a run of ops but a run of glyphs INSIDE one TJ array — a
+          // Ghostscript or Print-to-PDF table row, every cell a kern apart.
+          // The array is split around the segment and the colour set between
+          // the pieces; the pen is where it was, so nothing else moves. A
+          // size change cannot be done this way (the row's advances would
+          // change under it) and is refused rather than applied to the row.
+          if (sizeRatio !== null || !colorOp) continue
+          const seg = findTargetSegment(block, targetBlock, pageIndex, stream, pageHeight)
+          if (!seg) continue
+          const raw = seg.op.raw
+          const pre = raw.slice(0, seg.spliceStart).trimEnd()
+          const mid = raw.slice(seg.spliceStart, seg.spliceEnd)
+          const post = raw.slice(seg.spliceEnd).replace(/^\s*/, '')
+          const restore = lastFillColorIn(block.content, seg.op.end) ?? fillColorStateAt(stream, block.start) ??
+            `${fmtNum(targetBlock.color[0])} ${fmtNum(targetBlock.color[1])} ${fmtNum(targetBlock.color[2])} rg`
+          const newRaw = `${pre}] TJ ${colorOp} [${mid}] TJ ${restore} [${post}`
+          inner = block.content.slice(0, seg.op.start) + newRaw + block.content.slice(seg.op.end)
+          usedStrategy ??= 'color_rewrite_segment'
+          splices.push({ start: block.start, end: block.end, text: `BT${inner}ET` })
+          continue
+        }
+        const ops = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef),
+          (name) => ({ encoding: getFontEncoding(pageIndex, name), simpleInfo: getSimpleFontInfo(pageIndex, name) }))
+        const first = ops.findIndex(o => o.start === run.start)
+        const lastIdx = ops.findIndex(o => o.end === run.end)
+        if (first < 0 || lastIdx < 0) continue
+        let before = ''
+        let after = ''
+        let runText = block.content.slice(run.start, run.end)
+        if (sizeRatio !== null) {
+          const state = textStateAtOp(block, ops, first, pageIndex)
+          const fontName = ops[first].fontRef ?? block.fontRef
+          if (!state || !fontName) {
+            return { success: false, error: 'Cannot resize: the size in force at this line could not be read' }
+          }
+          const hits = [...runText.matchAll(TF_RE)]
+          for (const h of hits.reverse()) {
+            const scaled = (parseFloat(h[2]) || 0) * sizeRatio
+            runText = runText.slice(0, h.index!) + h[1] + fmtNum(scaled) + h[3] + runText.slice(h.index! + h[0].length)
+          }
+          before += `/${fontName} ${fmtNum(state.tfSize * sizeRatio)} Tf `
+          // The font in force at the run's END: its own last Tf, else the one it began under.
+          const endTf = hits.length ? hits[0][0] : `/${fontName} ${fmtNum(state.tfSize)} Tf`
+          after += ` ${endTf}`
+          usedStrategy ??= 'tf_scale_run'
+        }
+        if (colorOp) {
+          const masked = maskStreamLiterals(runText)
+          const hits = [...masked.matchAll(/[\d.]+(?:\s+[\d.]+){0,3}\s+(?:rg|g|k|sc|scn)\b/g)]
+          for (const h of hits.reverse()) {
+            runText = runText.slice(0, h.index!) + colorOp + runText.slice(h.index! + h[0].length)
+          }
+          before += `${colorOp} `
+          const restore = lastFillColorIn(block.content, run.end) ?? fillColorStateAt(stream, block.start) ??
+            `${fmtNum(targetBlock.color[0])} ${fmtNum(targetBlock.color[1])} ${fmtNum(targetBlock.color[2])} rg`
+          after += ` ${restore}`
+          usedStrategy ??= 'color_rewrite_run'
+        }
+        inner = block.content.slice(0, run.start) + ' ' + before + runText + after + ' ' + block.content.slice(run.end)
+        splices.push({ start: block.start, end: block.end, text: `BT${inner}ET` })
+        continue
       } else {
         inner = block.content
+        /** State to leave in force after `ET`, in place of the `q`/`Q` wrapper this path used to have. */
+        const restoreAfter: string[] = []
         if (sizeRatio !== null) {
           const hits = [...inner.matchAll(TF_RE)]
           if (hits.length === 0) {
@@ -4310,6 +4556,9 @@ function restyleInSource(
               error: 'Cannot resize: this run inherits its font size from outside its own BT block'
             }
           }
+          // Later fontless blocks inherit the LAST Tf this block set; put the
+          // original back after ET so the new size stays inside the block.
+          restoreAfter.push(hits[hits.length - 1][0])
           for (const h of hits.reverse()) {
             const scaled = (parseFloat(h[2]) || 0) * sizeRatio
             inner = inner.slice(0, h.index!) + h[1] + fmtNum(scaled) + h[3] + inner.slice(h.index! + h[0].length)
@@ -4317,23 +4566,35 @@ function restyleInSource(
           usedStrategy ??= 'tf_scale'
         }
         if (colorOp) {
+          const original = lastFillColorIn(inner)
           const hits = [...maskStreamLiterals(inner).matchAll(/[\d.]+(?:\s+[\d.]+){0,3}\s+(?:rg|g|k|sc|scn)\b/g)]
           for (const h of hits.reverse()) {
             inner = inner.slice(0, h.index!) + colorOp + inner.slice(h.index! + h[0].length)
           }
           // Nothing to overwrite: this run inherits its colour from before the
-          // BT (Quartz sets `0.3 sc` outside it). The new one goes in the same
-          // place — ahead of the text object — because that is where MuPDF's
-          // extractor picks the fill colour up from. Emitting it INSIDE renders
-          // correctly but reports back as black, so the toolbar would show the
-          // wrong swatch the next time the block was selected.
-          if (hits.length === 0) colorPrefix = ` ${colorOp}`
+          // BT (Quartz sets `0.3 sc` outside it). The new one goes ahead of the
+          // text object, and the colour that WAS in force — read back through
+          // q/Q from the stream, or failing that the colour extraction reports
+          // for this very block — is put back after it.
+          if (hits.length === 0) colorPrefix = `${colorOp} `
+          const restore = original ?? fillColorStateAt(stream, block.start) ??
+            `${fmtNum(targetBlock.color[0])} ${fmtNum(targetBlock.color[1])} ${fmtNum(targetBlock.color[2])} rg`
+          restoreAfter.push(restore)
           usedStrategy ??= 'color_rewrite'
         }
+        inner = dropBaselineInBlock(inner, stream, block.start, baselineDrop)
+        // No q/Q here: a `Q` after the block hands whatever follows the state
+        // saved at the `q`, discarding the Tf and colour this block set for the
+        // fontless blocks after it — see `stateRestoreAfterBlock`. Restoring
+        // the original operators keeps the new style inside the block AND
+        // keeps what the block used to leave in force.
+        const tail = restoreAfter.length ? ` ${restoreAfter.join(' ')} ` : ''
+        splices.push({ start: block.start, end: block.end, text: `${colorPrefix}BT${inner}ET${tail}` })
+        continue
       }
 
       inner = dropBaselineInBlock(inner, stream, block.start, baselineDrop)
-      splices.push({ start: block.start, end: block.end, text: `q${colorPrefix} BT${inner}ET Q` })
+      splices.push({ start: block.start, end: block.end, text: `q${colorPrefix} BT${inner}ET Q${stateRestoreAfterBlock(block.content)}` })
     }
 
     if (splices.length === 0) return null
@@ -5372,7 +5633,10 @@ function findBtBlocksByPosition(
     const alongStream = joinOf(lineBlocks)
     const acrossPage = joinOf(byX)
     const orders = acrossPage === alongStream ? [acrossPage] : [acrossPage, alongStream]
-    let exact = orders.some(o => o === normalizedTarget)
+    // Space-free too: two BTs with a positional gap between them join with
+    // no space where extraction reports one (see the replace matcher).
+    const targetFree = normalizedTarget.replace(/\s+/g, '')
+    let exact = orders.some(o => o === normalizedTarget || o.replace(/\s+/g, '') === targetFree)
     let isMatch = exact || orders.some(readsAs)
     let runBlocks: BtInfo[] | null = null
 
@@ -5388,7 +5652,7 @@ function findBtBlocksByPosition(
             acc += sorted[j].decodedText
             const norm = acc.replace(/\s+/g, ' ').trim()
             if (norm.length > normalizedTarget.length * 1.5 + 8) break
-            if (norm === normalizedTarget) {
+            if (norm === normalizedTarget || norm.replace(/\s+/g, '') === targetFree) {
               runBlocks = sorted.slice(i, j + 1)
               exact = true; isMatch = true
               break outer
@@ -5419,7 +5683,8 @@ function findBtBlocksByPosition(
       const compact = (s: string) => foldForMatch(s).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
       const carrying = lineBlocks.filter(b =>
         !readsOnPlaceholders(b.decodedText, normalizedTarget) &&
-        wildcardIncludes(compact(b.decodedText), compact(normalizedTarget)))
+        wildcardIncludes(compact(b.decodedText), compact(normalizedTarget)) &&
+        !wildcardRestsOnPlaceholders(compact(b.decodedText), compact(normalizedTarget)))
       if (carrying.length === 0) continue
       picked = carrying
     }
@@ -5995,7 +6260,14 @@ function replaceTextInContentStreamFontAware(
             continue
           }
           let score = 0
-          if (norm === normalizedTarget) score = 2
+          // Space-FREE as well as space-normalised. The join concatenates the
+          // blocks' decodes with nothing between them, and a row drawn as two
+          // BTs with a positional gap — dompdf's "LENOVO" + "M70s Gen 6
+          // Desktop…", one inventory template repeated across forty forms —
+          // reads "LENOVOM70s…" against a target extraction reports with a
+          // space. That was no exact match, the second block alone won as a
+          // fuzzy single block, and deleting the line left "LENOVO" standing.
+          if (norm === normalizedTarget || winFree === tFree) score = 2
           else if (fuzzyTextMatch(norm, normalizedTarget)) score = ratio
           // The extractor shuffled two overlapping runs together (see
           // sameCharacters). The run still COVERS the target, so it scores
@@ -6152,6 +6424,7 @@ function replaceTextInContentStreamFontAware(
         if (!fontFiltered && targetFontRef && blockUsesFont(block, targetFontRef)) continue
         const decodedCompact = foldForMatch(block.decodedText).replace(/\s+/g, '').replace(ACCENT_MARKS, '')
         if (!(decodedCompact.length > targetCompact.length && wildcardIncludes(decodedCompact, targetCompact))) continue
+        if (wildcardRestsOnPlaceholders(decodedCompact, targetCompact)) continue
         let dist = distOf(block)
         if (loneChar) {
           const runDist = runDistanceToTarget(block, normalizedTarget, pageIndex, stream, targetBlock, pageHeight)
@@ -6443,8 +6716,18 @@ function measureEm(text: string, faceName: string): number {
   return w
 }
 
-/** Greedy word wrap on MEASURED width, breaking a word too long to ever fit. */
-function wrapToWidth(text: string, maxEm: number, faceName: string): string[] {
+/**
+ * Greedy word wrap on MEASURED width.
+ *
+ * A word wider than a line is put on a line of its own and left WHOLE while
+ * it still fits on the paper (`hardEm`, the room to the page edge); only a
+ * word that would run off the paper is broken by characters. Breaking is what
+ * this used to do at the margin, and on a table it broke a DATE: "27/13/3137"
+ * in a 5.5pt header cell 25pt from the margin became "27/13/31" with "37" on
+ * the next row. A few points into the margin is visible and right; a word cut
+ * in two is neither.
+ */
+function wrapToWidth(text: string, maxEm: number, faceName: string, hardEm = Number.POSITIVE_INFINITY): string[] {
   if (!(maxEm > 0)) return [text]
   const words = text.split(/\s+/).filter(w => w.length > 0)
   if (words.length === 0) return ['']
@@ -6460,6 +6743,7 @@ function wrapToWidth(text: string, maxEm: number, faceName: string): string[] {
     if (line) { lines.push(line); line = '' }
 
     if (measureEm(word, faceName) <= maxEm) { line = word; continue }
+    if (measureEm(word, faceName) <= hardEm) { lines.push(word); continue }
 
     // A word wider than the whole line still has to go somewhere. Breaking it
     // mid-word is ugly; letting it run off the paper loses it.
@@ -6492,7 +6776,7 @@ function layoutReplacementLines(
   pageWidth: number,
   sizeRatio = 1
 ): string[] {
-  const available = wrapRoom(pageWidth, targetBlock.x, targetBlock.fontSize)
+  const available = wrapRoomFor(pageWidth, targetBlock.x, targetBlock)
   if (!(available > 0)) return newText.split('\n')
 
   const face = pickSubstituteFont(null, targetBlock)
@@ -6509,11 +6793,12 @@ function layoutReplacementLines(
   const calibration = Math.min(Math.max(raw, 0.5), 2)
 
   const maxEm = available / (size * calibration)
+  const hardEm = Math.max(maxEm, (pageWidth - targetBlock.x) / (size * calibration))
 
   const out: string[] = []
   for (const para of newText.split('\n')) {
     if (para.length === 0) { out.push(''); continue }
-    out.push(...wrapToWidth(para, maxEm, face))
+    out.push(...wrapToWidth(para, maxEm, face, hardEm))
   }
   return out
 }
@@ -6542,8 +6827,8 @@ function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number,
   const m = wrapMeasure(targetBlock)
   if (!m) return null
   const { face, unit } = m
-  const roomFirst = wrapRoom(pageWidth, windowPageX, targetBlock.fontSize)
-  const roomRest = wrapRoom(pageWidth, targetBlock.x, targetBlock.fontSize)
+  const roomFirst = wrapRoomFor(pageWidth, windowPageX, targetBlock)
+  const roomRest = wrapRoomFor(pageWidth, targetBlock.x, targetBlock)
   if (!(roomRest > 0) || !(unit > 0)) return null
   if (measureEm(text, face) * unit <= Math.max(roomFirst, 0)) return null
   const words = text.split(/\s+/).filter(Boolean)
@@ -6555,26 +6840,34 @@ function wrapWindowText(text: string, targetBlock: TextBlock, pageWidth: number,
     first = cand
   }
   let rest = words.slice(k).join(' ')
-  // The first WORD alone is wider than the first line: break it by characters
-  // there, the way `wrapToWidth` breaks an over-wide word on any other line.
-  // Leaving the first line empty put a 73pt cover title ("CATÁLOGO" →
-  // "SWEEPMARK") one whole line LOWER than it stood, with a bare `() Tj`
-  // where the title had been — the sweep read it as the text having left
-  // its place.
+  // The first WORD alone is wider than the first line. While it still fits on
+  // the PAPER it stays whole on that line (a few points into the margin);
+  // only past the page edge is it broken by characters, the way `wrapToWidth`
+  // breaks an over-wide word on any other line. Leaving the first line empty
+  // put a 73pt cover title ("CATÁLOGO" → "SWEEPMARK") one whole line LOWER
+  // than it stood, with a bare `() Tj` where the title had been — the sweep
+  // read it as the text having left its place.
+  const hardFirst = Math.max(roomFirst, pageWidth - windowPageX)
   if (!first && k < words.length) {
     const word = words[k]
-    let chunk = ''
-    for (const ch of word) {
-      if (chunk && measureEm(chunk + ch, face) * unit > roomFirst) break
-      chunk += ch
-    }
-    if (chunk.length > 0 && chunk.length < word.length) {
-      first = chunk
-      rest = [word.slice(chunk.length), ...words.slice(k + 1)].join(' ')
+    if (measureEm(word, face) * unit <= hardFirst) {
+      first = word
+      rest = words.slice(k + 1).join(' ')
+    } else {
+      let chunk = ''
+      for (const ch of word) {
+        if (chunk && measureEm(chunk + ch, face) * unit > roomFirst) break
+        chunk += ch
+      }
+      if (chunk.length > 0 && chunk.length < word.length) {
+        first = chunk
+        rest = [word.slice(chunk.length), ...words.slice(k + 1)].join(' ')
+      }
     }
   }
   const lines = first ? [first] : ['']
-  if (rest) lines.push(...wrapToWidth(rest, roomRest / unit, face))
+  const hardRest = Math.max(roomRest, pageWidth - targetBlock.x) / unit
+  if (rest) lines.push(...wrapToWidth(rest, roomRest / unit, face, hardRest))
   return lines.length > 1 ? lines : null
 }
 
@@ -7183,6 +7476,41 @@ function lcsLength(a: string, b: string): number {
  * match rests on a wildcard. A decode with no '?' at all is never in
  * question.
  */
+/**
+ * Does the ONLY way `wildcardIncludes` can fit the needle into the hay run
+ * through placeholders?
+ *
+ * `readsOnPlaceholders` judges a whole decode against the target, and on a
+ * long block that is lenient: a Corel block reading
+ * "???????????????????Propiedades mecánicas del acero???…ESFUERZO DE
+ * FLUENCIA…" carries, somewhere among its 150 known letters, a subsequence
+ * of any short target — while the thing that actually matched was a run of
+ * nineteen '?' (the `/Corel_OTF <<…>> DP` operand walked as text) standing in
+ * for "AZUFRE:0.045%Máximo", nineteen characters exactly. That block sat 31pt
+ * from the click and the right one 64pt, so recolouring the AZUFRE row
+ * recoloured the mechanical-properties table below it. Aligned window by
+ * window, the share of '?' inside the best fit is what tells the two apart:
+ * a fit that is more than half placeholders identifies nothing. A hay that
+ * contains the needle outright never rests on a placeholder.
+ */
+function wildcardRestsOnPlaceholders(hay: string, needle: string): boolean {
+  if (!needle || !hay.includes('?') || hay.includes(needle)) return false
+  const n = needle.length
+  let best: number | null = null
+  for (let s = 0; s + n <= hay.length; s++) {
+    let q = 0
+    let ok = true
+    for (let j = 0; j < n; j++) {
+      const c = hay[s + j]
+      if (c === '?') q++
+      else if (c !== needle[j]) { ok = false; break }
+    }
+    if (!ok) continue
+    if (best === null || q < best) best = q
+  }
+  return best !== null && best * 2 > n
+}
+
 function readsOnPlaceholders(text: string, target: string): boolean {
   if (!text.includes('?')) return false
   const known = foldForMatch(text).replace(/[\s?]/g, '')
