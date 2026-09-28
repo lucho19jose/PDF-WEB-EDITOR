@@ -1132,14 +1132,21 @@ function splitBlocksAtGaps(blocks: TextBlock[], pageIndex: number): TextBlock[] 
     // a one-letter block that no move could address, so every reflow tore the
     // word apart. Glyphs are sorted by baseline and a new line starts only
     // where the baseline steps by more than the tolerance.
+    // The step is measured from the PREVIOUS glyph, not from the line's first:
+    // measured from the first, a line drawn at a slight tilt (an OCR redraw
+    // following a scan's 0.6° baseline, a skewed searchable layer) broke every
+    // 0.7pt of drift - nine blocks of one sentence, listed right to left. The
+    // spread of one line stays capped at an em (leading is 1.2 or more), so
+    // the lines of a page turned by more than a few degrees cannot chain.
     const byY = [...block.chars].sort((p, q) => p.origin[1] - q.origin[1])
     const lines: TextChar[][] = []
     let cur: TextChar[] = []
-    let curY = NaN
+    let curY = NaN, prevY = NaN
     for (const ch of byY) {
       const tol = Math.max(0.5, (ch.size || 0) * 0.08)
-      if (cur.length && Math.abs(ch.origin[1] - curY) > tol) { lines.push(cur); cur = [] }
+      if (cur.length && (Math.abs(ch.origin[1] - prevY) > tol || Math.abs(ch.origin[1] - curY) > Math.max(tol, (ch.size || 0) * 1.0))) { lines.push(cur); cur = [] }
       if (!cur.length) curY = ch.origin[1]
+      prevY = ch.origin[1]
       cur.push(ch)
     }
     if (cur.length) lines.push(cur)

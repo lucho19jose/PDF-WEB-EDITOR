@@ -4101,6 +4101,98 @@ floors to grain and JPEG ringing; reverted. What the scan holds at that level
 is what a reader sees as a weak E; the honest fix would be a stroke-aware
 fill along a bar whose ends are dark, which is not implemented.
 
+### A skewed scan: the ink box, the ink colour, the letter's shape and the missing glyph
+A SEIDOR appendix scanned about half a degree off level ("LICENCIA" →
+"LICENCIAA", "APÉNDICE 24" → "APÉNDICEe 24") baked with a Helvetica "A",
+a Helvetica "e", black body text sampled as 0.54 grey, and an editor that
+opened in 13.3pt over 8.4pt capitals. Four separate causes, each measured on
+the page in the browser (`window.__ocrWeightPlans`, the face's glyph list,
+`renderPageBitmap` crops):
+
+- **The box is level; the line is not.** One axis-aligned box fitted to the
+  middle of a tilted 464pt line cut through the feet of "AL CONTRATO" on the
+  left. The capitals traced there came out without their bottoms and sat on
+  the baseline short: the face's caps measured 618–726 units tall, left to
+  right, and a typed "A" drew at three quarters of its neighbours' height.
+  `extendForTilt` (inkMeasure) follows each vertical slice's ink out of the
+  box to the first empty row and accepts it only with a tilt's signature —
+  one slice needs nothing and the amounts rise steadily to the other end. An
+  underline, a rule or a neighbouring line touches every slice alike and is
+  refused. After it the caps measure 705–743.
+- **A weight is a HORIZONTAL run, so a letter's shape biases it.** An "A"'s
+  diagonals read wider than they are thick: 0.126 against 0.097 for the "I"
+  and "D" of the same bold title, past `weightPlan`'s 30% bar, so the face's
+  own A was skipped for Helvetica. `letterBias` divides the letter's shape
+  out against its own context on the line, and a difference of two pixels
+  never decides. The CONTRATO111 case the skip exists for still skips: its
+  bold "S" sits in a bold context, and is still 40% off the regular word.
+- **The darkest fifth is ink only while the box hugs the text.** A skewed
+  line's box is half again the letters' height, ink a tenth of it, and the
+  darkest fifth averaged in paper. Ink is now what lies beyond the
+  threshold, capped at the old fifth (body lines 0.54 → 0.28–0.33). Only the
+  darker HALF of it was tried first and read a grey scan's text as
+  near-black (0.24 → 0.10 on a form whose neighbours are grey).
+- **The face learned only from the runs the user edited.** An all-caps
+  heading has no "e"; the page had bold "e"s at the same size in
+  "31 de agosto de 2026". `borrowMissingGlyphs` (useOCR) cuts other runs of
+  the page — nearest first, three that cut out of eight tried, because long
+  skewed body lines refuse their cuts — and traces a cell only when its em is
+  within 15% and the letters AROUND it (not the letter, whose shape biases
+  the measure) weigh what the edited run's cells do, within 20%.
+  `traceRunIntoFace` takes `{ only, acceptCell }` for it. A donor's text is
+  the ENGINE's reading alone — the rule that only glyphs the engine and the
+  user agree on enter the face cannot hold for it — so it is gated harder:
+  confidence 90+, at most a tenth of its cells suspect, and the borrowed
+  cell's neighbours clean. At the ordinary vetting bar the OCR corpus showed
+  why: two runs that had baked cleanly in Helvetica took a "u" for an "i"
+  and an "n" for an "o" from donors.
+
+The editor and preview (`shownSize`, OcrTextLayer) size a run by WIDTH until
+the glyph cut has measured its letters, which the editor now starts in the
+background when it opens: a box a tilt inflated opened a 17.6pt editor over
+10pt prose (now 10.9). That open-time pass MEASURES only
+(`traceItem(item, { measureOnly: true })`). A full trace there was tried
+first: nothing is agreed while the editor is merely open, so `trustedCells`
+trusts the engine's whole reading, and the stretch the user was about to
+correct entered the face — on the OCR corpus an "i" traced as a "t", and a
+run whose own cut refused baked in those glyphs instead of Helvetica.
+
+### A cut that slides in the MIDDLE is caught by agreement between copies
+The same appendix's "262 (PS 8) LIMA … MARIA con RUC Nº …" line was read as
+"(PS8)IMA … MARIAcon RUCN": letters missing from the reading, so the cells
+slid by one around "MARIA con" and recovered further on. At under a fifth
+suspect the 2x-raster cut passed, the face learned "c" from an "o", "o" from
+an "n" and "C" from an "N", and every later edit drew "con" as "onn" and
+"Contrato" as "Nnntratn" — the user's screenshot. The end-sliver guard only
+sees a shift that starts at an END of the run.
+
+`chooseCells` (scanFace) makes the copies of a letter vote. `cellShape`
+(glyphCut) grids a cell's ink over a fixed em band about the baseline;
+several copies take the MEDOID (most like the rest on average, mean ≥ 0.66),
+because a shifted round letter can pass a bar (a "c" holding an "o" scored
+0.77 against real c's, true copies 0.8–0.9) but is never the most typical.
+Two copies agreeing (≥ 0.72) or one with clean neighbours; a lone copy only
+with no suspect cell within two. Measured on the line: the misaligned cells
+are no longer chosen and the corrected line bakes clean, the unconfirmed
+letters in the base font.
+
+### A partial redraw follows the line's slope, and extraction groups by STEP
+The same line's stretch was drawn level from its start while the scan's
+baseline rose, so the untouched tail sat a few points above the text before
+it. `planPartial` now rotates the whole group by the fitted baseline's angle
+(`rotation`, degrees counter-clockwise), places every part on the line at its
+own x, and moves a transplanted tail along the slope (dy = slope × dx).
+
+That exposed an extraction defect: `splitBlocksAtGaps` started a new line
+when a glyph's baseline was 0.7pt from the line's FIRST glyph — its comment
+already said "where the baseline STEPS" — so any gently tilted line (this
+redraw, a skewed Acrobat OCR layer) came back as a chain of 60pt blocks
+listed right to left. It compares with the previous glyph now, with the
+line's spread capped at one em. Text sweeps: realistic identical on all
+seven corpora; marker −3/+1, all on Acrobat OCR layers (every block `3 Tr`,
+never offered for editing) whose tilted words now group into lines and
+change which block the sweep picks by index.
+
 ### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
 Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)
 leaves a scan's words in the content stream as INVISIBLE text: render mode 3,

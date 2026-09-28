@@ -1,6 +1,6 @@
 import * as opentype from 'opentype.js'
 import { init as potraceInit, potrace } from 'esm-potrace-wasm'
-import { cutGlyphs, cellBitmap, cellBitmapTraced, cellStrokeRatio, strokeRatioOfImage, traceLevel, expectedAdvance, lastCutReason, type GlyphCutResult } from './glyphCut'
+import { cutGlyphs, cellBitmap, cellBitmapTraced, cellStrokeRatio, strokeRatioOfImage, traceLevel, expectedAdvance, lastCutReason, cellShape, shapeSimilarity, type GlyphCutResult } from './glyphCut'
 import { commonAffix } from './partialRedraw'
 import type { OcrBox } from './ocrEngine'
 
@@ -112,9 +112,16 @@ export async function traceRunIntoFace(
   /** What the user made of the run; characters they changed are not traced. */
   editedText?: string,
   /** A cut already made for this run (the partial redraw needs it whether or not there is anything to trace). */
-  precut?: GlyphCutResult | null
+  precut?: GlyphCutResult | null,
+  /**
+   * Restrict what enters the face: only these characters, and only cells the
+   * caller accepts (by index into the run's non-space characters). Used to
+   * BORROW one glyph from another run of the page without taking the rest of
+   * that line with it.
+   */
+  opts?: { only?: Set<string>; acceptCell?: (index: number) => boolean }
 ): Promise<TraceResult> {
-  const wanted = [...text].filter(c => c !== ' ' && !face.glyphs.has(c))
+  const wanted = [...text].filter(c => c !== ' ' && !face.glyphs.has(c) && (!opts?.only || opts.only.has(c)))
   if (!wanted.length) return { added: 0, refused: null }
   const cut = precut ?? cutGlyphs(ctx, inkRect, text, symbols)
   // A refused cut is the one outcome the user has to be told about: the run
@@ -156,10 +163,12 @@ export async function traceRunIntoFace(
   // run) and at twice the raster's resolution — the cut's own bitmap is the
   // segmentation, not the weight. See `cellBitmapTraced`.
   const level = traceLevel(cut)
+  const chosen = chooseCells(cut, (index, cell) =>
+    trusted(index) && !cell.suspect && !face.glyphs.has(cell.char) &&
+    (!opts?.only || opts.only.has(cell.char)) && (!opts?.acceptCell || opts.acceptCell(index)))
   let added = 0
   for (const [index, cell] of cut.cells.entries()) {
-    if (!trusted(index) || cell.suspect) continue
-    if (face.glyphs.has(cell.char)) continue
+    if (!chosen.has(index)) continue
     const traced = cellBitmapTraced(cut, cell, 1, TRACE_RES, level)
     const bmp = traced ?? (() => { const b = cellBitmap(cut, cell, 1); return b ? { ...b, res: 1 } : null })()
     if (!bmp) continue
@@ -184,6 +193,84 @@ export async function traceRunIntoFace(
   }
   if (added) await rebuild(face)
   return { added, refused: null }
+}
+
+/**
+ * Which cell to trace for each letter — or none.
+ *
+ * A cut can slide by one letter in the MIDDLE of a line and recover further
+ * on: the engine read "MARIAcon RUCN" for "MARIA con RUC Nº", the cells from
+ * there were each one letter off, and at under a fifth suspect the cut passed.
+ * The face then learned its "c" from an "o", its "o" from an "n" and its "C"
+ * from an "N", and every later edit on the page drew "con" as "onn" and
+ * "Contrato" as "Nnntratn". The end-sliver guard only sees a shift that starts
+ * at an end of the run.
+ *
+ * What a shift cannot fake is AGREEMENT: a letter that occurs several times on
+ * the line has to look like itself each time. Every candidate is compared with
+ * the others (`cellShape`: the ink on a grid in ems about the baseline) and
+ * the most typical copy is taken, if it is typical enough; letters whose
+ * copies do not agree are not traced. A letter seen only once
+ * has nothing to agree with, so it must have clean neighbours: a local shift
+ * is what makes the cells around it suspect.
+ */
+function chooseCells(cut: GlyphCutResult, eligible: (index: number, cell: GlyphCutResult['cells'][number]) => boolean): Set<number> {
+  // Measured on the SEIDOR appendix's line: true copies of a letter score
+  // 0.75-0.9 against each other, a shifted cell 0.6-0.7 against them.
+  const AGREE = 0.72, AGREE_MEAN = 0.66
+  const byChar = new Map<string, number[]>()
+  cut.cells.forEach((cell, i) => {
+    if (!eligible(i, cell)) return
+    const list = byChar.get(cell.char) ?? []
+    list.push(i)
+    byChar.set(cell.char, list)
+  })
+  const chosen = new Set<number>()
+  const clean = (i: number) => {
+    for (let k = i - 2; k <= i + 2; k++) if (k !== i && cut.cells[k]?.suspect) return false
+    return true
+  }
+  const widthEm = (i: number) => (cut.cells[i].x1 - cut.cells[i].x0) / cut.emPx
+  for (const [, idx] of byChar) {
+    if (idx.length === 1) { if (clean(idx[0])) chosen.add(idx[0]); continue }
+    const shapes = idx.map(i => cellShape(cut, cut.cells[i]))
+    const sim = (a: number, b: number): number => {
+      if (!shapes[a] || !shapes[b]) return 0
+      const wa = widthEm(idx[a]), wb = widthEm(idx[b])
+      // A width a third apart is another letter whatever the grid says.
+      if (Math.abs(wa - wb) > Math.max(wa, wb) * 0.35) return 0
+      return shapeSimilarity(shapes[a]!, shapes[b]!)
+    }
+    let best = -1
+    if (idx.length === 2) {
+      // Two copies cannot outvote each other. Agreeing, either will do (the
+      // one with clean neighbours first); disagreeing, only one whose
+      // neighbourhood is clean when the other's is not.
+      const c = idx.filter(clean)
+      if (sim(0, 1) >= AGREE) best = c[0] ?? idx[0]
+      else if (c.length === 1) best = c[0]
+    } else {
+      // Several: the MEDOID - the copy most like the rest on average. A
+      // shifted cell holding the neighbouring letter can resemble the true
+      // ones well enough to pass a bar ("c" and "o" are both round: 0.77),
+      // but it is never the most typical of them.
+      let bestMean = -1
+      for (let a = 0; a < idx.length; a++) {
+        if (!shapes[a]) continue
+        let sum = 0
+        for (let b = 0; b < idx.length; b++) if (a !== b) sum += sim(a, b)
+        const mean = sum / (idx.length - 1)
+        if (mean > bestMean) { bestMean = mean; best = idx[a] }
+      }
+      if (bestMean < AGREE_MEAN) best = -1
+    }
+    if (best >= 0) chosen.add(best)
+    if (typeof window !== 'undefined' && (window as any).__shapeDebug) {
+      const rows = idx.map((i, a) => `${i}:${idx.map((j, b) => a === b || !shapes[a] || !shapes[b] ? '-' : shapeSimilarity(shapes[a]!, shapes[b]!).toFixed(2)).join('/')}`)
+      ;((window as any).__shapeLog ??= []).push(`${cut.cells[idx[0]].char} -> ${best} [${rows.join(' ')}]`)
+    }
+  }
+  return chosen
 }
 
 /**

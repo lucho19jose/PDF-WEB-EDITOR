@@ -55,7 +55,9 @@ export function sampleLineColors(
   const px: { r: number; g: number; b: number; l: number }[] = []
   // Every pixel of a full page is millions of samples for no extra accuracy;
   // a stride keeps this at a few thousand per line.
-  const stride = Math.max(1, Math.floor(Math.sqrt((w * h) / 2000)))
+  // ...but never so coarse that a thin stroke falls between samples: a line
+  // of small text is a few pixels of stem.
+  const stride = Math.max(1, Math.min(h < 20 ? 2 : Infinity, Math.floor(Math.sqrt((w * h) / 2000))))
   for (let row = 0; row < h; row += stride) {
     for (let col = 0; col < w; col += stride) {
       const i = (row * w + col) * 4
@@ -130,7 +132,16 @@ export function sampleLineColors(
   const inkCount = Math.max(1, Math.floor(px.length * 0.2))
   // Ink from one end, paper from the other, and never from the middle of the
   // distribution: those are anti-aliased edge pixels, which are both.
-  const ink = inverted ? px.slice(px.length - inkCount) : px.slice(0, inkCount)
+  // The ink end is also bounded by the THRESHOLD: a fifth of the box is ink
+  // only while the box hugs the text. A skewed scan's line box is half again
+  // as tall as its letters, ink was a tenth of it, and the "darkest fifth"
+  // averaged in paper - black body text sampled 0.54 grey, and every edit to
+  // it baked grey. What lies beyond the threshold is the strokes; its darker
+  // half alone was tried and read a grey scan's text as near-black.
+  const lightThreshold = lightest - (lightest - darkest) * 0.42
+  const beyond = inverted ? px.filter(p => p.l > lightThreshold).length : px.filter(p => p.l < threshold).length
+  const coreCount = Math.max(1, Math.min(inkCount, beyond))
+  const ink = inverted ? px.slice(px.length - coreCount) : px.slice(0, coreCount)
   const paper = inverted ? px.slice(0, inkCount) : px.slice(px.length - inkCount)
 
   const mean = (list: typeof px): Rgb01 => {

@@ -370,6 +370,56 @@ export function extendAscenders(ctx: CanvasRenderingContext2D, box: InkRect, tex
 }
 
 /**
+ * Grow a long line's box to hold the ends a TILT carries past it.
+ *
+ * A skewed scan's line is not level, and one axis-aligned box fitted to its
+ * middle cuts the letters at both ends: on the SEIDOR appendix (about half a
+ * degree) the title's box sliced through the feet of "AL CONTRATO" on the left.
+ * The glyph cut then traced those capitals without their bottoms and sat them
+ * on the baseline, so a typed "A" came out at three quarters of its
+ * neighbours' height; the patch left the cut-off ink showing as well.
+ *
+ * The box is cut into vertical slices, and in each one the ink is followed out
+ * of the box, up and down, row by row until the first empty row (the gap to
+ * the next line) or half the box's height. A tilt has a signature, and only
+ * that is accepted: at least one slice needs nothing, and the amounts rise
+ * steadily from one end to the other. A neighbouring line, an underline or a
+ * rule touches every slice alike, and is refused.
+ */
+export function extendForTilt(ctx: CanvasRenderingContext2D, box: InkRect): InkRect {
+  if (box.width < box.height * 12) return box
+  const n = Math.min(8, Math.max(3, Math.floor(box.width / (box.height * 4))))
+  const reach = Math.max(2, Math.round(box.height * 0.5))
+  const down: number[] = [], up: number[] = []
+  for (let i = 0; i < n; i++) {
+    const sx = box.x + (box.width * i) / n
+    const band = { x: sx, y: box.y - reach, width: box.width / n, height: box.height + 2 * reach }
+    const p = profile(ctx, band, band.width * 4)
+    if (!p) return box
+    // Row indices of the box's own top and bottom inside the band's profile.
+    const top = Math.round(box.y - p.y), bottom = Math.round(box.y + box.height - 1 - p.y)
+    let d = 0
+    while (bottom + d + 1 < p.height && d < reach && p.rows[bottom + d + 1] >= 2) d++
+    let u = 0
+    while (top - u - 1 >= 0 && u < reach && p.rows[top - u - 1] >= 2) u++
+    down.push(d); up.push(u)
+  }
+  const tilted = (v: number[]): boolean => {
+    const lo = Math.min(...v), hi = Math.max(...v)
+    if (lo !== 0 || hi < 2 || hi >= reach) return false
+    // Monotonic within a row of noise, in one direction or the other.
+    const rising = v.every((x, i) => i === 0 || x >= v[i - 1] - 1)
+    const falling = v.every((x, i) => i === 0 || x <= v[i - 1] + 1)
+    return (rising && v[v.length - 1] === hi) || (falling && v[0] === hi)
+  }
+  const dExt = tilted(down) ? Math.max(...down) : 0
+  const uExt = tilted(up) ? Math.max(...up) : 0
+  walkDebug.push(`tilt down=[${down.join(',')}] up=[${up.join(',')}] -> +${dExt} -${uExt}`)
+  if (!dExt && !uExt) return box
+  return { x: box.x, y: box.y - uExt, width: box.width, height: box.height + uExt + dExt }
+}
+
+/**
  * The horizontal BANDS of ink inside a box — runs of inked rows separated by
  * `minGap` or more empty rows — as canvas-pixel y ranges, top to bottom.
  *

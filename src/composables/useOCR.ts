@@ -7,7 +7,7 @@ import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
 import { TesseractEngine } from '@/utils/ocr/engines/tesseractEngine'
 import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
-import { inkBounds, inkGaps, inkBands, extendDescenders, extendAscenders, walkNote, type InkCut } from '@/utils/ocr/inkMeasure'
+import { inkBounds, inkGaps, inkBands, extendDescenders, extendAscenders, extendForTilt, walkNote, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
 import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance } from '@/utils/ocr/glyphCut'
 import { toSpanCut, sizeOf, type SpanCut } from '@/utils/ocr/partialRedraw'
@@ -285,14 +285,21 @@ function createOCR() {
   async function settleTraces(): Promise<void> {
     while (pendingTraces.size) await Promise.allSettled([...pendingTraces])
   }
-  function traceItem(item: OcrTextItem): Promise<TraceResult> {
-    const p = traceItemNow(item)
+  /**
+   * `measureOnly`: cut the run and adopt its letters' size, trace nothing.
+   * For an editor that has just OPENED: nothing is agreed yet, and tracing
+   * then took the engine's whole reading into the face - the stretch the user
+   * was about to correct included (measured on the OCR corpus: an "i" traced
+   * as a "t" before the user retyped the run).
+   */
+  function traceItem(item: OcrTextItem, opts: { measureOnly?: boolean } = {}): Promise<TraceResult> {
+    const p = traceItemNow(item, opts)
     pendingTraces.add(p)
     p.finally(() => pendingTraces.delete(p)).catch(() => {})
     return p
   }
 
-  async function traceItemNow(item: OcrTextItem): Promise<TraceResult> {
+  async function traceItemNow(item: OcrTextItem, opts: { measureOnly?: boolean } = {}): Promise<TraceResult> {
     const base = rasters.get(item.pageIndex)
     if (!base || item.vertical) return { added: 0, refused: null }
     // Trace from the 2x raster when the layout can render one; the OCR raster
@@ -346,8 +353,10 @@ function createOCR() {
         }
         face = scanFaceFor(item.pageIndex, styleKeyOf(item))
       }
+      if (opts.measureOnly) return { added: 0, refused: null }
       const res = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, perGlyph ? symbols : undefined, item.text, cut)
       if (res.added) faceVersion.value++
+      if (cut && await borrowMissingGlyphs(item, raster, face)) faceVersion.value++
       if (res.added || !res.refused || perGlyph || cut) return res
       // The profile cut refused — letters that touch, too many fragments, a
       // misaligned end. PaddleOCR reports no glyph boxes, and the column
@@ -370,6 +379,79 @@ function createOCR() {
       console.warn('[OCR] scan face tracing failed:', err)
       return { added: 0, refused: null }
     }
+  }
+
+  /**
+   * Glyphs the edit needs that neither the run nor the face holds, BORROWED
+   * from another run of the page at the same size and weight.
+   *
+   * The face only ever learned from the runs the user edited, so typing a
+   * lowercase "e" into an all-caps heading drew it in Helvetica, while the
+   * page carried bold lowercase "e"s of the same size a few lines down
+   * ("09 de marzo de 2016" on the SEIDOR appendix). A donor cell is taken only
+   * when its em is within 15% of the run's and the letters AROUND it (not the
+   * letter itself - its shape biases the measure) weigh what the run's cells
+   * do, within 20%: a bold heading borrows from a bold span, never from the
+   * regular prose around it. At most three donor lines per commit, nearest
+   * first; each is cut on the same raster, so the weights compare.
+   */
+  async function borrowMissingGlyphs(item: OcrTextItem, raster: { ctx: CanvasRenderingContext2D; toPt: number }, face: ScanFace): Promise<number> {
+    const target = spanCuts.get(item.id)
+    if (!target) return 0
+    const missing = new Set([...item.text].filter(c => c.trim() && !face.glyphs.has(c)))
+    if (!missing.size) return 0
+    const median = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)]
+    const tw = target.cells.filter(c => !c.suspect && c.weight).map(c => c.weight!)
+    if (tw.length < 3) return 0
+    const tMed = median(tw)
+    const cy = item.inkRect.y + item.inkRect.height / 2
+    const donors = useOcrStore().itemsFor(item.pageIndex)
+      // A donor's text is the ENGINE's reading alone - nobody checked it the
+      // way the user checks the run they edit - so only a confident reading.
+      .filter(d => d.id !== item.id && !d.edited && !d.removed && !d.baked && !d.vertical && d.confidence >= 90 && [...d.originalText].some(c => missing.has(c)))
+      .sort((a, b) => Math.abs(a.inkRect.y + a.inkRect.height / 2 - cy) - Math.abs(b.inkRect.y + b.inkRect.height / 2 - cy))
+    const k = 1 / raster.toPt
+    // Three donors CUT, out of eight tried: a long line of a skewed scan
+    // refuses its cut far more often than a short one, and on the SEIDOR
+    // appendix the three lines nearest the heading all refused while the one
+    // that carried the bold "e" was fifth.
+    let added = 0, cutOk = 0, tried = 0
+    for (const d of donors) {
+      if (!missing.size || cutOk >= 3 || tried >= 8) break
+      if (![...d.originalText].some(c => missing.has(c))) continue
+      tried++
+      const rect = { x: d.inkRect.x * k, y: d.inkRect.y * k, width: d.inkRect.width * k, height: d.inkRect.height * k }
+      const nonSpace = [...d.originalText].filter(c => c !== ' ').length
+      const symbols = d.symbols && d.symbols.length === nonSpace
+        ? d.symbols.map(s => ({ x0: s.x * k, y0: s.y * k, x1: (s.x + s.width) * k, y1: (s.y + s.height) * k }))
+        : undefined
+      const cut = cutGlyphs(raster.ctx, rect, d.originalText, symbols)
+      if (!cut) continue
+      cutOk++
+      // ...and a cut with almost nothing suspect: a cell a single letter off
+      // is a plausible shape under the wrong name, and a borrowed one lands in
+      // lines the user never looked at. Measured on the OCR corpus: donors
+      // at the ordinary vetting bar put a "u" for an "i" and an "n" for an
+      // "o" into two runs that had baked cleanly in Helvetica.
+      if (cut.cells.filter(c => c.suspect).length > cut.cells.length * 0.1) continue
+      const span = toSpanCut(cut, raster.toPt, d.originalText, symbols ? 'symbols' : 'profile')
+      if (!(span.emPt > 0) || Math.abs(span.emPt / target.emPt - 1) > 0.15) continue
+      const acceptCell = (i: number) => {
+        const c = span.cells[i]
+        if (!c || c.suspect || !missing.has(c.char)) return false
+        if (span.cells[i - 1]?.suspect || span.cells[i + 1]?.suspect) return false
+        const around: number[] = []
+        for (let j = Math.max(0, i - 3); j <= Math.min(span.cells.length - 1, i + 3); j++) {
+          const o = span.cells[j]
+          if (j !== i && !o.suspect && o.weight) around.push(o.weight)
+        }
+        return around.length >= 3 && Math.abs(median(around) - tMed) <= tMed * 0.2
+      }
+      const res = await traceRunIntoFace(face, raster.ctx, rect, d.originalText, symbols, undefined, cut, { only: missing, acceptCell })
+      added += res.added
+      for (const c of [...missing]) if (face.glyphs.has(c)) missing.delete(c)
+    }
+    return added
   }
 
   /**
@@ -769,7 +851,8 @@ function createOCR() {
       // body text — see `extendAscenders`.
       const cjk = isMostlyCjk(line.text)
       if (typeof window !== 'undefined' && (window as any).__lastWalkDebug) walkNote(`line "${line.text.slice(0, 30)}" box=${[rect.x, rect.y, rect.width, rect.height].map(v => v.toFixed(1)).join(',')} em=${emGuess.toFixed(1)}`)
-      const ink = extendAscenders(ctx, extendDescenders(ctx, inkBounds(ctx, rect, emGuess, !cjk), line.text), line.text)
+      // A skewed scan's long line leaves its box at the ends — see `extendForTilt`.
+      const ink = extendAscenders(ctx, extendDescenders(ctx, extendForTilt(ctx, inkBounds(ctx, rect, emGuess, !cjk)), line.text), line.text)
       if (typeof window !== 'undefined' && (window as any).__lastWalkDebug) walkNote(`  ink=${[ink.x, ink.y, ink.width, ink.height].map(v => v.toFixed(1)).join(',')}`)
       const emPx = ink.height / (cjk ? GLYPH_BOX_PER_EM_CJK : boxPerEm(line.text))
       // Only an UNMISTAKABLE gap cuts (two and a half ems — the same bar

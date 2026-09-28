@@ -167,7 +167,7 @@ const scaled = computed(() =>
     confidence: item.confidence,
     boxStyle: styleFor(item),
     textStyle: {
-      fontSize: `${item.fontSize * scaleY.value}px`,
+      fontSize: `${shownSize(item) * scaleY.value}px`,
       fontFamily: faceStack(item),
       fontWeight: item.bold ? '700' : '400',
       fontStyle: item.italic ? 'italic' : 'normal',
@@ -191,6 +191,39 @@ function cssFamily(family: string): string {
 }
 
 const ocr = useOCR()
+
+/**
+ * The size a run is SHOWN at (preview and editor) until its letters have been
+ * measured.
+ *
+ * Recognition sizes a run from its box, and a box is what a skewed scan
+ * inflates: a 538pt line tilted 0.8 degrees is 16pt tall around 10pt letters,
+ * and the SEIDOR appendix's title arrived at 13.3pt for 8.4pt capitals - the
+ * editor opened in a type half again too big and ran off the page. Width is
+ * the measurement tilt cannot inflate (the rule `fitSize` already follows for
+ * the bake): the run's own text, set in the family it is shown in, has to fit
+ * the ink it stands for. Once the glyph cut has measured the letters
+ * (`traceItem` adopts that em into `fontSize`), a size the user set, or a run
+ * already baked, the stored size stands.
+ */
+const measureCtx = document.createElement('canvas').getContext('2d')
+const widthFitCache = new Map<string, number>()
+function shownSize(item: OcrTextItem): number {
+  if (item.restyled || item.baked || item.vertical || ocr.spanCutFor(item) || !measureCtx) return item.fontSize
+  const ink = item.inkRect ?? item.rect
+  const key = `${item.id}|${item.fontSize}|${item.fontFamily}|${item.bold}|${item.italic}|${ink.width}`
+  let size = widthFitCache.get(key)
+  if (size === undefined) {
+    measureCtx.font = `${item.italic ? 'italic ' : ''}${item.bold ? 700 : 400} 100px ${cssFamily(item.fontFamily)}`
+    const natural = measureCtx.measureText(item.originalText).width / 100 * item.fontSize
+    size = natural > ink.width * 1.05 && ink.width > 0
+      ? Math.max(item.fontSize * 0.6, item.fontSize * ink.width / natural)
+      : item.fontSize
+    size = Math.round(size * 10) / 10
+    widthFitCache.set(key, size)
+  }
+  return size
+}
 
 /**
  * The page's traced scan face first, the base family behind it: a character
@@ -220,7 +253,7 @@ const editorStyle = computed(() => {
   const item = ocrStore.itemsFor(pageIndex.value).find(i => i.id === editing.value)
   if (!item) return {}
   const base = styleFor(item)
-  const fs = item.fontSize * scaleY.value
+  const fs = shownSize(item) * scaleY.value
   // Never past the paper's edge: an editor wider than the page makes the
   // viewer scroll sideways the moment it opens, and the page moves under the
   // user — the one thing opening an editor must not do.
@@ -233,7 +266,7 @@ const editorStyle = computed(() => {
     ...base,
     width: `max(${base.width}, ${Math.round(minAlong)}px)`,
     height: `max(${base.height}, ${Math.round(minAcross)}px)`,
-    fontSize: `${item.fontSize * scaleY.value}px`,
+    fontSize: `${fs}px`,
     fontFamily: faceStack(item),
     fontWeight: item.bold ? '700' : '400',
     fontStyle: item.italic ? 'italic' : 'normal',
@@ -315,6 +348,11 @@ function beginEdit(id: string, caretAt?: number) {
   ocrStore.selectedId = id
   editing.value = id
   draft.value = item.text
+  // Measure the letters while the user types: the cut reads only the raster,
+  // and its em replaces the box's size (see `shownSize`) — without it the
+  // editor shows the box size until the edit is committed. Measure ONLY:
+  // nothing the user has not yet confirmed may enter the scan face.
+  if (!item.baked && !ocr.spanCutFor(item)) void ocr.traceItem(item, { measureOnly: true })
   nextTick(() => {
     const el = editorRef.value
     if (!el) return

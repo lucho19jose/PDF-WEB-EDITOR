@@ -889,6 +889,50 @@ function cellMask(cut: CutForCell, cell: GlyphCell, pad: number): CellMask | nul
   return { on, x, y, w, h, floor, colMin, colMax }
 }
 
+/**
+ * A cell's ink as a small grid, for telling whether two cells hold the same
+ * letter: 8 columns across the cell's own ink, 12 rows over a fixed band of the
+ * em around the baseline (0.85 em above to 0.3 below), each the share of the
+ * cell's pixels that are ink. The band is in ems, so a capital and a lowercase
+ * letter, or an "o" and an "n", differ in where their ink sits as well as in
+ * its shape. Null when the cell has no measurable ink.
+ */
+export function cellShape(cut: CutForCell, cell: GlyphCell): Float32Array | null {
+  const m = cellMask(cut, cell, 0)
+  if (!m || !cut.emPx || !cut.baselineAt) return null
+  const { on, w, h, y } = m
+  let c0 = w, c1 = -1
+  for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) if (on[yy * w + xx]) { if (xx < c0) c0 = xx; if (xx > c1) c1 = xx }
+  if (c1 < c0) return null
+  const base = cut.baselineAt((cell.x0 + cell.x1) / 2)
+  const top = base - cut.emPx * 0.85, bottom = base + cut.emPx * 0.3
+  const COLS = 8, ROWS = 12
+  const grid = new Float32Array(COLS * ROWS)
+  const cw = (c1 - c0 + 1) / COLS, rh = (bottom - top) / ROWS
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      let n = 0, ink = 0
+      for (let yy = Math.floor(top + r * rh); yy < Math.ceil(top + (r + 1) * rh); yy++) {
+        const ly = yy - y
+        if (ly < 0 || ly >= h) { n += Math.max(1, Math.round(cw)); continue }
+        for (let xx = Math.floor(c0 + c * cw); xx < Math.ceil(c0 + (c + 1) * cw); xx++) { n++; if (on[ly * w + xx]) ink++ }
+      }
+      grid[r * COLS + c] = n ? ink / n : 0
+    }
+  }
+  return grid
+}
+
+/** 1 for identical shapes, 0 for nothing in common: one minus the mean absolute difference, over the grid cells either shape inks. */
+export function shapeSimilarity(a: Float32Array, b: Float32Array): number {
+  let diff = 0, n = 0
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] < 0.05 && b[i] < 0.05) continue
+    diff += Math.abs(a[i] - b[i]); n++
+  }
+  return n ? 1 - diff / n : 1
+}
+
 export function cellBitmap(cut: CutForCell, cell: GlyphCell, pad = 1): { image: ImageData; x: number; y: number } | null {
   const m = cellMask(cut, cell, pad)
   if (!m) return null

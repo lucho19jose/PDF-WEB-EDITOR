@@ -82,6 +82,31 @@ const BOLD_STROKE = 0.115
  * `weightScale` × the line's `strokeRatio`). Null when the cut carries no
  * weights or the neighbours cannot be measured.
  */
+/**
+ * How much heavier than its neighbours a letter's SHAPE makes it read on this
+ * line: the median weight of its cells over the median of the three cells
+ * either side of each. Null when the letter does not occur (unsuspect, with a
+ * weight) or has no measurable context.
+ */
+export function letterBias(cells: SpanCut['cells'], ch: string): number | null {
+  const median = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)]
+  const own: number[] = [], ctx: number[] = []
+  cells.forEach((c, i) => {
+    if (c.char !== ch || c.suspect || !c.weight) return
+    const around: number[] = []
+    for (let k = Math.max(0, i - 3); k <= Math.min(cells.length - 1, i + 3); k++) {
+      const o = cells[k]
+      if (k !== i && o.char !== ch && !o.suspect && o.weight) around.push(o.weight)
+    }
+    if (around.length < 2) return
+    own.push(c.weight)
+    ctx.push(median(around))
+  })
+  if (!own.length) return null
+  const b = median(own) / median(ctx)
+  return b > 0 && Number.isFinite(b) ? b : null
+}
+
 export function weightPlan(
   item: OcrTextItem,
   cut: SpanCut,
@@ -102,16 +127,30 @@ export function weightPlan(
   for (let i = n - st.suffix, k = 0; i < n && k < 3; i++, k++) { const c = cells[i]; if (c && !c.suspect && c.weight) near.push(c.weight) }
   if (!near.length || !(lineMedian > 0)) return null
   const local = median(near)
+  // One raster pixel of stem, in the ratio's units: the smallest step between
+  // two distinct cell weights on this line.
+  const distinct = [...new Set(weights.map(w => Math.round(w * 1e4)))].sort((a, b) => a - b)
+  let quantum = Infinity
+  for (let i = 1; i < distinct.length; i++) quantum = Math.min(quantum, (distinct[i] - distinct[i - 1]) / 1e4)
+  if (!Number.isFinite(quantum)) quantum = 0
   let faceSkip = ''
   const tracedWeights: number[] = []
   if (faceWeightOf) {
     for (const ch of new Set([...st.text])) {
       if (ch === ' ') continue
       const w = faceWeightOf(ch)
+      if (w === undefined) continue
+      // The weight is a HORIZONTAL run over the em, so a diagonal stroke reads
+      // wider than it is thick: an "A" measured 0.126 among a same-weight
+      // title's "I"/"D" at 0.097, and the face's own A was skipped for a
+      // Helvetica one. Where the letter occurs on this line its shape is
+      // divided out against its own context there.
+      const norm = w / (letterBias(cells, ch) ?? 1)
       // A third apart is a weight, not a measurement: regular and bold stems
-      // differ by 60–70% of the regular one; one raster pixel on a 12pt em is 3%.
-      if (w !== undefined && Math.abs(w - local) > local * 0.3) faceSkip += ch
-      else if (w !== undefined) tracedWeights.push(w)
+      // differ by 60–70% of the regular one. And never on two pixels alone.
+      const diff = Math.abs(norm - local)
+      if (diff > local * 0.3 && diff > quantum * 2) faceSkip += ch
+      else tracedWeights.push(w)
     }
   }
   const tracedRatio = tracedWeights.length ? median(tracedWeights) : null
@@ -323,7 +362,16 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const width = st.text.length ? (ctx.stretchWidthPt ?? 0) : 0
   const penX = oldSpan ? oldSpan.x0 - bearing : (prefix > 0 ? headEnd + gapBefore - bearing : ink.x - bearing)
   const inkEnd = st.text.length ? penX + width - bearing : headEnd
-  const baselineY = cut.baseline.yAtCentre + cut.baseline.slope * (penX - cut.baseline.centreX)
+  // The fitted baseline is a LINE, and the redraw follows it: a stretch laid
+  // level from its start drifts off a tilted scan's line by slope x width -
+  // on the SEIDOR appendix, redrawing most of a 460pt line left the untouched
+  // tail 'el "Contrato"). Este Apéndice se emite' visibly above the text before
+  // it. Every part of the group is rotated by the line's own angle and placed
+  // on the line at its own x; a tilt under a twentieth of a degree is level.
+  const yAt = (x: number) => cut.baseline.yAtCentre + cut.baseline.slope * (x - cut.baseline.centreX)
+  const tiltDeg = -Math.atan(cut.baseline.slope) * 180 / Math.PI
+  const rotation = Math.abs(tiltDeg) < 0.05 ? 0 : tiltDeg
+  const baselineY = yAt(penX)
   // The patch reaches at least as far as the ink measured OUTSIDE the box
   // (an accent, a blurred fringe — `item.halo`), on the vertical axis where
   // the head and tail cannot object; horizontally the pads stay tight, since
@@ -344,14 +392,14 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const edited = nonSpace(item.text)
   const headText = prefix > 0 ? t.slice(0, positions[prefix - 1] + 1).join('').trim() : ''
   const tailText = suffix > 0 ? t.slice(positions[edited.length - suffix]).join('').trim() : ''
-  // On the STRETCH's baseline, not each at its own point of the fitted line:
-  // a scan tilted by 0.7° puts the head's baseline 0.8pt from the stretch's
-  // sixty points away, and the extractor reads a step that size as two lines
-  // — "X" listed before "Las partes que". The invisible words have no ink to
-  // sit anywhere, so one shared height costs nothing and keeps the line one.
+  // On the fitted line, at the group's shared rotation. Laid LEVEL, each at
+  // its own point of the line, a scan tilted by 0.7° put the head's baseline
+  // 0.8pt from the stretch's sixty points away and the extractor read a step
+  // that size as two lines ("X" listed before "Las partes que"); on one
+  // rotated line the parts are collinear, which is what reads as one line.
   const invisible = (text: string, x: number, fitWidth: number): TextOp[] => text ? [{
-    text, x, y: baselineY, fontSize: sizePt,
-    fontName: ctx.fontName, color: ctx.color, rotation: 0, invisible: true, group: item.id, fitWidth
+    text, x, y: rotation ? yAt(x) : baselineY, fontSize: sizePt,
+    fontName: ctx.fontName, color: ctx.color, rotation, invisible: true, group: item.id, fitWidth
   }] : []
   // An extractor puts a SPACE wherever one glyph's advance ends a sixth of an
   // em or more before the next begins. The invisible head is fitted to its
@@ -375,7 +423,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
       ...invisible(headText, headX, Math.max(1, headTo - headX)),
       ...(st.text.length ? [{
         text: st.text, x: penX, y: baselineY, fontSize: sizePt,
-        fontName: ctx.fontName, color: ctx.color, rotation: 0, faceId: ctx.faceId, group: item.id,
+        fontName: ctx.fontName, color: ctx.color, rotation, faceId: ctx.faceId, group: item.id,
         strokeWidth: strokeWidthFor(ctx.strokeRatio ? ctx.strokeRatio * (ctx.weightScale ?? 1) : undefined, ctx.fontName, sizePt),
         tracedStrokeWidth: tracedStrokeUpTo(ctx.strokeRatio ? ctx.strokeRatio * (ctx.weightScale ?? 1) : undefined, ctx.tracedStrokeRatio, sizePt),
         faceSkip: ctx.faceSkip || undefined
@@ -433,7 +481,10 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const padL = Math.min(1, Math.max(0.3, (oldSpan ? tailStart - oldSpan.x1 : gapAfter) / 2))
   const padR = Math.min(1.5, nextInk !== null ? Math.max(0, nextInk - inkRight) : 1.5)
   const src: RectT = [tailStart - padL, ink.y - padTop, inkRight + padR, ink.y + ink.height + padBottom]
-  const dst: RectT = [src[0] + dx, src[1], src[2] + dx, src[3]]
+  // Along the line, not level: moved dx to the right on a tilted scan the
+  // tail's pixels must also move by slope x dx, or they leave its line.
+  const dy = cut.baseline.slope * dx
+  const dst: RectT = [src[0] + dx, src[1] + dy, src[2] + dx, src[3] + dy]
   return {
     mode: 'partial+shift',
     patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkRight + dx) + padX, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id }],
