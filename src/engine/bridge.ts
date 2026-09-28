@@ -223,6 +223,16 @@ export class MuPDFBridge {
     return this.send('hasMarkedContent', { pageIndex, tag })
   }
 
+  /** A page's content stream bytes and its /XObject and /Font resource names. */
+  async getPageContent(pageIndex: number): Promise<{ bytes: Uint8Array; xobjects: string[]; fonts: string[] }> {
+    return this.send('getPageContent', { pageIndex })
+  }
+
+  /** Replace a page's content; with `keep`, prune the resources not named in it. */
+  async setPageContent(pageIndex: number, bytes: Uint8Array, keep?: { xobjects: string[]; fonts: string[] }): Promise<{ ok: boolean }> {
+    return this.send('setPageContent', { pageIndex, bytes, keep })
+  }
+
   /** Blank the invisible (3 Tr) show ops whose origin lies inside one of the rects (top-left page points). */
   async blankInvisibleText(pageIndex: number, rects: [number, number, number, number][], all = false): Promise<{ blanked: number }> {
     return this.send('blankInvisibleText', { pageIndex, rects, all })

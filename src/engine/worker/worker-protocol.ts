@@ -38,6 +38,8 @@ export type WorkerRequest =
   | { id: number; type: 'hasMarkedContent'; data: { pageIndex: number; tag: string } }
   /** Blank invisible (3 Tr) show ops whose origin lies inside one of the rects (top-left page points) — an existing searchable layer's words under an edited run. */
   | { id: number; type: 'blankInvisibleText'; data: { pageIndex: number; rects: [number, number, number, number][]; all?: boolean } }
+  | { id: number; type: 'getPageContent'; data: { pageIndex: number } }
+  | { id: number; type: 'setPageContent'; data: { pageIndex: number; bytes: Uint8Array; keep?: { xobjects: string[]; fonts: string[] } } }
   /** A traced scan face (OpenType bytes) the worker keeps by id for `addText` runs that name it. */
   | { id: number; type: 'registerFace'; data: { faceId: string; bytes: ArrayBuffer } }
   /** The exact pen advance `addText` would give each run, in points — measured with the fonts that will draw it. */

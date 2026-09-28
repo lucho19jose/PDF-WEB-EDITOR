@@ -94,6 +94,13 @@ export const useOcrStore = defineStore('ocr', () => {
       if (patch.restyled === undefined && (patch.fontSize !== undefined || patch.fontFamily !== undefined ||
         patch.bold !== undefined || patch.italic !== undefined || patch.color !== undefined ||
         patch.align !== undefined || patch.rect !== undefined)) after.restyled = true
+      // Anything the user changes makes the page's live bake stale; what the
+      // bake itself records (a halo) and the size the letters were measured
+      // at (`restyled: false`, from the glyph cut) do not.
+      if (patch.applied === undefined && (patch.text !== undefined || patch.removed !== undefined ||
+        patch.edited !== undefined || patch.fontFamily !== undefined || patch.bold !== undefined ||
+        patch.italic !== undefined || patch.color !== undefined || patch.align !== undefined ||
+        patch.rect !== undefined || (patch.fontSize !== undefined && patch.restyled !== false))) after.applied = false
       const items = [...page.items]
       items[idx] = after
       next.set(key, { ...page, items })

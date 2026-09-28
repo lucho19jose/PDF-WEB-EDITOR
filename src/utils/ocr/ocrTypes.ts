@@ -107,6 +107,13 @@ export interface OcrTextItem {
   baked?: boolean
   /** True once the user changed its style or moved it; a partial redraw needs the original face and place. */
   restyled?: boolean
+  /**
+   * True while the page's LIVE bake has drawn this run as it now stands: the
+   * canvas shows the real result, so the layer draws no stand-in for it.
+   * Unlike `baked`, the page can still be restored to its pristine scan and
+   * the run redrawn from its original ink.
+   */
+  applied?: boolean
 }
 
 /** What one page's OCR pass produced. */

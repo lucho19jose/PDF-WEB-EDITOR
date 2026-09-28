@@ -4193,6 +4193,46 @@ seven corpora; marker −3/+1, all on Acrobat OCR layers (every block `3 Tr`,
 never offered for editing) whose tilted words now group into lines and
 change which block the sweep picks by index.
 
+### A scanned edit is applied LIVE, re-baked from the page's pristine scan
+What the screen showed and what was saved were two different drawings. Until
+save, `OcrTextLayer` drew an edited run as a stand-in — the whole line
+retyped from the recogniser's reading over a paper patch — so every OCR
+misreading the user never touched ("MARIAcon RUCN", "Lostérminos queenel")
+was on screen, and a run whose cut refused showed as big grey Helvetica off
+the page. The bake at save is the faithful one; nobody saw it until they
+reopened the file. "It still looks like that" was the stand-in.
+
+`applyOcrLive` (EditorLayout) bakes a page ~300 ms after any change to its
+runs (a watcher on `ocrStore.pages`, serialised on `liveChain`), and the
+layer draws nothing for a run marked `applied`. Baking on commit alone would
+have made the second edit of a line a whole-run redraw — a baked run's cut
+is gone and its "original" is the first edit — so each page keeps its
+PRISTINE content (`getPageContent`: stream bytes plus its /XObject and /Font
+names) and every live bake restores it (`setPageContent` with `keep`, which
+also prunes what the previous bake added) and re-applies ALL of the page's
+edits, each against its original ink. Measured on the SEIDOR line: first
+edit `partial`, a second edit of the same line `partial` again, reverting
+the run puts the page back to its 48-byte scan stream with only `Im2` left
+in its resources.
+
+Four things hang off it:
+- **Undo carries OCR state.** A live bake changes the BYTES, so undoing it
+  must also put the store back, or the next live bake re-applies the undone
+  edit. Snapshots keep `{pages, hashes}` in a WeakMap beside them, and the
+  undo point pushed BEFORE a live bake carries `appliedMeta` — the state the
+  current bytes match — not the store as it is then, which already holds the
+  new edit.
+- **Something else wrote to the page** (a searchable layer, an image behind,
+  a text edit): the content hash no longer matches the last live bake, and
+  the page is ADOPTED — applied runs finalised the old way (`baked`), the
+  current content the new pristine.
+- **Tracing reads the pristine scan** (`renderPristine`, the OCR page
+  renderer): the page's content is swapped for its pristine in one queued
+  step, rendered, and swapped back — a 440 DPI raster of an edited page would
+  trace the edits' own glyphs as the scan's.
+- **Save and print** apply only what is still pending; everything else is in
+  the bytes already.
+
 ### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
 Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)
 leaves a scan's words in the content stream as INVISIBLE text: render mode 3,

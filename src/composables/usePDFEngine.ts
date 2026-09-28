@@ -232,6 +232,17 @@ export function usePDFEngine() {
    * rects (top-left page points), so a baked replacement does not leave the
    * old words findable underneath it.
    */
+  /** A page's content, for putting it back later (the OCR layer's live bake). */
+  async function getPageContent(pageIndex: number): Promise<{ bytes: Uint8Array; xobjects: string[]; fonts: string[] }> {
+    return bridge.getPageContent(pageIndex)
+  }
+
+  /** Put a page's content back; with `keep`, drop the resources added since. */
+  async function setPageContent(pageIndex: number, bytes: Uint8Array, keep?: { xobjects: string[]; fonts: string[] }): Promise<void> {
+    await bridge.setPageContent(pageIndex, bytes.slice(0), keep)
+    pageTextCache.delete(pageIndex)
+  }
+
   async function blankInvisibleText(pageIndex: number, rects: [number, number, number, number][], all = false): Promise<number> {
     const r = await bridge.blankInvisibleText(pageIndex, rects, all)
     if (r.blanked > 0) pageTextCache.delete(pageIndex)
@@ -563,7 +574,7 @@ export function usePDFEngine() {
     debugBtBlocks,
     readContentStream,
     replaceText,
-    addText, addTextRun, removeMarkedContent, hasMarkedContent, blankInvisibleText, registerFace, measureRuns, renderPageBitmap,
+    addText, addTextRun, removeMarkedContent, hasMarkedContent, blankInvisibleText, getPageContent, setPageContent, registerFace, measureRuns, renderPageBitmap,
     transformTextBlock,
     transformTextBlocks,
     restyleTextBlocks,

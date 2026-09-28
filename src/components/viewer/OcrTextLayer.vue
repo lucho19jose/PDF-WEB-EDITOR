@@ -43,7 +43,9 @@
       @mousedown.stop="onDown($event, item.id)"
       @dblclick.stop="beginEdit(item.id)"
     >
-      <div v-if="item.edited" class="ocr-replacement" :style="item.textStyle">{{ item.text }}</div>
+      <!-- A run the page's live bake has drawn is on the canvas already, as the
+           file has it; a stand-in here would cover the real result. -->
+      <div v-if="item.edited && !item.applied" class="ocr-replacement" :style="item.textStyle">{{ item.text }}</div>
     </div>
 
     <!-- In-place editor, positioned and turned the same way as its run.
@@ -140,7 +142,7 @@ function acrossPx(item: OcrTextItem, box: OcrRect = item.rect): number {
  */
 const patches = computed(() =>
   ocrStore.itemsFor(pageIndex.value)
-    .filter(item => item.edited || item.removed)
+    .filter(item => (item.edited || item.removed) && !item.applied)
     .map(item => {
       const ink = item.inkRect ?? item.rect
       return {
@@ -162,6 +164,7 @@ const scaled = computed(() =>
     id: item.id,
     text: item.text,
     edited: item.edited,
+    applied: !!item.applied,
     removed: item.removed,
     vertical: item.vertical,
     confidence: item.confidence,

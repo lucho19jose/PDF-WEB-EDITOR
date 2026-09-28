@@ -141,6 +141,19 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      case 'getPageContent': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({ id: req.id, type: 'success', data: getPageContent(req.data.pageIndex) })
+        break
+      }
+
+      case 'setPageContent': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        setPageContent(req.data.pageIndex, req.data.bytes, req.data.keep)
+        respond({ id: req.id, type: 'success', data: { ok: true } })
+        break
+      }
+
       case 'blankInvisibleText': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({ id: req.id, type: 'success', data: blankInvisibleTextIn(req.data.pageIndex, req.data.rects, 1, !!req.data.all) })
@@ -739,6 +752,59 @@ function markInvisibleBlocks(pageIndex: number, blocks: TextBlock[]): void {
  * Blanking keeps every other offset valid. Page stream only — a layer inside
  * a Form XObject is left alone (never seen from an OCR producer).
  */
+/**
+ * A page's content as it stands — the stream's raw bytes and the names in its
+ * /XObject and /Font resources — so a scanned page can be put back exactly as
+ * it was recognised (the OCR layer's live bake re-applies every edit from it).
+ */
+function getPageContent(pageIndex: number): { bytes: Uint8Array; xobjects: string[]; fonts: string[] } {
+  const s = readContentStream(pageIndex)
+  const bytes = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xFF
+  const page = pdfDoc.loadPage(pageIndex)
+  const res = pageResourcesOf(page.getObject())
+  const names = (key: string): string[] => {
+    const out: string[] = []
+    try {
+      const d = res?.get(key)
+      if (!isNullObj(d)) (d.resolve?.() ?? d).forEach((_v: any, k: any) => out.push(String(k).replace(/^\//, '')))
+    } catch (_) { /* none */ }
+    return out
+  }
+  const out = { bytes, xobjects: names('XObject'), fonts: names('Font') }
+  page.destroy()
+  return out
+}
+
+/**
+ * Put a page's content back, and — with `keep` — drop every /XObject and /Font
+ * entry that is not in it: what earlier live bakes added (tail crops, scan
+ * faces, CJK subsets). Without the pruning every re-bake of a page adds its
+ * objects again, and a page edited n times would carry n copies of each.
+ * Only the page's OWN resources are pruned; an inherited dictionary is shared.
+ */
+function setPageContent(pageIndex: number, bytes: Uint8Array, keep?: { xobjects: string[]; fonts: string[] }): void {
+  writeContentStream(pageIndex, bytes)
+  if (!keep) return
+  const page = pdfDoc.loadPage(pageIndex)
+  const own = page.getObject().get('Resources')
+  if (!isNullObj(own)) {
+    const r = own.resolve?.() ?? own
+    for (const [key, allowed] of [['XObject', keep.xobjects], ['Font', keep.fonts]] as const) {
+      try {
+        const d = r.get(key)
+        if (isNullObj(d)) continue
+        const dict = d.resolve?.() ?? d
+        const extra: string[] = []
+        dict.forEach((_v: any, k: any) => { const n = String(k).replace(/^\//, ''); if (!allowed.includes(n)) extra.push(n) })
+        for (const n of extra) dict.delete(n)
+      } catch (_) { /* leave it */ }
+    }
+  }
+  page.destroy()
+  invalidateContentSources(pageIndex)
+}
+
 function blankInvisibleTextIn(pageIndex: number, rects: [number, number, number, number][], margin = 1, all = false): { blanked: number } {
   // `all`: the VISIBLE ops under the rects go too. A run edited a second time
   // after a bake is patched over again, and the first bake's visible stretch

@@ -103,7 +103,7 @@ import type { RecognizeDocumentOptions, RecognizeProgress } from '@/components/d
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
 import { getMuPDFBridge } from '@/engine/bridge'
-import { enqueueOp, settleTransactions, transactionOpen } from '@/utils/opQueue'
+import { enqueueOp, settleTransactions, transactionOpen, beginTransaction } from '@/utils/opQueue'
 import MainToolbar from '@/components/toolbar/MainToolbar.vue'
 import PageThumbnails from '@/components/sidebar/PageThumbnails.vue'
 import StatusBar from '@/components/common/StatusBar.vue'
@@ -269,9 +269,12 @@ async function isScanLikePage(pageIndex: number): Promise<boolean> {
  * the status says so when there were any.
  */
 function forgetOcr() {
-  const hadEdits = ocrStore.hasEdits
+  // Edits the live bake has applied are in the document already; only the
+  // ones still pending are lost.
+  const hadEdits = pagesNeedingLive().length > 0
   ocrStore.clear()
   ocr.reset()
+  livePages.clear()
   if (hadEdits) editorStore.setStatus('Page structure changed — unsaved OCR edits were discarded; recognise the page again')
 }
 
@@ -397,7 +400,161 @@ async function runOcrNow(pageIndex: number, lang: string) {
  * plus the new text on top; everything else on the page is left completely
  * alone, which is what preserves the scan.
  */
-async function bakeOcrEdits(): Promise<number> {
+// ===== LIVE OCR BAKE =====
+/**
+ * A scanned page's edits are APPLIED as they are committed, the way Acrobat
+ * does it, so what is on screen is the file.
+ *
+ * Until now an edited run was shown as a stand-in the layer drew over a paper
+ * patch — the WHOLE line retyped from the recogniser's reading — and only the
+ * save baked it. The bake is the faithful one (only the changed letters
+ * redrawn, the rest the scan's own pixels); the stand-in showed every OCR
+ * misreading the user never touched ("MARIAcon RUCN"), and a line whose cut
+ * refused as big grey Helvetica off the edge of the page. The user judged the
+ * edit by the stand-in.
+ *
+ * Baking on commit alone would lose the second edit of a line: a baked run's
+ * glyph cut is gone and its "original" is the first edit. So each page keeps
+ * its PRISTINE content — the scan as recognised — and every live bake restores
+ * it and re-applies ALL of the page's edits, each still measured against its
+ * original ink. The bake's objects from the previous pass are pruned from the
+ * page's resources on the way (`setPageContent` with `keep`).
+ *
+ * The page's content hash after each live bake is remembered; content that
+ * no longer matches means something else wrote to the page (a searchable
+ * layer, a text edit, an image behind), and the page is ADOPTED: its applied
+ * runs are finalised the old way and the current content is the new pristine.
+ */
+interface LivePage { pristine: { bytes: Uint8Array; xobjects: string[]; fonts: string[] }; pristineHash: number; hash: number }
+const livePages = new Map<number, LivePage>()
+let liveChain: Promise<void> = Promise.resolve()
+let liveTimer: ReturnType<typeof setTimeout> | null = null
+let liveSuppressed = false
+/** The OCR state that matches the document's bytes — what an undo point before a live bake has to restore. */
+let appliedMeta: OcrUndoMeta | null = null
+
+function fnv1a(bytes: Uint8Array): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < bytes.length; i++) { h ^= bytes[i]; h = Math.imul(h, 0x01000193) >>> 0 }
+  return (h ^ bytes.length) >>> 0
+}
+
+/** Pages whose edits are not on the page yet, or that must go back to the scan (every edit reverted). */
+function pagesNeedingLive(): number[] {
+  const out: number[] = []
+  for (const [pageIndex, page] of ocrStore.pages) {
+    const pending = page.items.some(i => (i.edited || i.removed) && !i.applied && !i.baked)
+    const st = livePages.get(pageIndex)
+    const reverted = !!st && st.hash !== st.pristineHash && !page.items.some(i => (i.edited || i.removed) && !i.baked)
+    if (pending || reverted) out.push(pageIndex)
+  }
+  return out
+}
+
+function scheduleLive() {
+  if (liveTimer) clearTimeout(liveTimer)
+  liveTimer = setTimeout(() => {
+    liveTimer = null
+    if (liveSuppressed || !docStore.loaded) return
+    for (const p of pagesNeedingLive()) void applyOcrLive(p)
+  }, 300)
+}
+watch(() => ocrStore.pages, () => { if (!liveSuppressed && pagesNeedingLive().length) scheduleLive() })
+// A fresh recognition describes the page as it is NOW (edits included), so
+// its pristine is gone; and the state it leaves is one the bytes agree with.
+ocrStore.$onAction(({ name, args, after }) => {
+  if (name === 'setResult') after(() => { livePages.delete((args[0] as any)?.pageIndex); appliedMeta = captureOcrMeta() })
+  if (name === 'clearPage') after(() => { livePages.delete(args[0] as number) })
+})
+
+/** Apply a page's OCR edits to the document now. Serialised: one live bake at a time. */
+function applyOcrLive(pageIndex: number): Promise<void> {
+  const run = liveChain
+    .then(() => applyOcrLiveNow(pageIndex))
+    .catch(err => {
+      console.warn('[OCR] live bake failed:', err)
+      editorStore.setStatus(`The edit could not be applied to the page: ${err?.message ?? err}`)
+    })
+  liveChain = run
+  return run
+}
+
+async function applyOcrLiveNow(pageIndex: number) {
+  if (!docStore.loaded || !pagesNeedingLive().includes(pageIndex)) return
+  const end = beginTransaction()
+  try {
+    editorStore.setStatus('Applying edit...')
+    await ocr.settleTraces()
+    // One undo point per live bake, carrying the OCR state the CURRENT bytes
+    // match — not the store as it is now, which already holds the new edit.
+    if (docStore.pdfBytes) {
+      const snap = new Uint8Array(docStore.pdfBytes)
+      undoMeta.set(snap, appliedMeta ?? captureOcrMeta())
+      historyStore.pushSnapshot(snap)
+    }
+    let st = livePages.get(pageIndex)
+    const cur = await enqueueOp(() => pdfEngine.getPageContent(pageIndex))
+    if (st && fnv1a(cur.bytes) !== st.hash) { adoptLivePage(pageIndex); st = undefined }
+    if (!st) {
+      const h = fnv1a(cur.bytes)
+      st = { pristine: cur, pristineHash: h, hash: h }
+      livePages.set(pageIndex, st)
+    } else {
+      const p = st.pristine
+      await enqueueOp(() => pdfEngine.setPageContent(pageIndex, p.bytes, { xobjects: p.xobjects, fonts: p.fonts }))
+    }
+    const edits = ocrStore.itemsFor(pageIndex).some(i => (i.edited || i.removed) && !i.baked)
+    if (edits) await bakeOcrEdits({ live: true, pages: [pageIndex] })
+    else { docStore.markModified(); await syncAfterEdit() }
+    const after = await enqueueOp(() => pdfEngine.getPageContent(pageIndex))
+    st.hash = fnv1a(after.bytes)
+    appliedMeta = captureOcrMeta()
+    editorStore.setStatus(edits ? 'Edit applied to the page' : 'Page restored to the scan')
+  } finally {
+    end()
+  }
+}
+
+/** Something else wrote to the page: its applied runs become part of it (the pre-live behaviour), and the page as it is becomes the new pristine. */
+function adoptLivePage(pageIndex: number) {
+  for (const item of ocrStore.itemsFor(pageIndex)) {
+    if (!item.applied || !(item.edited || item.removed)) continue
+    ocrStore.updateItem(item.id, { baked: true, edited: false, removed: false, restyled: false, originalText: item.text, applied: true })
+    ocr.forgetSpanCut(item.id)
+  }
+  ocr.forgetTraceRaster(pageIndex)
+  livePages.delete(pageIndex)
+}
+
+/**
+ * The page as the SCAN has it, for tracing: a page with live edits is
+ * swapped back to its pristine content for the render and put back after,
+ * in one queued step. The 440 DPI tracing raster read from the edited page
+ * would trace the edits' own glyphs as the scan's.
+ */
+async function renderPristine(pageIndex: number, scale: number): Promise<HTMLCanvasElement | null> {
+  const st = livePages.get(pageIndex)
+  if (!st || st.hash === st.pristineHash) return renderForOcr(pageIndex, scale)
+  let canvas: HTMLCanvasElement | null = null
+  await enqueueOp(async () => {
+    const cur = await pdfEngine.getPageContent(pageIndex)
+    await pdfEngine.setPageContent(pageIndex, st.pristine.bytes)
+    try { canvas = await pdfEngine.renderPageBitmap(pageIndex, scale).catch(() => null) }
+    finally { await pdfEngine.setPageContent(pageIndex, cur.bytes) }
+  })
+  return canvas
+}
+
+async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Promise<number> {
+  // Outside a live bake (save, print, the assistant) every edit is normally
+  // on the page already: the live bake applies each one as it is committed.
+  // What is still pending — an edit a second old — is applied the same way.
+  if (!opts.live) {
+    await liveChain
+    let n = 0
+    for (const pageIndex of pagesNeedingLive()) { await applyOcrLive(pageIndex); n++ }
+    return n
+  }
   if (!ocrStore.hasEdits) return 0
   // The trace an edit started may still be running (a save a second after the
   // edit): consulting the faces before it finishes bakes the run in Helvetica.
@@ -410,15 +567,18 @@ async function bakeOcrEdits(): Promise<number> {
   // PAST the bake to that edit's snapshot, taking both away in one press.
   // `docStore.pdfBytes` is still the pre-bake document here (it is only
   // replaced by `syncAfterEdit` at the end), so one snapshot covers every
-  // page baked in this pass.
-  pushUndo()
+  // page baked in this pass. A live bake pushed its own before restoring.
+  if (!opts.live) pushUndo()
   let written = 0
   /** Per page, per edited item: how it was drawn — for the sweep (`window.__ocrBakeReport`). */
   const modes: Record<number, Record<string, string>> = {}
   /** Per page, per item: the union of the patches painted for it — what its ink box becomes after the bake. */
   const grownByPage = new Map<number, Map<string, [number, number, number, number]>>()
 
+  /** Per page, the item objects the plan was made from: a run the user changed DURING the bake is not marked applied. */
+  const plannedByPage = new Map<number, Set<OcrTextItem>>()
   for (const [pageIndex, page] of ocrStore.pages) {
+    if (opts.pages && !opts.pages.includes(pageIndex)) continue
     // The page's traced scan faces — one per style — embedded once per bake
     // so the runs that name them draw with the document's own glyphs.
     const registered = new Set<string>()
@@ -507,6 +667,7 @@ async function bakeOcrEdits(): Promise<number> {
     }
     // `updateItem` replaces the page's item objects; plan from the fresh ones.
     const planItems = ocrStore.pages.get(pageIndex)?.items ?? page.items
+    plannedByPage.set(pageIndex, new Set(planItems))
     const plan = planOcrExport(planItems, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null, tracedRatioFor)
     modes[pageIndex] = plan.modes
     // What each run's ink box becomes: a stretch appended past the old ink,
@@ -586,6 +747,20 @@ async function bakeOcrEdits(): Promise<number> {
   }
   ;(window as any).__ocrBakeReport = modes
 
+  if (opts.live) {
+    // Live: the page now shows every edit, drawn from its pristine scan. The
+    // runs stay EDITED against their original text and keep their glyph cuts,
+    // so the next edit of any of them redraws from the original ink again.
+    docStore.markModified()
+    await syncAfterEdit()
+    for (const [pageIndex, planned] of plannedByPage) {
+      for (const item of ocrStore.itemsFor(pageIndex)) {
+        if ((item.edited || item.removed) && planned.has(item)) ocrStore.updateItem(item.id, { applied: true })
+      }
+    }
+    return written
+  }
+
   if (written > 0 || ocrStore.hasEdits) {
     docStore.markModified()
     await syncAfterEdit()
@@ -642,6 +817,7 @@ async function loadBytes(bytes: Uint8Array, name: string) {
   searchStore.clear()
   ocrStore.clear()
   ocr.reset()
+  livePages.clear()
 
   const rendered = await pdfViewer.loadDocument(bytes, name)
   if (!rendered?.success) {
@@ -1034,7 +1210,33 @@ function exclusiveOp(fn: () => Promise<void>) {
 }
 
 function pushUndo() {
-  if (docStore.pdfBytes) historyStore.pushSnapshot(new Uint8Array(docStore.pdfBytes))
+  if (!docStore.pdfBytes) return
+  const snap = new Uint8Array(docStore.pdfBytes)
+  undoMeta.set(snap, captureOcrMeta())
+  historyStore.pushSnapshot(snap)
+}
+
+/**
+ * What a document snapshot cannot hold: the recognised runs and what the live
+ * bake last left on each page. A live bake applies an OCR edit to the BYTES,
+ * so undoing it brings back bytes without the edit — and the store, left
+ * alone, would go on claiming the edit (and the next live bake would put it
+ * straight back). Kept beside the snapshot, keyed by it.
+ */
+interface OcrUndoMeta { pages: Map<number, any>; hashes: Map<number, number> }
+const undoMeta = new WeakMap<Uint8Array, OcrUndoMeta>()
+function captureOcrMeta(): OcrUndoMeta {
+  const pages = new Map<number, any>()
+  for (const [k, v] of ocrStore.pages) pages.set(k, { ...v, items: v.items.map(i => ({ ...i })) })
+  const hashes = new Map<number, number>()
+  for (const [k, v] of livePages) hashes.set(k, v.hash)
+  return { pages, hashes }
+}
+function restoreOcrMeta(meta: OcrUndoMeta | undefined) {
+  if (!meta) return
+  ocrStore.pages = new Map(meta.pages)
+  for (const [k, v] of livePages) v.hash = meta.hashes.get(k) ?? v.pristineHash
+  appliedMeta = meta
 }
 
 // ===== UNDO / REDO =====
@@ -1048,8 +1250,13 @@ async function undo() {
   await settleTransactions()
   await exclusiveOp(async () => {
     editorStore.setStatus('Undoing...')
-    if (docStore.pdfBytes) historyStore.pushRedo(new Uint8Array(docStore.pdfBytes))
+    if (docStore.pdfBytes) {
+      const cur = new Uint8Array(docStore.pdfBytes)
+      undoMeta.set(cur, captureOcrMeta())
+      historyStore.pushRedo(cur)
+    }
     const snapshot = historyStore.popUndo()!
+    liveSuppressed = true
     // ENGINE first, viewer second. reloadDocument bumps renderVersion (via
     // reloadBytes), and that bump is the ONLY signal the overlays get — undo
     // has no explicit re-fetch the way annotOp does. With the viewer first,
@@ -1059,6 +1266,8 @@ async function undo() {
     // move had put it.
     await pdfEngine.loadDocument(snapshot.buffer.slice(0) as ArrayBuffer)
     await pdfViewer.reloadDocument(snapshot)
+    restoreOcrMeta(undoMeta.get(snapshot))
+    liveSuppressed = false
     docStore.markModified()
     editorStore.setStatus('Undo applied')
   })
@@ -1069,11 +1278,18 @@ async function redo() {
   await settleTransactions()
   await exclusiveOp(async () => {
     editorStore.setStatus('Redoing...')
-    if (docStore.pdfBytes) historyStore.pushUndoNoClear(new Uint8Array(docStore.pdfBytes))
+    if (docStore.pdfBytes) {
+      const cur = new Uint8Array(docStore.pdfBytes)
+      undoMeta.set(cur, captureOcrMeta())
+      historyStore.pushUndoNoClear(cur)
+    }
     const snapshot = historyStore.popRedo()!
+    liveSuppressed = true
     // Engine before viewer — same reason as undo above.
     await pdfEngine.loadDocument(snapshot.buffer.slice(0) as ArrayBuffer)
     await pdfViewer.reloadDocument(snapshot)
+    restoreOcrMeta(undoMeta.get(snapshot))
+    liveSuppressed = false
     docStore.markModified()
     editorStore.setStatus('Redo applied')
   })
@@ -1309,7 +1525,7 @@ async function handleDrop(e: DragEvent) {
 provide('runOcrOnPage', runOcrOnPage)
 // The recogniser has no viewer of its own; lend it ours so it can render a
 // page again at tracing resolution (see `traceRasterFor`).
-ocr.setPageRenderer((pageIndex, scale) => renderForOcr(pageIndex, scale))
+ocr.setPageRenderer((pageIndex, scale) => renderPristine(pageIndex, scale))
 
 /** The page as a raster for recognition: MuPDF, and pdf.js when MuPDF cannot. */
 async function renderForOcr(pageIndex: number, scale: number): Promise<HTMLCanvasElement | null> {
