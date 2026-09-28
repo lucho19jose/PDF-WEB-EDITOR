@@ -7655,14 +7655,14 @@ function lineRefuse(where: string): null {
  * the line kept as `wrapRef` for the wrap calibration. The target itself when
  * the needle cannot be located in its glyphs.
  */
-function shareOfTarget(targetBlock: TextBlock, needle: string): TextBlock {
+function shareOfTarget(targetBlock: TextBlock, needle: string, fromFree = 0): TextBlock {
   const chars = targetBlock.chars || []
   const needleFree = needle.replace(/\s+/g, '')
   if (!needleFree || chars.length === 0) return targetBlock
   const idx: number[] = []
   let free = ''
   chars.forEach((ch, i) => { if (ch.c.trim()) { idx.push(i); free += ch.c } })
-  const k = free.indexOf(needleFree)
+  const k = free.indexOf(needleFree, fromFree)
   if (k < 0) return targetBlock
   const from = idx[k], to = idx[k + needleFree.length - 1]
   if (from === undefined || to === undefined) return targetBlock
@@ -10184,7 +10184,28 @@ function findCrossBlockLine(
     members.sort((a, b) => a.pageX - b.pageX)
     const joined = foldForMatch(members.map(m => m.readText).join('')).replace(/\s+/g, '')
     if ((globalThis as any).__debugCandidates) console.log(`[cross] joined=${JSON.stringify(joined.slice(0, 80))} target=${JSON.stringify(tCompact.slice(0, 80))}`)
-    if (joined === tCompact && members.some(m => m.first > 0 || m.last < m.ops.length - 1)) return members
+    const partial = (ms: CrossMember[]) => ms.some(m => m.first > 0 || m.last < m.ops.length - 1)
+    if (joined === tCompact && partial(members)) return members
+    // The row can hold MORE than the target: extraction splits a line at a
+    // superscript ("José Luis Barboza Gonzales¹,*, Diego Omar …"), so the
+    // clicked block is only the part after the footnote mark while the row
+    // also carries the name before it. A contiguous stretch of members that
+    // reads as the target is the line — the members outside it are another
+    // block's text and are left alone.
+    const folded = members.map(m => foldForMatch(m.readText).replace(/\s+/g, ''))
+    for (let i = 0; i < members.length; i++) {
+      let acc = ''
+      for (let j = i; j < members.length; j++) {
+        acc += folded[j]
+        if (acc.length > tCompact.length) break
+        if (acc !== tCompact) continue
+        const sub = members.slice(i, j + 1)
+        if ((sub.length >= 2 || (sub.length === 1 && sub[0].text.replace(/\s+/g, '') !== sub[0].readText.replace(/\s+/g, ''))) && partial(sub)) {
+          if ((globalThis as any).__debugCandidates) console.log(`[cross] sub-range ${i}..${j} of ${members.length}`)
+          return sub
+        }
+      }
+    }
     return null
 }
 
@@ -10277,6 +10298,47 @@ function applyCrossBlockLine(
   pageHeight?: number,
   pageWidth?: number
 ): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
+  // Members the edit did not change are left exactly as they are. Each member
+  // is its own BT with its own absolute position, so an untouched member at
+  // EITHER end keeps its place however the text between changed (the hazard
+  // that forbids trimming an op's tail is between ops, not between blocks).
+  // Writing the whole line into the first member instead redraws every other
+  // member's words from there, and anything drawn between them — a
+  // superscript "1," after each author's name — is left where it was, inside
+  // the new text.
+  if (members.length > 1) {
+    let lo = 0, hi = members.length - 1, text = newText
+    const free = (m: CrossMember) => m.readText.replace(/\s+/g, '')
+    while (lo < hi) {
+      const f = free(members[lo]); if (!f) break
+      const p = consumePrefixFree(text, f); if (p === null) break
+      text = text.slice(p); lo++
+    }
+    while (hi > lo) {
+      const f = free(members[hi]); if (!f) break
+      const p = consumeSuffixFree(text, f); if (p === null) break
+      text = text.slice(0, p); hi--
+    }
+    if (lo > 0 || hi < members.length - 1) {
+      const sub = members.slice(lo, hi + 1)
+      const kept = sub.map(m => m.readText).join('')
+      if (!/^\s/.test(kept)) text = text.replace(/^\s+/, '')
+      if (!/\s$/.test(kept)) text = text.replace(/\s+$/, '')
+      // Located by how many of the line's glyphs come BEFORE it: a ","
+      // member would otherwise match the line's first comma.
+      const before = members.slice(0, lo).reduce((n, m) => n + m.readText.replace(/\s+/g, '').length, 0)
+      const share = shareOfTarget(targetBlock, kept, before)
+      if (share !== targetBlock) {
+        if ((globalThis as any).__debugCandidates) console.log(`[cross] narrowed to members ${lo}..${hi}: ${JSON.stringify(text)}`)
+        if (sub.length === 1) {
+          const one = applyPartialBlockReplacement(stream, sub[0].block, text, pageIndex, { ...share, text: sub[0].text }, pageHeight, pageWidth)
+          if (one && !('error' in one)) return { ...one, anchorOffset: sub[0].block.start }
+          return one
+        }
+        return applyCrossBlockLine(stream, sub, text, pageIndex, { ...share, text: kept }, pageHeight, pageWidth)
+      }
+    }
+  }
   const primary = members[0]
   // The share's text is the primary member's, its geometry the whole line's;
   // `wrapRef` keeps the wrap calibration honest about that (measured: "6."

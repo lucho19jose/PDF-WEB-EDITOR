@@ -4574,6 +4574,25 @@ Two things had to be right for the row test:
   read as part of its first. `BtInfo.inheritedTL` replays TL/TD through q/Q
   the way `fontStateAt` replays fonts and seeds `scanShowOps`.
 
+**The row can hold MORE than the target, and untouched members stay put.** A
+LaTeX author line ("José Luis Barboza Gonzales¹,ⓘ,*, Diego Omar … ¹,ⓘ, Paul …")
+draws each name as the tail op of its own BT, with the superscripts as ops
+positioned by `Td` between them; extraction splits the line at the first
+superscript, so the clicked block is only ", Diego Omar … Crisostomo," while
+the row's members also carry the first author. The members were only accepted
+when ALL of them joined to the target, so every edit of that block reported
+"could not find matching text". `findCrossBlockLine` now also accepts a
+contiguous sub-range of members that reads as the target. And
+`applyCrossBlockLine` drops leading and trailing members the edit did not
+change before writing (each member is its own BT, so an untouched one keeps
+its place at either end): written whole into the first member, the line
+redrew "Paul …" from Diego's position, and the "¹,ⓘ" between the names was
+left inside the new text. The narrowed share is located by glyph COUNT
+(`shareOfTarget`'s `fromFree`), or a "," member matches the line's first comma.
+**Known:** a Td-placed superscript after an edited name stays where it was,
+so a longer name runs into its own "¹,", and the ORCID icon (an image) never
+moves.
+
 ### A substitute face is fitted back to the width the original set
 Helvetica is wider than Calibri, Aptos, Arial Narrow or a condensed display
 face, and on a same-length edit the excess ran the line off the page: a
