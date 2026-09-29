@@ -170,7 +170,7 @@ function plainColor(c: readonly number[] | undefined): [number, number, number] 
  * page, less a small margin; the size comes down just enough, never below
  * half the original.
  */
-function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined, all: OcrTextItem[], widthAt10: number | null = null): number {
+function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined, all: OcrTextItem[], widthAt10: number | null = null, originalWidthAt10: number | null = null, measured = false): number {
   let size = item.fontSize
   if (item.vertical) return size
   // The run's own WIDTH is the one measure a box cannot inflate. Its height
@@ -183,9 +183,17 @@ function fitSize(item: OcrTextItem, text: string, pageWidth: number | undefined,
   // they are, never below six tenths.
   const ink = item.inkRect ?? item.rect
   const original = (item.originalText || item.text).trim()
-  if (original && ink.width > 4) {
-    const natural = approxWidth(original, size, item.fontFamily)
-    if (natural > ink.width * 1.25) size = Math.max(size * 0.6, Math.round(size * (ink.width * 1.1 / natural) * 10) / 10)
+  // Once the letters have been measured (or the user chose a size), do not
+  // shrink that size again using a character-count estimate. Condensed faces
+  // and narrow letters make that estimate especially misleading.
+  if (!measured && !item.restyled && original && ink.width > 4) {
+    if (originalWidthAt10 !== null && originalWidthAt10 > 0) {
+      const natural = originalWidthAt10 * size / 10
+      if (natural > ink.width * 1.05) size = Math.max(size * 0.6, Math.round(ink.width / originalWidthAt10 * 100) / 10)
+    } else {
+      const natural = approxWidth(original, size, item.fontFamily)
+      if (natural > ink.width * 1.25) size = Math.max(size * 0.6, Math.round(size * (ink.width * 1.1 / natural) * 10) / 10)
+    }
   }
   const margin = 12
   let room = pageWidth ? Math.max(20, pageWidth - margin - item.rect.x) : Infinity
@@ -246,7 +254,9 @@ export function planOcrExport(
   /** The engine-measured width of an item's full text at 10pt in the fonts that will draw it, when the caller has it. */
   widthAt10For?: (item: OcrTextItem) => number | null,
   /** The median measured weight of the traced glyphs an item's text will use, when the caller has a face — they are stroked up to the scan's stems. */
-  tracedRatioFor?: (item: OcrTextItem) => number | null
+  tracedRatioFor?: (item: OcrTextItem) => number | null,
+  /** Original reading measured in the same face: calibrates uncut, inflated OCR boxes. */
+  originalWidthAt10For?: (item: OcrTextItem) => number | null
 ): OcrExportPlan {
   const patches: PatchOp[] = []
   const images: ImageOp[] = []
@@ -303,14 +313,20 @@ export function planOcrExport(
       continue
     }
 
-    // The baseline sits about four fifths of the way down the em from the top
-    // of the box — placing text at the box top would print it a whole line high.
-    const baselineY = item.rect.y + item.rect.height - Math.max(1, item.rect.height * 0.2)
+    // With a cut in hand the size comes from the letters themselves, not from
+    // the box (see `sizeOf`); the whole-run redraw then agrees with the
+    // partial one and with the traced face's own proportions.
+    const ink = item.inkRect ?? item.rect
+    // The scan's fitted baseline, unless the user restyled or moved the run —
+    // a rotation they chose must not be overridden by the scan's tilt.
+    const baseline = !item.restyled ? partial?.cut.baseline : undefined
 
     let x = item.rect.x
     const widthAt10 = widthAt10For?.(item) ?? null
+    const sized = partial && !item.restyled ? { ...item, fontSize: sizeOf(item, partial.cut) } : item
+    const fontSize = Number(fitSize(sized, item.text, pageWidth, items, widthAt10, originalWidthAt10For?.(item) ?? null, !!partial))
     if (item.align !== 'left') {
-      const w = widthAt10 !== null ? widthAt10 * item.fontSize / 10 : approxWidth(item.text, item.fontSize, item.fontFamily)
+      const w = widthAt10 !== null ? widthAt10 * fontSize / 10 : approxWidth(item.text, fontSize, item.fontFamily)
       x = item.align === 'center'
         ? item.rect.x + (item.rect.width - w) / 2
         : item.rect.x + item.rect.width - w
@@ -318,11 +334,12 @@ export function planOcrExport(
       x = Math.max(x, item.rect.x)
     }
 
-    // With a cut in hand the size comes from the letters themselves, not from
-    // the box (see `sizeOf`); the whole-run redraw then agrees with the
-    // partial one and with the traced face's own proportions.
-    const sized = partial ? { ...item, fontSize: sizeOf(item, partial.cut) } : item
-    const fontSize = Number(fitSize(sized, item.text, pageWidth, items, widthAt10))
+    // On the scan's fitted baseline (a skewed line's letters do not sit at a
+    // fixed share of its box), mapped from the ink box to wherever the run now
+    // is; without a cut, about four fifths of the way down the box.
+    const baselineY = baseline
+      ? baseline.yAtCentre + baseline.slope * (x - (item.rect.x - ink.x) - baseline.centreX) + item.rect.y - ink.y
+      : item.rect.y + item.rect.height - Math.max(1, item.rect.height * 0.2)
     texts.push({
       text: String(item.text),
       x: Number(x),
@@ -330,7 +347,7 @@ export function planOcrExport(
       fontSize,
       fontName,
       color: plainColor(item.color),
-      rotation: 0,
+      rotation: baseline ? -Math.atan(baseline.slope) * 180 / Math.PI : -item.rotation,
       faceId: faceIdFor?.(item),
       strokeWidth: strokeWidthFor(item.strokeRatio, fontName, fontSize),
       tracedStrokeWidth: tracedStrokeUpTo(item.strokeRatio, tracedRatioFor?.(item) ?? undefined, fontSize)

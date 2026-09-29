@@ -107,6 +107,8 @@ export interface OcrTextItem {
   baked?: boolean
   /** True once the user changed its style or moved it; a partial redraw needs the original face and place. */
   restyled?: boolean
+  /** The scan's style before the first user style change, for Restore original. */
+  originalStyle?: Pick<OcrTextItem, 'fontSize' | 'fontFamily' | 'bold' | 'italic' | 'color' | 'align' | 'rotation'>
   /**
    * True while the page's LIVE bake has drawn this run as it now stands: the
    * canvas shows the real result, so the layer draws no stand-in for it.

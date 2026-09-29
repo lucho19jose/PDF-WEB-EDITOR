@@ -4233,6 +4233,43 @@ Four things hang off it:
 - **Save and print** apply only what is still pending; everything else is in
   the bytes already.
 
+### Measuring a run is not editing it — and a skewed line's neighbour is judged against the LINE
+Live baking made every store change visible, and three of them were not
+edits. Opening the editor runs the glyph cut in the background, which adopts
+the letters' em (`updateItem({ fontSize, restyled: false })`) — and
+`updateItem` counted any `fontSize` in a patch as a style change, so merely
+clicking a line marked it edited, painted a patch over its pixels and redrew
+it. A style change is now one whose value DIFFERS and is not the cut's
+measurement, a move one whose rect differs; unchanged controls re-sending the
+same values do nothing. The first real style change records
+`originalStyle`, which `revertItem` restores (it restored the text and place
+and left the new size, face and colour), and a finalised bake clears it.
+`traceItem` yields for the 440 DPI raster and the Tesseract fallback; the
+user can edit, restyle or re-recognise meanwhile, so `rememberCut` re-reads
+the run from the store and drops a measurement that belongs to a replaced
+raster or an older reading instead of writing it over the user's size.
+
+The whole-run redraw now sits on the cut's fitted baseline, rotated to its
+slope (not at four fifths of a tilted box, level), unless the run was
+restyled or moved. Without a cut, a box inflated by skew is calibrated by
+measuring the ORIGINAL reading in the face that will draw it
+(`originalWidthAt10For`) against the ink width, never below six tenths; with
+a cut the letters' em stands and no estimate shrinks it again. And
+`trimProfile`'s neighbour test asked for a band inking 15% of the box's
+width — a long skewed line never reaches that even in its own densest row,
+so the row above stayed in the box. On a box twelve ems or wider the bar is
+half the line's own peak row (capped at the old one).
+
+Measured on the 15-document OCR corpus against a static HEAD build: 74/74
+read back both ways, average re-read 0.965 → 0.959, every changed row
+inspected. "PAGADO SOLES" 0.75 → 0.92; "MINERA" 1 → 0.6 renders pixel-
+identical (re-read noise); "Referencia." 1 → 0.83 is now drawn at the height
+of "Nombre:" above it, as the scan has it, where HEAD shrank it by the
+character-count estimate — the re-read loses on the colon OCR read as a
+period. `msp.pdf` hangs the sweep driver at HEAD as well (not investigated).
+`tools/ocr-calibrate/store-regression.test.mjs` covers the store rules
+(`node --experimental-strip-types --test …`).
+
 ### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
 Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)
 leaves a scan's words in the content stream as INVISIBLE text: render mode 3,

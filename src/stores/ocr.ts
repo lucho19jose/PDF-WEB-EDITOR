@@ -73,6 +73,27 @@ export const useOcrStore = defineStore('ocr', () => {
       if (idx < 0) continue
       const before = page.items[idx]
       const after: OcrTextItem = { ...before, ...patch }
+      // A refined measurement describes the original scan. It is not a user
+      // edit: merely opening a line must never paint over its original pixels.
+      const sizeChanged = patch.fontSize !== undefined && after.fontSize !== before.fontSize && patch.restyled !== false
+      const styleChanged = sizeChanged ||
+        patch.fontFamily !== undefined && after.fontFamily !== before.fontFamily ||
+        patch.bold !== undefined && after.bold !== before.bold ||
+        patch.italic !== undefined && after.italic !== before.italic ||
+        patch.color !== undefined && after.color.some((v, i) => v !== before.color[i]) ||
+        patch.align !== undefined && after.align !== before.align ||
+        patch.rotation !== undefined && after.rotation !== before.rotation
+      const moved = patch.rect !== undefined && (['x', 'y', 'width', 'height'] as const)
+        .some(k => after.rect[k] !== before.rect[k])
+      if (styleChanged && !before.originalStyle && patch.edited !== false) {
+        after.originalStyle = {
+          fontSize: before.fontSize, fontFamily: before.fontFamily,
+          bold: before.bold, italic: before.italic, color: [...before.color],
+          align: before.align, rotation: before.rotation
+        }
+      }
+      // Finalising a bake makes its current appearance the new original.
+      if (patch.originalText !== undefined && patch.baked) after.originalStyle = undefined
       // An explicit `edited: false` is a RESET, and has to win over the "was it
       // edited before" term below — otherwise reverting a run puts its words
       // back but leaves it marked as changed, and export still paints over it.
@@ -81,26 +102,17 @@ export const useOcrStore = defineStore('ocr', () => {
         : after.removed
         ? false
         : after.text !== after.originalText ||
-          after.fontSize !== before.fontSize && patch.fontSize !== undefined ||
+          styleChanged ||
           before.edited ||
-          patch.fontFamily !== undefined ||
-          patch.bold !== undefined ||
-          patch.italic !== undefined ||
-          patch.color !== undefined ||
-          patch.align !== undefined ||
-          patch.rect !== undefined
+          moved
       // A style or a move changes what a partial redraw would have to keep;
       // remembered here because nothing else records the original style.
-      if (patch.restyled === undefined && (patch.fontSize !== undefined || patch.fontFamily !== undefined ||
-        patch.bold !== undefined || patch.italic !== undefined || patch.color !== undefined ||
-        patch.align !== undefined || patch.rect !== undefined)) after.restyled = true
+      if (patch.restyled === undefined && (styleChanged || moved)) after.restyled = true
       // Anything the user changes makes the page's live bake stale; what the
       // bake itself records (a halo) and the size the letters were measured
       // at (`restyled: false`, from the glyph cut) do not.
       if (patch.applied === undefined && (patch.text !== undefined || patch.removed !== undefined ||
-        patch.edited !== undefined || patch.fontFamily !== undefined || patch.bold !== undefined ||
-        patch.italic !== undefined || patch.color !== undefined || patch.align !== undefined ||
-        patch.rect !== undefined || (patch.fontSize !== undefined && patch.restyled !== false))) after.applied = false
+        patch.edited !== undefined || styleChanged || moved)) after.applied = false
       const items = [...page.items]
       items[idx] = after
       next.set(key, { ...page, items })
@@ -118,6 +130,8 @@ export const useOcrStore = defineStore('ocr', () => {
     const item = selectedIn(id)
     if (!item) return
     updateItem(id, {
+      ...item.originalStyle,
+      originalStyle: undefined,
       text: item.originalText,
       // Back onto its own ink, or a run that was dragged reverts its words and
       // stays where it was dropped.

@@ -648,10 +648,12 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
     // beside it by this width, where an estimate of half an em per character
     // let a traced calligraphic "中國銀行 X" run across its neighbour.
     const wholeItems = page.items.filter(i => i.edited && !i.removed && !i.vertical)
-    const wholeMeasured = await pdfEngine.measureRuns(wholeItems.map(item => ({
-      text: item.text, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item)
-    })))
+    const wholeMeasured = await pdfEngine.measureRuns([
+      ...wholeItems.map(item => ({ text: item.text, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item) })),
+      ...wholeItems.map(item => ({ text: item.originalText, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item) }))
+    ])
     const widthAt10 = new Map(wholeItems.map((item, i) => [item.id, wholeMeasured[i]?.exact ? wholeMeasured[i].width : null]))
+    const originalWidthAt10 = new Map(wholeItems.map((item, i) => [item.id, wholeMeasured[i + wholeItems.length]?.exact ? wholeMeasured[i + wholeItems.length].width : null]))
     // How far each edited run's ink reaches OUTSIDE its box — an accent over
     // the caps, a bold letter's blurred fringe — read from the page as it is
     // now, so the patch covers it. Cut at the box, a deleted "PERÚ" left its
@@ -668,7 +670,7 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
     // `updateItem` replaces the page's item objects; plan from the fresh ones.
     const planItems = ocrStore.pages.get(pageIndex)?.items ?? page.items
     plannedByPage.set(pageIndex, new Set(planItems))
-    const plan = planOcrExport(planItems, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null, tracedRatioFor)
+    const plan = planOcrExport(planItems, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null, tracedRatioFor, item => originalWidthAt10.get(item.id) ?? null)
     modes[pageIndex] = plan.modes
     // What each run's ink box becomes: a stretch appended past the old ink,
     // or a shifted tail, is painted OUTSIDE the box the recogniser read, and
@@ -791,6 +793,7 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
           ocr.forgetSpanCut(item.id)
         }
         item.edited = false; item.removed = false; item.restyled = false; item.originalText = item.text
+        item.originalStyle = undefined
       }
     }
   }

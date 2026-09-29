@@ -514,6 +514,15 @@ function trimProfile(p: Profile, emHint?: number, dipStrip = true): { top: numbe
   // gap: to the sparse branch a lone ascender's stem is quiet too.
   let peakRow = 0
   for (let r = top; r <= bottom; r++) if (p.rows[r] > peakRow) peakRow = p.rows[r]
+  // On a long skewed line the letters cross many different pixel rows, so
+  // even its densest row may ink less than 15% of the full width. Judge a
+  // neighbouring band's density against the line's own peak in that case.
+  // Short labels keep the absolute bar: an accent can be a large share of
+  // their ink. The gap/dip and relative-height checks below still separate
+  // a neighbour from the line's own ascenders and descenders.
+  const neighbourDensity = emPx > 0 && p.width >= emPx * 12
+    ? Math.min(p.width * 0.15, peakRow * 0.5)
+    : p.width * 0.15
   const quietRow = Math.max(minRow, Math.round(peakRow * 0.1))
   const dipRow = Math.max(quietRow, Math.round(peakRow * 0.3))
   walkDebug.push(`trim rows=[${Array.from(p.rows).join(',')}] top=${top} bottom=${bottom} peak=${peakRow} quiet=${quietRow} dip=${dipRow} minRow=${minRow}`)
@@ -542,7 +551,7 @@ function trimProfile(p: Profile, emHint?: number, dipStrip = true): { top: numbe
           // Three ems: "MINERA" is 3.9 ems and the band under it is as dense
           // as the word itself; density already keeps an accent band out.
           const wide = p.width >= emPx * 3
-          const neighbour = emPx > 0 && wide && densest >= p.width * 0.15 &&
+          const neighbour = emPx > 0 && wide && densest >= neighbourDensity &&
             bandH < bodyH * 0.8 && bodyH >= emPx * 0.5
           walkDebug.push(`strip${step > 0 ? 'Top' : 'Bottom'} quiet=${quiet} dip=${dip} densest=${densest} peak=${peakRow} bandH=${bandH} bodyH=${bodyH} em=${emPx.toFixed(1)} w=${p.width} -> ${neighbour ? 'strip' : 'keep'}`)
           if (neighbour) return next
@@ -569,7 +578,7 @@ function trimProfile(p: Profile, emHint?: number, dipStrip = true): { top: numbe
         // letters, the em came out 7.8pt for 4.6, and the redraw painted
         // over the row above. The gap is what separates lines; accents and
         // dots never reach 15% of the width, so density still keeps them.
-        const neighbour = emPx > 0 && p.width >= emPx * 3 && densest >= p.width * 0.15 &&
+        const neighbour = emPx > 0 && p.width >= emPx * 3 && densest >= neighbourDensity &&
           bandH < bodyH * 0.8 && bodyH >= emPx * 0.5
         if (neighbour) return next
         // A blob in one CORNER: the black edge of a scanned page reaching into

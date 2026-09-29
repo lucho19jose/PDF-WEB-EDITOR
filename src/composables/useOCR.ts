@@ -9,7 +9,7 @@ import { PaddleEngine } from '@/utils/ocr/engines/paddleEngine'
 import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
 import { inkBounds, inkGaps, inkBands, extendDescenders, extendAscenders, extendForTilt, walkNote, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
-import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance } from '@/utils/ocr/glyphCut'
+import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance, type GlyphCutResult } from '@/utils/ocr/glyphCut'
 import { toSpanCut, sizeOf, type SpanCut } from '@/utils/ocr/partialRedraw'
 import { useOcrStore } from '@/stores/ocr'
 
@@ -309,6 +309,13 @@ function createOCR() {
     // it the partial redraw as well as the trace. Every conversion below goes
     // through `toPt`.
     const hi = await traceRasterFor(item.pageIndex, base)
+    // Rendering yields while the user can type, restyle, or replace the page.
+    // Continue with the current run so a late measurement cannot overwrite
+    // their font size, and a committed trace learns the latest confirmed text.
+    if (rasters.get(item.pageIndex) !== base) return { added: 0, refused: null }
+    const current = useOcrStore().itemsFor(item.pageIndex).find(i => i.id === item.id)
+    if (!current || current.originalText !== item.originalText || current.baked) return { added: 0, refused: null }
+    item = current
     let raster = hi ?? base
     if (hi) {
       const kHi = 1 / hi.toPt
@@ -324,6 +331,26 @@ function createOCR() {
     // text, not its original ink, so neither a cut nor a trace can be made.
     if (item.baked) return { added: 0, refused: null }
     let face = scanFaceFor(item.pageIndex, styleKeyOf(item))
+    const rememberCut = (cut: GlyphCutResult, source: SpanCut['source']): boolean => {
+      // The fallback recogniser also yields. Recheck the user style before
+      // adopting its measurement and picking the face keyed by that size.
+      const latest = useOcrStore().itemsFor(item.pageIndex).find(i => i.id === item.id)
+      if (rasters.get(item.pageIndex) !== base || !latest || latest.baked || latest.originalText !== item.originalText) return false
+      item = latest
+      const span = toSpanCut(cut, raster.toPt, item.originalText, source)
+      spanCuts.set(item.id, span)
+      // Use the letters' em, rather than a bounding box inflated by skew.
+      // This metadata update preserves edited/applied; a user-set size stands.
+      if (!item.restyled) {
+        const size = sizeOf(item, span)
+        if (Math.abs(size - item.fontSize) > 0.05) {
+          useOcrStore().updateItem(item.id, { fontSize: size, restyled: false })
+          item = { ...item, fontSize: size }
+        }
+      }
+      face = scanFaceFor(item.pageIndex, styleKeyOf(item))
+      return true
+    }
     try {
       // The cut is made FIRST and kept whatever the tracer then does with it:
       // the partial redraw needs the letters' positions even when every glyph
@@ -334,25 +361,7 @@ function createOCR() {
       let cut = cutGlyphs(raster.ctx, rect, item.originalText, perGlyph ? symbols : undefined)
       let source: SpanCut['source'] = perGlyph ? 'symbols' : 'profile'
       const firstReason = cut ? '' : lastCutReason()
-      if (cut) {
-        const span = toSpanCut(cut, raster.toPt, item.originalText, source)
-        spanCuts.set(item.id, span)
-        // The run's size is the LETTERS' em from here on, which is what the
-        // bake draws the stretch at: the box's size is what a neighbour's tips
-        // or an ideograph beside the Latin letters inflate — the title of a
-        // comparison sheet was previewed at 12.1pt over a 9.8pt line, so the
-        // editor showed the edit a quarter larger than the page then drew it.
-        // The face is keyed by size, so it is chosen AFTER the size is known;
-        // a size the user set (`restyled`) stands.
-        if (!item.restyled) {
-          const size = sizeOf(item, span)
-          if (Math.abs(size - item.fontSize) > 0.05) {
-            useOcrStore().updateItem(item.id, { fontSize: size, restyled: false })
-            item = { ...item, fontSize: size }
-          }
-        }
-        face = scanFaceFor(item.pageIndex, styleKeyOf(item))
-      }
+      if (cut && !rememberCut(cut, source)) return { added: 0, refused: null }
       if (opts.measureOnly) return { added: 0, refused: null }
       const res = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, perGlyph ? symbols : undefined, item.text, cut)
       if (res.added) faceVersion.value++
@@ -371,7 +380,7 @@ function createOCR() {
       if (!boxes) return res
       cut = cutGlyphs(raster.ctx, rect, item.originalText, boxes)
       source = 'tesseract'
-      if (cut) spanCuts.set(item.id, toSpanCut(cut, raster.toPt, item.originalText, source))
+      if (cut && !rememberCut(cut, source)) return { added: 0, refused: null }
       const again = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, boxes, item.text, cut)
       if (again.added) { faceVersion.value++; return again }
       return { added: 0, refused: `${firstReason || res.refused}; on Tesseract's glyph boxes: ${again.refused || 'nothing to add'}` }
