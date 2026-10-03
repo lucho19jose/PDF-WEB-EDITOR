@@ -1,6 +1,7 @@
 import type { OcrTextItem } from './ocrTypes'
 import type { RectT } from '@/engine/types'
-import { cellStrokeRatio, type GlyphCutResult } from './glyphCut'
+import { cellStrokeRatio, expectedAdvance, type GlyphCutResult } from './glyphCut'
+import type { LineWords } from './wordSeg'
 import type { PatchOp, TextOp, ImageOp } from './ocrExport'
 import { strokeWidthFor, tracedStrokeUpTo } from './ocrStroke'
 
@@ -33,8 +34,13 @@ import { strokeWidthFor, tracedStrokeUpTo } from './ocrStroke'
  */
 
 export interface SpanCut {
-  /** One per NON-SPACE character of the original text, in reading order. `weight` is the cell's stem over the em (`cellStrokeRatio`). */
-  cells: { char: string; x0: number; x1: number; suspect: boolean; weight?: number }[]
+  /**
+   * One per NON-SPACE character of the original text, in reading order.
+   * `weight` is the cell's stem over the em (`cellStrokeRatio`). `approx`: the
+   * cell's word could not be cut, and the cell is that word's ink shared out
+   * by expected advances — exact at the word's edges, a guess inside it.
+   */
+  cells: { char: string; x0: number; x1: number; suspect: boolean; weight?: number; approx?: boolean }[]
   /** Fitted ink baseline: y(x) = yAtCentre + slope * (x - centreX). */
   baseline: { yAtCentre: number; slope: number; centreX: number }
   /** The em the cut measured, in points. */
@@ -42,7 +48,13 @@ export interface SpanCut {
   /** Median gap between adjacent letters of a word, and between words. */
   letterGapPt: number
   wordGapPt: number
-  source: 'symbols' | 'profile' | 'tesseract'
+  source: 'symbols' | 'profile' | 'tesseract' | 'words'
+  /**
+   * The line's ink WORDS (cells [from, to) each), when the span was built word
+   * by word (`toSpanCutFromWords`). A word with `cut: false` holds approximate
+   * cells; an edit whose edge falls inside it takes the whole word.
+   */
+  words?: { from: number; to: number; x0: number; x1: number; cut: boolean; err: number }[]
 }
 
 export interface PartialContext {
@@ -114,7 +126,7 @@ export function weightPlan(
   /** The face detector's stroke ratio over the run's ink between two page x's, or null when it cannot be measured. */
   measureRatio?: (x0: number, x1: number) => number | null
 ): { faceSkip: string; weightScale: number; bold: boolean | null; tracedRatio: number | null } | null {
-  const st = stretchOf(item)
+  const st = stretchOf(item, cut)
   if (!st || !st.text) return null
   const cells = cut.cells
   const n = cells.length
@@ -263,6 +275,54 @@ export function toSpanCut(cut: GlyphCutResult, toPt: number, originalText: strin
   }
 }
 
+/**
+ * A line segmented into words (`segmentLine`) and cut word by word → the run's
+ * span geometry in points. `cuts[k]` is the glyph cut of `lw.matches[k]`, or
+ * null where that word could not be cut; its cells are then the word's ink
+ * shared out by expected advances and marked `approx`.
+ */
+export function toSpanCutFromWords(lw: LineWords, cuts: (GlyphCutResult | null)[], toPt: number): SpanCut {
+  const cells: SpanCut['cells'] = new Array(lw.chars.length)
+  const words: NonNullable<SpanCut['words']> = []
+  const letterGaps: number[] = []
+  const ems: number[] = []
+  lw.matches.forEach((m, k) => {
+    const cut = cuts[k]
+    const ok = !!cut && cut.cells.length === m.to - m.from
+    words.push({ from: m.from, to: m.to, x0: m.ink.x0 * toPt, x1: m.ink.x1 * toPt, cut: ok, err: m.err })
+    if (ok) {
+      cut!.cells.forEach((c, i) => {
+        cells[m.from + i] = { char: c.char, x0: c.x0 * toPt, x1: c.x1 * toPt, suspect: !!c.suspect, weight: cellStrokeRatio(cut!, c) ?? undefined }
+        const prev = i > 0 ? cut!.cells[i - 1] : null
+        if (prev && !prev.suspect && !c.suspect && c.x0 >= prev.x1) letterGaps.push((c.x0 - prev.x1) * toPt)
+      })
+      if (cut!.letterEmPx) ems.push(cut!.letterEmPx)
+      return
+    }
+    const chars = lw.chars.slice(m.from, m.to)
+    const total = chars.reduce((s, c) => s + expectedAdvance(c), 0) || 1
+    let x = m.ink.x0
+    chars.forEach((ch, i) => {
+      const x1 = i === chars.length - 1 ? m.ink.x1 : x + (m.ink.x1 - m.ink.x0) * expectedAdvance(ch) / total
+      cells[m.from + i] = { char: ch, x0: x * toPt, x1: x1 * toPt, suspect: false, approx: true }
+      x = x1
+    })
+  })
+  const median = (v: number[]) => { const s = [...v].sort((a, b) => a - b); return s[Math.floor(s.length / 2)] }
+  // The em: what the cut words' own letters measured, pooled — the line fit's
+  // estimate only seeds the cuts.
+  const emPx = ems.length >= 2 ? median(ems) : lw.fit.emPx
+  return {
+    cells,
+    baseline: { yAtCentre: lw.fit.y * toPt, slope: lw.fit.slope, centreX: lw.fit.centreX * toPt },
+    emPt: emPx * toPt,
+    letterGapPt: letterGaps.length >= 3 ? median(letterGaps) : lw.split.letterGapPx * toPt,
+    wordGapPt: lw.split.wordGapPx * toPt,
+    source: 'words',
+    words
+  }
+}
+
 export interface Stretch {
   prefix: number
   suffix: number
@@ -273,11 +333,32 @@ export interface Stretch {
   spaceAfter: boolean
 }
 
-/** What the edit changed, as the run's non-space characters see it. */
-export function stretchOf(item: OcrTextItem): Stretch | null {
+/**
+ * Whether the boundary BEFORE cell `k` (between cells k-1 and k) is known to
+ * the pixel: the edge of a line, a gap between two ink words, or a join inside
+ * a word that was cut. Inside a word that could not be cut, its cells are a
+ * guess, and an edit there has to take the whole word.
+ */
+function boundaryKnown(cut: SpanCut, k: number): boolean {
+  if (!cut.words || k <= 0 || k >= cut.cells.length) return true
+  const w = cut.words.find(w => k > w.from && k < w.to)
+  return !w || (w.cut && !cut.cells[k - 1].approx && !cut.cells[k].approx)
+}
+
+/**
+ * What the edit changed, as the run's non-space characters see it. With a
+ * word-built span (`cut.words`), an edge that falls inside a word that could
+ * not be cut is moved out to that word's edge — the word is replaced whole.
+ */
+export function stretchOf(item: OcrTextItem, cut?: SpanCut | null): Stretch | null {
   const original = nonSpace(item.originalText)
   const edited = nonSpace(item.text)
-  const { prefix, suffix } = commonAffix(original, edited)
+  let { prefix, suffix } = commonAffix(original, edited)
+  if (cut?.words && cut.cells.length === original.length) {
+    const n = original.length
+    if (!boundaryKnown(cut, prefix)) prefix = cut.words.find(w => prefix > w.from && prefix < w.to)!.from
+    if (!boundaryKnown(cut, n - suffix)) suffix = n - cut.words.find(w => n - suffix > w.from && n - suffix < w.to)!.to
+  }
   // Indices into the FULL edited text of the first changed non-space character
   // and of the first non-space character of the tail.
   const positions: number[] = []
@@ -292,6 +373,23 @@ export function stretchOf(item: OcrTextItem): Stretch | null {
   const spaceBefore = prefix > 0 && start > 0 && t[start - 1] === ' '
   const spaceAfter = suffix > 0 && end > 0 && t[end - 1] === ' '
   return { prefix, suffix, text: raw.trim(), spaceBefore, spaceAfter }
+}
+
+/**
+ * Whether the ORIGINAL text has a space right before its `prefix`-th non-space
+ * character — i.e. whether the old span began a word gap after the head.
+ * False when there is no such character (the edit appends).
+ */
+export function originalSpaceBefore(originalText: string, prefix: number): boolean {
+  if (prefix <= 0) return false
+  const o = [...originalText]
+  let seen = 0
+  for (let i = 0; i < o.length; i++) {
+    if (o[i] === ' ') continue
+    if (seen === prefix) return o[i - 1] === ' '
+    seen++
+  }
+  return false
 }
 
 /** The size the stretch is drawn at: the cut's own em, held near the run's. */
@@ -321,6 +419,33 @@ export function nextRunInkRight(item: OcrTextItem, all: OcrTextItem[]): number |
 
 const TOUCH_PT = 0.34 // about one raster pixel at 220 DPI
 
+/**
+ * A line's letter BAND over [x0, x1], as rectangles: `above` over the fitted
+ * baseline and `below` under it, inside [clampTop, clampBottom].
+ *
+ * A long line of a skewed scan has an axis-aligned box far taller than its
+ * letters (a 0.7° tilt over 470pt is 5.6pt of rise), and one rectangle over it
+ * reaches into the line above at one end and the line below at the other — a
+ * patch erased the lower half of the line above, and a moved tail carried the
+ * tips of both neighbours along with it. Laid as a staircase of segments over
+ * which the baseline moves by half a point at most, the band follows the
+ * letters; each segment overlaps the last by a hair so no seam survives.
+ */
+export function bandRects(x0: number, x1: number, yAt: (x: number) => number, slope: number, above: number, below: number, clampTop: number, clampBottom: number): RectT[] {
+  if (!(x1 > x0)) return []
+  const segW = Math.abs(slope) > 1e-4 ? Math.max(8, 0.5 / Math.abs(slope)) : x1 - x0
+  const n = Math.min(60, Math.max(1, Math.ceil((x1 - x0) / segW)))
+  const step = (x1 - x0) / n
+  const out: RectT[] = []
+  for (let i = 0; i < n; i++) {
+    const xa = x0 + i * step, xb = i === n - 1 ? x1 : x0 + (i + 1) * step
+    const ya = Math.min(yAt(xa), yAt(xb)), yb = Math.max(yAt(xa), yAt(xb))
+    const top = Math.max(clampTop, ya - above), bottom = Math.min(clampBottom, yb + below)
+    if (bottom > top) out.push([i === 0 ? xa : xa - 0.15, top, xb, bottom])
+  }
+  return out
+}
+
 export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrTextItem[], pageWidth?: number): PartialOutcome {
   const { cut } = ctx
   if (item.vertical) return { reason: 'vertical run' }
@@ -332,7 +457,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const original = nonSpace(item.originalText)
   const n = cut.cells.length
   if (n !== original.length) return { reason: 'cut does not match the text' }
-  const st = stretchOf(item)
+  const st = stretchOf(item, cut)
   if (!st) return { reason: 'no stretch' }
   const { prefix, suffix } = st
   if (prefix + suffix === 0) return { reason: 'whole text changed' }
@@ -360,7 +485,15 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const gapAfter = st.spaceAfter ? cut.wordGapPt : cut.letterGapPt
 
   const width = st.text.length ? (ctx.stretchWidthPt ?? 0) : 0
-  const penX = oldSpan ? oldSpan.x0 - bearing : (prefix > 0 ? headEnd + gapBefore - bearing : ink.x - bearing)
+  // The old span's first letter is where the stretch starts only while the
+  // boundary keeps its kind. "USUARIO DESIGNADO" → "USUARIOS DESIGNADOS"
+  // replaces " DESIGNADO" with "S DESIGNADOS": the old span began a WORD gap
+  // after the head, the new one is glued to it, and starting at the old "D"
+  // drew "USUARIO S DESIGNADOS". Where the space came or went, the pen starts
+  // from the head by the gap the NEW text asks for.
+  const penX = oldSpan && (prefix === 0 || st.spaceBefore === originalSpaceBefore(item.originalText, prefix))
+    ? oldSpan.x0 - bearing
+    : (prefix > 0 ? headEnd + gapBefore - bearing : ink.x - bearing)
   const inkEnd = st.text.length ? penX + width - bearing : headEnd
   // The fitted baseline is a LINE, and the redraw follows it: a stretch laid
   // level from its start drifts off a tilted scan's line by slope x width -
@@ -382,6 +515,15 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const padX = Math.max(1, ink.height * 0.15)
   const padHead = prefix > 0 ? Math.min(1, Math.max(0.4, gapBefore / 2)) : padX
   const patchX0 = prefix > 0 ? headEnd + padHead : ink.x - padX
+  // Patches and moved tails cover the letter band along the baseline, not the
+  // box (`bandRects`): an em above it for capital accents, a third below for
+  // descenders, plus the halo — and never more than the box.
+  const above = cut.emPt + 0.6 + (halo?.top ?? 0)
+  const below = cut.emPt * 0.35 + 0.6 + (halo?.bottom ?? 0)
+  const boxTop = ink.y - padTop, boxBottom = ink.y + ink.height + padBottom
+  const band = (x0: number, x1: number) => bandRects(x0, x1, yAt, cut.baseline.slope, above, below, boxTop, boxBottom)
+  const patchesOver = (x0: number, x1: number, paint?: boolean): PatchOp[] =>
+    band(x0, x1).map(rect => ({ rect, color: plain(item.background), item: item.id, ...(paint === undefined ? {} : { paint }) }))
 
   // The words the scan keeps drawing are put back into the page as INVISIBLE
   // text at their own positions (render mode 3), so the line still extracts,
@@ -444,7 +586,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
       // ground (an identity card's strip) a flat patch there showed as a block
       // behind the new letters, and it hid nothing. The rectangle is still
       // reported (`paint: false`) so the run's box grows to the new letters.
-      patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkEnd) + padX, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id, paint: !!oldSpan }],
+      patches: patchesOver(patchX0, Math.max(inkRight, inkEnd) + padX, !!oldSpan),
       images: [],
       texts: textOp()
     }
@@ -466,7 +608,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
     return {
       mode: 'partial',
       // An insertion the tail absorbs in place covers only the gap's paper.
-      patches: [{ rect: [patchX0, ink.y - padTop, tailStart - padTail, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id, paint: !!oldSpan }],
+      patches: patchesOver(patchX0, tailStart - padTail, !!oldSpan),
       images: [],
       texts: textOp()
     }
@@ -480,15 +622,16 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   // old-span ink on the left and no neighbour's ink on the right.
   const padL = Math.min(1, Math.max(0.3, (oldSpan ? tailStart - oldSpan.x1 : gapAfter) / 2))
   const padR = Math.min(1.5, nextInk !== null ? Math.max(0, nextInk - inkRight) : 1.5)
-  const src: RectT = [tailStart - padL, ink.y - padTop, inkRight + padR, ink.y + ink.height + padBottom]
   // Along the line, not level: moved dx to the right on a tilted scan the
-  // tail's pixels must also move by slope x dx, or they leave its line.
+  // tail's pixels must also move by slope x dx, or they leave its line. Moved
+  // as band segments, so the neighbours' tips stay where they are.
   const dy = cut.baseline.slope * dx
-  const dst: RectT = [src[0] + dx, src[1] + dy, src[2] + dx, src[3] + dy]
+  const images: ImageOp[] = band(tailStart - padL, inkRight + padR)
+    .map(src => ({ srcRect: src, dstRect: [src[0] + dx, src[1] + dy, src[2] + dx, src[3] + dy] as RectT, item: item.id }))
   return {
     mode: 'partial+shift',
-    patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkRight + dx) + padX, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id }],
-    images: [{ srcRect: src, dstRect: dst }],
+    patches: patchesOver(patchX0, Math.max(inkRight, inkRight + dx) + padX),
+    images,
     texts: textOp(dx)
   }
 }

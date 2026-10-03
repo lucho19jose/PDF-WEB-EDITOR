@@ -36,6 +36,8 @@ export interface GlyphCutResult {
   baselineAt: (x: number) => number
   /** Em in canvas pixels. */
   emPx: number
+  /** What the cut's own letters measured the em at (caps or x-height), when they could — a line hint's em otherwise stands in `emPx`. */
+  letterEmPx?: number | null
   /** Threshold used, so the tracer binarises the same way. */
   threshold: number
   /** Light glyphs on a dark ground — the tracer must flip the bitmap too. */
@@ -56,7 +58,20 @@ export interface GlyphCutResult {
  * level `traceLevel` picks for the run (see there), where `ink` is the fixed
  * cut the segmentation is made on.
  */
-interface Bin { x: number; y: number; w: number; h: number; ink: Uint8Array; dark: Float32Array; threshold: number; inverted: boolean }
+export interface Bin { x: number; y: number; w: number; h: number; ink: Uint8Array; dark: Float32Array; threshold: number; inverted: boolean }
+
+/**
+ * What a caller already knows about the LINE a cut belongs to. A single word
+ * cut on its own has too few letters to measure: "en" is all x-height, so the
+ * em read off its box comes out a third short, and a three-letter word's
+ * baseline fitted through three bottoms swings with any one of them.
+ */
+export interface LineHint {
+  /** The line's em, in canvas pixels. */
+  emPx: number
+  /** The line's fitted baseline at canvas x. */
+  baselineAt: (x: number) => number
+}
 
 /** Why the last cut was refused — for the sweep, which counts the reasons. */
 let refusedBecause = ''
@@ -70,7 +85,7 @@ export function lastCutDebug() { return { ...cutDebug } }
 const DESCENDER_CHARS = /[gjpqyQ,;()\[\]{}]/
 const CJK = /[\p{Script=Han}　-〿＀-￯]/u
 
-function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; width: number; height: number }, ruleSpan: number, ruleThick: number): Bin | null {
+export function binarise(ctx: CanvasRenderingContext2D, rect: { x: number; y: number; width: number; height: number }, ruleSpan: number, ruleThick: number): Bin | null {
   const x = Math.max(0, Math.floor(rect.x)), y = Math.max(0, Math.floor(rect.y))
   const w = Math.min(ctx.canvas.width - x, Math.ceil(rect.width)), h = Math.min(ctx.canvas.height - y, Math.ceil(rect.height))
   if (w < 3 || h < 3) return null
@@ -194,11 +209,13 @@ export function cutGlyphs(
   ctx: CanvasRenderingContext2D,
   rect: { x: number; y: number; width: number; height: number },
   text: string,
-  symbols?: OcrBox[]
+  symbols?: OcrBox[],
+  /** The line this word belongs to — see `LineHint`. With it, `rect` is the line's letter band over the word, not the word's own box. */
+  line?: LineHint
 ): GlyphCutResult | null {
   const chars = [...text].filter(c => c !== ' ')
   if (!chars.length) return refuse('no characters')
-  const emGuess = rect.width / Math.max(1, chars.reduce((s, c) => s + expectedAdvance(c), 0))
+  const emGuess = line?.emPx ?? rect.width / Math.max(1, chars.reduce((s, c) => s + expectedAdvance(c), 0))
   const bin = binarise(ctx, rect, emGuess * 2.5, Math.max(4, Math.round(emGuess * 0.25)))
   if (!bin) return refuse('blank or unreadable box')
   refusedBecause = ''
@@ -206,7 +223,7 @@ export function cutGlyphs(
   const cjk = chars.filter(c => CJK.test(c)).length * 2 >= chars.length
   // The same ratios `boxPerEm` in useOCR uses: a letter descender makes the
   // box 0.95 of an em, punctuation alone (a comma, a parenthesis) 0.85.
-  const emPx = bin.h / (cjk ? 0.92 : chars.some(c => /[gjpqyQ]/.test(c)) ? 0.95 : chars.some(c => DESCENDER_CHARS.test(c)) ? 0.85 : 0.76)
+  const emPx = line?.emPx ?? bin.h / (cjk ? 0.92 : chars.some(c => /[gjpqyQ]/.test(c)) ? 0.95 : chars.some(c => DESCENDER_CHARS.test(c)) ? 0.85 : 0.76)
   // Sixteen pixels of em is a 5pt line at 220 DPI: its stems are one pixel,
   // its punctuation falls below the threshold, and an outline traced from
   // that is a blob. The tracer tries the 440 DPI raster first, where the same
@@ -218,7 +235,7 @@ export function cutGlyphs(
     // An engine's glyph boxes are vetted like a profile cut: Tesseract's box
     // for a touching pair can straddle the join, and a wrong shape under a
     // letter is the one outcome worse than no trace.
-    cells = vetCells(bin, symbols.map((s, i) => ({ char: chars[i], x0: Math.round(s.x0), x1: Math.round(s.x1) })), chars)
+    cells = vetCells(bin, symbols.map((s, i) => ({ char: chars[i], x0: Math.round(s.x0), x1: Math.round(s.x1) })), chars, line?.emPx)
     // And with NO suspect cell at all. Engine boxes admitted at the profile
     // cut's fifth traced a 6-letter "MINERA" as nonsense (re-read similarity
     // 0) and a 4.7pt watermark at 0.67 on the corpus, against one good line;
@@ -226,13 +243,13 @@ export function cutGlyphs(
     // means the engine misread the run's segmentation.
     if (cells && cells.some(c => c.suspect)) return refuse(`${cells.filter(c => c.suspect).length} of ${cells.length} engine boxes suspect`)
   } else {
-    cells = cutByProfile(bin, chars, emPx, cjk)
+    cells = cutByProfile(bin, chars, emPx, cjk, line?.emPx)
   }
   if (!cells) return null
 
-  const base = baselineOf(bin, cells)
   const centreX = bin.x + bin.w / 2
-  const baselineAt = (x: number) => base.y + base.slope * (x - centreX)
+  const base = line ? { y: line.baselineAt(centreX), slope: (line.baselineAt(centreX + 100) - line.baselineAt(centreX)) / 100 } : baselineOf(bin, cells)
+  const baselineAt = line ? line.baselineAt : (x: number) => base.y + base.slope * (x - centreX)
   // The em from the LETTERS when they can say: the box's height is what a rule
   // crossing it or a neighbour's tips inflate, and an em taken from a box 82
   // rows tall around letters 46 rows high made the traced glyphs half an em
@@ -245,11 +262,17 @@ export function cutGlyphs(
   const caps = cjk ? [] : cells.filter(c => !c.suspect && TALL_CHARS.test(c.char)).map(heightOf).filter(h => h > 2)
   const xs = cjk ? [] : cells.filter(c => !c.suspect && X_HEIGHT_CHARS.test(c.char)).map(heightOf).filter(h => h > 2)
   const letterEm = caps.length >= 2 ? median(caps) / 0.72 : xs.length >= 3 ? median(xs) / 0.52 : null
-  const em = letterEm !== null && letterEm > 4 ? letterEm : emPx
-  return { cells, baselineY: base.y, baselineAt, emPx: em, threshold: bin.threshold, inverted: bin.inverted, bin: { x: bin.x, y: bin.y, w: bin.w, h: bin.h, ink: bin.ink, dark: bin.dark } }
+  // A word cut on its line's band takes the LINE's em: every word of the line
+  // must draw at one size, and a word's own two or three letters are a poor
+  // measure of it. What its letters said is reported for the caller to pool.
+  const em = line ? line.emPx : letterEm !== null && letterEm > 4 ? letterEm : emPx
+  return {
+    cells, baselineY: base.y, baselineAt, emPx: em, letterEmPx: letterEm !== null && letterEm > 4 ? letterEm : null,
+    threshold: bin.threshold, inverted: bin.inverted, bin: { x: bin.x, y: bin.y, w: bin.w, h: bin.h, ink: bin.ink, dark: bin.dark }
+  }
 }
 
-function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): GlyphCell[] | null {
+function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false, lineEm?: number): GlyphCell[] | null {
   // Excluding fully-inked ROWS here (the rule `inkMeasure` applies on the axis
   // a rule crosses) was tried and reverted: measured on the two documents that
   // report "1 runs for N characters" — a letterhead's company name and a 73pt
@@ -393,7 +416,7 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
       x = x1
     })
   }
-  return vetCells(bin, cells, chars)
+  return vetCells(bin, cells, chars, lineEm)
 }
 
 /**
@@ -402,7 +425,7 @@ function cutByProfile(bin: Bin, chars: string[], emPx: number, cjk = false): Gly
  * (never traced); a run with too many of them, or a sliver at an end, is
  * refused whole.
  */
-function vetCells(bin: Bin, cells: GlyphCell[], chars: string[]): GlyphCell[] | null {
+function vetCells(bin: Bin, cells: GlyphCell[], chars: string[], lineEm?: number): GlyphCell[] | null {
   // Every cell's width against its character. An italic serif footer whose
   // letters touch fit the least-squares partition well enough as a WHOLE and
   // still gave a 5px "b" beside a 12px "i" — and those shapes went into the
@@ -551,7 +574,10 @@ function vetCells(bin: Bin, cells: GlyphCell[], chars: string[]): GlyphCell[] | 
   // the foreign ink, and on a line of x-height letters the tallest cells are
   // the few with ascenders - the box is only as tall as they are.
   const heights = cells.filter(c => !c.suspect).map(c => { const e = cellExtent(bin, c); return e.top < 0 ? 0 : e.bottom - e.top + 1 }).filter(h => h > 0).sort((a, b) => b - a)
-  if (heights.length >= 3 && heights[1] < bin.h * 0.55) {
+  // A word cut on its LINE's band (`LineHint`) is meant to be taller than an
+  // all-x-height word: there the letters only have to be letters — a third of
+  // the line's em at least.
+  if (lineEm ? heights.length >= 1 && heights[Math.min(1, heights.length - 1)] < lineEm * 0.3 : heights.length >= 3 && heights[1] < bin.h * 0.55) {
     return refuse('the box is far taller than its letters')
   }
   return cells
@@ -811,9 +837,31 @@ function baselineOf(bin: Bin, cells: GlyphCell[]): { y: number; slope: number } 
     const slope = (n * sxy - sx * sy) / denom
     return { y: (sy - slope * sx) / n, slope }
   }
+  // The line MOST letters sit on first, searched over a scan's slopes, then
+  // refined on those letters. A plain fit was pulled by whatever does not sit
+  // on it: old-style figures hang a 3, 4, 5, 7 or 9 below the line, and
+  // "Bo08-190845", whose last three figures descend, fitted a tilt past the
+  // partial redraw's limit — the whole number was redrawn instead of one
+  // letter added, and an "X" appended to "S/ 250.00" was set two points high.
   let line = fit(pts)
-  const kept = pts.filter(q => Math.abs(q.y - (line.y + line.slope * (q.x - centreX))) <= 1.5)
-  if (kept.length >= 3 && kept.length < pts.length) line = fit(kept)
+  if (pts.length >= 3) {
+    const tol = Math.max(0.75, bin.h * 0.04)
+    let bestN = -1, bestSlope = 0, bestY = line.y
+    const proj = new Float64Array(pts.length)
+    const idx = pts.map((_, i) => i)
+    for (let k = -25; k <= 25; k++) {
+      const sl = k * 0.002
+      for (let i = 0; i < pts.length; i++) proj[i] = pts[i].y - sl * (pts[i].x - centreX)
+      idx.sort((a, b) => proj[a] - proj[b])
+      for (let i = 0, j = 0; i < idx.length; i++) {
+        while (proj[idx[i]] - proj[idx[j]] > 2 * tol) j++
+        const n = i - j + 1
+        if (n > bestN || (n === bestN && Math.abs(sl) < Math.abs(bestSlope))) { bestN = n; bestSlope = sl; bestY = (proj[idx[i]] + proj[idx[j]]) / 2 }
+      }
+    }
+    const kept = pts.filter(q => Math.abs(q.y - (bestY + bestSlope * (q.x - centreX))) <= Math.max(1.5, tol * 1.5))
+    line = kept.length >= 3 ? fit(kept) : { y: bestY, slope: bestSlope }
+  }
   // A slope steeper than a few degrees is not a scan's tilt; fall back to level.
   if (Math.abs(line.slope) > 0.05) line = { y: median(pts.map(q => q.y)), slope: 0 }
   return line
@@ -885,7 +933,7 @@ function cellMask(cut: CutForCell, cell: GlyphCell, pad: number): CellMask | nul
     if (touchesLeft) colMin = pad + k
     if (touchesRight) colMax = w - 1 - pad - k
   }
-  stripEdgeCrumbs(on, w, h, pad)
+  stripEdgeCrumbs(on, w, h, pad, cell.char)
   return { on, x, y, w, h, floor, colMin, colMax }
 }
 
@@ -1251,14 +1299,22 @@ export function cellBitmapTraced(
   }
   const left = colMin * res, right = (colMax + 1) * res - 1
   const cellW = Math.max(1, right - left + 1)
-  for (const piece of pieces) {
+  // A letter's MARK — an i's dot, an accent — is a small, blurred piece: at
+  // 9pt its peak darkness stays under the stroke bar and its area under the
+  // speck floor, and the traced face's "i" came out dotless ("fınancıeros").
+  // Stacked over or under the letter's body, it is kept on a lower bar.
+  const marks = markPieces(pieces, cell.char, res)
+  const MARK_STROKE = 0.3
+  pieces.forEach((piece, i) => {
+    const isMark = marks.has(i) && piece.area >= 2 * res * res
     const touchesEdge = piece.x0 <= left || piece.x1 >= right
-    const speck = piece.area <= Math.max(4 * res * res, Math.round(total * 0.03))
+    const speck = piece.area <= Math.max(4 * res * res, Math.round(total * 0.03)) && !isMark
     const narrow = touchesEdge && (piece.x1 - piece.x0 + 1) < cellW * 0.2
-    const crumb = narrow && piece.area < total * 0.25
+    const crumb = narrow && piece.area < total * 0.25 && !isMark
     const rule = narrow && (piece.y1 - piece.y0 + 1) >= H * 0.8
-    if (piece.darkest < STROKE || speck || crumb || rule) for (const j of piece.members) ink[j] = 0
-  }
+    const faint = piece.darkest < (isMark ? MARK_STROKE : STROKE)
+    if (faint || speck || crumb || rule) for (const j of piece.members) ink[j] = 0
+  })
   const out = new ImageData(W, H)
   const o = out.data
   let inked = 0
@@ -1281,42 +1337,49 @@ export function cellBitmapTraced(
  * piece of the "N" beside it, an "R" with a foot of the "A". A glyph's own
  * strokes are wider than that, or hold most of the ink, or both.
  */
-function stripEdgeCrumbs(on: Uint8Array, w: number, h: number, pad: number): void {
+function stripEdgeCrumbs(on: Uint8Array, w: number, h: number, pad: number, char?: string): void {
   const label = new Int32Array(w * h)
   let total = 0
   for (let j = 0; j < on.length; j++) total += on[j]
   if (total < 4) return
   const left = pad, right = w - 1 - pad
   const cellW = Math.max(1, right - left + 1)
-  let next = 0
+  const pieces: Piece[] = []
   const stack: number[] = []
   for (let start = 0; start < on.length; start++) {
     if (!on[start] || label[start]) continue
-    next++
-    let area = 0, x0 = w, x1 = -1, y0 = h, y1 = -1
-    stack.push(start); label[start] = next
+    const id = pieces.length + 1
+    const p: Piece = { area: 0, x0: w, x1: -1, y0: h, y1: -1 }
+    stack.push(start); label[start] = id
     while (stack.length) {
       const j = stack.pop()!
-      area++
+      p.area++
       const xx = j % w, yy = (j - xx) / w
-      if (xx < x0) x0 = xx
-      if (xx > x1) x1 = xx
-      if (yy < y0) y0 = yy
-      if (yy > y1) y1 = yy
+      if (xx < p.x0) p.x0 = xx
+      if (xx > p.x1) p.x1 = xx
+      if (yy < p.y0) p.y0 = yy
+      if (yy > p.y1) p.y1 = yy
       for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
         if (!dx && !dy) continue
         const nx = xx + dx, ny = yy + dy
         if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
         const n = ny * w + nx
-        if (on[n] && !label[n]) { label[n] = next; stack.push(n) }
+        if (on[n] && !label[n]) { label[n] = id; stack.push(n) }
       }
     }
+    pieces.push(p)
+  }
+  const marks = markPieces(pieces, char, 1)
+  pieces.forEach((p, i) => {
+    const { area, x0, x1, y1, y0 } = p
     const touchesEdge = x0 <= left || x1 >= right
     // And a SPECK anywhere: the anti-aliased fringe of an underline two rows
     // below the letters, a scanner's grain, holds a few pixels where Potrace's
     // turd size drops only one. Under 3% of the cell's ink is no part of a
-    // letter — an "i" dot is a tenth of its stem, an accent more.
-    const speck = area <= Math.max(4, Math.round(total * 0.03))
+    // letter — an accent is more. An "i" dot is NOT: at 220 DPI a 9pt dot is
+    // two pixels square and fell under the floor of four, and the face drew
+    // "fınancıeros". A mark of a letter that has one (`markPieces`) is kept.
+    const speck = area <= Math.max(4, Math.round(total * 0.03)) && !(marks.has(i) && area >= 2)
     // A narrow piece on the cell's edge running the HEIGHT of the line is a
     // cell border, whatever share of the ink it holds: a table's grey rule
     // beside the "C" of "CONTRATO" was a third of the cell's ink, over the
@@ -1324,8 +1387,38 @@ function stripEdgeCrumbs(on: Uint8Array, w: number, h: number, pad: number): voi
     // then read back as "IC". A stem on a glyph's edge (E, L, B) is joined to
     // the rest of it; a lone stem (I, l, 1) has a cell no wider than itself.
     const rule = touchesEdge && (x1 - x0 + 1) < cellW * 0.2 && (y1 - y0 + 1) >= h * 0.8
-    if (speck || rule || (touchesEdge && (x1 - x0 + 1) < cellW * 0.2 && area < total * 0.25)) {
-      for (let j = 0; j < on.length; j++) if (label[j] === next) on[j] = 0
+    if (speck || rule || (touchesEdge && (x1 - x0 + 1) < cellW * 0.2 && area < total * 0.25 && !marks.has(i))) {
+      for (let j = 0; j < on.length; j++) if (label[j] === i + 1) on[j] = 0
     }
-  }
+  })
+}
+
+interface Piece { area: number; x0: number; x1: number; y0: number; y1: number }
+
+/**
+ * Letters drawn in more than one piece stacked VERTICALLY: the dot of an i or
+ * j, an accent, a tilde, a diaeresis, the dots of : ; ! ? and their inverted
+ * forms. Their small piece is part of the glyph however small it is.
+ */
+const MARKED_CHARS = /^[ijíìîïñáéóúàèòùâêôûäëöüÁÉÍÓÚÀÈÌÒÙÂÊÎÔÛÄËÏÖÜÑ:;!¡?¿]$/
+
+/**
+ * Which pieces of a cell are the MARKS of its letter (indices into `pieces`):
+ * for a marked character, a piece sitting wholly above or below the cell's
+ * largest piece and overlapping it horizontally. `tol` is the horizontal slack
+ * in bitmap pixels.
+ */
+function markPieces(pieces: Piece[], char: string | undefined, tol: number): Set<number> {
+  const out = new Set<number>()
+  if (!char || !MARKED_CHARS.test(char) || pieces.length < 2) return out
+  let main = 0
+  for (let i = 1; i < pieces.length; i++) if (pieces[i].area > pieces[main].area) main = i
+  const m = pieces[main]
+  pieces.forEach((p, i) => {
+    if (i === main) return
+    const apart = p.y1 < m.y0 || p.y0 > m.y1
+    const overlaps = p.x1 >= m.x0 - tol && p.x0 <= m.x1 + tol
+    if (apart && overlaps) out.add(i)
+  })
+  return out
 }

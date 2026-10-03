@@ -60,6 +60,9 @@ export type WorkerRequest =
   | { id: number; type: 'reorderContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string; where: 'front' | 'back' } }
   | { id: number; type: 'replaceContentImage'; data: { pageIndex: number; sourceKey: string; doOffset: number; name: string; imageBytes: Uint8Array } }
   | { id: number; type: 'drawImageInContent'; data: { pageIndex: number; rect: RectT; bytes: ArrayBuffer; behind: boolean } }
+  | { id: number; type: 'getScanImage'; data: { pageIndex: number } }
+  | { id: number; type: 'rasterGlyphs'; data: { fontFile: string; chars: string[]; emPx: number } }
+  | { id: number; type: 'drawPixelOverlays'; data: { pageIndex: number; overlays: { rect: RectT; width: number; height: number; rgb: ArrayBuffer; alpha: ArrayBuffer }[] } }
   | { id: number; type: 'fillRect'; data: { pageIndex: number; rect: RectT; color: [number, number, number] } }
   | { id: number; type: 'shiftGraphicsBelow'; data: { pageIndex: number; thresholdY: number; dy: number } }
   | { id: number; type: 'debugFonts'; data: { pageIndex: number } }
@@ -85,7 +88,7 @@ export type WorkerRequest =
   | { id: number; type: 'searchDocument'; data: { needle: string; maxHitsPerPage?: number } }
   | { id: number; type: 'saveDocument' }
   /** Render a page through MuPDF at `scale` (1 = 72 DPI), /Rotate applied, as RGBA — for OCR rasters, where pdf.js takes minutes on some fax-encoded scans. */
-  | { id: number; type: 'renderPixmap'; data: { pageIndex: number; scale: number } }
+  | { id: number; type: 'renderPixmap'; data: { pageIndex: number; scale: number; contentOnly?: boolean } }
   /** The document's digital signatures (/Sig fields), read but not verified. */
   | { id: number; type: 'getSignatures' }
   | { id: number; type: 'destroy' }

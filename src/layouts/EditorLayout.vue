@@ -135,6 +135,9 @@ getMuPDFBridge().onCrash = (reason: string) => {
 }
 
 function handleBeforeUnload(e: BeforeUnloadEvent) {
+  // The test drivers (public/_sweep) set this: the prompt otherwise blocks
+  // every automation call after a hot reload of an edited document.
+  if (import.meta.env.DEV && (window as any).__noUnloadPrompt) return
   if (docStore.isModified) {
     e.preventDefault()
     e.returnValue = ''
@@ -317,7 +320,6 @@ provide('ocrController', {
 })
 
 async function runOcrNow(pageIndex: number, lang: string) {
-  const size = await pdfEngine.getPageSize(pageIndex).catch(() => ({ width: 612, height: 792 }))
   editorStore.setStatus('Recognising text on this page...')
 
   // OCR reads its own render of THIS page at its own resolution. The visible
@@ -329,6 +331,15 @@ async function runOcrNow(pageIndex: number, lang: string) {
   // button appeared to do nothing. pdf.js stays as the fallback.
   const canvas = await renderForOcr(pageIndex, OCR_RENDER_SCALE)
   if (!canvas) { editorStore.setStatus('The page could not be rendered for recognition'); return }
+  // The page's size is the RENDER's whenever the engine cannot say, or says
+  // something of another shape. It used to fall back to a Letter page: an A4
+  // scan recognised while the worker was busy was stretched into a Letter-
+  // shaped raster, and every box came back at 0.94 of its height down the
+  // page — a box a whole table row above its text, and an edit planned on
+  // the row above.
+  const rendered = { width: canvas.width / OCR_RENDER_SCALE, height: canvas.height / OCR_RENDER_SCALE, rotation: 0 }
+  let size = await pdfEngine.getPageSize(pageIndex).catch(() => null)
+  if (!size || Math.abs(size.width / size.height - rendered.width / rendered.height) > 0.005) size = rendered
 
   // Progress in the status bar: a page of Chinese and Spanish takes long
   // enough that silence reads as a hang.
@@ -482,9 +493,11 @@ function applyOcrLive(pageIndex: number): Promise<void> {
 async function applyOcrLiveNow(pageIndex: number) {
   if (!docStore.loaded || !pagesNeedingLive().includes(pageIndex)) return
   const end = beginTransaction()
+  const t0 = performance.now()
   try {
     editorStore.setStatus('Applying edit...')
     await ocr.settleTraces()
+    const tTraces = performance.now()
     // One undo point per live bake, carrying the OCR state the CURRENT bytes
     // match — not the store as it is now, which already holds the new edit.
     if (docStore.pdfBytes) {
@@ -509,6 +522,7 @@ async function applyOcrLiveNow(pageIndex: number) {
     const after = await enqueueOp(() => pdfEngine.getPageContent(pageIndex))
     st.hash = fnv1a(after.bytes)
     appliedMeta = captureOcrMeta()
+    if (import.meta.env.DEV) ((window as any).__liveBakeTimes ??= []).push({ page: pageIndex, traces: Math.round(tTraces - t0), total: Math.round(performance.now() - t0) })
     editorStore.setStatus(edits ? 'Edit applied to the page' : 'Page restored to the scan')
   } finally {
     end()
@@ -591,19 +605,29 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
       const face = ocr.faceOf(pageIndex, styleKeyOf(item))
       return face && registered.has(face.familyName) ? face.familyName : undefined
     }
+    // FIRST, the edits the scan itself can make (scanEditPage.ts): every line
+    // it handles keeps the scan's pixels for the letters it keeps and takes
+    // the page's own letters for the ones it adds, drawn back over exactly the
+    // scan's pixel grid. Only the lines it declines go on to the vector
+    // redraw below, which is unchanged.
+    const scanPlan = await ocr.planScanEditsFor(pageIndex, page.items).catch(err => {
+      console.warn('[OCR] scan edit planning failed:', err)
+      return null
+    })
+    const scanHandled = scanPlan?.handled ?? new Set<string>()
     // Only the CHANGED stretch of a run is redrawn when its letters' positions
     // are known (the glyph cut made at commit time) and the engine can say
     // exactly how wide the new stretch will be with the fonts that will draw
     // it; the untouched words keep the scan's own pixels. The widths are
     // measured in one batched call per page.
-    const candidates = page.items.filter(i => i.edited && !i.removed && !i.vertical && !i.baked && ocr.spanCutFor(i))
+    const candidates = page.items.filter(i => i.edited && !i.removed && !i.vertical && !i.baked && !scanHandled.has(i.id) && ocr.spanCutFor(i))
     // Which weight the changed stretch should have is what its neighbours
     // say (`weightPlan`): a face glyph traced from the other half of a line
     // that changes weight midway is skipped, and the skip has to be known
     // BEFORE the stretch is measured, or the width is that of the wrong glyph.
     // One 220 DPI raster of the page as it is now serves the weight windows
     // below and the ink halos further down.
-    const touched = page.items.filter(i => (i.edited || i.removed) && !i.baked)
+    const touched = page.items.filter(i => (i.edited || i.removed) && !i.baked && !scanHandled.has(i.id))
     const rasterCanvas = touched.length ? await renderForOcr(pageIndex, 220 / 72) : null
     const hctx = rasterCanvas?.getContext('2d', { willReadFrequently: true }) ?? null
     const k = rasterCanvas ? rasterCanvas.width / page.pageWidth : 0
@@ -622,7 +646,7 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
     const localFont = (item: OcrTextItem) => base14(item.fontFamily, plans.get(item.id)?.bold ?? item.bold, item.italic)
     const measured = await pdfEngine.measureRuns(candidates.map(item => {
       const cut = ocr.spanCutFor(item)!
-      return { text: stretchOf(item)?.text ?? '', fontSize: sizeOf(item, cut), fontName: localFont(item), faceId: faceIdFor(item), faceSkip: plans.get(item.id)?.faceSkip || undefined }
+      return { text: stretchOf(item, cut)?.text ?? '', fontSize: sizeOf(item, cut), fontName: localFont(item), faceId: faceIdFor(item), faceSkip: plans.get(item.id)?.faceSkip || undefined }
     }))
     const partialCtx = new Map(candidates.map((item, i) => [item.id, {
       cut: ocr.spanCutFor(item)!,
@@ -647,7 +671,7 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
     // it — the whole-run redraw fits its size to the paper and to the run
     // beside it by this width, where an estimate of half an em per character
     // let a traced calligraphic "中國銀行 X" run across its neighbour.
-    const wholeItems = page.items.filter(i => i.edited && !i.removed && !i.vertical)
+    const wholeItems = page.items.filter(i => i.edited && !i.removed && !i.vertical && !scanHandled.has(i.id))
     const wholeMeasured = await pdfEngine.measureRuns([
       ...wholeItems.map(item => ({ text: item.text, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item) })),
       ...wholeItems.map(item => ({ text: item.originalText, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item) }))
@@ -667,11 +691,43 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
         ocrStore.updateItem(item.id, { halo: { top: h.top / k, bottom: h.bottom / k, left: h.left / k, right: h.right / k } })
       }
     }
-    // `updateItem` replaces the page's item objects; plan from the fresh ones.
-    const planItems = ocrStore.pages.get(pageIndex)?.items ?? page.items
-    plannedByPage.set(pageIndex, new Set(planItems))
-    const plan = planOcrExport(planItems, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null, tracedRatioFor, item => originalWidthAt10.get(item.id) ?? null)
-    modes[pageIndex] = plan.modes
+    // `updateItem` replaces the page's item objects; plan from the fresh ones —
+    // but in the state the bake STARTED from. A run the user changed while it
+    // ran (the scan planner above already saw the old state) is planned as it
+    // was and not marked applied: the next live bake takes it whole. Planned
+    // from the fresh store instead, a line committed a second into a page's
+    // first scan bake was drawn by the vector redraw behind the scan edit's back.
+    const snapById = new Map(page.items.map(i => [i.id, i]))
+    const changedDuring = (i: OcrTextItem) => { const o = snapById.get(i.id); return !o || o.text !== i.text || o.edited !== i.edited || o.removed !== i.removed || o.restyled !== i.restyled }
+    const fresh = ocrStore.pages.get(pageIndex)?.items ?? page.items
+    const planItems = fresh.map(i => changedDuring(i) ? (snapById.get(i.id) ?? i) : i)
+    plannedByPage.set(pageIndex, new Set(fresh.filter(i => !changedDuring(i))))
+    // The lines the scan edit drew stay on the page as NEIGHBOURS of the
+    // vector redraw (a replacement must not run into them), unedited.
+    const vectorItems = scanHandled.size ? planItems.map(i => scanHandled.has(i.id) ? { ...i, edited: false, removed: false } : i) : planItems
+    const plan = planOcrExport(vectorItems, faceIdFor, page.pageWidth, item => partialCtx.get(item.id) ?? null, item => widthAt10.get(item.id) ?? null, tracedRatioFor, item => originalWidthAt10.get(item.id) ?? null)
+    // Where the page's scan was read, the vector redraw's paper patches and
+    // moved tails are made on its pixels instead: only the edited run's own
+    // letters are erased or moved (`inkAwareFallback`). A rectangle of paper
+    // colour took whatever fell inside it — the tops of the next line, under
+    // a tilted one — and a tail's crop carried its neighbours' descenders.
+    const inkAware = scanPlan ? ocr.inkAwareFallbackFor(pageIndex, { patches: plan.patches, modes: plan.modes, items: vectorItems, images: plan.images }) : null
+    const pageModes: Record<string, string> = { ...plan.modes }
+    for (const [id, m] of Object.entries(scanPlan?.modes ?? {})) pageModes[id] = scanHandled.has(id) ? m : `${plan.modes[id] ?? 'whole'} [${m}]`
+    if (inkAware) for (const id of new Set(inkAware.overlays.map(o => o.item))) if (pageModes[id] && !scanHandled.has(id)) pageModes[id] += inkAware.grounded.has(id) ? ' {ground}' : ' {ink-aware}'
+    modes[pageIndex] = pageModes
+    // What this bake is ALLOWED to change, for the fidelity harness
+    // (public/_sweep/fidelity-driver.js): any pixel that moves outside these
+    // rectangles is damage to something the user never edited.
+    if (import.meta.env.DEV) {
+      ;((window as any).__ocrBakePlans ??= {})[pageIndex] = JSON.parse(JSON.stringify({
+        // A scan edit's overlays are where it was allowed to change pixels.
+        patches: [...plan.patches, ...[...(scanPlan?.overlays ?? []), ...(inkAware?.overlays ?? [])].map(o => ({ rect: o.rect, item: o.item, overlay: true }))],
+        images: plan.images,
+        texts: [...plan.texts, ...(scanPlan?.texts ?? [])].map(t => ({ text: t.text, x: t.x, y: t.y, fontSize: t.fontSize, invisible: !!t.invisible, group: t.group })),
+        modes: pageModes
+      }))
+    }
     // What each run's ink box becomes: a stretch appended past the old ink,
     // or a shifted tail, is painted OUTSIDE the box the recogniser read, and
     // a second edit of the run has to patch and blank all of it — cut at the
@@ -687,16 +743,18 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
         : [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)])
     }
     grownByPage.set(pageIndex, grown)
-    if (plan.patches.length === 0 && plan.texts.length === 0 && plan.images.length === 0) continue
+    if (plan.patches.length === 0 && plan.texts.length === 0 && plan.images.length === 0 && !scanPlan?.overlays.length && !scanPlan?.texts.length && !inkAware?.overlays.length) continue
 
     // The scan's pixels for any tail that moves, read from a fresh render of
     // the page BEFORE anything is drawn on it: PDF.js still holds the
     // pre-bake document until `syncAfterEdit`, whatever the OCR raster LRU has.
+    // A tail moved on the scan's own pixels (`inkAware`) needs no crop.
     const crops: (ArrayBuffer | null)[] = []
-    if (plan.images.length) {
+    if (plan.images.some((_, i) => !inkAware?.images.has(i))) {
       const canvas = await renderForOcr(pageIndex, 300 / 72)
       const k = canvas ? canvas.width / page.pageWidth : 0
-      for (const img of plan.images) {
+      for (const [i, img] of plan.images.entries()) {
+        if (inkAware?.images.has(i)) { crops.push(null); continue }
         const [x0, y0, x1, y1] = img.srcRect
         crops.push(canvas ? await cropToPng(canvas, { x: x0 * k, y: y0 * k, width: (x1 - x0) * k, height: (y1 - y0) * k }) : null)
       }
@@ -717,14 +775,40 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
       // Into the content stream, not as an annotation: annotations paint over
       // page content whatever order they were made in, so a patch drawn as one
       // covered the replacement text and it came out with its start missing.
-      for (const patch of plan.patches) {
-        if (patch.paint === false) continue
+      for (const [n, patch] of plan.patches.entries()) {
+        if (patch.paint === false || inkAware?.patches.has(n)) continue
         await pdfEngine.fillRect(pageIndex, patch.rect, patch.color)
       }
+      // The patches and tails made on the scan's own pixels, where the
+      // painted ones would have gone: before the images and the new text.
+      if (inkAware?.overlays.length) {
+        await pdfEngine.drawPixelOverlays(pageIndex, inkAware.overlays.map(o => ({
+          rect: o.rect, width: o.width, height: o.height, rgb: o.rgb.buffer as ArrayBuffer, alpha: o.alpha.buffer as ArrayBuffer
+        })))
+      }
       for (const [i, img] of plan.images.entries()) {
+        if (inkAware?.images.has(i)) continue
         const png = crops[i]
         if (png) await pdfEngine.drawImageInContent(pageIndex, img.dstRect, png, false)
       }
+      // The scan edits' pixels, all in one rewrite, then each edited line's
+      // words as one invisible text object (fitted to the ink they stand for).
+      if (scanPlan?.overlays.length) {
+        await pdfEngine.drawPixelOverlays(pageIndex, scanPlan.overlays.map(o => ({
+          rect: o.rect, width: o.width, height: o.height, rgb: o.rgb.buffer as ArrayBuffer, alpha: o.alpha.buffer as ArrayBuffer
+        })))
+      }
+      if (scanPlan?.texts.length) {
+        const byItem = new Map<string, typeof scanPlan.texts>()
+        for (const t of scanPlan.texts) { const list = byItem.get(t.group!) ?? []; list.push(t); byItem.set(t.group!, list) }
+        for (const run of byItem.values()) {
+          await pdfEngine.addTextRun(pageIndex, run.map(o => ({
+            x: o.x, y: page.pageHeight - o.y, text: o.text, fontSize: o.fontSize, fontName: o.fontName,
+            color: o.color, invisible: true, fitWidth: o.fitWidth
+          })), run[0].rotation)
+        }
+      }
+      written += scanHandled.size
       // Ops of one GROUP — a partial redraw's invisible head, visible stretch
       // and invisible tail — go into one text object, or MuPDF lists the
       // stretch before its own head and the line stops copying in order.
@@ -1529,6 +1613,29 @@ provide('runOcrOnPage', runOcrOnPage)
 // The recogniser has no viewer of its own; lend it ours so it can render a
 // page again at tracing resolution (see `traceRasterFor`).
 ocr.setPageRenderer((pageIndex, scale) => renderPristine(pageIndex, scale))
+// The scan at its own resolution, for edits made on its pixels. The scan
+// image itself is never rewritten by a bake (overlays are new objects), so
+// reading it from the page as it now stands gives the pristine pixels.
+// The scan a page's edits are made on: its one upright scan image, at its own
+// pixels — or, when the page is not that (an office scanner's layered "compact
+// PDF", whose letters are masks over a background image; a /Rotate page whose
+// image is turned; a scan in tiles), a render of the page's CONTENT at up to
+// 300 DPI, on whose grid the edits' overlays are then drawn. Without it such
+// a page never reached the scan edit at all.
+ocr.setScanLoader(pageIndex => enqueueOp(async () => {
+  const img = await pdfEngine.getScanImage(pageIndex)
+  if (img && Math.abs(img.ctm[1]) < 1e-6 && Math.abs(img.ctm[2]) < 1e-6 && img.ctm[0] > 0 && img.ctm[3] > 0) return img
+  const size = await pdfEngine.getPageSize(pageIndex).catch(() => null)
+  if (!size) return null
+  const scale = Math.min(300 / 72, Math.sqrt(16e6 / (size.width * size.height)))
+  const r = await pdfEngine.renderPageRgba(pageIndex, scale)
+  if (!r) return null
+  const pageWidth = r.width / scale, pageHeight = r.height / scale
+  return { width: r.width, height: r.height, rgba: r.rgba, ctm: [pageWidth, 0, 0, pageHeight, 0, 0] as [number, number, number, number, number, number], pageWidth, pageHeight, name: '' }
+}))
+// Letters the scan never printed are drawn from bundled faces the engine
+// rasterises; nothing in the document is read or written, so no queue.
+ocr.setGlyphRasterizer((file, chars, emPx) => pdfEngine.rasterGlyphs(file, chars, emPx))
 
 /** The page as a raster for recognition: MuPDF, and pdf.js when MuPDF cannot. */
 async function renderForOcr(pageIndex: number, scale: number): Promise<HTMLCanvasElement | null> {

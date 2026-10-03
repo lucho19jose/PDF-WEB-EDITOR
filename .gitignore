@@ -49,3 +49,6 @@ public/_sweep/r6/
 # chrome-devtools MCP session artefacts
 .playwright-mcp/
 public/_sweep/ocr2/
+public/_sweep/ocr3/
+# Fidelity-driver edit suites quote the documents they test.
+public/_sweep/suites/

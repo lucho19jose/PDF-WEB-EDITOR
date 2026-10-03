@@ -1,6 +1,6 @@
 import type { OcrTextItem } from './ocrTypes'
 import type { RectT } from '@/engine/types'
-import { planPartial, sizeOf, type PartialContext } from './partialRedraw'
+import { planPartial, sizeOf, bandRects, type PartialContext, type SpanCut } from './partialRedraw'
 import { strokeWidthFor, tracedStrokeUpTo } from './ocrStroke'
 
 /**
@@ -79,6 +79,8 @@ export interface TextOp {
 export interface ImageOp {
   srcRect: RectT
   dstRect: RectT
+  /** The run whose tail it moves. */
+  item?: string
 }
 
 export interface OcrExportPlan {
@@ -142,6 +144,76 @@ function patchRect(item: OcrTextItem): RectT {
     ink.x + ink.width + Math.max(padX, (halo?.right ?? 0) + 0.5),
     ink.y + ink.height + Math.max(padY, (halo?.bottom ?? 0) + 0.5)
   ]
+}
+
+/**
+ * A patch never reaches over another run's words.
+ *
+ * The pads are proportional to the run's height, and on a cover's title that
+ * is a lot of paper: 12% of a 166pt "RICO" is 20pt, and the patch took the
+ * bottom half of "Y HÁGASE" above it and the whole of "LA RIQUEZA Y LA
+ * REALIZACIÓN PERSONAL" below — the detector's box around the title already
+ * held that line. So the patch stops at a neighbour:
+ *
+ * - a run whose centre lies OUTSIDE this one's box (the line above or below,
+ *   a word beside it) trims only the pad — never into this run's own box,
+ *   because on tightly set text two honest boxes overlap by an ascender, and
+ *   cut at the neighbour's edge the tops of the erased capitals stay behind;
+ * - a run whose centre lies INSIDE this one's box, but outside its middle
+ *   band, is a line the box was inflated over: the patch stops at it, though
+ *   never closer than a quarter of the run's height to its middle.
+ *
+ * On the scan's own pixels the ground fill (`groundFill`) decides the same
+ * thing letter by letter; this is what a flat patch can do.
+ */
+export function clampToNeighbours(r: RectT, item: OcrTextItem, all: OcrTextItem[]): RectT {
+  if (item.vertical) return r
+  const ink = item.inkRect ?? item.rect
+  let [x0, y0, x1, y1] = r
+  const top = ink.y, bottom = ink.y + ink.height, left = ink.x, right = ink.x + ink.width
+  const cy = top + ink.height / 2, band = ink.height * 0.25
+  for (const o of all) {
+    if (o === item || o.vertical) continue
+    const b = o.inkRect ?? o.rect
+    const bx1 = b.x + b.width, by1 = b.y + b.height, bcx = b.x + b.width / 2, bcy = b.y + b.height / 2
+    if (b.x < x1 && bx1 > x0) {
+      if (bcy < top) y0 = Math.max(y0, Math.min(top, by1 + 0.3))
+      else if (bcy < cy - band) y0 = Math.max(y0, Math.min(cy - band, by1 + 0.3))
+      else if (bcy > bottom) y1 = Math.min(y1, Math.max(bottom, b.y - 0.3))
+      else if (bcy > cy + band) y1 = Math.min(y1, Math.max(cy + band, b.y - 0.3))
+    }
+    if (b.y < y1 && by1 > y0 && bcy >= cy - band && bcy <= cy + band) {
+      if (bcx < left) x0 = Math.max(x0, Math.min(left, bx1 + 0.3))
+      else if (bcx > right) x1 = Math.min(x1, Math.max(right, b.x - 0.3))
+    }
+  }
+  return [x0, y0, x1, y1]
+}
+
+/**
+ * The whole-run patch, following the LETTERS rather than the box.
+ *
+ * A long line of a skewed scan has an axis-aligned box far taller than its
+ * letters (a 0.7° tilt over 470pt is 5.6pt of rise), and one rectangle over it
+ * reaches into the line above at one end and the line below at the other: the
+ * SEIDOR appendix lost the lower half of "…cantidad total de USD 3,150.00" when
+ * the line under it was redrawn. With the glyph cut's fitted baseline the patch
+ * is laid as a staircase of segments, each covering the letter band — an em
+ * above the baseline (capital accents), a third below (descenders) — over a
+ * stretch of the line where the baseline moves by half a point at most; each
+ * stays inside the old rectangle, so it can only cover less.
+ */
+function bandPatches(item: OcrTextItem, cut: SpanCut | undefined): RectT[] {
+  const box = patchRect(item)
+  if (!cut || item.vertical || !(cut.emPt > 0)) return [box]
+  const [X0, Y0, X1, Y1] = box
+  const { yAtCentre, slope, centreX } = cut.baseline
+  const yAt = (x: number) => yAtCentre + slope * (x - centreX)
+  const rects = bandRects(X0, X1, yAt, slope, cut.emPt + 0.6 + (item.halo?.top ?? 0), cut.emPt * 0.35 + 0.6 + (item.halo?.bottom ?? 0), Y0, Y1)
+  // A band that does not fit in the box means the cut does not describe this
+  // run's ink; the box it always used is the honest answer.
+  if (!rects.length || rects.some(r => !(r[3] - r[1] > cut.emPt * 0.5))) return [box]
+  return rects
 }
 
 /**
@@ -267,7 +339,7 @@ export function planOcrExport(
     if (!item.edited && !item.removed) continue
 
     if (item.removed) {
-      patches.push({ rect: patchRect(item), color: plainColor(item.background), item: item.id })
+      patches.push({ rect: clampToNeighbours(patchRect(item), item, items), color: plainColor(item.background), item: item.id })
       modes[item.id] = 'removed'
       continue
     }
@@ -280,7 +352,7 @@ export function planOcrExport(
     if (partial) {
       const outcome = planPartial(item, { ...partial, fontName: partial.localFontName ?? fontName, color: plainColor(item.color), faceId: faceIdFor?.(item), strokeRatio: item.strokeRatio }, items, pageWidth)
       if ('mode' in outcome) {
-        patches.push(...outcome.patches)
+        patches.push(...outcome.patches.map(p => ({ ...p, rect: clampToNeighbours(p.rect, item, items) })))
         images.push(...outcome.images)
         texts.push(...outcome.texts)
         modes[item.id] = outcome.mode
@@ -291,7 +363,7 @@ export function planOcrExport(
       modes[item.id] = 'whole'
     }
 
-    patches.push({ rect: patchRect(item), color: plainColor(item.background), item: item.id })
+    for (const rect of bandPatches(item, partial?.cut)) patches.push({ rect: clampToNeighbours(rect, item, items), color: plainColor(item.background), item: item.id })
 
     if (item.vertical) {
       // Rotated a quarter turn anti-clockwise, the glyphs' own "up" points LEFT

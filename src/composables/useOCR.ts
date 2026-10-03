@@ -10,8 +10,24 @@ import { MistralEngine } from '@/utils/ocr/engines/mistralEngine'
 import { inkBounds, inkGaps, inkBands, extendDescenders, extendAscenders, extendForTilt, walkNote, type InkCut } from '@/utils/ocr/inkMeasure'
 import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces, type ScanFace, type TraceResult } from '@/utils/ocr/scanFace'
 import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance, type GlyphCutResult } from '@/utils/ocr/glyphCut'
-import { toSpanCut, sizeOf, type SpanCut } from '@/utils/ocr/partialRedraw'
+import { toSpanCut, toSpanCutFromWords, stretchOf, sizeOf, type SpanCut } from '@/utils/ocr/partialRedraw'
+import { segmentLine, baselineAtOf, type LineWords } from '@/utils/ocr/wordSeg'
+import { scanRasterOf, isUpright, type ScanRaster } from '@/utils/ocr/scanRaster'
+import { preparePage, analyzeLine, lastLineFailure, type PageInk, type LineInk } from '@/utils/ocr/lineInk'
+import { harvestPage, atlasFrom, type PageHarvest, type Atlas } from '@/utils/ocr/glyphAtlas'
+import { planScanEdits, inkAwareFallback, type ScanEditPlan, type FallbackOps, type PixelOverlay } from '@/utils/ocr/scanEditPage'
+import { wantKey, type GlyphImage } from '@/utils/ocr/scanEdit'
+import { fitScanLook, synthGlyph, type Rasterize, type ScanLook, type LookNear } from '@/utils/ocr/glyphSynth'
 import { useOcrStore } from '@/stores/ocr'
+
+/** A line cut word by word — see `wordSpanFor`. Rects are each word's cut box, raster pixels. */
+interface WordSpan {
+  raster: { ctx: CanvasRenderingContext2D; toPt: number }
+  lw: LineWords
+  cuts: (GlyphCutResult | null)[]
+  rects: { x: number; y: number; width: number; height: number }[]
+  span: SpanCut
+}
 
 /**
  * Recognising the text in a scanned page.
@@ -211,11 +227,59 @@ function createOCR() {
    * pages at most (~19 MB each) — the current one and the last.
    */
   const rasters = new Map<number, { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; toPt: number }>()
-  function keepRaster(pageIndex: number, entry: { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; toPt: number }) {
+  /**
+   * Bumped when a page is RECOGNISED, never when its raster is merely rendered
+   * again. A cut made against one recognition must not be adopted for the next
+   * (the runs it describes are gone); a raster evicted and re-rendered from the
+   * same scan describes the same runs to the pixel.
+   */
+  const rasterGen = new Map<number, number>()
+  const genOf = (pageIndex: number) => rasterGen.get(pageIndex) ?? 0
+  function keepRaster(pageIndex: number, entry: { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; toPt: number }, recognised = false) {
     rasters.delete(pageIndex)
     rasters.set(pageIndex, entry)
-    traceRasters.delete(pageIndex)
+    if (recognised) {
+      rasterGen.set(pageIndex, genOf(pageIndex) + 1)
+      traceRasters.delete(pageIndex)
+    }
     while (rasters.size > 2) rasters.delete(rasters.keys().next().value!)
+  }
+  /**
+   * The page's OCR raster — rendered again from its PRISTINE scan when the
+   * two-page cache has let it go.
+   *
+   * Recognising a whole document ("Reconocer texto en este archivo", or three
+   * pages in a row) left only the last two pages' rasters, and an edit on any
+   * earlier page then found none: `traceItemNow` returned before cutting a
+   * glyph, no partial redraw was possible, and every edit on page 1 of a
+   * three-page contract was redrawn whole in Helvetica. The render is the
+   * same MuPDF rasterisation recognition used, at the same size, so the cut
+   * sees the pixels the boxes were measured on.
+   */
+  async function rasterFor(pageIndex: number) {
+    const have = rasters.get(pageIndex)
+    if (have) return have
+    const page = useOcrStore().pages.get(pageIndex)
+    if (!pageRenderer || !page) return null
+    const scale = OCR_DPI / PDF_DPI
+    const canvas = await pageRenderer(pageIndex, scale).catch(() => null)
+    if (!canvas) return null
+    const again = rasters.get(pageIndex)
+    if (again) return again
+    // The size rule `recognizePage` follows, so the two rasters agree.
+    const target = document.createElement('canvas')
+    target.width = Math.round(page.pageWidth * scale)
+    target.height = Math.round(page.pageHeight * scale)
+    if (Math.abs(canvas.width - target.width) <= 2 && Math.abs(canvas.height - target.height) <= 2) {
+      target.width = canvas.width
+      target.height = canvas.height
+    }
+    const tctx = target.getContext('2d', { willReadFrequently: true })
+    if (!tctx) return null
+    tctx.drawImage(canvas, 0, 0, target.width, target.height)
+    const entry = { canvas: target, ctx: tctx, toPt: page.pageWidth / target.width }
+    keepRaster(pageIndex, entry)
+    return entry
   }
   /** Bumped whenever a page's scan face gains glyphs; the layer's styles watch it. */
   const faceVersion = ref(0)
@@ -300,8 +364,10 @@ function createOCR() {
   }
 
   async function traceItemNow(item: OcrTextItem, opts: { measureOnly?: boolean } = {}): Promise<TraceResult> {
-    const base = rasters.get(item.pageIndex)
-    if (!base || item.vertical) return { added: 0, refused: null }
+    if (item.vertical) return { added: 0, refused: null }
+    const gen = genOf(item.pageIndex)
+    const base = await rasterFor(item.pageIndex)
+    if (!base || genOf(item.pageIndex) !== gen) return { added: 0, refused: null }
     // Trace from the 2x raster when the layout can render one; the OCR raster
     // stands in where it cannot - and where the finer raster's cut REFUSES: the
     // cut's pixel floors were calibrated at 220 DPI, and a 35pt line that cuts
@@ -312,7 +378,7 @@ function createOCR() {
     // Rendering yields while the user can type, restyle, or replace the page.
     // Continue with the current run so a late measurement cannot overwrite
     // their font size, and a committed trace learns the latest confirmed text.
-    if (rasters.get(item.pageIndex) !== base) return { added: 0, refused: null }
+    if (genOf(item.pageIndex) !== gen) return { added: 0, refused: null }
     const current = useOcrStore().itemsFor(item.pageIndex).find(i => i.id === item.id)
     if (!current || current.originalText !== item.originalText || current.baked) return { added: 0, refused: null }
     item = current
@@ -331,13 +397,15 @@ function createOCR() {
     // text, not its original ink, so neither a cut nor a trace can be made.
     if (item.baked) return { added: 0, refused: null }
     let face = scanFaceFor(item.pageIndex, styleKeyOf(item))
-    const rememberCut = (cut: GlyphCutResult, source: SpanCut['source']): boolean => {
+    const rememberCut = (cut: GlyphCutResult, source: SpanCut['source']): boolean =>
+      rememberSpan(toSpanCut(cut, raster.toPt, item.originalText, source))
+    const rememberSpan = (span: SpanCut): boolean => {
       // The fallback recogniser also yields. Recheck the user style before
       // adopting its measurement and picking the face keyed by that size.
       const latest = useOcrStore().itemsFor(item.pageIndex).find(i => i.id === item.id)
-      if (rasters.get(item.pageIndex) !== base || !latest || latest.baked || latest.originalText !== item.originalText) return false
+      if (genOf(item.pageIndex) !== gen || !latest || latest.baked || latest.originalText !== item.originalText) return false
       item = latest
-      const span = toSpanCut(cut, raster.toPt, item.originalText, source)
+      const hadSpan = spanCuts.has(item.id)
       spanCuts.set(item.id, span)
       // Use the letters' em, rather than a bounding box inflated by skew.
       // This metadata update preserves edited/applied; a user-set size stands.
@@ -347,6 +415,15 @@ function createOCR() {
           useOcrStore().updateItem(item.id, { fontSize: size, restyled: false })
           item = { ...item, fontSize: size }
         }
+      }
+      // A live bake already in flight when the edit was committed planned the
+      // run before this cut existed: it drew the WHOLE line in a base font and
+      // marked it applied, and nothing ever asked again — "02" → "03" in a
+      // table, edited a second after the line above, stayed a Helvetica cell
+      // for good. A first cut for an applied edit makes the bake stale.
+      if (!hadSpan && item.edited && item.applied && !item.restyled) {
+        useOcrStore().updateItem(item.id, { applied: false })
+        item = { ...item, applied: false }
       }
       face = scanFaceFor(item.pageIndex, styleKeyOf(item))
       return true
@@ -362,7 +439,23 @@ function createOCR() {
       let source: SpanCut['source'] = perGlyph ? 'symbols' : 'profile'
       const firstReason = cut ? '' : lastCutReason()
       if (cut && !rememberCut(cut, source)) return { added: 0, refused: null }
+      // A line that will not cut WHOLE is cut word by word (wordSeg.ts): one
+      // letter the recogniser dropped then costs its own word, not the line,
+      // and an edit redraws the words it changed instead of the whole line in
+      // a base font. Every body line over 80 characters of the SEIDOR
+      // appendix refused the line cut.
+      let words: WordSpan | null = null
+      if (!cut && !perGlyph) {
+        words = wordSpanFor(hi ?? raster, item)
+        if (words && !rememberSpan(words.span)) return { added: 0, refused: null }
+      }
       if (opts.measureOnly) return { added: 0, refused: null }
+      if (words) {
+        const added = await traceUnchangedWords(face, words, item)
+        if (added) faceVersion.value++
+        if (await borrowMissingGlyphs(item, raster, face)) faceVersion.value++
+        return { added, refused: null }
+      }
       const res = await traceRunIntoFace(face, raster.ctx, rect, item.originalText, perGlyph ? symbols : undefined, item.text, cut)
       if (res.added) faceVersion.value++
       if (cut && await borrowMissingGlyphs(item, raster, face)) faceVersion.value++
@@ -464,6 +557,52 @@ function createOCR() {
   }
 
   /**
+   * A line that would not cut whole, cut WORD BY WORD on the raster (see
+   * wordSeg.ts): its ink split into words, the reading shared among them by
+   * width, and each word cut alone on its own ink box with the LINE's em and
+   * baseline (`LineHint`) — a word's own two or three letters are a poor
+   * measure of either. A word whose cut refuses keeps approximate cells
+   * (`toSpanCutFromWords`), so an edit that reaches into it takes it whole.
+   * Null when the line's ink cannot be segmented at all.
+   */
+  function wordSpanFor(raster: { ctx: CanvasRenderingContext2D; toPt: number }, item: OcrTextItem): WordSpan | null {
+    const k = 1 / raster.toPt
+    const rect = { x: item.inkRect.x * k, y: item.inkRect.y * k, width: item.inkRect.width * k, height: item.inkRect.height * k }
+    const lw = segmentLine(raster.ctx, rect, item.originalText)
+    if (!lw) return null
+    const hint = { emPx: lw.fit.emPx, baselineAt: baselineAtOf(lw.fit) }
+    const rects: WordSpan['rects'] = []
+    const cuts = lw.matches.map(m => {
+      const r = { x: m.ink.x0 - 1, y: m.ink.top - 1, width: m.ink.x1 - m.ink.x0 + 2, height: m.ink.bottom - m.ink.top + 2 }
+      rects.push(r)
+      return cutGlyphs(raster.ctx, r, lw.chars.slice(m.from, m.to).join(''), undefined, hint)
+    })
+    return { raster, lw, cuts, rects, span: toSpanCutFromWords(lw, cuts, raster.toPt) }
+  }
+
+  /**
+   * Trace into the face the glyphs of the words the edit did NOT change —
+   * the ones the engine's reading and the user's text agree on (the common
+   * prefix and suffix, as `trustedCells` has it for a whole run). Each word
+   * goes in on its own cut; a word that refused contributes nothing.
+   */
+  async function traceUnchangedWords(face: ScanFace, words: WordSpan, item: OcrTextItem): Promise<number> {
+    const st = stretchOf(item, words.span)
+    const n = words.lw.chars.length
+    const prefix = st?.prefix ?? n, suffix = st?.suffix ?? 0
+    let added = 0
+    for (const [i, m] of words.lw.matches.entries()) {
+      const cut = words.cuts[i]
+      if (!cut || cut.cells.length !== m.to - m.from) continue
+      if (!(m.to <= prefix || m.from >= n - suffix)) continue
+      const text = words.lw.chars.slice(m.from, m.to).join('')
+      const res = await traceRunIntoFace(face, words.raster.ctx, words.rects[i], text, undefined, undefined, cut)
+      added += res.added
+    }
+    return added
+  }
+
+  /**
    * Tesseract's per-glyph boxes for the run at `rect` (raster pixels), in
    * raster coordinates and reading order — or null when its reading does not
    * match `text` closely enough to trust the boxes.
@@ -548,7 +687,7 @@ function createOCR() {
    * Says which one the trace would have used.
    */
   async function debugCuts(item: OcrTextItem) {
-    const base = rasters.get(item.pageIndex)
+    const base = await rasterFor(item.pageIndex)
     if (!base) return null
     const describe = (raster: { ctx: CanvasRenderingContext2D; toPt: number }, boxes?: OcrBox[]) => {
       const k = 1 / raster.toPt
@@ -582,11 +721,194 @@ function createOCR() {
     return scanFacesOf(pageIndex)
   }
 
+  // ===== SCAN EDITS (scanEdit.ts) =====
+  /**
+   * Edits made ON the scan: the letters a line keeps stay the scan's pixels,
+   * the ones it adds are the page's own letters, and the result is drawn back
+   * over exactly the scan's pixel grid. Everything below caches what that
+   * needs per page — the scan at its own resolution, its paper, its lines
+   * analysed — keyed by the recognition generation (a page recognised again
+   * describes different runs), at most two pages' pixels at a time (~30 MB
+   * each); what each page contributes to the glyph atlas is kept small and
+   * for the whole document.
+   */
+  type ScanImage = { width: number; height: number; rgba: ArrayBuffer; ctm: [number, number, number, number, number, number]; pageWidth: number; pageHeight: number; name: string }
+  let scanLoader: ((pageIndex: number) => Promise<ScanImage | null>) | null = null
+  function setScanLoader(fn: typeof scanLoader) { scanLoader = fn }
+  interface ScanPage { gen: number; raster: ScanRaster; pi: PageInk; lines: Map<string, LineInk | null>; unread: Map<string, string> }
+  const scanPages = new Map<number, { gen: number; sp: ScanPage | null }>()
+  const harvests = new Map<number, { gen: number; h: PageHarvest }>()
+  let atlasCache: { key: string; atlas: Atlas } | null = null
+
+  /**
+   * `keep: false` — only HARVEST the page for the atlas (a letter the edited
+   * page lacks): its pixels are not kept, so the page being edited is never
+   * pushed out of the two-page cache by its own neighbours.
+   */
+  async function scanPageFor(pageIndex: number, keep = true): Promise<ScanPage | null> {
+    const gen = genOf(pageIndex)
+    const have = scanPages.get(pageIndex)
+    if (have && have.gen === gen) return have.sp
+    const page = useOcrStore().pages.get(pageIndex)
+    if (!scanLoader || !page) return null
+    const img = await scanLoader(pageIndex).catch(() => null)
+    if (genOf(pageIndex) !== gen) return null
+    let sp: ScanPage | null = null
+    // Sixteen megapixels at most (A4 at 400 DPI): the paper estimate takes
+    // four bytes a channel a pixel while it is made, and a 600 DPI page would
+    // ask the tab for half a gigabyte. Such a page keeps the vector redraw.
+    const MAX_SCAN_PX = 16e6
+    if (img && img.width * img.height <= MAX_SCAN_PX && Math.abs(img.pageWidth - page.pageWidth) < 1 && Math.abs(img.pageHeight - page.pageHeight) < 1) {
+      const raster = scanRasterOf(img.width, img.height, new Uint8ClampedArray(img.rgba), img.ctm, img.pageWidth, img.pageHeight, img.name)
+      if (raster && isUpright(raster)) {
+        const pi = preparePage(raster)
+        const lines = new Map<string, LineInk | null>()
+        const unread = new Map<string, string>()
+        // A run a bake already finalised reads its NEW text over ink the scan
+        // still shows the old way: analysed, it would teach the atlas the
+        // wrong letters, and it cannot be redrawn from the scan anyway.
+        for (const it of page.items) {
+          if (it.vertical || it.baked) continue
+          const li = analyzeLine(pi, { id: it.id, text: it.originalText, inkRect: it.inkRect, confidence: it.confidence })
+          lines.set(it.id, li)
+          if (!li) unread.set(it.id, lastLineFailure())
+        }
+        sp = { gen, raster, pi, lines, unread }
+        harvests.set(pageIndex, { gen, h: harvestPage(pi, [...lines.values()].filter((l): l is LineInk => !!l), pageIndex) })
+      }
+    }
+    if (!keep) return sp
+    scanPages.delete(pageIndex)
+    scanPages.set(pageIndex, { gen, sp })
+    while (scanPages.size > 2) scanPages.delete(scanPages.keys().next().value!)
+    return sp
+  }
+
+  /** The atlas over every page harvested so far (of the current recognitions). */
+  function currentAtlas(): Atlas | null {
+    const list = [...harvests.entries()].filter(([p, e]) => e.gen === genOf(p)).sort((a, b) => a[0] - b[0])
+    if (!list.length) return null
+    const key = list.map(([p, e]) => `${p}:${e.gen}`).join(',')
+    if (atlasCache?.key === key) return atlasCache.atlas
+    const atlas = atlasFrom(list.map(([, e]) => e.h))
+    atlasCache = { key, atlas }
+    return atlas
+  }
+
+  /**
+   * Plan a page's scan edits (see scanEditPage.ts), or null when the page has
+   * no scan to edit (a vector page, a rotated or tiled scan). A line refused
+   * for want of a letter is planned again once up to four more recognised
+   * pages have been harvested, nearest first — the same printer and scanner
+   * set the rest of the document.
+   */
+  async function planScanEditsFor(pageIndex: number, items: OcrTextItem[]): Promise<ScanEditPlan | null> {
+    const t0 = performance.now()
+    const sp = await scanPageFor(pageIndex)
+    if (!sp) return null
+    const t1 = performance.now()
+    let atlas = currentAtlas()
+    if (!atlas) return null
+    const t2 = performance.now()
+    let plan = planScanEdits(sp.pi, sp.lines, atlas, items, undefined, sp.unread)
+    if (import.meta.env.DEV) ((window as any).__scanEditTimes ??= []).push({ page: pageIndex, scanPage: Math.round(t1 - t0), atlas: Math.round(t2 - t1), plan: Math.round(performance.now() - t2) })
+    const wanting = Object.values(plan.modes).some(m => m.includes('no letter on the page'))
+    if (wanting) {
+      const others = [...useOcrStore().pages.keys()]
+        .filter(q => q !== pageIndex && harvests.get(q)?.gen !== genOf(q))
+        .sort((a, b) => Math.abs(a - pageIndex) - Math.abs(b - pageIndex))
+        .slice(0, 4)
+      for (const q of others) await scanPageFor(q, false)
+      if (others.length) {
+        atlas = currentAtlas() ?? atlas
+        plan = planScanEdits(sp.pi, sp.lines, atlas, items, undefined, sp.unread)
+      }
+    }
+    // Letters no harvested page holds in either weight: drawn from the face
+    // that prints most like this scan (glyphSynth.ts), and planned again.
+    if (plan.wanting.length && glyphRasterizer) {
+      // Each line's letters in that LINE's look: a page sets a logo, headings
+      // and body in different faces, and one look for the page fitted their
+      // mix (see `lookRefs`).
+      const synth = new Map<string, GlyphImage>()
+      const refused = new Map<string, string>()
+      for (const w of plan.wanting) {
+        const look = await lookFor(atlas, w.line ? { line: w.line, page: pageIndex, emPx: w.emPx } : undefined)
+        // Only a face that prints like this line: below this agreement the
+        // synthesised letters read as another face (a serif X on a sans form,
+        // a typeface for handwriting — 0.43 to 0.69 on the corpus). Between it
+        // and 0.85 a letter is still made: the line may take two at most
+        // (`applyLineEdit`), and what it is refused for draws a foreign face
+        // anyway — Helvetica, crisp, placed by a coarser measure of the line.
+        // A receipt set in a geometric sans none of the faces is (0.77 to
+        // 0.81) floated a Helvetica "X" two points over its baseline.
+        if (!look || look.score < 0.75) {
+          if (w.line) refused.set(w.line, look ? `no face prints like this line (best ${look.family} at ${look.score.toFixed(2)})` : 'no face could be fitted to this line')
+          continue
+        }
+        const key = `${w.line ?? ''}|${look.family}|${look.regularAs ?? ''}|${wantKey(w)}|${w.ink.map(v => v >> 3).join(',')}|${(w.stem ?? 0).toFixed(3)}`
+        let g = synthCache.get(key)
+        if (!g) {
+          g = await synthGlyph(look, glyphRasterizer, atlas, w).catch(() => null) ?? undefined
+          if (g) synthCache.set(key, g)
+        }
+        if (g) synth.set(w.line ? `${w.line}|${wantKey(w)}` : wantKey(w), g)
+      }
+      if (synth.size) plan = planScanEdits(sp.pi, sp.lines, atlas, items, synth, sp.unread)
+      // Say why a letter was not made: the status line and the sweep read it.
+      for (const [id, m] of Object.entries(plan.modes)) {
+        const why = refused.get(id)
+        if (why && m.includes('no letter on the page')) plan.modes[id] = m.replace(/\)$/, `; ${why})`)
+      }
+    }
+    return plan
+  }
+
+  /**
+   * The vector redraw's patches and moved tails made on the scan's pixels
+   * (`inkAwareFallback`), for every run whose line the page's scan analysis
+   * read — null when the page has no scan analysis to hand. Only reads the
+   * cache `planScanEditsFor` filled for this bake: it never loads a page.
+   */
+  function inkAwareFallbackFor(pageIndex: number, ops: FallbackOps): ReturnType<typeof inkAwareFallback> | null {
+    const have = scanPages.get(pageIndex)
+    if (!have || have.gen !== genOf(pageIndex) || !have.sp) return null
+    // Every patch is a candidate: one whose line was read is erased letter by
+    // letter, any other is filled from its ground (`groundFill`).
+    if (!ops.patches.some(p => p.item && p.paint !== false)) return null
+    return inkAwareFallback(have.sp.pi, have.sp.lines, ops)
+  }
+
+  /**
+   * Glyphs of the bundled match faces, rasterised by the engine — lent by the
+   * layout, like the page renderer. Synthesised letters and the fitted look
+   * are cached per atlas: a different set of harvested pages is a different
+   * judgement of how the scan prints.
+   */
+  let glyphRasterizer: Rasterize | null = null
+  function setGlyphRasterizer(fn: Rasterize | null) { glyphRasterizer = fn }
+  let lookCache: { atlasKey: string; looks: Map<string, ScanLook | null> } | null = null
+  const synthCache = new Map<string, GlyphImage>()
+  async function lookFor(atlas: Atlas, near?: LookNear): Promise<ScanLook | null> {
+    const atlasKey = atlasCache?.key ?? ''
+    if (lookCache?.atlasKey !== atlasKey) { lookCache = { atlasKey, looks: new Map() }; synthCache.clear() }
+    const key = near ? `${near.page}|${near.line}` : ''
+    if (lookCache.looks.has(key)) return lookCache.looks.get(key)!
+    const look = await fitScanLook(atlas, glyphRasterizer!, { near }).catch(() => null)
+    lookCache.looks.set(key, look)
+    return look
+  }
+
   /** Forget rasters and faces — a different document is being opened. */
   function reset() {
     rasters.clear()
     traceRasters.clear()
     spanCuts.clear()
+    scanPages.clear()
+    harvests.clear()
+    atlasCache = null
+    lookCache = null
+    synthCache.clear()
     clearScanFaces()
     faceVersion.value++
   }
@@ -1304,7 +1626,7 @@ function createOCR() {
       let confSum = 0
       for (const it of items) confSum += it.confidence
 
-      keepRaster(pageIndex, { canvas: target, ctx: tctx, toPt })
+      keepRaster(pageIndex, { canvas: target, ctx: tctx, toPt }, true)
       // Warm the recogniser the glyph-box fallback will ask for, so the first
       // edit on a fresh browser does not pay its ~20 s worker start. Not
       // awaited, and a failure is the fallback's to report when it is needed.
@@ -1474,5 +1796,5 @@ function createOCR() {
     engines.clear()
   }
 
-  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, spanCutFor, forgetSpanCut, setPageRenderer, forgetTraceRaster, cutFor, debugCuts, faceOf, facesOf, reset, destroy }
+  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, spanCutFor, forgetSpanCut, setPageRenderer, setScanLoader, setGlyphRasterizer, planScanEditsFor, inkAwareFallbackFor, forgetTraceRaster, cutFor, debugCuts, faceOf, facesOf, reset, destroy }
 }

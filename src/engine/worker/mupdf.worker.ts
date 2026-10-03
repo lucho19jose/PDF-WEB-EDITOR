@@ -3,6 +3,7 @@
 import type { WorkerRequest, WorkerResponse } from './worker-protocol'
 import { glyphNameToUnicode } from './glyphNames'
 import { readPkcs7Signer } from './pkcs7Signer'
+import { rasterizeGlyph } from '../../utils/ocr/glyphRaster'
 import * as opentype from 'opentype.js'
 // opentype.js is CJS: the browser bundle gives the namespace itself, the
 // SSR loader (tools/pdf-sweep/node-harness.mjs) wraps it under `default`.
@@ -371,6 +372,44 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      case 'rasterGlyphs': {
+        if (!mupdf) throw new Error('MuPDF not initialized')
+        const font = await matchFont(req.data.fontFile)
+        const glyphs = (req.data.chars as string[]).map(ch => rasterizeGlyph(mupdf, font, ch, req.data.emPx))
+        const transfer: ArrayBuffer[] = []
+        const data = glyphs.map(g => {
+          if (!g) return null
+          const buf = g.cov.buffer as ArrayBuffer
+          transfer.push(buf)
+          return { ...g, cov: buf }
+        })
+        self.postMessage({ id: req.id, type: 'success', data }, transfer as any)
+        break
+      }
+
+      case 'getScanImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const scan = getScanImage(req.data.pageIndex)
+        if (!scan) { respond({ id: req.id, type: 'success', data: null }); break }
+        const buf = scan.rgba.buffer as ArrayBuffer
+        self.postMessage(
+          { id: req.id, type: 'success', data: { width: scan.width, height: scan.height, rgba: buf, ctm: scan.ctm, pageWidth: scan.pageWidth, pageHeight: scan.pageHeight, name: scan.name } },
+          [buf] as any
+        )
+        break
+      }
+
+      case 'drawPixelOverlays': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({
+          id: req.id, type: 'success',
+          data: drawPixelOverlays(req.data.pageIndex, (req.data.overlays as any[]).map(o => ({
+            rect: o.rect, width: o.width, height: o.height, rgb: new Uint8Array(o.rgb), alpha: new Uint8Array(o.alpha)
+          })))
+        })
+        break
+      }
+
       case 'drawImageInContent': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({
@@ -464,7 +503,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         const page = pdfDoc.loadPage(req.data.pageIndex)
         try {
           const s = req.data.scale
-          const pix = page.toPixmap(mupdf.Matrix.scale(s, s), mupdf.ColorSpace.DeviceRGB, false, true)
+          // `contentOnly`: the page's content without its annotations — the
+          // raster a scan edit reads must not take a stamp or a highlight for scan.
+          const pix = page.toPixmap(mupdf.Matrix.scale(s, s), mupdf.ColorSpace.DeviceRGB, false, !req.data.contentOnly)
           const w = pix.getWidth(), h = pix.getHeight()
           const n = pix.getNumberOfComponents()
           const src = pix.getPixels()
@@ -3231,6 +3272,26 @@ function addTextToPage(
  * Ensure a standard PDF font (Helvetica, Times-Roman, Courier) is registered
  * in the page's Resources/Font dictionary. Returns the font reference name (e.g. "F10").
  */
+// ── Faces for letters a scan never printed (src/utils/ocr/glyphSynth.ts) ──
+
+/** The bundled metric-compatible faces, loaded on first use from /fonts/match. */
+const matchFonts = new Map<string, Promise<any>>()
+function matchFont(file: string): Promise<any> {
+  if (!/^[A-Za-z0-9-]+$/.test(file)) return Promise.reject(new Error(`bad font name ${file}`))
+  let p = matchFonts.get(file)
+  if (!p) {
+    p = (async () => {
+      const res = await fetch(`/fonts/match/${file}.ttf`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return new mupdf!.Font(file, new Uint8Array(await res.arrayBuffer()))
+    })()
+    // A failed load is not remembered: the next request may succeed.
+    p.catch(() => matchFonts.delete(file))
+    matchFonts.set(file, p)
+  }
+  return p
+}
+
 // ── A CJK face for text WinAnsi cannot hold ──
 
 /** Where the shipped CJK face lives; fetched once, on the first run that needs it. */
@@ -12195,6 +12256,186 @@ function flattenAnnotationBehind(
     page.deleteAnnotation(annot)
     invalidateContentSources(pageIndex)
     return { success: true }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  } finally {
+    try { page?.destroy() } catch (_) {}
+  }
+}
+
+/**
+ * The page's SCAN at its own resolution: the largest image the content draws,
+ * if it covers at least half the paper, decoded to RGBA at its native pixel
+ * size, with the CTM that places its unit square in the VISIBLE frame
+ * (bottom-up user space, /Rotate composed in, as `getFullCtmAtOffset` gives).
+ *
+ * An edit that has to be indistinguishable from the scan is made on these
+ * pixels and drawn back over exactly them (see src/utils/ocr/scanEdit.ts); a
+ * render at any other resolution straddles the scan's pixels and its edge
+ * shows.
+ */
+function getScanImage(pageIndex: number): { width: number; height: number; rgba: Uint8ClampedArray; ctm: Mat6; pageWidth: number; pageHeight: number; name: string } | null {
+  if (!pdfDoc || !mupdf) return null
+  const size = getPageSize(pageIndex)
+  const images = listContentImages(pageIndex)
+  let best: ContentImageInfo | null = null, bestArea = 0
+  for (const im of images) {
+    const area = Math.abs((im.rect[2] - im.rect[0]) * (im.rect[3] - im.rect[1]))
+    if (area > bestArea) { bestArea = area; best = im }
+  }
+  if (!best || bestArea < size.width * size.height * 0.5) return null
+  // A LAYERED scan — an office scanner's "compact PDF": a JPEG background and
+  // the text as 1-bit masks painted over it — keeps its letters out of the
+  // largest image, which then holds paper and nothing to edit. Other images
+  // covering a tenth of the page say so; the caller then reads a render of
+  // the page instead.
+  // Only MASKS are layers — 1-bit stencils painted over the background; a
+  // slide's other pictures are pictures, and its largest image still holds
+  // the text. This editor's own overlays (OcrPx…) are edits, not layers.
+  const isMask = (im: ContentImageInfo): boolean => {
+    try {
+      const s = getContentSources(pageIndex).find(x => x.key === im.sourceKey)
+      let res: any = s?.resources
+      if (!res) { const pg = pdfDoc.loadPage(pageIndex); try { res = pageResourcesOf(pg.getObject()) } finally { pg.destroy() } }
+      const xo = (res?.resolve?.() ?? res)?.get?.('XObject')
+      if (!xo || String(xo) === 'null') return false
+      const d = (xo.resolve ? xo.resolve() : xo).get(im.name)?.resolve?.()
+      if (!d || String(d) === 'null') return false
+      const mask = d.get('ImageMask'), bpc = d.get('BitsPerComponent')
+      return String(mask) === 'true' || Number(String(bpc)) === 1
+    } catch (_) { return false }
+  }
+  let others = 0
+  for (const im of images) {
+    if (im === best || im.name.startsWith('OcrPx') || !isMask(im)) continue
+    others += Math.abs((im.rect[2] - im.rect[0]) * (im.rect[3] - im.rect[1]))
+  }
+  if (others > size.width * size.height * 0.1) return null
+  const src = getContentSources(pageIndex).find(s => s.key === best!.sourceKey)
+  if (!src) return null
+  let page: any = null, pix: any = null, rgbPix: any = null, image: any = null
+  try {
+    let resources: any = src.resources
+    if (!resources) {
+      page = pdfDoc.loadPage(pageIndex)
+      resources = pageResourcesOf(page.getObject())
+    }
+    const res = resources?.resolve?.() ?? resources
+    const xo = res?.get?.('XObject')
+    if (!xo || String(xo) === 'null') return null
+    // The INDIRECT reference: MuPDF's image loader wants the reference, not
+    // the resolved dictionary (the same quirk as `readStream`).
+    const ref = (xo.resolve ? xo.resolve() : xo).get(best.name)
+    if (!ref || String(ref) === 'null') return null
+    image = pdfDoc.loadImage(ref)
+    pix = image.toPixmap()
+    const cs = pix.getColorSpace?.()
+    const isRgb = cs && String(cs.getName?.() ?? '').toLowerCase().includes('rgb') && pix.getNumberOfComponents() - (pix.getAlpha() ? 1 : 0) === 3
+    rgbPix = isRgb ? pix : pix.convertToColorSpace(mupdf.ColorSpace.DeviceRGB, false)
+    const w = rgbPix.getWidth(), h = rgbPix.getHeight(), n = rgbPix.getNumberOfComponents(), stride = rgbPix.getStride?.() ?? w * n
+    const samples = rgbPix.getPixels()
+    const rgba = new Uint8ClampedArray(w * h * 4)
+    for (let y = 0; y < h; y++) {
+      let s = y * stride, o = y * w * 4
+      for (let x = 0; x < w; x++, s += n, o += 4) {
+        rgba[o] = samples[s]; rgba[o + 1] = samples[s + 1]; rgba[o + 2] = samples[s + 2]; rgba[o + 3] = 255
+      }
+    }
+    // In the DISPLAYED frame, as the page size is: on a /Rotate page the
+    // content's own frame is turned against what the reader sees.
+    const inContent = withSource(src, () => getFullCtmAtOffset(src.stream, best!.doOffset))
+    const rot = pageRotationCtm(pageIndex)
+    const ctm = rot ? matConcat(inContent, rot) : inContent
+    return { width: w, height: h, rgba, ctm, pageWidth: size.width, pageHeight: size.height, name: best.name }
+  } catch (err) {
+    console.warn('[MuPDF Worker] getScanImage failed:', err)
+    return null
+  } finally {
+    try { if (rgbPix && rgbPix !== pix) rgbPix.destroy() } catch (_) {}
+    try { pix?.destroy() } catch (_) {}
+    try { image?.destroy() } catch (_) {}
+    try { page?.destroy() } catch (_) {}
+  }
+}
+
+/**
+ * Draw pixel overlays over the page — the scan edits of scanEdit.ts — in ONE
+ * stream rewrite. Each is an RGB image with an 8-bit soft mask: opaque where
+ * the scan changed, transparent where it did not, so the overlay cannot
+ * disagree with the scan under it anywhere it left alone. Written as plain
+ * DeviceRGB/DeviceGray streams (no ICC profile, Flate on save), placed at
+ * `rect` in the visible frame (top-left points) with the same /Rotate and
+ * end-of-stream CTM corrections `drawImageInContent` applies. Names `OcrPx<n>`
+ * are fresh on the page.
+ */
+function drawPixelOverlays(
+  pageIndex: number,
+  overlays: { rect: number[]; width: number; height: number; rgb: Uint8Array; alpha: Uint8Array }[]
+): { success: boolean; names?: string[]; error?: string } {
+  if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
+  if (!overlays.length) return { success: true, names: [] }
+  let page: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+    const pageHeight = getPageSize(pageIndex).height
+    let resources = ownPageResources(pageObj).resolve()
+    let xobjects = resources.get('XObject')
+    if (!xobjects || String(xobjects) === 'null') {
+      xobjects = pdfDoc.newDictionary()
+      resources.put('XObject', xobjects)
+    }
+    xobjects = xobjects.resolve()
+    const existing = readContentStream(pageIndex)
+    let correction: Mat6 | null = null
+    const pageRot = pageRotationCtm(pageIndex)
+    if (pageRot) correction = matInvert(pageRot)
+    const endCtm = getCtmAtOffset(existing, existing.length)
+    if (endCtm.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
+      const inv = matInvert(endCtm)
+      if (inv) correction = correction ? matConcat(correction, inv) : inv
+    }
+    const undo = correction ? `${correction.map(v => fmtNum(v)).join(' ')} cm ` : ''
+    const names: string[] = []
+    let ops = ''
+    let slot = 0
+    for (const o of overlays) {
+      if (!(o.width > 0 && o.height > 0) || o.rgb.length !== o.width * o.height * 3 || o.alpha.length !== o.width * o.height) continue
+      const mk = (bytes: Uint8Array, cs: string, smask?: any) => {
+        const d = pdfDoc.newDictionary()
+        d.put('Type', pdfDoc.newName('XObject'))
+        d.put('Subtype', pdfDoc.newName('Image'))
+        d.put('Width', o.width)
+        d.put('Height', o.height)
+        d.put('ColorSpace', pdfDoc.newName(cs))
+        d.put('BitsPerComponent', 8)
+        if (smask) d.put('SMask', smask)
+        return pdfDoc.addStream(bytes, d)
+      }
+      const imgRef = mk(o.rgb, 'DeviceRGB', mk(o.alpha, 'DeviceGray'))
+      let name = ''
+      for (; slot < 5000; slot++) {
+        const candidate = `OcrPx${slot}`
+        const taken = xobjects.get(candidate)
+        if (!taken || String(taken) === 'null') { name = candidate; slot++; break }
+      }
+      if (!name) break
+      xobjects.put(name, imgRef)
+      names.push(name)
+      const x = Math.min(o.rect[0], o.rect[2]), w = Math.abs(o.rect[2] - o.rect[0])
+      const top = Math.min(o.rect[1], o.rect[3]), h = Math.abs(o.rect[3] - o.rect[1])
+      const y = pageHeight - top - h
+      ops += `\nq ${undo}${fmtNum(w)} 0 0 ${fmtNum(h)} ${fmtNum(x)} ${fmtNum(y)} cm /${name} Do Q`
+    }
+    const combined = existing + ops + '\n'
+    const bytes = new Uint8Array(combined.length)
+    for (let i = 0; i < combined.length; i++) bytes[i] = combined.charCodeAt(i) & 0xFF
+    const contents = pageObj.get('Contents')
+    const isStream = !!contents && String(contents) !== 'null' && typeof contents.isStream === 'function' && contents.isStream()
+    if (isStream) contents.writeStream(bytes)
+    else pageObj.put('Contents', pdfDoc.addStream(bytes, {}))
+    invalidateContentSources(pageIndex)
+    return { success: true, names }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
   } finally {

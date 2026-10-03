@@ -471,6 +471,36 @@ export function usePDFEngine() {
     return wrap(await bridge.drawImageInContent(pageIndex, rect, bytes, behind), 'drawImageInContent', pageIndex)
   }
 
+  /** The page's scan at native resolution — see `MuPDFBridge.getScanImage`. */
+  async function getScanImage(pageIndex: number) {
+    try { return await bridge.getScanImage(pageIndex) } catch (err: any) {
+      console.warn('[Engine] getScanImage failed:', err?.message || err)
+      return null
+    }
+  }
+
+  /** The page rendered by MuPDF (its /Rotate applied) as raw RGBA — what a scan edit reads when the scan is not one upright image. */
+  async function renderPageRgba(pageIndex: number, scale: number): Promise<{ width: number; height: number; rgba: ArrayBuffer } | null> {
+    try {
+      const px = await bridge.renderPixmap(pageIndex, scale, true)
+      return px && px.width && px.height ? px : null
+    } catch (err: any) {
+      console.warn('[Engine] renderPageRgba failed:', err?.message || err)
+      return null
+    }
+  }
+
+  /** Glyphs of a bundled match face at `emPx`, coverage as Float32Arrays — see glyphSynth.ts. */
+  async function rasterGlyphs(fontFile: string, chars: string[], emPx: number) {
+    const out = await bridge.rasterGlyphs(fontFile, chars, emPx)
+    return out.map(g => g ? { ...g, cov: new Float32Array(g.cov) } : null)
+  }
+
+  /** Draw scan-edit pixel overlays over the page in one rewrite. */
+  async function drawPixelOverlays(pageIndex: number, overlays: { rect: RectT; width: number; height: number; rgb: ArrayBuffer; alpha: ArrayBuffer }[]): Promise<boolean> {
+    return wrap(await bridge.drawPixelOverlays(pageIndex, overlays), 'drawPixelOverlays', pageIndex)
+  }
+
   /** Paint a filled rectangle into the page content stream (behind later drawing). */
   async function fillRect(pageIndex: number, rect: RectT, color: [number, number, number]): Promise<boolean> {
     return wrap(await bridge.fillRect(pageIndex, rect, color), 'fillRect', pageIndex)
@@ -574,7 +604,7 @@ export function usePDFEngine() {
     debugBtBlocks,
     readContentStream,
     replaceText,
-    addText, addTextRun, removeMarkedContent, hasMarkedContent, blankInvisibleText, getPageContent, setPageContent, registerFace, measureRuns, renderPageBitmap,
+    addText, addTextRun, removeMarkedContent, hasMarkedContent, blankInvisibleText, getPageContent, setPageContent, registerFace, measureRuns, renderPageBitmap, renderPageRgba,
     transformTextBlock,
     transformTextBlocks,
     restyleTextBlocks,
@@ -608,6 +638,9 @@ export function usePDFEngine() {
     reorderContentImage,
     replaceContentImage,
     drawImageInContent,
+    getScanImage,
+    drawPixelOverlays,
+    rasterGlyphs,
     fillRect,
     shiftGraphicsBelow,
     mergePages,
