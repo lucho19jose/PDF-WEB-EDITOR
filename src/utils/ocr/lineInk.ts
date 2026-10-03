@@ -393,6 +393,56 @@ function stackPieces(comps: Comp[], em: number, gapLimit?: number): Comp[] {
 
 const median = (v: number[]) => { const s = [...v].sort((a, b) => a - b); return s[Math.floor(s.length / 2)] }
 
+let smoothDebug: unknown = null
+export function lastSmoothTest(): unknown { const v = smoothDebug; smoothDebug = null; return v }
+
+/**
+ * How far the paper estimate departs from its own local average, over the
+ * line's region: the 90th percentile of |paper − box blur(paper)| at pixels
+ * that are not ink, in levels. A gradient reads one or two; a photograph's
+ * texture tens.
+ */
+function paperRoughness(pi: PageInk, roi: { x0: number; y0: number; x1: number; y1: number }, em: number): number {
+  const s = pi.s, W = roi.x1 - roi.x0, H = roi.y1 - roi.y0
+  const P = new Float32Array(W * H)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const p = (roi.y0 + y) * s.w + roi.x0 + x
+    P[y * W + x] = (pi.paper[p * 3] * 299 + pi.paper[p * 3 + 1] * 587 + pi.paper[p * 3 + 2] * 114) / 1000
+  }
+  const r = Math.max(3, Math.round(em * 0.5))
+  // Separable box blur with edge clamping, via running sums.
+  const tmp = new Float32Array(W * H), blur = new Float32Array(W * H)
+  for (let y = 0; y < H; y++) {
+    let acc = 0, n = 0
+    for (let x = -r; x <= r; x++) if (x >= 0 && x < W) { acc += P[y * W + x]; n++ }
+    for (let x = 0; x < W; x++) {
+      tmp[y * W + x] = acc / n
+      const out = x - r, inn = x + r + 1
+      if (out >= 0) { acc -= P[y * W + out]; n-- }
+      if (inn < W) { acc += P[y * W + inn]; n++ }
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    let acc = 0, n = 0
+    for (let y = -r; y <= r; y++) if (y >= 0 && y < H) { acc += tmp[y * W + x]; n++ }
+    for (let y = 0; y < H; y++) {
+      blur[y * W + x] = acc / n
+      const out = y - r, inn = y + r + 1
+      if (out >= 0) { acc -= tmp[out * W + x]; n-- }
+      if (inn < H) { acc += tmp[inn * W + x]; n++ }
+    }
+  }
+  const res: number[] = []
+  for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 2) {
+    const p = (roi.y0 + y) * s.w + roi.x0 + x
+    if (pi.dark[p] >= FRINGE) continue
+    res.push(Math.abs(P[y * W + x] - blur[y * W + x]))
+  }
+  if (res.length < 20) return Infinity
+  res.sort((a, b) => a - b)
+  return res[Math.floor(res.length * 0.9)]
+}
+
 /**
  * Analyse one recognised line on the prepared page. `inkRect` is in page
  * points (top-left), as OCR reports it. Null when the line's ink cannot be
@@ -447,6 +497,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   // Plain paper behind the line, or nothing is erased cleanly: lettering set
   // over a photograph or a gradient (a brochure's title on its picture) has no
   // paper to fill from, and an erase there punched pale holes in the picture.
+  let smoothGround = false
   {
     const lums: number[] = []
     for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 3) {
@@ -455,9 +506,19 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
       lums.push((pi.paper[p * 3] * 299 + pi.paper[p * 3 + 1] * 587 + pi.paper[p * 3 + 2] * 114) / 1000)
     }
     if (lums.length > 40) {
-      lums.sort((a, b) => a - b)
-      const range = lums[Math.floor(lums.length * 0.95)] - lums[Math.floor(lums.length * 0.05)]
-      if (range > 40) return fail('the background is not plain paper')
+      const sorted = [...lums].sort((a, b) => a - b)
+      const range = sorted[Math.floor(sorted.length * 0.95)] - sorted[Math.floor(sorted.length * 0.05)]
+      if (range > 40) {
+        // A wide range is not a picture when it is SMOOTH: a cover's gradient
+        // spans a hundred levels across a line and a pixel's paper differs
+        // from the paper around it by a level or two. What the erase needs is
+        // that the paper can be filled from its surroundings, and a gradient
+        // can — a photograph's texture cannot.
+        const rough = paperRoughness(pi, roi, emGuess)
+        smoothDebug = { range, rough }
+        if (rough > 8) return fail('the background is not plain paper')
+        smoothGround = true
+      }
     }
   }
   // The core is the stroke, not its fringe. Thin strokes that print grey —
@@ -744,6 +805,24 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
         ownPieces.splice(i, 1)
       }
     }
+  }
+  // A mark lying wholly BELOW the baseline is the line beneath's when it is
+  // shaped and placed like an accent — small and short, none of this line's
+  // letters reaching down to it, and sitting right on top of a letter that is
+  // NOT this line's. Set tight, the next line's accents sit inside this
+  // line's band, and taken as its loose ink the accent travelled with the
+  // line's tail: deleting "LOS" from a title moved the accent of "SEDUCCIÓN"
+  // under it onto its U. Asking less (any piece below the baseline nothing
+  // reaches) took a form's handwritten blank and a tilted heading's "S".
+  for (let i = ownPieces.length - 1; i >= 0; i--) {
+    const c = ownPieces[i]
+    if (c.y0 <= base(c.cx) + em * 0.08 || c.area > em * em * 0.06 || c.y1 - c.y0 > em * 0.35) continue
+    const hangs = ownPieces.some(o => o !== c && o.x1 > c.x0 && o.x0 < c.x1 && o.y0 < c.y0 && o.y1 >= c.y0 - em * 0.1)
+    if (hangs) continue
+    const over = comps.some(o => !ownPieces.includes(o) && o.x1 > c.x0 && o.x0 < c.x1 && o.y0 >= c.y1 - 1 && o.y0 <= c.y1 + em * 0.45 && o.area >= c.area)
+    if (!over) continue
+    for (const p of c.pix) protect.add(p)
+    ownPieces.splice(i, 1)
   }
   for (const c of ownPieces) for (const p of c.pix) own.add(p)
 
@@ -1035,6 +1114,15 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
       frontier = next
     }
   }
+
+  // On a GRADIENT (a ground the plain-paper test let through for being
+  // smooth) only a line cut cleanly is taken: every word one ink run per
+  // letter. A cover title printed in two inks — black "APOCALÍP", grey "SEX"
+  // — reaches the core level only in places in its grey half, its reading is
+  // shared out over the wrong ink, and deleting "SEX" erased the "P". No
+  // test of the letters' darkness told its cells from a misread's; the
+  // approximate cut is what both have, and on plain paper the old rules stand.
+  if (smoothGround && words.some(w => !(w.cut && w.exact))) return fail('the line is set on a gradient and could not be cut cleanly')
 
   return {
     id: item.id, text, inkRect: { ...item.inkRect }, chars, spaceAfter, confidence: item.confidence ?? 100, roi, fit, words, cells, rules, borders, protect, own,

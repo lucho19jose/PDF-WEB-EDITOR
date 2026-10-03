@@ -4958,9 +4958,12 @@ look fit's references beside every face), `repair <page> <id> [text]` (the
 line re-read from the page's letters, op by op, and a typed text merged onto
 it), `exact <page>` (how many words were cut, and how many more stand one run
 per letter; `WIDTHS=1` prints each run's width in ems), `fill <page> <id> <out.png>` (a
-vector patch: original, flat, ground-filled); `VARIANT=<dir>` loads the OCR
+vector patch: original, flat, ground-filled), `repairall <page>` (every line's
+reading beside its repair from the page's letters), `colors <page>` (each
+run's sampled ink and ground); `VARIANT=<dir>` loads the OCR
 modules from a copy of `src/utils/ocr` there, so a change can be measured
-against `src/` without touching it while a browser run is going),
+against `src/` without touching it while a browser run is going — the unit
+tests below take it too),
 `tools/ocr-calibrate/scanedit.test.mjs` (node --test; alignment, push-pull, an
 end-to-end edit on a synthetic MuPDF-rendered scan asserting nothing outside
 the edited line changes, a correction that changes no pixel, a real edit not
@@ -4984,6 +4987,118 @@ corpus runs, run it on a FROZEN build: `NODE_ENV=development npx vite build
 hooks such as `__ocrBakePlans` and `__noUnloadPrompt` survive; it copies
 `public/_sweep` too) and `npx vite preview --outDir <scratch>/snap --port
 9100`; nothing written to `src/` reaches that page.
+
+### A smooth ground is ground; the lines that are not the scan's are left alone
+Found by the full OCR sweep (three corpora, 51 documents), each measured with
+the lab before it went in:
+
+- **A wide range of ground is accepted when it is SMOOTH** (`paperRoughness`:
+  the 90th percentile of |paper − box blur(paper)| over the line's non-ink
+  pixels, at most 8 levels). A cover's gradient spans a hundred levels across
+  one title and was refused as "not plain paper"; a photograph's texture reads
+  tens. On such a ground only a line cut CLEANLY is taken — every word one ink
+  run per letter: a title printed in two inks (black "APOCALÍP", grey "SEX")
+  reached the core level only in places in its grey half, its reading was
+  shared out over the wrong ink, and deleting "SEX" erased the "P". A guard on
+  two ink darknesses was tried first; it refused good lines on two forms and
+  could not tell that title from them. Both failures had an approximate cut.
+- **The erased hole is relaxed after the push-pull** (`relaxErased`: SOR on
+  Laplace's equation over the erased pixels, 120 sweeps at ω = 1.85, held at
+  the scan where it is not ink and at the paper estimate where it is).
+  Push-pull is a pyramid average: on a gradient it leaves a faint plateau
+  where a letter was.
+- **An accent below the baseline is the line beneath's** when it is shaped
+  like one (at most 0.06 em² and 0.35 em tall, starting 0.08 em under the
+  baseline, none of this line's letters reaching down to it) and sits right
+  on top of a letter that is NOT this line's. Set tight, the next line's
+  accents fall inside this line's band; taken as its loose ink, deleting "LOS"
+  from a title carried the accent of "SEDUCCIÓN" onto its U. Asking less (any
+  piece below the baseline that nothing reaches) took a form's handwritten
+  blank and a tilted heading's "S".
+- **A change in marks alone is an edit, never a correction** (`stripMarks`).
+  An "O" and an "Ó" are one letter to the shapes, so "SEDUCCIÓN" retyped
+  "SEDUCCION" was taken for what the ink already said: the accent stayed on
+  the page and only the text layer lost it.
+- **Light-on-dark is judged on a box padded by min(15% of the width, half
+  the height)**, not 15% of the width: on a long title the padding reached
+  past the band, outvoted it, and white lettering on navy was sampled as
+  navy. Identical on 1088 runs on plain paper.
+- **A run the recogniser read off the page's own VISIBLE text is not the
+  scan's** (`dropRunsOnVisibleText`): visible blocks covering 60% of its width
+  on its row and reading what it read (LCS ≥ 0.7) take it, and the status line
+  says those lines are real text. A translation service draws its banner and
+  the book's title as text over the scan; edited as OCR runs, "ALEX HORMOZI"
+  baked as "XELA" — the partial redraw kept "HORMOZI" as scan pixels while the
+  bake blanked the real text under it. 11.7k damaged pixels on that page to 0.
+- **A first edit blanks only the INVISIBLE text under a run**;
+  `blankInvisibleText(…, all)` is for runs already baked, whose first bake
+  has to go. With `all` on a first edit, visible text overlapping the patch —
+  the same banner, a stamp's ID strip — was blanked too.
+
+### A re-read is held to what the document reads, and to letters it can read
+`repairReading` re-reads a line from the page's own letters when the user
+edits a garbled reading, and its text is what the edited line's text layer
+says. On the MSP appendix it turned "Lostérminos queenel … deinidos" into
+"Los términos que en el … definidos" and "USD 30.00" into "USD 630.00", but it
+also made words worse: "Limitado" → "Lmitado", "Upgrade" → "Uugrade", `("Software")`
+→ `("SSoftware"))`, "o Licencia:" → "ooi Ucencia:", and on a form whose small
+bold letters the atlas cannot tell apart every repair it made was wrong
+("Normal" → "Normel", "Valorización:" → "Valorizacien"). Each defect, fixed:
+
+- **A line is re-read only when its shapes can read it.** Where the alignment
+  KEEPS a label, the run should plainly be that letter (thin strokes agree
+  with each other). Under 80% of at least 8 kept letters, nothing on the line
+  changes. MSP lines read 88–99%; the form's failed.
+- **A word the document reads elsewhere is not re-read into one it reads
+  nowhere** (`wordsLeavingVocab`). The atlas counts every word of the
+  recognised pages (`forms`, `vocab`); each token of the old reading that is
+  a word of the document (three letters read elsewhere once, two letters
+  three times) is followed into the new text by aligning the two letter by
+  letter, and unless it comes back intact or only as words the document also
+  reads, the ink words holding it keep their old labels and the line is
+  re-read around them.
+- **A double quote is two strokes**, and the page holds no shape for it: two
+  neighbouring runs that both hang where a quote hangs are one quote. Read as
+  two, the second tick took the next label and its letter was read twice.
+- **A label the analysis found no ink for is not shown absent if it is a
+  mark** — a colon's dots are specks, and "PROYECTO:" came back "PROYECTO".
+- **A full stop or comma is named by its PLACE** (`markAt`: a small blob at
+  the foot of the line, on the baseline or hanging below it). Its shape is a
+  blob the atlas barely knows, so the shapes never named it: unnamed, the
+  comma after "Perú" took the "ú" label and the "ú" was read as a "d" —
+  "Perdú". Named, "Perú,", "período. La forma" and "Business One, versión"
+  came back right.
+- **A word's FIRST letter may be a capital, and a word of letters takes no
+  figure**: read by the rest of its word, the "S" of "Software" became the "3"
+  it looks like, and the "L" of "Licencia" an "l". When the word's kind
+  decides, its rivals are of that kind too.
+- **Thin strokes**: where the line's own exact i's show their dot apart, an
+  undotted stroke is no "i", "í" or "j" ("el" came back "ei"); a stroke
+  clearly taller than the line's capitals is no capital ("la" came back "Ia");
+  and a re-read word one i/l/I stroke from a word the document reads twice is
+  that word (`lookalikeFix`, only for words the re-read changed).
+- **A small letter followed by a capital inside one word** ("eL") is refused
+  unless the reading had that shape already.
+- **An accented vowel is also read from the letter under its mark**: judged
+  whole, the mark outweighs the vowel. (It did not fix "número" → "nómero":
+  this page's "u" under its accent matches the "o" medoid 0.73 against 0.70 —
+  the shape grid barely sees an open top. Known.)
+- **Over a rule, a descender is cut off**: an underline or a table cell's
+  rule runs where a descender hangs, so such a run may show none and a
+  descender label is never replaced by a letter without one ("Upgrade" came
+  back "Uugrade").
+- **A refused word hands its labels back both ways**: a word that keeps its
+  old labels reverts every neighbour whose alignment took one of them AND
+  every neighbour one of whose labels its own alignment took. Refused, "N" →
+  "N2" kept the "2" of "2039277697", which came back "039277697".
+
+Measured with `repairall <page>` (every line's reading beside its repair):
+MSP 19/30/14 lines repaired on its three pages, the errors left are
+"Professional", "Perdú", "Adddnns", "Regaláas", "v/o" and "nómero" (most of
+them replacing words the recogniser had wrong too); the form 12 repairs, every
+one wrong (an amount among them, "13,000.00" → "1 3,000 00"), to none; a
+certificate 6, all wrong, to none. The MSP edit suites draw exactly the same
+pixels; `scanedit.test.mjs` passes.
 
 ### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
 Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)

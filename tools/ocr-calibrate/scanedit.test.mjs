@@ -22,15 +22,18 @@ before(async () => {
     optimizeDeps: { noDiscovery: true, include: [] },
   })
   globalThis.ImageData ??= class ImageData { constructor(w, h) { this.width = w; this.height = h; this.data = new Uint8ClampedArray(w * h * 4) } }
-  SE = await server.ssrLoadModule('/src/utils/ocr/scanEdit.ts')
-  R = await server.ssrLoadModule('/src/utils/ocr/scanRaster.ts')
-  LI = await server.ssrLoadModule('/src/utils/ocr/lineInk.ts')
-  GA = await server.ssrLoadModule('/src/utils/ocr/glyphAtlas.ts')
-  IP = await server.ssrLoadModule('/src/utils/ocr/inpaint.ts')
-  GR = await server.ssrLoadModule('/src/utils/ocr/glyphRaster.ts')
+  SE = await loadOcr('scanEdit.ts')
+  R = await loadOcr('scanRaster.ts')
+  LI = await loadOcr('lineInk.ts')
+  GA = await loadOcr('glyphAtlas.ts')
+  IP = await loadOcr('inpaint.ts')
+  GR = await loadOcr('glyphRaster.ts')
   mupdf = await import(pathToFileURL(ROOT + '/node_modules/mupdf/dist/mupdf.js').href)
 })
 after(async () => { await server?.close() })
+
+// VARIANT=<dir>: the OCR modules from a copy of src/utils/ocr there (as the lab takes it).
+const loadOcr = (name) => server.ssrLoadModule(process.env.VARIANT ? '/@fs/' + process.env.VARIANT.split(String.fromCharCode(92)).join('/') + '/' + name : '/src/utils/ocr/' + name)
 
 test('alignment keeps a run of letters together rather than picking them from anywhere', () => {
   const pairs = SE.alignChars([...'cientocincuenta'], [...'quinientos'])
@@ -180,8 +183,24 @@ test('an edit that the ink does NOT already show is drawn, not taken for a corre
   assert.ok(changed > 50, 'the edit drew nothing')
 })
 
+test('removing an accent is an edit, never a correction', () => {
+  const lines = [
+    'La garantia cubre todos los equipos durante el periodo pactado.',
+    'El proveedor entregara los equipos en un plazo de treinta dias habiles.',
+    'Las partes acuerdan que la garantía incluye todos los impuestos.'
+  ]
+  const { raster, pi, lis, atlas } = analysed(lines)
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, lis[2], atlas, lines[2].replace('garantía', 'garantia'), work, {})
+  assert.ok(res.ok, res.reason)
+  assert.ok(!res.corrected, 'the accent change was taken for a correction')
+  let changed = 0
+  for (let i = 0; i < work.length; i += 4) if (work[i] !== raster.data[i]) changed++
+  assert.ok(changed > 20, 'the accent stayed on the page')
+})
+
 test('an overlay is opaque around every changed pixel, so its edge never falls on old ink', async () => {
-  const SEP = await server.ssrLoadModule('/src/utils/ocr/scanEditPage.ts')
+  const SEP = await loadOcr('scanEditPage.ts')
   const lines = [
     'Los terminos del presente contrato son claros y precisos para ambas partes.',
     'El proveedor entregara los equipos en un plazo de treinta dias habiles.'
@@ -307,7 +326,7 @@ function coverScan() {
 }
 
 test('a vector patch on a gradient is filled from the ground: the title goes, the line beneath stays', async () => {
-  const GF = await server.ssrLoadModule('/src/utils/ocr/groundFill.ts')
+  const GF = await loadOcr('groundFill.ts')
   const { raster, ground, title, sub, W, H } = coverScan()
   // The title's box as a detector gives it — down into the line beneath — and
   // the vector patch around it, padded.

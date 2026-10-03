@@ -98,7 +98,7 @@ import { cropToPng } from '@/utils/ocr/pixelCrop'
 import { measureHalo } from '@/utils/ocr/ocrSampling'
 import { detectFace } from '@/utils/ocr/ocrFontDetect'
 import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
-import { snapItemsToTextLayer } from '@/utils/ocr/snapToLayer'
+import { snapItemsToTextLayer, dropRunsOnVisibleText } from '@/utils/ocr/snapToLayer'
 import type { RecognizeDocumentOptions, RecognizeProgress } from '@/components/dialogs/OcrRecognizeDialog.vue'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
@@ -375,6 +375,7 @@ async function runOcrNow(pageIndex: number, lang: string) {
   }
 
   let result: Awaited<ReturnType<typeof ocr.recognizePage>> = null
+  let textLines = 0
   try {
     result = await ocr.recognizePage(canvas, pageIndex, size.width, size.height, lang, true, engineId)
     // The page's own text layer (Acrobat's, or this editor's bake) knows
@@ -384,6 +385,14 @@ async function runOcrNow(pageIndex: number, lang: string) {
     if (result && result.items.length) {
       const blocks = await pdfEngine.getTextBlocks(pageIndex).catch(() => [])
       result = { ...result, items: snapItemsToTextLayer(result.items, blocks).items }
+      // Lines the page draws as real text (a translation banner over a scan)
+      // stay with the text tool: edited as OCR runs they were redrawn as scan
+      // pixels over text that was never in the scan.
+      const kept = dropRunsOnVisibleText(result.items, blocks)
+      if (kept.dropped) {
+        result = { ...result, items: kept.items }
+        textLines = kept.dropped
+      }
     }
   } finally {
     stopProgress()
@@ -400,7 +409,7 @@ async function runOcrNow(pageIndex: number, lang: string) {
   const note = result.fallbackNote ? ` (${result.fallbackNote})` : ''
   editorStore.setStatus(result.items.length === 0
     ? `No text was recognised on this page${by}${note}`
-    : `${result.items.length} text areas detected${by}${sideways} — ${result.confidence}% average confidence${note}. Click one to select it, click again to edit, drag to move.`)
+    : `${result.items.length} text areas detected${by}${sideways} — ${result.confidence}% average confidence${note}${textLines ? `; ${textLines} line${textLines > 1 ? 's are' : ' is'} real text, edited with the text tool` : ''}. Click one to select it, click again to edit, drag to move.`)
 }
 
 /**
@@ -766,12 +775,20 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
       // new words (visible, plus their own invisible copy where the redraw is
       // partial), so the old ones would be found by search a second time.
       // Blank the layer's ops under each edited run first.
-      const editedRects = page.items
-        .filter(i => i.edited || i.removed)
-        .map(i => [i.inkRect.x, i.inkRect.y, i.inkRect.x + i.inkRect.width, i.inkRect.y + i.inkRect.height] as [number, number, number, number])
+      const inkOf = (i: OcrTextItem) => [i.inkRect.x, i.inkRect.y, i.inkRect.x + i.inkRect.width, i.inkRect.y + i.inkRect.height] as [number, number, number, number]
+      const touched = page.items.filter(i => i.edited || i.removed)
+      // Under a run edited for the first time only the invisible layer goes.
+      // VISIBLE text there is the page's own — a translation service draws its
+      // title as real text over the scan — and blanking it deleted "HORMOZI"
+      // from "ALEX HORMOZI" when only "ALEX" was being redrawn. (A live bake
+      // starts from the page's pristine content, so no earlier bake of ours is
+      // under a run that was not finalised.)
+      const editedRects = touched.filter(i => !i.baked).map(inkOf)
+      if (editedRects.length) await pdfEngine.blankInvisibleText(pageIndex, editedRects, false).catch(() => 0)
       // `all`: a run baked once and edited again has its FIRST bake's words
       // under the new patch — visible ops that no reader should still find.
-      if (editedRects.length) await pdfEngine.blankInvisibleText(pageIndex, editedRects, true).catch(() => 0)
+      const bakedRects = touched.filter(i => i.baked).map(inkOf)
+      if (bakedRects.length) await pdfEngine.blankInvisibleText(pageIndex, bakedRects, true).catch(() => 0)
       // Into the content stream, not as an annotation: annotations paint over
       // page content whatever order they were made in, so a patch drawn as one
       // covered the replacement text and it came out with its start missing.

@@ -44,6 +44,63 @@ export function snapItemsToTextLayer(items: OcrTextItem[], blocks: TextBlock[]):
   return { items: out, snapped }
 }
 
+/**
+ * Runs the recogniser read off the page's own VISIBLE text are not the scan's.
+ *
+ * A translation service draws its banner ("Machine Translated by Google") and
+ * the book's title as real text over the scanned page, and the recogniser
+ * reads them off the render like everything else. Edited as OCR runs, they
+ * were patched and redrawn as if they were scan pixels: a partial redraw kept
+ * "HORMOZI" as "the scan's own pixels" while the bake blanked the real text
+ * underneath — "ALEX HORMOZI" came back as "XELA". That text is editable as
+ * text, with its own font, by the text tool; OCR has no business with it.
+ *
+ * A run is dropped when visible text blocks cover most of its width on its own
+ * row AND read what the recogniser read — agreement is what says the text is
+ * on top (text hidden under the scan would have been read off the scan's
+ * pixels; a layer under the image in plain ink, which the render cannot show,
+ * would still be read, so the reading must agree, not merely overlap).
+ */
+export function dropRunsOnVisibleText(items: OcrTextItem[], blocks: TextBlock[]): { items: OcrTextItem[]; dropped: number } {
+  const visible = blocks.filter(b => !b.invisible && b.text.trim())
+  if (!items.length || !visible.length) return { items, dropped: 0 }
+  let dropped = 0
+  const out = items.filter(item => {
+    if (item.vertical) return true
+    const ink = item.inkRect ?? item.rect
+    const y0 = ink.y, y1 = ink.y + ink.height, x0 = ink.x, x1 = ink.x + ink.width
+    const onRun = visible.filter(b => {
+      const by0 = Math.min(b.bbox[1], b.bbox[3]), by1 = Math.max(b.bbox[1], b.bbox[3])
+      const bx0 = Math.min(b.bbox[0], b.bbox[2]), bx1 = Math.max(b.bbox[0], b.bbox[2])
+      const vy = Math.min(y1, by1) - Math.max(y0, by0)
+      return vy > 0.6 * Math.min(ink.height, by1 - by0) && Math.min(x1, bx1) - Math.max(x0, bx0) > 0
+    })
+    if (!onRun.length) return true
+    // Their union along the run.
+    const spans = onRun.map(b => [Math.max(x0, Math.min(b.bbox[0], b.bbox[2])), Math.min(x1, Math.max(b.bbox[0], b.bbox[2]))] as [number, number])
+      .filter(([a, b]) => b > a).sort((p, q) => p[0] - q[0])
+    let covered = 0, end = -Infinity
+    for (const [a, b] of spans) { if (b > end) { covered += b - Math.max(a, end); end = b } }
+    if (covered < (x1 - x0) * 0.6) return true
+    const read = noSpace(fold(item.text)), layer = noSpace(fold(onRun.map(b => b.text).join('')))
+    if (read.length < 2 || lcsLength(read, layer) < read.length * 0.7) return true
+    dropped++
+    return false
+  })
+  return { items: out, dropped }
+}
+
+function lcsLength(a: string, b: string): number {
+  const A = [...a], B = [...b]
+  let prev = new Array(B.length + 1).fill(0)
+  for (let i = 1; i <= A.length; i++) {
+    const cur = new Array(B.length + 1).fill(0)
+    for (let j = 1; j <= B.length; j++) cur[j] = A[i - 1] === B[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1])
+    prev = cur
+  }
+  return prev[B.length]
+}
+
 const fold = (s: string) => s.normalize('NFC').toLowerCase()
 const noSpace = (s: string) => s.replace(/\s+/g, '')
 

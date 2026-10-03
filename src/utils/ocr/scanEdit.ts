@@ -1,5 +1,5 @@
 import { cellRegion, looseRegion, analyzeLine, CORE, type PageInk, type LineInk } from './lineInk'
-import { pickGlyph, predictGap, lineMetrics, cellShapeOf, shapeOfCore, shapeAgreement, type Atlas, type Exemplar } from './glyphAtlas'
+import { pickGlyph, predictGap, lineMetrics, cellShapeOf, shapeOfCore, shapeAgreement, vocabKey, formKey, type Atlas, type Exemplar } from './glyphAtlas'
 import { expectedAdvance } from './glyphCut'
 
 /**
@@ -451,6 +451,11 @@ function wordReadsAs(pi: PageInk, L: LineInk, atlas: Atlas, k: number, mustKnow?
  * the text confirms nothing the recogniser had not already read, or the line
  * cannot be analysed that way.
  */
+/** The text without its diacritics: "SEDUCCIÓN" → "SEDUCCION". */
+function stripMarks(s: string): string {
+  return s.normalize('NFD').replace(/\p{M}/gu, '').normalize('NFC')
+}
+
 export function refineReading(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, log?: (line: string) => void): { li: LineInk; confirmed: number } | null {
   const squash = (t: string) => t.replace(/\s+/g, '')
   if (squash(newText) === squash(li.text)) return null
@@ -483,6 +488,11 @@ export function refineReading(pi: PageInk, li: LineInk, atlas: Atlas, newText: s
         typed.forEach((_, j) => { if (!kept.has(j)) changed.add(w.from + j) })
       }
       if (user === ocr) spaceBefore = lu.spaceAfter.has(w.from)
+      // An ACCENT is never confirmed by the ink's shapes: an "O" and an "Ó"
+      // are the same letter to them, and "SEDUCCIÓN" retyped "SEDUCCION" was
+      // taken for what the ink already said — the accent stayed on the page
+      // while the text layer dropped it. A change in marks alone is an edit.
+      else if (stripMarks(user) === stripMarks(ocr)) log?.(`"${ocr}" -> "${user}" differs in marks only: an edit`)
       else if (wordReadsAs(pi, lu, atlas, k, changed)) { text = user; spaceBefore = lu.spaceAfter.has(w.from); confirmed++ }
       log?.(`"${ocr}" -> "${user}" cut=${w.cut} exact=${w.exact} ${text === user ? 'TYPED' : 'ocr'}`)
     } else log?.(`"${ocr}" -> ${us.length} typed words: kept`)
@@ -542,6 +552,8 @@ export function findCorrections(pi: PageInk, li: LineInk, atlas: Atlas, newText:
     const w = li.words[wi]
     const old = li.chars.slice(w.from, w.to)
     if (old.join('') === tok) return
+    // Marks alone are never a correction: the shapes cannot see them.
+    if (stripMarks(old.join('')) === stripMarks(tok)) return
     // The whole word, and nothing of it in another token.
     for (let i = w.from; i < w.to; i++) if (matchOfOld[i] >= 0 && tokenOf[matchOfOld[i]] !== k) return
     const kept = js.filter(j => matchOfNew[j] >= 0).length
@@ -601,6 +613,8 @@ function extentOf(ch: string): { rise: [number, number]; drop: [number, number] 
   if (ch === ';') return { rise: [0.3, 0.62], drop: [0, 0.35] }
   if ('()[]{}'.includes(ch)) return { rise: [0.58, 1.08], drop: [0.06, 0.42] }
   if ('-–—'.includes(ch)) return { rise: [0.12, 0.5], drop: [-0.5, -0.08] }
+  // Quotes hang high, off the baseline altogether.
+  if ('"“”\'‘’'.includes(ch)) return { rise: [0.55, 1.08], drop: [-0.85, -0.22] }
   return null
 }
 
@@ -612,6 +626,18 @@ function extentOf(ch: string): { rise: [number, number]; drop: [number, number] 
  * touches its letter, so a run without one may still be an "ó".
  */
 const NO_DETACHED_TOP = /^[lI1|!aeouAEIOUnN]$/
+
+/** Letters that hang below the baseline. */
+const DESCENDS = /^[gjpqy]$/
+
+/** The share of a line's kept letters its shapes must read right for it to be re-read. */
+const READ_RATE = 0.8
+
+/** A letter with the mark a Spanish text puts over it: the acute, or the tilde over n. */
+const MARKED: Record<string, string> = { a: 'á', e: 'é', o: 'ó', u: 'ú', n: 'ñ', A: 'Á', E: 'É', O: 'Ó', U: 'Ú', N: 'Ñ' }
+
+/** Characters drawn as two strokes side by side, by design. */
+const TWO_STROKES = new Set(['"', '“', '”'])
 
 /** An accented letter's plain form. */
 const FOLD: Record<string, string> = { á: 'a', é: 'e', í: 'i', ó: 'o', ú: 'u', à: 'a', è: 'e', ì: 'i', ò: 'o', ù: 'u', ü: 'u', Á: 'A', É: 'E', Í: 'I', Ó: 'O', Ú: 'U' }
@@ -636,7 +662,7 @@ const classOf = (c: string) => /\p{Nd}/u.test(c) ? 'digit' : /\p{L}/u.test(c) ? 
  * — a word that does not read well this way either keeps it outright, a guess
  * being worse than the old reading, which at least changes nothing.
  */
-function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string) => void): { texts: (string | null)[]; reads: boolean[] } {
+function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string) => void, keepOld?: Set<number>): { texts: (string | null)[]; reads: boolean[] } {
   const W = pi.s.w
   const out: (string | null)[] = li.words.map(() => null)
   const readsAlready: boolean[] = li.words.map(() => false)
@@ -654,16 +680,54 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
     return list
   }
   const medsByWeight = { regular: medsOf(false), bold: medsOf(true) }
+  // A small piece on top, cut off from the rest by an empty row: the row of
+  // the cut, or -1.
+  const topCut = (pix: ArrayLike<number>): number => {
+    let top = Infinity, bottom = -Infinity, x0 = Infinity, x1 = -Infinity
+    const rows = new Map<number, number>()
+    for (let q = 0; q < pix.length; q++) {
+      const p = pix[q], x = p % W, y = (p - x) / W
+      if (y < top) top = y
+      if (y > bottom) bottom = y
+      if (x < x0) x0 = x
+      if (x > x1) x1 = x
+      rows.set(y, (rows.get(y) ?? 0) + 1)
+    }
+    const base = li.fit.y + li.fit.slope * ((x0 + x1) / 2 - li.fit.centreX)
+    for (let y = top + 1, above = rows.get(top) ?? 0; y < bottom; y++) {
+      const n = rows.get(y) ?? 0
+      if (!n) return above > 0 && above <= pix.length * 0.4 && y < base - em * 0.3 ? y : -1
+      above += n
+    }
+    return -1
+  }
+  // Whether the line's i's show their dot apart, read from its exact words:
+  // where they do, a thin stroke with no dot is no "i" ("el" came back "ei").
+  let iCells = 0, dotted = 0
+  for (const w of li.words) if (w.cut && w.exact) for (let i = w.from; i < w.to; i++) {
+    if ((li.chars[i] !== 'i' && li.chars[i] !== 'j') || !li.cells[i].pix.length) continue
+    iCells++
+    if (topCut(li.cells[i].pix) >= 0) dotted++
+  }
+  const iNeedsDot = iCells >= 2 && dotted >= iCells * 0.75
+  // A capital stands no taller than the line's capitals: a stroke clearly
+  // above them is an ascender ("la" came back "Ia").
+  const { capH } = lineMetrics(li)
+  const capRise = capH ? capH / em : null
   const TOL = 0.06
-  const fits = (ch: string, g: { rise: number; drop: number; capped: boolean }) => {
+  const fits = (ch: string, g: { rise: number; drop: number; capped: boolean; ruled: boolean }) => {
     const e = extentOf(ch)
     if (NO_DETACHED_TOP.test(ch) && g.capped) return false
-    return !e || (g.rise >= e.rise[0] - TOL && g.rise <= e.rise[1] + TOL && g.drop >= e.drop[0] - TOL && g.drop <= e.drop[1] + TOL)
+    if (iNeedsDot && (ch === 'i' || ch === 'j' || ch === 'í') && !g.capped) return false
+    if (capRise !== null && /^[A-Z0-9]$/.test(ch) && g.rise > capRise + 0.07) return false
+    // Over a rule a descender is cut off where it crosses: it may show none.
+    const dropLo = g.ruled ? Math.min(e?.drop[0] ?? 0, -0.1) : e?.drop[0] ?? 0
+    return !e || (g.rise >= e.rise[0] - TOL && g.rise <= e.rise[1] + TOL && g.drop >= dropLo - TOL && g.drop <= e.drop[1] + TOL)
   }
   // Every run of every word, left to right: where it sits, and how it looks
   // against every letter of its word's weight.
   type Run = {
-    word: number; pix: number[]; x0: number; x1: number; n: number; g: { rise: number; drop: number; capped: boolean }
+    word: number; pix: number[]; x0: number; x1: number; n: number; g: { rise: number; drop: number; capped: boolean; ruled: boolean }
     agree: Map<string, number>; known: Set<string>; meds: { ch: string; shape: Float32Array }[]
     b1: string; a1: number; a2: number
     /** Its word mostly reads as its labels: replacing one takes more. */
@@ -682,8 +746,16 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
     const lower = own.filter(c => /\p{Ll}/u.test(c)).length, upper = own.filter(c => /\p{Lu}/u.test(c)).length
     const digits = own.filter(c => /\p{Nd}/u.test(c)).length
     const kind = lower > upper + digits ? 'lower' : upper > lower + digits ? 'upper' : digits > lower + upper ? 'digit' : ''
-    const ofKind = (c: string) => kind === 'lower' ? /\p{Ll}/u.test(c) || !/\p{L}/u.test(c) : kind === 'upper' ? /\p{Lu}/u.test(c) || !/\p{L}/u.test(c) : kind === 'digit' ? !/\p{L}/u.test(c) : true
+    // A word of letters takes no figure, and its FIRST letter may be a
+    // capital whatever the rest are: read by the rest, the "S" of "Software"
+    // was demoted to the "3" it looks like, and the "L" of "Licencia" to "l".
+    const mark = (c: string) => !/\p{L}/u.test(c) && !/\p{Nd}/u.test(c)
+    const ofKind = (c: string, first: boolean) => kind === 'lower' ? /\p{Ll}/u.test(c) || (first && /\p{Lu}/u.test(c)) || mark(c)
+      : kind === 'upper' ? /\p{Lu}/u.test(c) || mark(c)
+      : kind === 'digit' ? !/\p{L}/u.test(c) : true
+    let nth = 0
     for (const pix of columnRuns(pi, li, w.from, w.to)) {
+      const first = nth++ === 0
       let x0 = Infinity, x1 = -Infinity, top = Infinity, bottom = -Infinity
       for (const p of pix) {
         const x = p % W, y = (p - x) / W
@@ -693,28 +765,44 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
         if (y > bottom) bottom = y
       }
       const base = li.fit.y + li.fit.slope * ((x0 + x1) / 2 - li.fit.centreX)
-      // A small piece on top, cut off from the rest by an empty row.
-      const rows = new Map<number, number>()
-      for (const p of pix) { const y = (p - p % W) / W; rows.set(y, (rows.get(y) ?? 0) + 1) }
-      let capped = false
-      for (let y = top + 1, above = rows.get(top) ?? 0; y < bottom; y++) {
-        const n = rows.get(y) ?? 0
-        if (!n) { capped = above > 0 && above <= pix.length * 0.4 && y < base - em * 0.3; break }
-        above += n
-      }
-      const g = { rise: (base - top) / em, drop: (bottom - base) / em, capped }
+      const cutRow = topCut(pix)
+      // An underline, or the rule under a table cell, runs through where a
+      // descender would hang: the "p" of "Upgrade" came back a "u".
+      const xc = (x0 + x1) / 2
+      const ruled = li.rules.some(rl => {
+        if (rl.x0 > x1 || rl.x1 < x0) return false
+        const ry = rl.y + rl.slope * (xc - rl.centreX)
+        return ry >= base - em * 0.05 && ry <= base + em * 0.45
+      })
+      const g = { rise: (base - top) / em, drop: (bottom - base) / em, capped: cutRow >= 0, ruled }
       const shape = shapeOfCore(pi, li, pix)
       const agree = new Map<string, number>()
       if (shape) for (const m of meds) agree.set(m.ch, shapeAgreement(shape, m.shape))
+      // An accented letter is read from the letter UNDER its mark as well:
+      // judged whole, the mark outweighs the vowel, and "número" came back
+      // "nómero" (ó 0.74 against ú 0.68) — a page may hold one copy of an
+      // "ú", or none at all.
+      if (cutRow >= 0) {
+        const below = shapeOfCore(pi, li, pix.filter(p => (p - p % W) / W > cutRow))
+        if (below) for (const m of meds) {
+          const acc = MARKED[m.ch]
+          if (!acc) continue
+          const a = shapeAgreement(below, m.shape)
+          if (a > (agree.get(acc) ?? 0)) agree.set(acc, a)
+        }
+      }
       // The letter it plainly is: the best of those that could sit there — an
       // accented one only when the plain one does clearly worse, the accent
       // being a few pixels a shape barely weighs — and how far ahead of every
       // letter that is not a form of it.
-      const cands = [...agree].filter(([ch]) => fits(ch, g)).sort((a, b) => b[1] - a[1])
+      // When the word's kind decides, its rivals are of that kind too: a
+      // margin measured against the letter the kind rule set aside could
+      // never be met.
+      let cands = [...agree].filter(([ch]) => fits(ch, g)).sort((a, b) => b[1] - a[1])
       let best = cands[0]
-      if (best && !ofKind(best[0])) {
-        const same = cands.find(c => ofKind(c[0]))
-        if (same && same[1] >= best[1] - 0.08) best = same
+      if (best && !ofKind(best[0], first)) {
+        const inKind = cands.filter(c => ofKind(c[0], first))
+        if (inKind[0] && inKind[0][1] >= best[1] - 0.08) { best = inKind[0]; cands = inKind }
       }
       if (best && fold(best[0]) !== best[0]) {
         const plain = cands.find(c => c[0] === fold(best[0]))
@@ -732,6 +820,13 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
   if (!M || medsByWeight.regular.length + medsByWeight.bold.length < 8) return result()
   const masses = runs.map(r => r.n).sort((a, b) => a - b)
   const midMass = masses[Math.floor(masses.length / 2)] || 1
+  // A small blob at the foot of the line: a full stop on the baseline, a
+  // comma hanging below it — or nothing the place can name.
+  const markAt = (r: Run): string => {
+    if (r.n > midMass * 0.5 || r.x1 - r.x0 > li.fit.emPx * 0.3 || r.g.rise > 0.3) return ''
+    if (r.g.drop >= 0.06 && r.g.drop <= 0.4) return ','
+    return r.g.rise <= 0.22 ? '.' : ''
+  }
   // Two neighbouring runs of one word as ONE letter (a letter broken in the scan).
   const pairShape = new Map<number, Float32Array | null>()
   const pairAgree = (j: number, ch: string) => {
@@ -765,7 +860,7 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
       // …or replaced by the letter the run plainly is. A digit the page has
       // no shape for is never taken for a letter that happens to be like it
       // ("5" and "S"): only for one of its own kind, or where it cannot sit.
-      if (r.b1 && r.b1 !== ch && r.a1 >= 0.72 && r.a1 - r.a2 >= 0.03 &&
+      if (r.b1 && r.b1 !== ch && r.a1 >= 0.72 && r.a1 - r.a2 >= 0.03 && !(r.g.ruled && DESCENDS.test(ch) && !DESCENDS.test(r.b1)) &&
           (own >= 0 ? r.a1 >= own + (sits ? (r.strict ? 0.25 : 0.15) : 0.05) : !sits || (classOf(ch) === classOf(r.b1) && r.a1 >= 0.85))) {
         relax(i, j, i + 1, j + 1, 1 - r.a1 + SUB, { op: 'sub', text: r.b1, fit: 1 - r.a1, run: j, label: i, labels: 1 })
       }
@@ -780,6 +875,16 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
         const a = pairAgree(j, ch)
         if (a > Math.max(own, runs[j + 1].agree.get(ch) ?? 0) + 0.05) relax(i, j, i + 1, j + 2, 1 - a + 0.1, { op: 'broken', text: ch, fit: 1 - a, run: j, label: i, labels: 1 })
       }
+      // A character drawn in separate strokes by design — a double quote's
+      // two ticks — that the page holds no shape for: two neighbouring runs
+      // that both sit where it sits are that one character, at the price of
+      // any unknown label that sits. Read as two, the second tick took the
+      // next label and the letter it belonged to was read twice: `("Software")`
+      // came back `("SSoftware"))`.
+      if (j + 1 < M && runs[j + 1].word === r.word && !r.known.has(ch) && TWO_STROKES.has(ch) && sits && fits(ch, runs[j + 1].g) &&
+          runs[j + 1].x0 - r.x1 <= Math.max(2, li.fit.emPx * 0.15)) {
+        relax(i, j, i + 1, j + 2, 0.3, { op: 'broken', text: ch, fit: 0.3, run: j, label: i, labels: 1 })
+      }
     }
     // A label with no ink of its own.
     if (i < N) relax(i, j, i + 1, j, DEL, { op: 'del', text: '', fit: -1, run: -1, label: i, labels: 1 })
@@ -789,6 +894,12 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
       // refused: refused, the alignment accounted for the run worse, keeping
       // the "d" of "calculad" on the "o" of "calculado".)
       if (r.b1 && r.a1 >= 0.7) relax(i, j, i, j + 1, 1 - r.a1 + INS + Math.max(0, 0.06 - (r.a1 - r.a2)) * 3, { op: 'ins', text: r.b1, fit: 1 - r.a1, run: j, label: -1, labels: 0 })
+      // …or the full stop or comma its place says it is. A mark's shape is a
+      // blob the atlas barely knows, so the shapes never name it; where it
+      // sits does. Unnamed, the comma after "Perú" took the "ú" label and the
+      // "ú" itself was read as a "d": "Perdú".
+      const mark = markAt(r)
+      if (mark) relax(i, j, i, j + 1, INS + 0.15, { op: 'ins', text: mark, fit: 0.3, run: j, label: -1, labels: 0 })
       // …or a speck that looks like nothing.
       if (r.n < midMass * 0.15 && r.x1 - r.x0 < li.fit.emPx * 0.15 && r.a1 < 0.65) relax(i, j, i, j + 1, 0.05, { op: 'noise', text: '', fit: -1, run: j, label: -1, labels: 0 })
     }
@@ -802,6 +913,25 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
     i = b.i; j = b.j
   }
   ops.reverse()
+  // The page's shapes must be able to read this line at all: where the
+  // alignment KEEPS a label, the run should plainly be that letter. On a
+  // form whose small bold letters the atlas cannot tell apart, "Normal" read
+  // as "e" for its "o" and "a" and came back "Normel", "Valorización"
+  // "Valorizacien" — the re-read is worse than the recogniser there, and
+  // where too few kept letters are judged it cannot be told, so nothing is
+  // changed. Thin strokes count as agreeing with each other.
+  {
+    const thin = (c: string) => /^[iIl1|íìj!]$/.test(c)
+    const same = (a: string, b: string) => fold(a.toLowerCase()) === fold(b.toLowerCase()) || (thin(a) && thin(b))
+    let judged = 0, agreeing = 0
+    for (const o of ops) {
+      if (o.op !== 'keep' || o.run < 0 || !runs[o.run].known.has(o.text) || !runs[o.run].b1) continue
+      judged++
+      if (same(runs[o.run].b1, o.text)) agreeing++
+    }
+    log?.(`shapes read the kept letters: ${agreeing} of ${judged}`)
+    if (judged < 8 || agreeing < judged * READ_RATE) return result()
+  }
   // Each op to its word: a dropped label to the word of the next run.
   const wordOf = new Array<number>(ops.length).fill(-1)
   let nextWord = runs[M - 1].word
@@ -814,12 +944,20 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
   li.words.forEach((w, k) => {
     const mine = ops.filter((_, q) => wordOf[q] === k)
     for (const o of mine) if (o.label >= 0) { range[k].lo = Math.min(range[k].lo, o.label); range[k].hi = Math.max(range[k].hi, o.label + o.labels) }
-    const text = mine.map(o => o.text).join('')
+    // A mark with no ink of its own found is not shown to be absent — a
+    // colon's dots are specks, and "PROYECTO:" came back "PROYECTO" — so a
+    // dropped mark stays.
+    const markKept = (o: Op) => o.op === 'del' && !/\p{L}/u.test(labels[o.label]) && !/\p{Nd}/u.test(labels[o.label])
+    const text = mine.map(o => markKept(o) ? labels[o.label] : o.text).join('')
     const old = labelOf(w)
-    const changes = mine.filter(o => o.op === 'sub' || o.op === 'ins' || o.op === 'del').length
+    const changes = mine.filter(o => (o.op === 'sub' || o.op === 'ins' || o.op === 'del') && !markKept(o)).length
     const scored = mine.filter(o => o.fit >= 0)
     const meanFit = scored.reduce((t, o) => t + o.fit, 0) / Math.max(1, scored.length)
-    const ok = text !== old && text.length > 0 && scored.length > 0 && meanFit <= 0.33 && changes <= Math.max(2, Math.ceil(Math.max(old.length, text.length) * 0.5))
+    // A small letter followed by a capital inside one word ("eL") is a thin
+    // stroke read as the wrong one of "l", "I", "L" — unless the reading had
+    // that shape already.
+    const oddCase = /\p{Ll}\p{Lu}/u.test(text) && !/\p{Ll}\p{Lu}/u.test(old)
+    const ok = text !== old && text.length > 0 && scored.length > 0 && meanFit <= 0.33 && !oddCase && changes <= Math.max(2, Math.ceil(Math.max(old.length, text.length) * 0.5))
     log?.(`"${old}" -> "${text}" ${mine.map(o => `${o.op}${o.text ? ':' + o.text : ''}`).join(' ')} fit ${meanFit.toFixed(2)}${ok ? '' : text === old ? '' : ' REFUSED'}`)
     // The runs of a word read differently, each with its three best letters.
     if (log && text !== old) for (const o of mine) {
@@ -830,16 +968,22 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
     }
     if (ok) out[k] = text
   })
+  // Words held to their old labels by the caller (`repairReading`'s
+  // vocabulary check).
+  if (keepOld) for (const k of keepOld) out[k] = null
   // A word that keeps its old labels keeps ALL of them: a neighbour the
   // alignment gave one of those labels to keeps its own too, or the label
-  // would be read twice.
+  // would be read twice — and a neighbour whose labels the kept word's
+  // alignment took keeps ITS old ones, or they would be read by nobody
+  // (refused "N" → "N2" took the "2" of "2039277697", which came back
+  // "039277697").
   for (let changed = true; changed;) {
     changed = false
     li.words.forEach((w, k) => {
       if (out[k] !== null) return
-      li.words.forEach((_, k2) => {
+      li.words.forEach((w2, k2) => {
         if (out[k2] === null || k2 === k) return
-        if (range[k2].lo < w.to && range[k2].hi > w.from) { out[k2] = null; changed = true }
+        if ((range[k2].lo < w.to && range[k2].hi > w.from) || (range[k].lo < w2.to && range[k].hi > w2.from)) { out[k2] = null; changed = true }
       })
     })
   }
@@ -867,24 +1011,120 @@ export function repairReading(pi: PageInk, li: LineInk, atlas: Atlas, log?: (lin
     for (let i = w.from; i < w.to; i++) { if (i > w.from && li.spaceAfter.has(i)) t += ' '; t += li.chars[i] }
     return t
   }
-  const { texts: fixed, reads } = rereadLine(pi, li, atlas, log)
-  const repaired = fixed.filter(f => f !== null).length
-  if (!repaired) return null
   const em = li.fit.emPx
   const wordGap = li.wordGapPx > 0 ? li.wordGapPx : Math.min(0.6, Math.max(0.25, atlas.wordGapEm)) * em
-  let text = ''
-  li.words.forEach((w, k) => {
-    // A word's gap the reading missed is put back only between words whose
-    // labels fit their ink: between two that do not, the gap is not where the
-    // labels part ("l\"|Contrato\"" over ink saying "el \"Contrato\"").
-    const inkGap = w.x0 - li.words[k - 1]?.x1 >= wordGap * 0.6 && reads[k] && reads[k - 1]
-    if (k > 0 && (li.spaceAfter.has(w.from) || inkGap)) text += ' '
-    text += fixed[k] ?? labelOf(w)
-  })
-  if (text === li.text) return null
-  const ln = analyzeLine(pi, { id: li.id, text, inkRect: li.inkRect, confidence: li.confidence })
-  log?.(`repaired: "${text}" ${ln ? 'analysed' : 'NOT analysed'}`)
-  return ln ? { text, li: ln, repaired } : null
+  const keepOld = new Set<number>()
+  for (let round = 0; round < 4; round++) {
+    const { texts: fixed, reads } = rereadLine(pi, li, atlas, round ? undefined : log, keepOld)
+    const repaired = fixed.filter(f => f !== null).length
+    if (!repaired) return null
+    let text = ''
+    li.words.forEach((w, k) => {
+      // A word's gap the reading missed is put back only between words whose
+      // labels fit their ink: between two that do not, the gap is not where the
+      // labels part ("l\"|Contrato\"" over ink saying "el \"Contrato\"").
+      const inkGap = w.x0 - li.words[k - 1]?.x1 >= wordGap * 0.6 && reads[k] && reads[k - 1]
+      if (k > 0 && (li.spaceAfter.has(w.from) || inkGap)) text += ' '
+      text += fixed[k] ?? labelOf(w)
+    })
+    if (text === li.text) return null
+    const stray = wordsLeavingVocab(li, text, atlas, log)
+    const fresh = [...stray].filter(k => !keepOld.has(k))
+    if (stray.size) {
+      if (!fresh.length) return null
+      for (const k of fresh) keepOld.add(k)
+      continue
+    }
+    text = lookalikeFix(li, text, atlas, log)
+    const ln = analyzeLine(pi, { id: li.id, text, inkRect: li.inkRect, confidence: li.confidence })
+    log?.(`repaired: "${text}" ${ln ? 'analysed' : 'NOT analysed'}`)
+    return ln ? { text, li: ln, repaired } : null
+  }
+  return null
+}
+
+/** Strokes the shapes cannot tell apart in most faces. */
+const LOOKALIKE: Record<string, string[]> = { i: ['l'], l: ['i', 'I'], I: ['l'] }
+
+/**
+ * A word the re-read made that the document reads nowhere, one lookalike
+ * stroke from a word it reads at least twice, is that word: "ei" is "el",
+ * "Ia" is "la" — a thin stroke is an "i", an "l" or an "I" in most faces, and
+ * the shapes cannot say which. Only for the words the re-read changed: the
+ * recogniser's own readings stay as it read them.
+ */
+function lookalikeFix(li: LineInk, text: string, atlas: Atlas, log?: (line: string) => void): string {
+  const forms = atlas.forms
+  if (!forms?.size) return text
+  const old = new Set(li.text.split(/\s+/).map(formKey))
+  return text.split(' ').map(tok => {
+    const core = formKey(tok)
+    if (core.length < 2 || old.has(core) || (forms.get(core) ?? 0) > 0) return tok
+    const chars = [...core]
+    for (let i = 0; i < chars.length; i++) for (const alt of LOOKALIKE[chars[i]] ?? []) {
+      const v = [...chars.slice(0, i), alt, ...chars.slice(i + 1)].join('')
+      if ((forms.get(v) ?? 0) >= 2) {
+        log?.(`"${core}" read as "${v}", a word of the document`)
+        return tok.replace(core, v)
+      }
+    }
+    return tok
+  }).join(' ')
+}
+
+/**
+ * A word the document reads elsewhere is not re-read into one it reads
+ * nowhere. The shapes confuse letters a reader never would — "Limitado" came
+ * back "Lmitado" (its "i" touching the "m"), "Upgrade" "Uugrade", "o
+ * Licencia:" "ooi Ucencia:" over an underline that had cut the descenders off
+ * — while the same words, read the same way on other lines, say what they
+ * are. Each token of the old reading that is a word of the document (read
+ * elsewhere: three letters once, two letters three times) is followed into
+ * the new text by aligning the two letter by letter; unless it comes back
+ * intact, or only as words the document also reads, the ink words holding
+ * its letters are returned — to keep their old labels.
+ */
+function wordsLeavingVocab(li: LineInk, text: string, atlas: Atlas, log?: (line: string) => void): Set<number> {
+  const out = new Set<number>()
+  const vocab = atlas.vocab
+  if (!vocab?.size) return out
+  const own = new Map<string, number>()
+  for (const t of li.text.split(/\s+/)) { const v = vocabKey(t); if (v) own.set(v, (own.get(v) ?? 0) + 1) }
+  const known = (v: string) => { const e = (vocab.get(v) ?? 0) - (own.get(v) ?? 0); return v.length >= 3 ? e >= 1 : v.length === 2 && e >= 3 }
+  const labels = li.chars
+  const N = labels.length
+  const newToks = text.split(/\s+/).filter(Boolean)
+  const newChars: string[] = [], tokOf: number[] = []
+  newToks.forEach((t, ti) => { for (const c of t) { newChars.push(c); tokOf.push(ti) } })
+  const toNew = new Map<number, number>(alignChars(labels, newChars))
+  for (let i = 1, s = 0; i <= N; i++) {
+    if (i < N && !li.spaceAfter.has(i)) continue
+    const a = s, b = i
+    s = i
+    const v = vocabKey(labels.slice(a, b).join(''))
+    if (!v || !known(v)) continue
+    const js: number[] = []
+    for (let p = a; p < b; p++) { const j = toNew.get(p); if (j !== undefined) js.push(j) }
+    const now = [...new Set(js.map(j => tokOf[j]))].map(ti => newToks[ti])
+    if (now.length && now.every(t => { const nv = vocabKey(t); return !nv || nv === v || (vocab.get(nv) ?? 0) >= 1 })) continue
+    // Letters only ADDED at its edges leave the word as it was read: "no"
+    // was "uno" with its "u" lost, and a misreading the recogniser repeats
+    // ("mitidas" for "emitidas") is a "word of the document" too. Unless the
+    // added letter repeats the one beside it — a broken letter's second half
+    // read as another copy ("Precio" came back "Precioo").
+    if (js.length === b - a && js.every((j, q) => j === js[0] + q) && now.length === 1) {
+      const ti = tokOf[js[0]]
+      let t0 = js[0], t1 = js[js.length - 1]
+      while (t0 > 0 && tokOf[t0 - 1] === ti) t0--
+      while (t1 + 1 < newChars.length && tokOf[t1 + 1] === ti) t1++
+      const same = (x: string | undefined, y: string | undefined) => x !== undefined && y !== undefined && x.toLowerCase() === y.toLowerCase()
+      const doubled = (t0 < js[0] && same(newChars[js[0] - 1], labels[a])) || (t1 > js[js.length - 1] && same(newChars[js[js.length - 1] + 1], labels[b - 1]))
+      if (!doubled) continue
+    }
+    log?.(`"${labels.slice(a, b).join('')}" is a word of the document; ${now.length ? `"${now.join(' ')}" is not` : 'it is gone'}: kept`)
+    li.words.forEach((w, k) => { if (w.from < b && w.to > a) out.add(k) })
+  }
+  return out
 }
 
 /** Where `b` differs from `a`: each stretch of `a` [a0, a1) and what `b` has in its place. */
@@ -1545,6 +1785,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     work[p * 4] = pi.paper[p * 3]; work[p * 4 + 1] = pi.paper[p * 3 + 1]; work[p * 4 + 2] = pi.paper[p * 3 + 2]
     touch(p)
   }
+  relaxErased(work, eraseSet, pi, W, s.h)
   for (const plan of ulPlans) if (plan) plan.erase(work, pi, touch)
 
   // 7. Print: the moved letters with their own pixels, the new ones from
@@ -1575,6 +1816,53 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     box: box.x0 < box.x1 ? box : undefined,
     drawn: nc.map(c => c.drawnAs ?? '?').join(''),
     debug: { layout: layoutLog, underlines: ulPlans.map(p => p ? p.span : 'unchanged') }
+  }
+}
+
+/**
+ * The erased pixels relaxed to a harmonic fill of the ground around them.
+ *
+ * The paper estimate under a letter is push-pull over the pixels `preparePage`
+ * did not call ink — and on a coloured, noisy ground (a scanned cover's JPEG
+ * grain) the darker grain near the letters is called ink too, so the fill is
+ * made from the brighter grain alone: a vacated word on a green cover came out
+ * a shade lighter than the green around it, a box where it had been. Relaxed
+ * (successive over-relaxation of the four-neighbour average) with the scan's
+ * OWN pixels held fixed around the hole — the estimate only where a neighbour
+ * is real ink — the fill takes the ground's true level, and a gradient stays
+ * exact across it. On plain paper the two agree and nothing changes.
+ */
+function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W: number, H: number): void {
+  if (!erase.size) return
+  let x0 = W, y0 = H, x1 = -1, y1 = -1
+  for (const p of erase) { const x = p % W, y = (p - x) / W; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y }
+  // A frame one pixel wider, for the fixed neighbours.
+  x0 = Math.max(0, x0 - 1); y0 = Math.max(0, y0 - 1); x1 = Math.min(W - 1, x1 + 1); y1 = Math.min(H - 1, y1 + 1)
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1
+  const free = new Uint8Array(bw * bh)
+  const v = [new Float32Array(bw * bh), new Float32Array(bw * bh), new Float32Array(bw * bh)]
+  const src = pi.s.data
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    const p = (y0 + y) * W + x0 + x, j = y * bw + x
+    if (erase.has(p)) { free[j] = 1; for (let c = 0; c < 3; c++) v[c][j] = work[p * 4 + c] }
+    else for (let c = 0; c < 3; c++) v[c][j] = pi.dark[p] < 50 ? src[p * 4 + c] : pi.paper[p * 3 + c]
+  }
+  const idx: number[] = []
+  for (let j = 0; j < bw * bh; j++) if (free[j]) idx.push(j)
+  const omega = 1.85
+  for (let it = 0; it < 120; it++) {
+    for (const j of idx) {
+      const x = j % bw, y = (j - x) / bw
+      const l = x > 0 ? j - 1 : j, r = x < bw - 1 ? j + 1 : j, u = y > 0 ? j - bw : j, d = y < bh - 1 ? j + bw : j
+      for (let c = 0; c < 3; c++) {
+        const a = v[c]
+        a[j] += omega * ((a[l] + a[r] + a[u] + a[d]) * 0.25 - a[j])
+      }
+    }
+  }
+  for (const j of idx) {
+    const x = j % bw, y = (j - x) / bw, p = (y0 + y) * W + x0 + x
+    for (let c = 0; c < 3; c++) work[p * 4 + c] = v[c][j]
   }
 }
 

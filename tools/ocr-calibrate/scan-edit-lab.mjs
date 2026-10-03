@@ -157,6 +157,7 @@ if (cmd === 'lines' || cmd === 'debug') {
     words += li.words.length; cut += li.words.filter(w => w.cut).length
     const ws = li.words.map(w => `${li.chars.slice(w.from, w.to).join('')}${w.cut ? '' : '~'}${w.weight ? '/' + w.weight.toFixed(3) : ''}`).join(' ')
     if (process.env.PALE && LI.lastPaleTest) console.log('     pale', JSON.stringify(LI.lastPaleTest()), 'smooth', JSON.stringify(LI.lastSmoothTest?.()))
+    if (process.env.INK && LI.lastInkTest) { const m = LI.lastInkTest(); if (m) { const so = [...m].sort((x, y) => x - y); console.log('     ink', m.join(' ')) } }
     if (process.env.FRAG) console.log('   frag', JSON.stringify(LI.lastFragTest?.()))
     console.log(`${it.id.padEnd(9)} em ${li.fit.emPx.toFixed(1)} sl ${li.fit.slope.toFixed(4)} gaps ${li.letterGapPx}/${li.wordGapPx} core ${li.coreLevel} rules ${li.rules.length} cut ${li.words.filter(w => w.cut).length}/${li.words.length} | ${ws.slice(0, 160)}`)
     if (cmd === 'debug') {
@@ -432,6 +433,26 @@ if (cmd === 'repair') {
   if (r && args[2]) console.log('merged: "' + SE.mergeReadings(li.text, args[2], r.text) + '"')
 }
 
+if (cmd === 'repairall') {
+  // `repairall <page>`: every analysed line's reading beside its repair from
+  // the page's own letters — how the editor would read the page.
+  const GA = await load('/src/utils/ocr/glyphAtlas.ts')
+  const SE = await load('/src/utils/ocr/scanEdit.ts')
+  const p = Number(args[0])
+  const { pages, atlas } = await pagesAndAtlas(GA)
+  const { pi, lis } = pages.get(p)
+  let n = 0, changed = 0
+  const t0 = Date.now()
+  for (const li of lis) {
+    n++
+    const r = SE.repairReading(pi, li, atlas)
+    if (!r) continue
+    changed++
+    console.log(`${li.id}\n  ocr: "${li.text}"\n  fix: "${r.text}"  (${r.repaired} word${r.repaired > 1 ? 's' : ''})`)
+  }
+  console.log(`${changed} of ${n} lines repaired in ${Date.now() - t0} ms`)
+}
+
 if (cmd === 'exact') {
   // `exact <page>`: how the page's words were cut — exact, cut but not exact,
   // not cut — and how many of the others stand in one ink run per character.
@@ -635,6 +656,21 @@ if (cmd === 'fill') {
   for (let i = 0; i < 3; i++) stack.set(cropRgba(s, cx0, cy0, cx1, cy1, [s.data, a, b][i]), i * (h + 2) * w * 4)
   savePng(args[2], w, h * 3 + 4, stack, Number(args[3] || 1))
   console.log(`${it.id} "${it.text}" em ${em.toFixed(1)}px reversed ${rev} rect ${JSON.stringify(rect)} changed ${JSON.stringify(got)} ${JSON.stringify(GF.lastGroundFill())}`)
+}
+
+if (cmd === 'colors') {
+  // `colors <page>`: the ink and paper colours `sampleLineColors` gives every
+  // run, read off the scan (with VARIANT, the variant's sampling).
+  const p = Number(args[0])
+  const s = scanOf(p)
+  const OS = await load('/src/utils/ocr/ocrSampling.ts')
+  const ctx = R.readerCtx(s)
+  const hex = (c) => '#' + c.map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('')
+  for (const it of itemsOf(p)) {
+    const b = R.pxRectOf(s, it.inkRect)
+    const { color, background } = OS.sampleLineColors(ctx, { x: b.x0, y: b.y0, width: b.x1 - b.x0, height: b.y1 - b.y0 })
+    console.log(`${it.id.padEnd(10)} ink ${hex(color)} paper ${hex(background)}  "${it.text.slice(0, 50)}"`)
+  }
 }
 
 if (cmd === 'cell') {

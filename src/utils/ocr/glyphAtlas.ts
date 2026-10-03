@@ -79,6 +79,21 @@ export interface Atlas {
   stem: { regular: number; bold: number }
   /** Each established letter's medoid shape and how closely its copies agree with it, keyed `char|bold`. */
   medoids: Map<string, { shape: Float32Array; cohesion: number }>
+  /** How often each word (`vocabKey`) is read on the pages — what the document says elsewhere. */
+  vocab?: Map<string, number>
+  /** The same, case kept (`formKey`). */
+  forms?: Map<string, number>
+}
+
+/** A reading's word with the punctuation around it dropped; '' for a token with no letter in it. */
+export function formKey(token: string): string {
+  const t = token.normalize('NFC').replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')
+  return /\p{L}/u.test(t) ? t : ''
+}
+
+/** A reading's word as the document's vocabulary counts it: `formKey`, case-folded. */
+export function vocabKey(token: string): string {
+  return formKey(token).toLowerCase()
 }
 
 /** The x-height and cap height of a line, px, from its cut letters. */
@@ -354,13 +369,17 @@ export interface PageHarvest {
   gaps: { a: string; b: string; g: number; weight: number | null }[]
   /** Word gaps, ems. */
   wordGaps: number[]
+  /** Its lines' words, counted (`formKey`). */
+  forms: Map<string, number>
 }
 
 export function harvestPage(pi: PageInk, lines: LineInk[], page: number): PageHarvest {
   const exemplars: Exemplar[] = []
   const weights: number[] = [], wordGaps: number[] = []
   const gaps: PageHarvest['gaps'] = []
+  const forms = new Map<string, number>()
   for (const li of lines) {
+    for (const t of li.text.split(/\s+/)) { const f = formKey(t); if (f) forms.set(f, (forms.get(f) ?? 0) + 1) }
     harvestLine(pageOfLine(pi, li), li, page, exemplars)
     const em = li.fit.emPx
     // Only gaps the reading puts a space in: the ink's split also cuts one
@@ -379,7 +398,7 @@ export function harvestPage(pi: PageInk, lines: LineInk[], page: number): PageHa
       }
     }
   }
-  return { page, exemplars, weights, gaps, wordGaps }
+  return { page, exemplars, weights, gaps, wordGaps, forms }
 }
 
 /** Build the atlas from analysed lines (of one page or several pages scanned alike). */
@@ -414,6 +433,12 @@ export function atlasFrom(harvests: PageHarvest[]): Atlas {
     }
   }
   const wordGaps = harvests.flatMap(h => h.wordGaps).sort((a, b) => a - b)
+  const forms = new Map<string, number>(), vocab = new Map<string, number>()
+  for (const h of harvests) for (const [f, n] of h.forms ?? []) {
+    forms.set(f, (forms.get(f) ?? 0) + n)
+    const v = f.toLowerCase()
+    vocab.set(v, (vocab.get(v) ?? 0) + n)
+  }
   const med = (v: number[]) => v.length ? [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)] : null
   const regW = med(weights.filter(w => boldAt === null || w < boldAt)) ?? 0.06
   const boldW = med(weights.filter(w => boldAt !== null && w >= boldAt)) ?? regW * 1.7
@@ -422,7 +447,7 @@ export function atlasFrom(harvests: PageHarvest[]): Atlas {
     spacing: { regular: fitSpacing(regular), bold: fitSpacing(bold.length >= 20 ? bold : [...bold, ...regular]) },
     wordGapEm: wordGaps.length ? wordGaps[Math.floor(wordGaps.length / 2)] : 0.28,
     stem: { regular: regW, bold: boldW },
-    medoids
+    medoids, vocab, forms
   }
 }
 
