@@ -268,10 +268,13 @@ if (cmd === 'edit') {
   const { s, pi, lis } = pages.get(p)
   const work = Uint8ClampedArray.from(s.data)
   const norm = (t) => (t || '').replace(/\s+/g, '').toLowerCase()
-  // The same margins scanEditPage computes.
-  const ends = lis.filter(l => l.words.length >= 5).map(l => l.words[l.words.length - 1].x1).sort((a, b) => a - b)
-  const editOpts = { justifyTo: ends.length >= 3 ? ends[Math.floor(ends.length * 0.8)] : null, limitRight: s.w - Math.round(18 / Math.abs(s.toPage[0])) }
-  console.log('margins', JSON.stringify(editOpts))
+  // The same margins scanEditPage computes (a line is respaced to the page's
+  // text margin only when it is a line of a justified paragraph).
+  const SEP = await load('/src/utils/ocr/scanEditPage.ts')
+  const margin = SEP.textMargin ? SEP.textMargin(lis) : null
+  const limitRight = s.w - Math.round(18 / Math.abs(s.toPage[0]))
+  const optsFor = (li) => ({ justifyTo: SEP.justifiedMargin ? SEP.justifiedMargin(margin, lis, li) : margin, limitRight })
+  console.log('margins', JSON.stringify({ margin, limitRight }))
   for (const spec of suite) {
     const items = itemsOf(p)
     // `id` names the run outright, for text that occurs on more than one line.
@@ -283,7 +286,7 @@ if (cmd === 'edit') {
     if (!li) { console.log(`${spec.label}: line not analysed`); continue }
     const next = it.text.replace(spec.from ?? spec.find ?? spec.exact, spec.to)
     const t1 = Date.now()
-    let res = editOn(SE, pi, li, atlas, next, work, editOpts)
+    let res = editOn(SE, pi, li, atlas, next, work, optsFor(li))
     if (!res.ok && res.wanting?.length) {
       // Letters no page holds: fit the scan's look once, synthesise, retry.
       const GS = await load('/src/utils/ocr/glyphSynth.ts')
@@ -295,7 +298,7 @@ if (cmd === 'edit') {
         console.log(`   want "${w.char}" em ${w.emPx.toFixed(1)} xh ${w.xh?.toFixed(1)} capH ${w.capH?.toFixed(1)} bold ${w.bold} -> ${g ? `${g.w}x${g.h} ink ${g.inkL}-${g.inkR} base ${g.baseY}` : 'none'}`)
         if (g) synth.set(SE.wantKey(w), g)
       }
-      res = editOn(SE, pi, li, atlas, next, work, { ...editOpts, synth })
+      res = editOn(SE, pi, li, atlas, next, work, { ...optsFor(li), synth })
     }
     const tookMs = Date.now() - t1
     if (!res.ok) { console.log(`${spec.label}: REFUSED ${res.reason}`); continue }

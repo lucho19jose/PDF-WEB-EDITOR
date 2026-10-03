@@ -277,6 +277,37 @@ export function scanEditable(item: OcrTextItem): string | null {
   return null
 }
 
+/**
+ * The page's right text margin: where its long lines end (the upper part of
+ * their spread — a justified paragraph's lines all end there).
+ */
+export function textMargin(lines: Iterable<LineInk | null>): number | null {
+  const ends: number[] = []
+  for (const li of lines) if (li && li.words.length >= 5) ends.push(li.words[li.words.length - 1].x1)
+  ends.sort((a, b) => a - b)
+  return ends.length >= 3 ? ends[Math.floor(ends.length * 0.8)] : null
+}
+
+/**
+ * The margin a line is respaced to after its edit, or null. A justified line
+ * is a line of a justified PARAGRAPH: one just above or below it ends at the
+ * same margin. A title that alone reaches it — a slide's "Introduction to
+ * Deep Learning" — is not respaced: deleting one letter from it spread every
+ * word gap to keep an edge it never kept.
+ */
+export function justifiedMargin(margin: number | null, lines: Iterable<LineInk | null>, li: LineInk): number | null {
+  if (margin === null || !li.words.length) return null
+  const em = li.fit.emPx
+  if (Math.abs(li.words[li.words.length - 1].x1 - margin) > em * 0.6) return null
+  for (const o of lines) {
+    if (!o || o === li || !o.words.length) continue
+    if (Math.abs(o.words[o.words.length - 1].x1 - margin) > em * 0.6) continue
+    const dy = Math.abs(o.fit.y - li.fit.y)
+    if (dy > em * 0.5 && dy < em * 2.5) return margin
+  }
+  return null
+}
+
 export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, atlas: Atlas, items: OcrTextItem[], synth?: Map<string, GlyphImage>, unread?: Map<string, string>): ScanEditPlan {
   const s = pi.s
   // .slice(), not Uint8ClampedArray.from: `from` walks the iterator and took
@@ -285,13 +316,8 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
   const handled = new Set<string>()
   const modes: Record<string, string> = {}
   const wanting = new Map<string, GlyphWant>()
-  // The page's right text margin: where its long lines end (the upper part of
-  // their spread — a justified paragraph's lines all end there). A line that
-  // ended there is respaced to end there after its edit.
-  const ends: number[] = []
-  for (const li of lines.values()) if (li && li.words.length >= 5) ends.push(li.words[li.words.length - 1].x1)
-  ends.sort((a, b) => a - b)
-  const justifyTo = ends.length >= 3 ? ends[Math.floor(ends.length * 0.8)] : null
+  const margin = textMargin(lines.values())
+  const justifyFor = (li: LineInk) => justifiedMargin(margin, lines.values(), li)
   // And no line may run off the paper: a quarter inch from its edge at most.
   const limitRight = s.w - Math.round(18 / Math.abs(s.toPage[0] || 1))
   const done: { item: OcrTextItem; box: { x0: number; y0: number; x1: number; y1: number }; words: { text: string; x0: number; x1: number; base: number }[]; li: LineInk }[] = []
@@ -317,7 +343,7 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
     // of its own, and folded back into this one below.
     const pl = li.inverted ? invertedPage(pi) : pi
     const w = li.inverted ? (workInv ??= pl.s.data.slice()) : work
-    const res = applyLineEdit(pl, li, atlas, item.text, w, { remove: item.removed, justifyTo, limitRight, synth })
+    const res = applyLineEdit(pl, li, atlas, item.text, w, { remove: item.removed, justifyTo: justifyFor(li), limitRight, synth })
     if (!res.ok) {
       modes[item.id] = `vector (${res.reason})`
       for (const w of res.wanting ?? []) wanting.set(wantKey(w), w)

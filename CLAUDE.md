@@ -4681,6 +4681,13 @@ A difference of up to two pixels (or 0.08 em) is split between the gaps either
 side of the change, as a figure set in the same advance; the overlay is the
 figure's box alone.
 
+**Only a line of a justified PARAGRAPH is respaced to the margin**
+(`justifiedMargin` in scanEditPage, shared with the lab): one just above or
+below it must end at the same margin. A slide's title "Introduction to Deep
+Learning" happened to end at the page's estimated margin, and deleting the
+"o" of "to" spread every word gap of it to keep an edge it never kept; now
+the line simply ends shorter.
+
 **A justified line is re-justified whole when the change is large.** Only the
 gaps after the change used to give way, a quarter of each at most: "el 31 de
 agosto de 2026" → "el 30 de septiembre de 2026" closed the gaps after the date
