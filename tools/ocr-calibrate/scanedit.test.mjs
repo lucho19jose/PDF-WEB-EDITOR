@@ -350,6 +350,57 @@ test('a vector patch on a gradient is filled from the ground: the title goes, th
   assert.equal(damaged, 0, 'the line beneath was touched')
 })
 
+test('a number whose figures touch is cut by its pitch, and a changed figure takes its own cell', () => {
+  // 200 DPI (0.36 pt a pixel), Arimo at 11pt: a cost centre "9408100" whose
+  // "08" is set close enough to touch, and a date line that holds a "2".
+  const W = 1000, H = 220, size = 11 / 0.36
+  const font = new mupdf.Font('Arimo', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Regular.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const adv = (ch) => font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0))) * size
+  const set = (text, x, y, squeeze = () => 0) => {
+    const t = new mupdf.Text()
+    let pen = x
+    for (let i = 0; i < text.length; i++) {
+      t.showString(font, [size, 0, 0, -size, pen, y], text[i])
+      pen += adv(text[i]) - squeeze(i)
+    }
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  }
+  // The "0" (index 2 of the number) is set 5 px into the "8"'s advance: they touch.
+  set('Centro de costos', 40, 80)
+  set('9408100', 300, 80, i => (i === 2 ? 5 : 0))
+  set('Fecha 2024 y 2026', 40, 150)
+  dev.close()
+  const g = pix.getPixels(), stride = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = g[y * stride + x], i = (y * W + x) * 4
+    rgba[i] = rgba[i + 1] = rgba[i + 2] = v
+    rgba[i + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Figures')
+  const pi = LI.preparePage(raster)
+  const box = (y0, y1) => ({ x: 30 * 0.36, y: y0 * 0.36, width: 560 * 0.36, height: (y1 - y0) * 0.36 })
+  const li = LI.analyzeLine(pi, { id: 'n', text: 'Centro de costos 9408100', inkRect: box(52, 86), confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const other = LI.analyzeLine(pi, { id: 'd', text: 'Fecha 2024 y 2026', inkRect: box(122, 156), confidence: 95 })
+  assert.ok(other, LI.lastLineFailure())
+  // The number's ink words (the gaps between its runs split it): every one,
+  // the touching "08" included, cut exactly.
+  const first = 'Centro de costos '.replace(/ /g, '').length
+  const parts = li.words.filter(w => w.from >= first)
+  assert.ok(parts.length && parts.every(w => w.exact), `the number is cut exactly: ${JSON.stringify(parts.map(w => [w.from, w.to, w.exact]))}`)
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li, other], 0)])
+  const work = raster.data.slice()
+  // The "8" of the touching pair becomes a "2": drawn alone, every other
+  // figure — its "0" neighbour included — keeps its pixels.
+  const res = SE.applyLineEdit(pi, li, atlas, 'Centro de costos 9402100', work, {})
+  assert.ok(res.ok, res.reason)
+  assert.match(res.drawn, /^k+[gws]kkk$/, `drawn ${res.drawn}`)
+})
+
 test('a large bold title on white paper is edited without grey halos: its thick strokes are ink, not paper', () => {
   // A bilevel scan at 300 DPI (0.24 pt a pixel): a 45pt bold title, its stems
   // ~34 px wide — wider than the paper estimate's 3.6pt filter can see across.

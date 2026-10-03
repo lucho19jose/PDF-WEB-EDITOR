@@ -53,10 +53,24 @@ function imageOf(ex: Exemplar): GlyphImage {
  * borrowed from read as a lighter word set into it.
  */
 function toned(g: GlyphImage, fromInk: [number, number, number], toInk: [number, number, number]): GlyphImage {
-  const k = [0, 1, 2].map(c => Math.max(0.75, Math.min(1.35, (255 - toInk[c]) / Math.max(1, 255 - fromInk[c]))))
-  if (k.every(v => Math.abs(v - 1) < 0.03)) return g
+  // Each pixel's DARKNESS, as a share of the copy's own ink, printed in the
+  // target line's ink: the hue is the line's, never the copy's. Scaled channel
+  // by channel instead, a copy kept the colour fringes of where it was taken
+  // from — JPEG chroma, a stamp's red — and a "123" borrowed into a grey form
+  // came with a pink haze (ten levels of red over the green) the line around
+  // it did not have.
+  const lum = (r: number, gg: number, b: number) => (r * 299 + gg * 587 + b * 114) / 1000
+  const fromDark = Math.max(1, 255 - lum(fromInk[0], fromInk[1], fromInk[2]))
+  const toDark = Math.max(1, 255 - lum(toInk[0], toInk[1], toInk[2]))
+  // How much darker the target's ink is, within the old bounds: a copy is
+  // never made more than a third darker or a quarter lighter than it was.
+  const k = Math.max(0.75, Math.min(1.35, toDark / fromDark))
+  const scale = k * fromDark / toDark
   const t = new Uint8ClampedArray(g.t.length)
-  for (let i = 0; i < g.t.length; i++) t[i] = 255 - (255 - g.t[i]) * k[i % 3]
+  for (let i = 0; i < g.w * g.h; i++) {
+    const d = (255 - lum(g.t[i * 3], g.t[i * 3 + 1], g.t[i * 3 + 2])) / fromDark
+    for (let c = 0; c < 3; c++) t[i * 3 + c] = 255 - d * scale * (255 - toInk[c])
+  }
   return { ...g, t }
 }
 
@@ -123,6 +137,40 @@ export function scaleImage(g: GlyphImage, s: number): GlyphImage {
     m[y * w + x] = 1
   }
   return { t, m, w, h, baseY: g.baseY * s, inkL: g.inkL * s, inkR: g.inkR * s }
+}
+
+/**
+ * A glyph moved down by a fraction of a pixel, `fy` in (0, 1), resampled with
+ * the same cubic kernel `scaleImage` uses. One row taller, so nothing of it is
+ * cut off at the foot; the baseline goes down with the ink.
+ */
+export function shiftDown(g: GlyphImage, fy: number): GlyphImage {
+  const w = g.w, h = g.h + 1
+  const t = new Uint8ClampedArray(w * h * 3).fill(255)
+  const m = new Uint8Array(w * h)
+  const cr = (x: number) => {
+    const a = Math.abs(x)
+    return a < 1 ? 1.5 * a ** 3 - 2.5 * a ** 2 + 1 : a < 2 ? -0.5 * a ** 3 + 2.5 * a ** 2 - 4 * a + 2 : 0
+  }
+  for (let y = 0; y < h; y++) {
+    const sy = y - fy, y0 = Math.floor(sy), f = sy - y0
+    for (let x = 0; x < w; x++) {
+      let any = false
+      for (let dy = -1; dy <= 2; dy++) { const Y = y0 + dy; if (Y >= 0 && Y < g.h && g.m[Y * w + x] && Math.abs(dy - f) < 1.5) { any = true; break } }
+      if (!any) continue
+      for (let c = 0; c < 3; c++) {
+        let acc = 0, wsum = 0
+        for (let dy = -1; dy <= 2; dy++) {
+          const Y = y0 + dy, wt = cr(dy - f)
+          acc += (Y < 0 || Y >= g.h ? 255 : g.t[(Y * w + x) * 3 + c]) * wt
+          wsum += wt
+        }
+        t[(y * w + x) * 3 + c] = acc / wsum
+      }
+      m[y * w + x] = 1
+    }
+  }
+  return { ...g, t, m, w, h, baseY: g.baseY + fy }
 }
 
 /**
@@ -1636,13 +1684,36 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   // The prefix stays where it is.
   for (let j = 0; j < pre; j++) place(nc[j], li.cells[nc[j].old].inkL)
   let pen = pre > 0 ? nc[pre - 1].x + widthOf(nc[pre - 1]) : -Infinity
-  pen = layoutRun(pre, tail, pen, extra)
+  // Figures replacing as many figures take the old ones' CELLS, each centred
+  // where its predecessor stood: lining figures share one advance, so an
+  // amount or a code keeps its spacing to the pixel and nothing after it
+  // moves. Typeset by the gap model instead, "13,000.00" → "13,500.00" put
+  // the new "5" two pixels right of the old "0" and moved ",00.00" with it.
+  const sameCells = (() => {
+    if (pre < 1 || tail >= nc.length || tail <= pre) return false
+    const a = nc[pre - 1].old, b = nc[tail].old
+    if (b - a - 1 !== tail - pre) return false
+    for (let k = 0; k < tail - pre; k++) {
+      const c = nc[pre + k]
+      // An approximate cell is a share of a word's ink, not a figure's place.
+      if (c.kind === 'orig' || c.space !== oldSpace(a + 1 + k) || !/^[0-9]$/.test(c.ch) || !/^[0-9]$/.test(oldChars[a + 1 + k]) || li.cells[a + 1 + k].approx) return false
+    }
+    return true
+  })()
+  if (sameCells) {
+    const a = nc[pre - 1].old
+    for (let k = 0; k < tail - pre; k++) {
+      const c = nc[pre + k], cell = li.cells[a + 1 + k]
+      place(c, cell.inkL + ((cell.inkR - cell.inkL) - widthOf(c)) / 2)
+    }
+    pen = nc[tail - 1].x + widthOf(nc[tail - 1])
+  } else pen = layoutRun(pre, tail, pen, extra)
   // The tail, as one block, after the middle.
   let dxTail = 0, dyTail = 0
   const oldTailX = tail < nc.length ? li.cells[nc[tail].old].inkL : Infinity
   if (tail < nc.length) {
     // A line whose first letters went starts where it always started.
-    const x = tail === 0 ? li.cells[0].inkL : pen + gapBefore(tail)
+    const x = tail === 0 ? li.cells[0].inkL : sameCells ? oldTailX : pen + gapBefore(tail)
     dxTail = Math.round(x - oldTailX)
     // A change about as wide as what it replaced ("5" → "6") keeps the tail
     // where it is: the difference goes into the gaps either side of the
@@ -1703,10 +1774,36 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     return off > -em * 0.9 && off < em * 0.5
   })
   const clean = !li.loose.some(significant) && !ownRules.length
-  let target: number | null = null
-  if (opts.justifyTo != null && clean && Math.abs(oldRight - opts.justifyTo) <= em * 0.6 && nc.length) target = oldRight
-  else if (opts.limitRight != null && newRight > opts.limitRight) target = opts.limitRight
+  // A figure column is set flush RIGHT against its cell's border, and a
+  // longer amount grows to the left: "20,000.00" → "25,000.00" redrawn from
+  // the line's start ran its last "0" into the border. A line of figures
+  // (most of it digits) that ends within an em and a half of a vertical rule,
+  // with more room on its left than on its right, keeps its right edge.
   let rigid = true
+  const oldLeft = li.cells.length ? Math.min(...li.cells.map(c => c.inkL)) : 0
+  const flushRight = (() => {
+    if (!clean || !nc.length || Math.abs(newRight - oldRight) < 1) return false
+    const visible = oldChars.filter(ch => ch.trim())
+    const digits = visible.filter(ch => /[0-9]/.test(ch)).length
+    if (digits < 2 || digits < visible.length * 0.6) return false
+    const right = li.borders.filter(x => x >= oldRight - 1 && x <= oldRight + em * 1.5)
+    if (!right.length) return false
+    const left = li.borders.filter(x => x <= oldLeft + 1).sort((a, b) => b - a)[0]
+    return left === undefined || oldLeft - left > (Math.min(...right) - oldRight) * 2
+  })()
+  if (flushRight) {
+    const d = Math.round(oldRight - newRight)
+    for (const c of nc) {
+      if (c.kind === 'orig') place(c, c.x + d)
+      else c.x += d
+    }
+    newRight += d
+    rigid = false
+    notes.push('set flush right in its cell')
+  }
+  let target: number | null = null
+  if (!flushRight && opts.justifyTo != null && clean && Math.abs(oldRight - opts.justifyTo) <= em * 0.6 && nc.length) target = oldRight
+  else if (!flushRight && opts.limitRight != null && newRight > opts.limitRight) target = opts.limitRight
   if (target !== null && Math.abs(newRight - target) >= 1 && pre < nc.length) {
     if (!clean) return { ok: false, reason: 'the edit would run the line off the paper', notes }
     rigid = false
@@ -1856,8 +1953,14 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     if (c.kind !== 'synth' || !c.glyph) continue
     const g = c.glyph
     const cx = c.x + (g.inkR - g.inkL) / 2
-    const X = Math.round(c.x - g.inkL), Y = Math.round(base(cx) - g.baseY)
-    printGlyph(work, W, s.h, g, X, Y, touch)
+    // On the baseline to the sub-pixel: rounded, each glyph lands up to half
+    // a pixel off it, two neighbours a whole pixel apart — "PYT000123" came
+    // out with its first new "0" a pixel above the next.
+    const yExact = base(cx) - g.baseY
+    const Y0 = Math.floor(yExact), fy = yExact - Y0
+    const X = Math.round(c.x - g.inkL)
+    if (fy > 0.2 && fy < 0.8) printGlyph(work, W, s.h, shiftDown(g, fy), X, Y0, touch)
+    else printGlyph(work, W, s.h, g, X, fy >= 0.8 ? Y0 + 1 : Y0, touch)
   }
   for (const plan of ulPlans) if (plan) plan.print(work, pi, touch)
 

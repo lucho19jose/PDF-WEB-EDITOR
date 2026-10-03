@@ -4701,6 +4701,73 @@ Only the image's edge is the bar: refused 6pt short of it, an "X" appended to
 a book cover's "NATURE" went from the page's own letters (damage 0) to a
 redraw in another face (22 497 px).
 
+**A figure is set like a figure.** Hand-written edits of numbers on two forms
+(a payment checklist: cost centre, amount, reference, project code; a public
+service order: order number, day, year, amount, page number) found six ways
+a new figure came out wrong, each measured on the crops (glyph extents per
+5x zoom, ink under 140):
+- **Sized by the wrong measure.** A copy is compared on what both lines
+  measured, and a line that measured neither x-height nor cap height (a lone
+  "8" in a table cell) was compared by its em — the least reliable measure —
+  so "9408100" → "9408200" took an "8" 2 px short of the figures beside it.
+  And x-height first is wrong for a figure or a capital: a form sets "RUC:
+  20613872893" larger than the "Teléfono :" after it, so that line's x-height
+  matched the header's while its figures stood 13% taller, and its "2" went
+  into "Página: 2 de 3" two pixels taller than the "1" it replaced.
+  `sizeRatioOf` (glyphAtlas) measures a capital by the copy's OWN height
+  over the baseline first (`ownCapHeight`, core pixels), then cap height,
+  then x-height; a figure by the lines' cap heights first and its own height
+  (over 0.98, as `lineMetrics` takes figures) only where its line measured
+  neither; any other letter by x-height first. Own height first for figures
+  was tried and is wrong for OLD-STYLE figures, which stand at the x-height
+  or rise and fall below it: a receipt's "1980" → "1985" had every page
+  figure refused and came back in synthesised lining figures.
+- **Typeset instead of placed.** "13,000.00" → "13,500.00" put the new "5"
+  where the gap model said, two pixels right of the old "0", and moved
+  ",00.00" with it. Figures replacing as many figures (each with the same
+  space before it, from cut, not approximate, cells) now take the old ones'
+  cells, centred where each stood — lining figures share one advance — and
+  the tail stays to the pixel: the edit rewrites one figure.
+- **Rounded onto the baseline.** Every borrowed glyph was placed at a whole
+  pixel, half a pixel off the fitted baseline either way, so two neighbours
+  could stand a pixel apart ("PYT000123": the first new "0" a pixel above the
+  next). A fractional offset between 0.2 and 0.8 is now applied by
+  resampling (`shiftDown`, the cubic kernel `scaleImage` uses).
+- **Grown to the right in a right-aligned cell.** "20,000.00" →
+  "25,000.00" redrawn from the line's start ran its last figure into the
+  cell's border. A line mostly of figures that ends within an em and a half
+  of a vertical rule (`li.borders`), with more room on its left than its
+  right, keeps its right edge ("set flush right in its cell").
+- **A number whose figures touch was never cut.** At 150 DPI "9408100" has
+  its "08" in one run of ink, the word was not exact, and changing one figure
+  redrew all five after the "94". `figureCellsOf` (lineInk) cuts a word of
+  figures alone by its PITCH — lining figures share one advance, so a run
+  holding k figures is k equal cells — when every run's width is a whole
+  number of figures within a third and the counts add up to the reading's
+  exactly. A number's separators (". , : / -") stand apart as narrow runs of
+  their own; which runs they are is decided with the counts in reading order
+  (a small DP over the reading's tokens and the runs), so a bold "20,000.00"
+  whose "20", "000" and "00" each touch is cut too. The edit's kept-letter
+  shape check still refuses a figure cut wrong. Measured: "9408100" →
+  "9408200" redraws the "2" alone, "PYT000000" → "PYT000123" keeps "PYT000"
+  and adds "123", and "20,000.00" → "25,000.00" redraws the "5" alone.
+- **A borrowed glyph brought its colour fringes.** `toned` scaled each
+  channel by the ratio of the two lines' inks, so a copy kept the chroma of
+  where it was taken from (JPEG fringes, a stamp's red): "123" borrowed into
+  a grey form came with a pink haze, ten levels of red over the green that
+  the line around it did not have. Each pixel's darkness, as a share of the
+  copy's ink, is now printed in the target line's ink (within the old
+  0.75–1.35 bound on how much darker or lighter); the haze is gone, and the
+  MSP edits move by at most 8 levels on a few pixels.
+
+The MSP suite in the browser is unchanged (14/14 on the scan, damage 0); in
+the lab the misread amount now keeps its tail in place and two figures change
+their source copy. **Known:** a figure the page does not hold is synthesised
+in LINING figures, the bundled faces' default: on a 96 DPI receipt set in
+old-style figures, "28/08/2025" → "29/08/2025" (too small to cut, so redrawn
+whole) came back with its synthesised zeros standing a head taller than the
+page's own.
+
 **Letters that stand apart are the cut** (`runCellsOf` in lineInk). The cutter
 refuses a line under 16 px of em ("too small to trace" — a floor for outlines,
 not for moving pixels) and vets widths against a face it guesses; on a 150 DPI

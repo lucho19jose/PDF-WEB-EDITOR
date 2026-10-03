@@ -993,7 +993,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     // of 72 words uncut, and an edit could keep none of their letters — a
     // letter deleted from a logo redrew the whole word, from letters the page
     // did not hold.
-    const byRuns = cutExact ? null : runCellsOf(pieces, wordChars, em)
+    const byRuns = cutExact ? null : runCellsOf(pieces, wordChars, em) ?? figureCellsOf(pieces, wordChars, em)
     const ok = cutOk || !!byRuns
     let wordCells: { char: string; x0: number; x1: number; suspect: boolean }[]
     if (byRuns) {
@@ -1234,6 +1234,110 @@ function runCellsOf(pieces: Comp[], chars: string[], em: number): { char: string
     if (w > adv * 1.6 + 0.12 || (adv >= 0.45 && w < adv * 0.3)) return null
   }
   return spans.map((sp, i) => ({ char: chars[i], x0: sp.x0, x1: sp.x1, suspect: false }))
+}
+
+/**
+ * A NUMBER whose figures touch — "9408100" at 150 DPI, its "08" one run of
+ * ink — cut by its pitch: lining figures share one advance, so the figures
+ * stand at equal steps across the word and a run that holds k of them is k
+ * equal cells. The pitch comes from the word itself (its ink spans n figures
+ * less the sidebearing of the two outer ones, about a fifth of a figure); each
+ * run takes as many figures as its width holds, within a third of a figure,
+ * and the counts must add up to the reading's exactly. Only for words of
+ * figures and the separators of a number — a "1" is narrow but stands in a
+ * full figure's cell, and no letter has that property. A separator (". , : /
+ * -") is one narrow run of its own; which runs are separators is decided with
+ * the counts, in reading order, so a bold "20,000.00" whose "20", "000" and
+ * "00" each touch is cut as well as a code. Null otherwise; the kept-letter
+ * shape check in the edit still refuses a figure cut wrong.
+ */
+function figureCellsOf(pieces: Comp[], chars: string[], em: number): { char: string; x0: number; x1: number; suspect: boolean }[] | null {
+  const isFigure = (c: string) => c >= '0' && c <= '9'
+  // Figures, and the separators of a number (each of which stands apart).
+  if (chars.length < 2 || !chars.every(c => isFigure(c) || c === '.' || c === ',' || c === ':' || c === '/' || c === '-')) return null
+  const figures = chars.filter(isFigure).length
+  if (figures < 2) return null
+  const spans: { x0: number; x1: number }[] = []
+  for (const c of [...pieces].sort((a, b) => a.x0 - b.x0)) {
+    const last = spans[spans.length - 1]
+    if (last && c.x0 < last.x1) last.x1 = Math.max(last.x1, c.x1)
+    else spans.push({ x0: c.x0, x1: c.x1 })
+  }
+  if (spans.length >= chars.length || !spans.length) return null
+  // The reading as tokens: one separator, or a run of figures.
+  const tokens: { from: number; to: number; sep: boolean }[] = []
+  for (let i = 0; i < chars.length;) {
+    if (!isFigure(chars[i])) { tokens.push({ from: i, to: i + 1, sep: true }); i++; continue }
+    let j = i
+    while (j < chars.length && isFigure(chars[j])) j++
+    tokens.push({ from: i, to: j, sep: false })
+    i = j
+  }
+  const T = tokens.length, N = spans.length
+  /** How many characters each run holds at this pitch — a separator one narrow run, a run of figures as many as its width holds — or null when no assignment of the reading fits the runs. */
+  const assign = (pitch: number): number[] | null => {
+    const best = Array.from({ length: T + 1 }, () => new Float64Array(N + 1).fill(Infinity))
+    const back: ({ s: number; counts: number[] } | null)[][] = Array.from({ length: T + 1 }, () => new Array(N + 1).fill(null))
+    best[0][0] = 0
+    for (let t = 0; t < T; t++) for (let s = 0; s < N; s++) {
+      if (best[t][s] === Infinity) continue
+      const tok = tokens[t]
+      if (tok.sep) {
+        if (spans[s].x1 - spans[s].x0 <= pitch * 0.6 && best[t][s] < best[t + 1][s + 1]) { best[t + 1][s + 1] = best[t][s]; back[t + 1][s + 1] = { s, counts: [1] } }
+        continue
+      }
+      const d = tok.to - tok.from
+      for (let m = 1; m <= d && s + m <= N; m++) {
+        const counts: number[] = []
+        let cost = 0, ok = true
+        for (let q = s; q < s + m && ok; q++) {
+          const w = spans[q].x1 - spans[q].x0
+          const k = Math.max(1, Math.round((w + pitch * 0.2) / pitch))
+          const err = Math.abs(w + pitch * 0.2 - k * pitch) / pitch
+          // A run a third of a figure off its count is not the count; a lone
+          // figure may be narrow (a "1" stands in a full cell) but not wide.
+          if ((k > 1 && err > 1 / 3) || (k === 1 && w > pitch * 1.3)) ok = false
+          counts.push(k)
+          cost += k > 1 ? err * err : 0
+        }
+        if (!ok || counts.reduce((a, b) => a + b, 0) !== d) continue
+        if (best[t][s] + cost < best[t + 1][s + m]) { best[t + 1][s + m] = best[t][s] + cost; back[t + 1][s + m] = { s, counts } }
+      }
+    }
+    if (best[T][N] === Infinity) return null
+    const per = new Array<number>(N)
+    let s = N
+    for (let t = T; t > 0; t--) { const b = back[t][s]!; b.counts.forEach((k, i) => { per[b.s + i] = k }); s = b.s }
+    return per
+  }
+  // The pitch: first as a figure's share of the word (a separator about half
+  // a figure), then refitted once on the figures' own runs.
+  let pitch = (spans[N - 1].x1 - spans[0].x0) / (figures + 0.5 * (chars.length - figures) - 0.2)
+  if (!(pitch > em * 0.3 && pitch < em * 0.8)) return null
+  let counts = assign(pitch)
+  if (!counts) return null
+  {
+    let w = 0, k = 0, runs = 0
+    let i = 0
+    for (let s = 0; s < N; s++) {
+      if (isFigure(chars[i])) { w += spans[s].x1 - spans[s].x0; k += counts[s]; runs++ }
+      i += counts[s]
+    }
+    const refit = k > runs * 0.2 ? w / (k - runs * 0.2) : pitch
+    if (Math.abs(refit - pitch) > pitch * 0.02) {
+      if (!(refit > em * 0.3 && refit < em * 0.8)) return null
+      pitch = refit
+      counts = assign(pitch)
+      if (!counts) return null
+    }
+  }
+  const out: { char: string; x0: number; x1: number; suspect: boolean }[] = []
+  let i = 0
+  for (let s = 0; s < N; s++) {
+    const sp = spans[s], k = counts[s], w = sp.x1 - sp.x0
+    for (let j = 0; j < k; j++) out.push({ char: chars[i++], x0: Math.round(sp.x0 + w * j / k), x1: Math.round(sp.x0 + w * (j + 1) / k), suspect: false })
+  }
+  return out
 }
 
 /**

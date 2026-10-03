@@ -537,6 +537,72 @@ function inStyle(atlas: Atlas, req: GlyphRequest, copies: Exemplar[]): Exemplar[
 }
 
 /**
+ * How much bigger the request's line sets this letter than the copy's line
+ * did, measured on what both lines measured — and on the height the LETTER
+ * stands at. A capital or a figure stands at the cap height, anything else on
+ * the x-height, and the two need not keep one proportion from line to line:
+ * a form's "RUC: 20613872893" line measured an x-height within 3% of the page
+ * header's and a cap height 13% above it, and by x-height its "2" passed into
+ * "Página: 2 de 3" two pixels taller than the "1" it replaced. The em a
+ * line's fit reports is the least reliable measure of all — 21 to 25 px
+ * across lines set in the same 9 pt face on one page — and is the last resort.
+ */
+function sizeRatioOf(req: GlyphRequest, ex: Exemplar): number {
+  const base = req.char.normalize('NFD')[0] ?? req.char
+  if (/^[A-Z]$/.test(base)) {
+    // A capital by its OWN height first: a line can mix sizes (a form sets
+    // "RUC: 20613872893" larger than the "Teléfono :" after it), and then
+    // neither of its measures is the height of the letter taken from it.
+    const own = req.capH ? ownCapHeight(ex) : null
+    if (req.capH && own) return req.capH / own
+    if (req.capH && ex.capH) return req.capH / ex.capH
+    if (req.xh && ex.xh) return req.xh / ex.xh
+  } else if (/^[0-9]$/.test(base)) {
+    // A figure by the lines' cap heights first, its own height only where its
+    // line measured none: OLD-STYLE figures stand at the x-height, rise or
+    // fall below the baseline, and a receipt's "1980" → "1985" judged by
+    // their own heights had every figure of the page refused and set in
+    // lining figures instead.
+    if (req.capH && ex.capH) return req.capH / ex.capH
+    const own = req.capH && !ex.xh ? ownCapHeight(ex) : null
+    if (req.capH && own) return req.capH / own
+    if (req.xh && ex.xh) return req.xh / ex.xh
+  } else {
+    if (req.xh && ex.xh) return req.xh / ex.xh
+    if (req.capH && ex.capH) return req.capH / ex.capH
+  }
+  return req.emPx / ex.emPx
+}
+
+/**
+ * A capital's or a figure's own height over the baseline, px — what its
+ * line's cap height would have measured. A line that measured neither
+ * x-height nor cap height (a lone "8" in a table cell) could only be compared
+ * by its em, and a line's em is the least reliable measure there is: that
+ * "8" passed at 0.97 by em, and set into "9408100" it stood 2px short of the
+ * figures beside it. Null for any other letter, whose height says nothing
+ * about the line's.
+ */
+const ownCapCache = new WeakMap<Exemplar, number | null>()
+function ownCapHeight(ex: Exemplar): number | null {
+  if (ownCapCache.has(ex)) return ownCapCache.get(ex)!
+  let v: number | null = null
+  // The letters `lineMetrics` measures a cap height on, and figures as it
+  // takes them (lining figures stand at 0.98 of it).
+  const figure = /^[0-9]$/.test(ex.char)
+  if (figure || /^[A-HK-PR-Z]$/.test(ex.char)) {
+    // Its CORE — the fringe would add a row of anti-aliasing the line's own
+    // measure does not count.
+    const core = (j: number) => ex.m[j] && Math.min(ex.t[j * 3], ex.t[j * 3 + 1], ex.t[j * 3 + 2]) < 145
+    let top = -1
+    for (let y = 0; y < ex.h && top < 0; y++) for (let x = Math.max(0, Math.floor(ex.inkL)); x < Math.min(ex.w, Math.ceil(ex.inkR)); x++) if (core(y * ex.w + x)) { top = y; break }
+    if (top >= 0 && ex.baseY - top > 2) v = (ex.baseY - top) / (figure ? 0.98 : 1)
+  }
+  ownCapCache.set(ex, v)
+  return v
+}
+
+/**
  * The exemplar that stands for `req.char` at the request's size and weight:
  * the medoid of the compatible copies, provided it is typical enough of them
  * and — when it is the only copy — clean (whole, alone, from a confident
@@ -548,7 +614,7 @@ export function pickGlyph(atlas: Atlas, req: GlyphRequest): PickedGlyph | null {
   // Sizes compare on what both lines measured: the x-height, else the cap
   // height. The em a line's fit reports is the least reliable of the three —
   // 21 to 25 px across lines set in the same 9 pt face on one page.
-  const sizeRatio = (ex: Exemplar) => (req.xh && ex.xh) ? req.xh / ex.xh : (req.capH && ex.capH) ? req.capH / ex.capH : req.emPx / ex.emPx
+  const sizeRatio = (ex: Exemplar) => sizeRatioOf(req, ex)
   const boldOf = (ex: Exemplar) => atlas.boldAt === null ? false : ex.weight === null ? null : ex.weight >= atlas.boldAt
   const compatible = inStyle(atlas, req, list.filter(ex => {
     if (ex.doubt) return false
@@ -596,7 +662,7 @@ export function pickGlyph(atlas: Atlas, req: GlyphRequest): PickedGlyph | null {
 /** Why each copy of a letter would or would not be picked — for the lab. */
 export function explainPick(atlas: Atlas, req: GlyphRequest): string[] {
   const list = atlas.byChar.get(req.char) ?? []
-  const sizeRatio = (ex: Exemplar) => (req.xh && ex.xh) ? req.xh / ex.xh : (req.capH && ex.capH) ? req.capH / ex.capH : req.emPx / ex.emPx
+  const sizeRatio = (ex: Exemplar) => sizeRatioOf(req, ex)
   return list.map(ex => {
     const bold = atlas.boldAt === null ? false : ex.weight === null ? null : ex.weight >= atlas.boldAt
     return `${ex.doubtNote ?? ''} ${ex.lineId} p${ex.page} w=${ex.weight?.toFixed(3)} bold=${bold} ratio=${sizeRatio(ex).toFixed(3)} (xh ${ex.xh?.toFixed(1)} cap ${ex.capH?.toFixed(1)} em ${ex.emPx.toFixed(1)}) doubt=${!!ex.doubt} iso=${ex.isolated} conf=${ex.conf}`
