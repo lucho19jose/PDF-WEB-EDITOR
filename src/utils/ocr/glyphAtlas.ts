@@ -176,6 +176,12 @@ export function harvestLine(pi: PageInk, li: LineInk, page: number, out: Exempla
     for (let k = word.from; k < word.to; k++) {
       const c = li.cells[k]
       if (c.suspect || c.approx || c.inkR <= c.inkL || c.pix.length < 3) continue
+      // A stop, a comma or a colon is SMALL: a cell labelled one that is a
+      // figure's width is a figure read as one. A purchase order's quantity
+      // column read "1.00" over ink whose stop was too faint to be a piece;
+      // the "." took the first "0", every row gave the page the same
+      // "full stop", and an amount typed "1,050.00" printed "1,050000".
+      if (/^[.,:;'·]$/.test(c.char) && (c.inkR - c.inkL + 1 > li.fit.emPx * 0.24 || (c.char !== ':' && c.char !== ';' && c.bottom - c.top > li.fit.emPx * 0.4))) continue
       const ex = cutExemplar(pi, li, c, k, base, word.weight, xh, capH, page)
       if (ex) out.push(ex)
     }

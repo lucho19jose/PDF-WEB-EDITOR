@@ -5191,6 +5191,27 @@ border's too. Only on such a piece: stepping over the edge columns of a
 bold "l" whose stem ends two pixels under the fitted baseline carved it as
 a border, and reshuffled a whole MSP line's word split.
 
+**A stop, a comma or a colon is harvested only if it is SMALL**
+(`harvestLine`). A purchase order's quantity column reads "1.00" over ink
+whose stop is too faint to be a piece; the word split gave the "." the
+first "0", every row did the same, and the page's established "full stop"
+was a zero — an amount typed "1,050.00" printed "1,050000", and every real
+stop on the page failed the kept-letter check against it. A cell labelled
+". , : ; ' ·" wider than 0.24 em (or, but for a colon, taller than 0.4 em) is
+not taken.
+
+**Peers vouch for a kept letter at any real size difference.** The
+kept-letter check compares a letter with its medoid; on that order the
+medoid "0" came from rows fitted at a 13.9 px em and the "930.00" rows at
+15.3, the same face, and a perfectly good "0" scored 0.49 — under the 0.5
+bar — so "930.00" was redrawn whole to become "1,050.00". Copies at the
+line's own size now speak for it from an 8% em difference (it was 20%).
+
+**Amounts in a column are set flush right even when all are as wide**
+(`amount` in `alignedRight`): a column of "930.00" down every row gives no
+left edge that differs, and amounts are set flush right; a code column as
+wide as itself (923-002) is not taken for one.
+
 **A signature or stamp crossing the line is another LAYER of ink**
 (`LineInk.overInk`, `layers` in `applyOnPixels`). A notarised deed's blue
 signature crosses three lines of grey text; the owner map gave each letter

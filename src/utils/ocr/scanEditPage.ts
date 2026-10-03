@@ -335,10 +335,16 @@ export function alignedRight(lines: Iterable<LineInk | null>, li: LineInk): bool
   const right = (o: LineInk) => Math.max(...o.cells.map(c => c.inkR))
   const left = (o: LineInk) => Math.min(...o.cells.map(c => c.inkL))
   const r0 = right(li), l0 = left(li)
+  // An AMOUNT (figures ending in a decimal separator and two decimals) in a
+  // column of amounts that end where it ends is set flush right even when
+  // they all start where it starts: a purchase order's TOTAL column read
+  // "930.00" down every row, nothing told the alignments apart, and an edit
+  // to "1,050.00" grew out to the right. Amounts are set flush right.
+  const amount = (o: LineInk) => /^[0-9.,']*[0-9][.,][0-9]{2}$/.test(o.chars.join(''))
   for (const o of lines) {
     if (!o || o === li || !o.cells.length || !!o.inverted !== !!li.inverted || !figures(o)) continue
     if (Math.abs(o.fit.y - li.fit.y) > em * 6 || Math.abs(o.fit.emPx - em) > em * 0.3) continue
-    if (Math.abs(right(o) - r0) <= Math.max(2, em * 0.12) && Math.abs(left(o) - l0) > em * 0.5) return true
+    if (Math.abs(right(o) - r0) <= Math.max(2, em * 0.12) && (Math.abs(left(o) - l0) > em * 0.5 || (amount(li) && amount(o)))) return true
   }
   return false
 }

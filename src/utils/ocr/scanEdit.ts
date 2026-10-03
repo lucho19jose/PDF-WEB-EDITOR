@@ -1473,7 +1473,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
         let own = shapeAgreement(shape, m.shape)
         // The medoid may be another face's (a title's): copies of the letter
         // at this line's size, from other words, speak for it too.
-        if (own < 0.75 && m.emPx && (li.fit.emPx / m.emPx > 1.2 || m.emPx / li.fit.emPx > 1.2)) own = Math.max(own, peerAgreement(oldChars[i], bold, shape, li.cells[i].x0, li.cells[i].x1))
+        if (own < 0.75 && m.emPx && (li.fit.emPx / m.emPx > 1.08 || m.emPx / li.fit.emPx > 1.08)) own = Math.max(own, peerAgreement(oldChars[i], bold, shape, li.cells[i].x0, li.cells[i].x1))
         // Unless what it plainly is is the label's look-alike: the ink of a
         // receipt's "B008" was read "Bo08", and its zero — an old-style one,
         // shaped like an "o" — is the right pixels to keep wherever the edit

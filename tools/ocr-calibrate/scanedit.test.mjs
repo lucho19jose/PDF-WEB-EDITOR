@@ -1098,3 +1098,38 @@ test('a signature crossing a line stays where it is: the letters move under it a
   assert.ok(alone > 100, `only ${alone} stroke pixels to check`)
   assert.ok(kept >= alone * 0.97, `${alone - kept} of ${alone} stroke pixels lost`)
 })
+
+test('amounts in a column are set flush right even when every one is as wide as the next', () => {
+  // A purchase order's TOTAL column: "930.00" down every row, nothing in the
+  // column itself telling a left alignment from a right one. A column of
+  // codes as wide as each other is not taken for one.
+  const W = 400, H = 260, size = 22
+  const font = new mupdf.Font('Arimo', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Regular.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const rows = [['930.00', '923-002', 50], ['930.00', '923-002', 100], ['930.00', '923-002', 150]]
+  for (const [a, c, y] of rows) for (const [text, x] of [[a, 240], [c, 40]]) {
+    const t = new mupdf.Text()
+    t.showString(font, [size, 0, 0, -size, x, y], text)
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  }
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let p = 0; p < W * H; p++) {
+    const a = 1 - g[Math.floor(p / W) * st + (p % W)] / 255
+    for (let c = 0; c < 3; c++) rgba[p * 4 + c] = Math.round(250 * (1 - a) + 30 * a)
+    rgba[p * 4 + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Totals')
+  const pi = LI.preparePage(raster)
+  const lis = []
+  rows.forEach(([a, c, y], k) => {
+    lis.push(LI.analyzeLine(pi, { id: `a${k}`, text: a, inkRect: { x: 236 * 0.36, y: (y - 20) * 0.36, width: 90 * 0.36, height: 26 * 0.36 }, confidence: 95 }))
+    lis.push(LI.analyzeLine(pi, { id: `c${k}`, text: c, inkRect: { x: 36 * 0.36, y: (y - 20) * 0.36, width: 100 * 0.36, height: 26 * 0.36 }, confidence: 95 }))
+  })
+  lis.forEach((li, k) => assert.ok(li, `line ${k}: ${LI.lastLineFailure()}`))
+  assert.equal(SEP.alignedRight(lis, lis[2]), true, 'an amount in a column of amounts')
+  assert.equal(SEP.alignedRight(lis, lis[3]), false, 'a code in a column of codes')
+})
