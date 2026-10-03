@@ -1035,3 +1035,66 @@ test('a line of old-style figures is sized by its letters, not by figures taken 
   const fit2 = WS.fitLine(lining, 14, 'Fecha: 28/08/2025')
   assert.ok(Math.abs(fit2.emPx - 9.7 / 0.72) < 1, `em ${fit2.emPx.toFixed(1)}`)
 })
+
+
+test('a signature crossing a line stays where it is: the letters move under it and an erased letter gives it back', () => {
+  // 200 DPI: a black line of capitals with a blue pen stroke drawn across it,
+  // over "DIAS" (densities multiply where the inks overlap). "TRES" retyped
+  // "CUATRO" moves everything after it to the right, under the stroke.
+  const W = 900, H = 230, size = 26
+  const font = new mupdf.Font('Carlito', fs.readFileSync(ROOT + '/public/fonts/match/Carlito-Bold.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  for (const [text, y] of [['A LOS TRES DIAS DEL MES DE MAYO', 80], ['CUATRO TRES DOS UNO', 180]]) {
+    const t = new mupdf.Text()
+    t.showString(font, [size, 0, 0, -size, 40, y], text)
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  }
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  // The stroke: a 3 px line from (330, 20) down to (290, 140).
+  const stroke = new Float32Array(W * H)
+  for (let k = 0; k <= 600; k++) {
+    const x = 330 - 40 * k / 600, y = 20 + 120 * k / 600
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+      const X = Math.round(x + dx), Y = Math.round(y + dy), d = Math.hypot(x + dx - X, y + dy - Y)
+      const a = Math.max(0, Math.min(1, 1.6 - Math.hypot(dx, dy) * 0.6 - d * 0.2))
+      if (X >= 0 && Y >= 0 && X < W && Y < H) stroke[Y * W + X] = Math.max(stroke[Y * W + X], a)
+    }
+  }
+  const paper = [248, 246, 240], blue = [55, 90, 205]
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let p = 0; p < W * H; p++) {
+    const a = 1 - g[Math.floor(p / W) * st + (p % W)] / 255
+    for (let c = 0; c < 3; c++) {
+      const tText = 1 - a * (1 - 30 / paper[c]), tBlue = 1 - stroke[p] * (1 - blue[c] / paper[c])
+      rgba[p * 4 + c] = Math.round(paper[c] * tText * tBlue)
+    }
+    rgba[p * 4 + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Signed')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 's', text: 'A LOS TRES DIAS DEL MES DE MAYO', inkRect: { x: 34 * 0.36, y: 54 * 0.36, width: 760 * 0.36, height: 34 * 0.36 }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  assert.ok(li.overInk, 'the blue stroke was not seen as another ink')
+  const li2 = LI.analyzeLine(pi, { id: 'w', text: 'CUATRO TRES DOS UNO', inkRect: { x: 34 * 0.36, y: 154 * 0.36, width: 500 * 0.36, height: 34 * 0.36 }, confidence: 95 })
+  assert.ok(li2, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li, li2], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, 'A LOS CUATRO DIAS DEL MES DE MAYO', work, {})
+  assert.ok(res.ok, res.reason)
+  // Every pixel where the stroke ran alone (no letter under it, before or
+  // after) is still the stroke: blue well over red.
+  const blueAt = (d, p) => d[p * 4 + 2] - d[p * 4] > 60
+  let alone = 0, kept = 0
+  for (let p = 0; p < W * H; p++) {
+    if (stroke[p] < 0.9 || !blueAt(rgba, p)) continue
+    // Not on a letter now: no dark neutral ink at it in the result.
+    if (work[p * 4 + 2] < 120) continue
+    alone++
+    if (blueAt(work, p)) kept++
+  }
+  assert.ok(alone > 100, `only ${alone} stroke pixels to check`)
+  assert.ok(kept >= alone * 0.97, `${alone - kept} of ${alone} stroke pixels lost`)
+})

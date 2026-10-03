@@ -5191,6 +5191,43 @@ border's too. Only on such a piece: stepping over the edge columns of a
 bold "l" whose stem ends two pixels under the fitted baseline carved it as
 a border, and reshuffled a whole MSP line's word split.
 
+**A signature or stamp crossing the line is another LAYER of ink**
+(`LineInk.overInk`, `layers` in `applyOnPixels`). A notarised deed's blue
+signature crosses three lines of grey text; the owner map gave each letter
+the stretch of stroke within its reach, so a respaced line carried those
+stretches along with its words and an erased letter took its stretch with
+it — the signature came back broken at every line it crossed. Where the
+line's box holds ink of another colour, every pixel's density is shared out
+between the two inks (densities add where inks overlap: least squares of
+`-ln(pixel / paper)` over the three channels against the two inks' density
+vectors, both non-negative). An erased pixel becomes the paper under the
+other ink, a moved letter carries only its own ink, and the other ink's
+pixels are held through the erase's relaxation.
+Two traps, both measured on a service order whose navy letters fringe into
+greyish blue on its tinted paper — taken for a second ink there, the
+letters' own density was shared out to it and erased letters stayed:
+- the other ink is judged as a DENSITY DIRECTION, on unclipped pixels only
+  (a dark core is cut off at zero in one channel and points anywhere), at
+  ten degrees or more from the letters' own mid-dark pixels — hue alone
+  calls a dark ink's anti-aliased edge another colour;
+- it must come in STROKES at least an em long — colour noise round other
+  letters and a form's rules comes in specks — and the two inks must be
+  fifteen degrees apart for the split to be trusted.
+A grey scan, and any page without such strokes, takes the old path to the
+pixel.
+
+**A rule before the change does not stop a line being respaced**
+(`cleanAfter`). The respacing moves the line from its first change on, so
+only loose ink and rules there forbid it; one before the change (a deed's
+underlined "INTRODUCCIÓN.-" opening the line) never moves. Such a line is
+respaced over the gaps after the change only, never the whole line.
+
+**A word given a new first letter keeps the gap before it.** "Moneda :
+S/." retyped "US$" kept the "S" and put the new "U" a word gap off the
+colon — the line's typical word gap, ten pixels more than the form's colon
+gap. The gap before an old word whose first letter now comes second is
+that word's own gap (`leadsOld` in `gapBefore`).
+
 **Word gaps are measured where the READING has a space.** The ink's own word
 split also cuts one word at a wide letter gap ("ESTE | FAN | I" in a capitals
 cell); counted as word gaps those gave a page of table cells a 0.15 em word

@@ -473,6 +473,12 @@ export interface LineInk {
   ink: [number, number, number]
   /** Median darkness of the line's letter cores, 0..1 — how dark this line prints. */
   coreDark: number
+  /**
+   * The colour (RGB 0..255) of ink of ANOTHER colour in the line's box — a
+   * signature or a stamp crossing it. An edit then shares every pixel's
+   * darkness between the two inks and erases and moves the line's own only.
+   */
+  overInk?: [number, number, number]
   /** The darkness (0..255) this line's letters were GROUPED at: `CORE`, or lower for a line whose thin strokes break apart there (its pixels are core pixels either way). */
   coreLevel: number
   /**
@@ -1521,6 +1527,58 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     }
   }
 
+  // Ink of ANOTHER COLOUR in the line's box — a signature's stroke, a stamp's
+  // rim — that the letters lie under or over (see `LineInk.overInk`).
+  // Judged as a density DIRECTION and in strokes: by plain hue, a dark ink's
+  // anti-aliased edge on a tinted paper reads as another colour too (a
+  // service order's navy letters came out greyish blue at their edges), and
+  // taking that fringe for a second ink shared the letters' own density out
+  // to it — erased, they stayed on the page.
+  const overInk = ((): [number, number, number] | null => {
+    if (cells.length < 2) return null
+    // An ink is a DIRECTION of density, -ln(pixel / paper) per channel: its
+    // edges, where it thins out over the paper, keep the direction, whatever
+    // tint the paper has. Measured on the letters' mid-dark pixels — a dark
+    // ink's cores are clipped by the scanner and say little.
+    const dir = (p: number): [number, number, number] | null => {
+      const d: number[] = []
+      for (let c = 0; c < 3; c++) d.push(-Math.log(Math.min(1, Math.max(0.01, s.data[p * 4 + c] / Math.max(1, pi.paper[p * 3 + c])))))
+      const n = Math.hypot(d[0], d[1], d[2])
+      return n > 0.15 ? [d[0] / n, d[1] / n, d[2] / n] : null
+    }
+    const ds: [number, number, number][] = []
+    for (const c of cells) for (const p of c.pix) {
+      if (pi.dark[p] < 60 || pi.dark[p] > 200) continue
+      const v = dir(p)
+      if (v) ds.push(v)
+    }
+    if (ds.length < 20) return null
+    const own = [median(ds.map(v => v[0])), median(ds.map(v => v[1])), median(ds.map(v => v[2]))]
+    const on = Math.hypot(own[0], own[1], own[2])
+    const fm = new Uint8Array(W * H)
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const p = (roi.y0 + y) * s.w + roi.x0 + x
+      // Unclipped pixels only: a dark core is cut off at zero in one channel
+      // and points anywhere.
+      if (pi.dark[p] < 60 || pi.dark[p] > 200) continue
+      const d = dir(p)
+      // Ten degrees and more off the line's own ink.
+      if (!d || (d[0] * own[0] + d[1] * own[1] + d[2] * own[2]) / on > 0.985) continue
+      fm[y * W + x] = 1
+    }
+    // In STROKES, an em long at least: colour noise round other letters and a
+    // form's rules comes in specks.
+    const v: [number, number, number][] = []
+    let n = 0
+    for (const c of components(fm, W, H, roi.x0, roi.y0, s.w)) {
+      if (Math.max(c.x1 - c.x0, c.y1 - c.y0) < em) continue
+      n += c.area
+      for (const p of c.pix) if (pi.dark[p] >= 90) v.push([s.data[p * 4], s.data[p * 4 + 1], s.data[p * 4 + 2]])
+    }
+    if (n < Math.max(30, em * 2) || v.length < 10) return null
+    return [median(v.map(c => c[0])), median(v.map(c => c[1])), median(v.map(c => c[2]))]
+  })()
+
   // The Voronoi partition of the ROI among the inks in it, out to ~1.4 pt.
   // Out to ~2.2 pt: as far as a letter's JPEG ringing reaches (the edge of
   // its 8×8 block at 200 DPI).
@@ -1608,6 +1666,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     })(),
     coreLevel,
     ...(opts.inverted ? { inverted: true } : {}),
+    ...(overInk ? { overInk } : {}),
     owner, ownDist: dist, ownR, loose
   }
 }

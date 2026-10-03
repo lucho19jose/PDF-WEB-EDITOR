@@ -1778,9 +1778,16 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     // "Electrico" stood 3 px further off than the word it replaced — and so is
     // a letter gap where the INK broke but the reading did not: ":09/08/2023"
     // read without its space came back ":20/08/2023", glued to the colon.
+    // So is a word given a new FIRST letter, its old first letter now its
+    // second: "Moneda : S/." retyped "US$" put the "U" a word gap off the
+    // colon, ten pixels further than the "S" had stood.
     if (c.kind !== 'orig' && p.kind === 'orig' && p.anchorR >= 0) {
       const i = p.anchorR + 1
-      if (i < li.cells.length && (c.space ? oldSpace(i) && matchOfOld[i] < 0 : !oldSpace(i) && inkWordBoundary(i))) return oldGap(i)
+      const leadsOld = () => {
+        for (let q = j + 1; q < nc.length && !nc[q].space; q++) if (nc[q].kind === 'orig') return nc[q].old === i
+        return false
+      }
+      if (i < li.cells.length && (c.space ? oldSpace(i) && (matchOfOld[i] < 0 || leadsOld()) : !oldSpace(i) && inkWordBoundary(i))) return oldGap(i)
     }
     if (c.space) return wordGapPx
     const model = spacing(c.styleWord)
@@ -2004,11 +2011,18 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     rigid = false
     notes.push('set flush right in its cell')
   }
+  // What a respacing moves is the line from its first change on — unless it
+  // has to spread into the whole line. A rule or a mark BEFORE the change
+  // never moves: a deed's line opens with an underlined "INTRODUCCIÓN.-", and
+  // "TRES" retyped "CUATRO" further along was refused as running off the
+  // paper because the line was not clean.
+  const firstChangeX = pre > 0 ? li.cells[nc[pre - 1].old].inkR : -Infinity
+  const cleanAfter = !li.loose.some(p => significant(p) && p.x1 > firstChangeX) && !ownRules.some(r => r.x1 > firstChangeX)
   let target: number | null = null
-  if (!flushRight && opts.justifyTo != null && clean && Math.abs(oldRight - opts.justifyTo) <= em * 0.6 && nc.length) target = oldRight
+  if (!flushRight && opts.justifyTo != null && cleanAfter && Math.abs(oldRight - opts.justifyTo) <= em * 0.6 && nc.length) target = oldRight
   else if (!flushRight && opts.limitRight != null && newRight > opts.limitRight) target = opts.limitRight
   if (target !== null && Math.abs(newRight - target) >= 1 && pre < nc.length) {
-    if (!clean) return { ok: false, reason: 'the edit would run the line off the paper', notes }
+    if (!cleanAfter) return { ok: false, reason: 'the edit would run the line off the paper', notes }
     rigid = false
     const delta = target - newRight
     const isGap = (j: number) => {
@@ -2025,7 +2039,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     // alone closed to "porlas" and the line still ran 18px past its margin.
     const afterWidth = after.reduce((t, j) => t + gapWidth(j), 0)
     const light = Math.abs(delta) <= afterWidth * (delta > 0 ? 0.25 : 0.12)
-    const gaps = light || all.length === after.length ? after : all
+    const gaps = light || all.length === after.length || !clean ? after : all
     const capOf = (j: number) => gapWidth(j) * (delta > 0 ? 0.6 : 0.3)
     const total = gaps.reduce((t, j) => t + capOf(j), 0)
     const f = total > 0 ? Math.min(1, Math.abs(delta) / total) : 0
@@ -2079,10 +2093,57 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
 
   // Moving pixels read the ORIGINAL scan, never the working copy.
   const src = s.data
+  // Two inks, one over the other (`LineInk.overInk`): a signature or a
+  // stamp in another colour crossing the line. Each pixel's density is
+  // shared out between the line's ink and the other one — as densities add
+  // where inks overlap, by least squares over the three channels — so that
+  // an erased letter gives back the stroke that ran over it, and a moved one
+  // takes its own ink and leaves the stroke where it was. Erased and moved
+  // as plain pixels, a respaced line under a notarised deed's blue signature
+  // carried every stretch of stroke inside its letters' reach along with
+  // them, and the signature came back broken at every line it crossed.
+  const layers = (() => {
+    if (!li.overInk) return null
+    const pr: number[] = [], pg: number[] = [], pb: number[] = []
+    for (const c of li.cells) for (let k = 0; k < c.pix.length; k += Math.max(1, Math.floor(c.pix.length / 8))) {
+      const p = c.pix[k]
+      pr.push(pi.paper[p * 3]); pg.push(pi.paper[p * 3 + 1]); pb.push(pi.paper[p * 3 + 2])
+    }
+    if (!pr.length) return null
+    const med = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)]
+    const P0 = [med(pr), med(pg), med(pb)]
+    const dens = (rgb: [number, number, number]) => [0, 1, 2].map(c => -Math.log(Math.min(0.98, Math.max(0.02, rgb[c] / Math.max(1, P0[c])))))
+    const Dt = dens(li.ink), Ds = dens(li.overInk)
+    const tt = Dt.reduce((t, v) => t + v * v, 0), ss = Ds.reduce((t, v) => t + v * v, 0)
+    const ts = Dt[0] * Ds[0] + Dt[1] * Ds[1] + Dt[2] * Ds[2]
+    const det = tt * ss - ts * ts
+    // Two inks of one colour cannot be told apart.
+    if (det < 0.067 * tt * ss) return null
+    const memo = new Map<number, [number, number]>()
+    /** The densities of the line's ink and of the other ink at p. */
+    const split = (p: number): [number, number] => {
+      let v = memo.get(p)
+      if (v) return v
+      let td = 0, sd = 0
+      for (let c = 0; c < 3; c++) {
+        const d = -Math.log(Math.min(1, Math.max(0.01, src[p * 4 + c] / Math.max(1, pi.paper[p * 3 + c]))))
+        td += Dt[c] * d; sd += Ds[c] * d
+      }
+      let a = (ss * td - ts * sd) / det, b = (tt * sd - ts * td) / det
+      if (a < 0) { a = 0; b = Math.max(0, sd / ss) } else if (b < 0) { b = 0; a = Math.max(0, td / tt) }
+      v = [a, b]
+      memo.set(p, v)
+      return v
+    }
+    return { Dt, Ds, split }
+  })()
   const T = (p: number, ch: number) => {
+    if (layers) return Math.min(1, Math.exp(-layers.split(p)[0] * layers.Dt[ch]))
     const paper = pi.paper[p * 3 + ch]
     return paper > 0 ? Math.min(1, src[p * 4 + ch] / paper) : 1
   }
+  /** What an erased pixel shows: the paper, under the other ink where it ran. */
+  const erasedTo = (p: number, ch: number) => layers ? pi.paper[p * 3 + ch] * Math.exp(-layers.split(p)[1] * layers.Ds[ch]) : pi.paper[p * 3 + ch]
   const printShifted = (set: Iterable<number>, dx: number, dy: number) => {
     const shift = dy * W + dx
     const seen = new Set<number>()
@@ -2141,10 +2202,11 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
 
   // 6. Erase.
   for (const p of eraseSet) {
-    work[p * 4] = pi.paper[p * 3]; work[p * 4 + 1] = pi.paper[p * 3 + 1]; work[p * 4 + 2] = pi.paper[p * 3 + 2]
+    work[p * 4] = erasedTo(p, 0); work[p * 4 + 1] = erasedTo(p, 1); work[p * 4 + 2] = erasedTo(p, 2)
     touch(p)
   }
-  relaxErased(work, eraseSet, pi, W, s.h)
+  // The other ink's strokes are held where they are, not relaxed away.
+  relaxErased(work, eraseSet, pi, W, s.h, layers ? (p: number) => layers.split(p)[1] > 0.15 : undefined)
   for (const plan of ulPlans) if (plan) plan.erase(work, pi, touch)
 
   // 7. Print: the moved letters with their own pixels, the new ones from
@@ -2197,7 +2259,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
  * is real ink — the fill takes the ground's true level, and a gradient stays
  * exact across it. On plain paper the two agree and nothing changes.
  */
-function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W: number, H: number): void {
+function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W: number, H: number, held?: (p: number) => boolean): void {
   if (!erase.size) return
   let x0 = W, y0 = H, x1 = -1, y1 = -1
   for (const p of erase) { const x = p % W, y = (p - x) / W; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y }
@@ -2211,6 +2273,7 @@ function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W
     const p = (y0 + y) * W + x0 + x, j = y * bw + x
     // A grid line through the hole is the grid (`PageInk.lines`): held, not relaxed away.
     if (erase.has(p) && pi.lines?.[p]) { for (let c = 0; c < 3; c++) { v[c][j] = pi.paper[p * 3 + c]; work[p * 4 + c] = pi.paper[p * 3 + c] } }
+    else if (erase.has(p) && held?.(p)) { for (let c = 0; c < 3; c++) v[c][j] = work[p * 4 + c] }
     else if (erase.has(p)) { free[j] = 1; for (let c = 0; c < 3; c++) v[c][j] = work[p * 4 + c] }
     else for (let c = 0; c < 3; c++) v[c][j] = pi.dark[p] < 50 ? src[p * 4 + c] : pi.paper[p * 3 + c]
   }
