@@ -5055,6 +5055,47 @@ under a dozen edges. Measured on a page built like the cover
 the line's 1.05; on the cover itself the "X" is now as crisp as "RYAN", and
 MSP's one synthesised "W" comes out a little sharper beside its "L" and "E".
 
+**Ten hand-written edits of a scanned purchase order** (dates, amounts,
+quantities, payment terms, a model, a supplier name) found four defects the
+automatic corpora never had, all on ordinary small print:
+- **A full stop fainter than its figures was no piece.** "1.00" printed its
+  stop at darkness 80 against the figures' 180, under the core level: the
+  reading's "." went on the first "0", the second "0" was split over two
+  halves, and changing the "1" erased a stop the analysis never knew about —
+  "2.00" came out "200". A faint mark of its own (touching no piece's core)
+  that is stop-sized, sits on the baseline in a GAP between pieces, now joins
+  the line's pieces — but only as many as the reading has stops and commas
+  its own small pieces do not already account for, the darkest first: on
+  handwriting any faint mark near the baseline would do, and with no count
+  a page of notes on squared paper lost a third of its cut words.
+- **A thin diagonal breaks into a staircase.** Each "/" of a 7.8pt
+  "09/08/2023" was three pieces in neighbouring columns, so the date counted
+  fourteen ink runs for ten characters, was never exact, and changing its day
+  redrew all of it from figures off other lines — resized, visibly heavier.
+  `inkSpans` (lineInk) joins pieces that only touch column to column when
+  their rows barely overlap — steps of one stroke — and `columnRuns`,
+  `runCellsOf` and `figureCellsOf` all count runs through it; a run held by
+  one cell goes to that cell whole, or the slash's foot, in the gap before
+  its cell, went with the figure beside it. Two letters that touch stand side
+  by side, rows overlapping, and stay two runs. The edit now changes the two
+  figures alone.
+- **A word in a replaced word's place takes that word's gap.** A new word
+  after a letter that stays was set at the line's TYPICAL word gap — on
+  ": Mantenimiento Instrumentacion" that was the 10 px after the colon, so
+  "Electrico" stood 3 px further off than the word it replaced. And where
+  the INK broke but the reading did not (":09/08/2023" read without the space
+  the scan shows) the new figure was set at a letter gap, glued to the colon.
+  `gapBefore` gives a new letter after a kept one the old gap there, when the
+  old text broke there — a space in the reading, or a word boundary in the
+  ink.
+- **Only a line of a paragraph is a paragraph's.** `justifiedMargin` now asks
+  that the line and the neighbour vouching for the margin each span half the
+  text's width (from where its lines usually start): two value fields of a
+  form's right-hand column ending at the same x are not justified prose.
+MSP: every edit as before but for a pixel's shift where a redrawn word
+picked a slightly different copy, and "30 de septiembre" set at the scan's
+own gap before the date rather than the line's typical one.
+
 **Word gaps are measured where the READING has a space.** The ink's own word
 split also cuts one word at a wide letter gap ("ESTE | FAN | I" in a capitals
 cell); counted as word gaps those gave a page of table cells a 0.15 em word

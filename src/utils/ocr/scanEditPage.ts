@@ -299,8 +299,18 @@ export function justifiedMargin(margin: number | null, lines: Iterable<LineInk |
   if (margin === null || !li.words.length) return null
   const em = li.fit.emPx
   if (Math.abs(li.words[li.words.length - 1].x1 - margin) > em * 0.6) return null
-  for (const o of lines) {
-    if (!o || o === li || !o.words.length) continue
+  // A line of a paragraph spans most of the text: a form's value field ending
+  // at the right margin (": Mantenimiento Instrumentacion", in the right-hand
+  // column of a purchase order) had a neighbouring field end there too, and
+  // an edit spread its one word gap by half again to keep an edge it never
+  // kept. The text's left edge is where its lines usually start.
+  const all = [...lines].filter((o): o is LineInk => !!o && o.words.length > 0)
+  const starts = all.map(o => o.words[0].x0).sort((a, b) => a - b)
+  const left = starts.length ? starts[Math.floor(starts.length * 0.1)] : li.words[0].x0
+  const spans = (o: LineInk) => margin - o.words[0].x0 >= (margin - left) * 0.5
+  if (!spans(li)) return null
+  for (const o of all) {
+    if (o === li || !spans(o)) continue
     if (Math.abs(o.words[o.words.length - 1].x1 - margin) > em * 0.6) continue
     const dy = Math.abs(o.fit.y - li.fit.y)
     if (dy > em * 0.5 && dy < em * 2.5) return margin

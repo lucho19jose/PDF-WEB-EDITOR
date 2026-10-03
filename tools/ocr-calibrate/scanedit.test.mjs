@@ -730,6 +730,55 @@ test('a synthesised letter is as sharp as the line it goes into, not as the page
   assert.ok(Math.abs(glyphEdge - lineEdge) <= 0.6, `the X's edges ${glyphEdge.toFixed(2)} px, the line's ${lineEdge.toFixed(2)} px`)
 })
 
+test('a full stop fainter than its figures is the line\'s: changing the figure before it keeps it', () => {
+  // 200 DPI, small figures: "1.00" whose stop prints at under half the
+  // figures' darkness — below the core level, so it was no piece at all.
+  const W = 300, H = 130, size = 7 / 0.36
+  const font = new mupdf.Font('Arimo', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Regular.ttf'))
+  const render = (s, y = 55) => {
+    const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+    pix.clear(255)
+    const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+    const t = new mupdf.Text()
+    t.showString(font, [size, 0, 0, -size, 40, y], s)
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+    dev.close()
+    const g = new Uint8Array(pix.getPixels()), st = pix.getStride(), a = new Float32Array(W * H)
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) a[y * W + x] = 1 - g[y * st + x] / 255
+    return a
+  }
+  // A second line gives the page its 2s.
+  const all = render('1.00'), digits = render('1 00'), twos = render('2 22 222', 105)
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  let stopX0 = W, stopX1 = 0
+  for (let p = 0; p < W * H; p++) {
+    // The stop is what "1.00" inks and "1 00" does not: printed at 0.4.
+    const isStop = all[p] > 0.05 && digits[p] < 0.05
+    if (isStop) { const x = p % W; stopX0 = Math.min(stopX0, x); stopX1 = Math.max(stopX1, x) }
+    const a = Math.max(isStop ? all[p] * 0.4 : all[p], twos[p])
+    for (let c = 0; c < 3; c++) rgba[p * 4 + c] = Math.round(250 * (1 - a) + 40 * a)
+    rgba[p * 4 + 3] = 255
+  }
+  assert.ok(stopX1 > stopX0, 'no stop rendered')
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Stop')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 'q', text: '1.00', inkRect: { x: 36 * 0.36, y: 35 * 0.36, width: 50 * 0.36, height: 24 * 0.36 }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const dot = li.cells.find(c => c.char === '.')
+  assert.ok(dot && dot.x0 <= stopX1 && dot.x1 > stopX0, `the "." cell [${dot?.x0}-${dot?.x1}] is not on the stop [${stopX0}-${stopX1}]`)
+  const li2 = LI.analyzeLine(pi, { id: 't', text: '2 22 222', inkRect: { x: 36 * 0.36, y: 85 * 0.36, width: 90 * 0.36, height: 24 * 0.36 }, confidence: 95 })
+  assert.ok(li2, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li, li2], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, '2.00', work, {})
+  assert.ok(res.ok, res.reason)
+  // Still a stop between the "2" and the "00": ink at its darkness or more
+  // somewhere in the band it sat in, a little to the right of where it was.
+  let ink = 0
+  for (let y = 0; y < H; y++) for (let x = stopX0 - 1; x <= stopX1 + 6; x++) if (250 - work[(y * W + x) * 4] > 30) ink++
+  assert.ok(ink >= 3, `no stop left (${ink} inked pixels)`)
+})
+
 test('a large bold title on white paper is edited without grey halos: its thick strokes are ink, not paper', () => {
   // A bilevel scan at 300 DPI (0.24 pt a pixel): a 45pt bold title, its stems
   // ~34 px wide — wider than the paper estimate's 3.6pt filter can see across.

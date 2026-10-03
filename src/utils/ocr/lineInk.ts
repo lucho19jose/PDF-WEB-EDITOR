@@ -1236,6 +1236,56 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     ownPieces.splice(i, 1)
   }
 
+  // A full stop or a comma printed fainter than the letters' cores — a small
+  // figure's "." peaked at darkness 80 against its figures' 180 — is no piece
+  // at the core level, and the reading's labels slid over the gap: "1.00" put
+  // its "." on the first "0" and split the second over two halves, and the
+  // edit that changed the "1" erased the stop it never knew about ("2.00"
+  // printed "200"). A faint mark of its own (touching no piece's core),
+  // small, sitting on the baseline in a GAP between pieces, joins the line's
+  // pieces — but only as many as the reading has stops and commas its own
+  // small pieces do not already account for, the darkest first: on
+  // handwriting, any faint mark near the baseline would do, and every pen
+  // skip taken for a stop slid the labels the other way.
+  const stopsInReading = [...text].filter(ch => ch === '.' || ch === ',').length
+  const isStopSized = (c: Comp) => c.x1 - c.x0 <= em * 0.3 && c.y1 - c.y0 <= em * 0.3 && (() => {
+    const b = base(c.cx)
+    return c.y1 >= b - em * 0.15 && c.y1 <= b + em * 0.35 && c.y0 >= b - em * 0.4
+  })()
+  const missingStops = stopsInReading - ownPieces.filter(isStopSized).length
+  if (missingStops > 0) {
+    const near = new Uint8Array(W * H)
+    const mark = (p: number) => {
+      const x = p % s.w - roi.x0, y = (p - (p % s.w)) / s.w - roi.y0
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const xx = x + dx, yy = y + dy
+        if (xx >= 0 && yy >= 0 && xx < W && yy < H) near[yy * W + xx] = 1
+      }
+    }
+    for (const c of ownPieces) for (const p of c.pix) mark(p)
+    for (const p of protect) mark(p)
+    const faint = new Uint8Array(W * H)
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const j = y * W + x
+      if (!near[j] && pi.dark[(roi.y0 + y) * s.w + roi.x0 + x] >= 55) faint[j] = 1
+    }
+    const candidates: { c: Comp; peak: number }[] = []
+    for (const c of components(faint, W, H, roi.x0, roi.y0, s.w)) {
+      if (c.area < 2 || !isStopSized(c)) continue
+      if (c.cx < box.x0 - em * 0.6 || c.cx > box.x1 + em * 0.6) continue
+      // In a gap: under or over a piece it would be part of a letter, or dirt.
+      if (ownPieces.some(o => c.x1 > o.x0 && c.x0 < o.x1)) continue
+      let peak = 0
+      for (const p of c.pix) if (pi.dark[p] > peak) peak = pi.dark[p]
+      candidates.push({ c, peak })
+    }
+    candidates.sort((a, b) => b.peak - a.peak)
+    for (const { c } of candidates.slice(0, missingStops)) {
+      ownPieces.push(c)
+      for (const p of c.pix) own.add(p)
+    }
+  }
+
   // A dash of the line's own cut off by the region's edge runs on past it,
   // and the part outside belonged to no line: a book cover's closing "—",
   // longer than the recogniser's box, was split when the tail moved — half of
@@ -1331,7 +1381,19 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     // Each piece of ink goes to the cell holding most of its columns; a piece
     // that two letters share (they touch) is divided at the cells' boundary.
     const pixOf: number[][] = wordCells.map(() => [])
+    // A run held by one cell goes to it whole — a broken "/" whose foot sat in
+    // the gap before its cell went, piece by piece, to the figure beside it,
+    // and was erased with that figure.
+    const runCell = new Map<Comp, number>()
+    for (const sp of inkSpans(pieces)) {
+      if (sp.pieces.length < 2) continue
+      const counts = wordCells.map(wc => Math.max(0, Math.min(sp.x1, wc.x1) - Math.max(sp.x0, wc.x0)))
+      const best = counts.indexOf(Math.max(...counts))
+      if (counts[best] > 0 && counts.filter(n => n > 0).length === 1) for (const c of sp.pieces) runCell.set(c, best)
+    }
     for (const c of pieces) {
+      const held = runCell.get(c)
+      if (held !== undefined) { for (const p of c.pix) pixOf[held].push(p); continue }
       const counts = wordCells.map(wc => Math.max(0, Math.min(c.x1, wc.x1) - Math.max(c.x0, wc.x0)))
       const best = counts.indexOf(Math.max(...counts))
       const span = c.x1 - c.x0
@@ -1543,12 +1605,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
  */
 function runCellsOf(pieces: Comp[], chars: string[], em: number): { char: string; x0: number; x1: number; suspect: boolean }[] | null {
   if (!pieces.length || chars.some(c => /[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/.test(c))) return null
-  const spans: { x0: number; x1: number }[] = []
-  for (const c of [...pieces].sort((a, b) => a.x0 - b.x0)) {
-    const last = spans[spans.length - 1]
-    if (last && c.x0 < last.x1) last.x1 = Math.max(last.x1, c.x1)
-    else spans.push({ x0: c.x0, x1: c.x1 })
-  }
+  const spans = inkSpans(pieces)
   if (spans.length !== chars.length) return null
   for (let i = 0; i < chars.length; i++) {
     const adv = expectedAdvance(chars[i])
@@ -1579,12 +1636,7 @@ function figureCellsOf(pieces: Comp[], chars: string[], em: number): { char: str
   if (chars.length < 2 || !chars.every(c => isFigure(c) || c === '.' || c === ',' || c === ':' || c === '/' || c === '-')) return null
   const figures = chars.filter(isFigure).length
   if (figures < 2) return null
-  const spans: { x0: number; x1: number }[] = []
-  for (const c of [...pieces].sort((a, b) => a.x0 - b.x0)) {
-    const last = spans[spans.length - 1]
-    if (last && c.x0 < last.x1) last.x1 = Math.max(last.x1, c.x1)
-    else spans.push({ x0: c.x0, x1: c.x1 })
-  }
+  const spans = inkSpans(pieces)
   if (spans.length >= chars.length || !spans.length) return null
   // The reading as tokens: one separator, or a run of figures.
   const tokens: { from: number; to: number; sep: boolean }[] = []
@@ -1761,14 +1813,33 @@ function isStraightUpright(c: Comp, pageW: number, tol: number): boolean {
   return xs.every((x, i) => Math.abs(x - (mx + slope * (ys[i] - my))) <= tol)
 }
 
-function columnRuns(pieces: Comp[]): number {
-  const spans = pieces.map(c => [c.x0, c.x1] as [number, number]).sort((a, b) => a[0] - b[0])
-  let runs = 0, end = -Infinity
-  for (const [x0, x1] of spans) {
-    if (x0 >= end) runs++
-    end = Math.max(end, x1)
+/**
+ * A word's pieces as runs of inked columns: pieces that share a column are
+ * one run, and so are pieces that only TOUCH column to column when they are
+ * steps of one stroke — one above the other, their rows barely overlapping.
+ * A thin diagonal breaks into such a staircase at small sizes: each "/" of a
+ * 7.8pt "09/08/2023" was three pieces in neighbouring columns, the date
+ * counted fourteen runs for ten characters, was never exact, and changing its
+ * day redrew it whole from figures off other lines, visibly heavier. Two
+ * letters that merely touch stand side by side, rows overlapping, and stay
+ * two runs.
+ */
+function inkSpans(pieces: Comp[]): { x0: number; x1: number; pieces: Comp[] }[] {
+  const spans: { x0: number; x1: number; pieces: Comp[]; last: Comp }[] = []
+  for (const c of [...pieces].sort((a, b) => a.x0 - b.x0)) {
+    const sp = spans[spans.length - 1]
+    const step = !!sp && c.x0 === sp.x1 && c.x0 === sp.last.x1 &&
+      Math.min(c.y1, sp.last.y1) - Math.max(c.y0, sp.last.y0) < Math.min(c.y1 - c.y0, sp.last.y1 - sp.last.y0) * 0.3
+    if (sp && (c.x0 < sp.x1 || step)) {
+      sp.pieces.push(c)
+      if (c.x1 >= sp.x1) { sp.x1 = c.x1; sp.last = c }
+    } else spans.push({ x0: c.x0, x1: c.x1, pieces: [c], last: c })
   }
-  return runs
+  return spans.map(({ x0, x1, pieces }) => ({ x0, x1, pieces }))
+}
+
+function columnRuns(pieces: Comp[]): number {
+  return inkSpans(pieces).length
 }
 
 /** What a recogniser may write for a bullet: one of these at the reading's end means it named the bullet. */

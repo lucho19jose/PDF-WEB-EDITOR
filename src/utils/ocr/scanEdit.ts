@@ -1668,6 +1668,16 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
       const i = c.anchorL
       if (oldSpace(i) === c.space || inkWordBoundary(i) === c.space) return oldGap(i)
     }
+    // A new letter right after one that stays, where the old text broke: the
+    // gap the break had. The line's typical word gap is the wrong figure — on
+    // ": Mantenimiento Instrumentacion" it was the 10 px after the colon, and
+    // "Electrico" stood 3 px further off than the word it replaced — and so is
+    // a letter gap where the INK broke but the reading did not: ":09/08/2023"
+    // read without its space came back ":20/08/2023", glued to the colon.
+    if (c.kind !== 'orig' && p.kind === 'orig' && p.anchorR >= 0) {
+      const i = p.anchorR + 1
+      if (i < li.cells.length && (c.space ? oldSpace(i) && matchOfOld[i] < 0 : !oldSpace(i) && inkWordBoundary(i))) return oldGap(i)
+    }
     if (c.space) return wordGapPx
     const model = spacing(c.styleWord)
     // A pair the page never printed has no gap of its own in the model, and
