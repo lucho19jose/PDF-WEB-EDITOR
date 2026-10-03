@@ -50,5 +50,6 @@ public/_sweep/r6/
 .playwright-mcp/
 public/_sweep/ocr2/
 public/_sweep/ocr3/
+public/_sweep/ocr4/
 # Fidelity-driver edit suites quote the documents they test.
 public/_sweep/suites/
