@@ -5137,6 +5137,12 @@ baked.
   asking for the same page share one build (`scanPageFor`): it now runs the
   moment recognition ends, where before it ran as one block of a second and a
   half at the first edit.
+- **The atlas keeps the letters of eight pages, the eight used last**
+  (`MAX_HARVESTS`). A page's harvest holds 4 to 10 MB of glyph crops
+  (measured: 2,700–4,100 exemplars a page on the MSP appendix), and with every
+  recognised page harvested, "Reconocer texto" on a hundred-page document
+  would have kept well over half a gigabyte. A document sets its pages in the
+  same few faces; a page in use is touched, so it is the last to go.
 - **Whatever looks runs up by their text waits for it**: the editing
   assistant's `recognise` awaits `settleRepairs()`, and so does the fidelity
   driver (`__pdfHooks.ocrController.settleRepairs`). A suite entry may carry

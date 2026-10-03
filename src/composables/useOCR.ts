@@ -738,20 +738,38 @@ function createOCR() {
   interface ScanPage { gen: number; raster: ScanRaster; pi: PageInk; lines: Map<string, LineInk | null>; unread: Map<string, string> }
   const scanPages = new Map<number, { gen: number; sp: ScanPage | null }>()
   const harvests = new Map<number, { gen: number; h: PageHarvest }>()
+  /**
+   * Pages whose letters the atlas keeps. A harvest holds 4 to 10 MB of glyph
+   * crops, and every page recognised is harvested now (its runs are re-read
+   * from its letters) — recognising a hundred-page document kept them all.
+   * The eight used last are plenty: a document sets its pages in the same
+   * few faces.
+   */
+  const MAX_HARVESTS = 8
+  function keepHarvest(pageIndex: number, entry: { gen: number; h: PageHarvest }) {
+    harvests.delete(pageIndex)
+    harvests.set(pageIndex, entry)
+    while (harvests.size > MAX_HARVESTS) harvests.delete(harvests.keys().next().value!)
+  }
   let atlasCache: { key: string; atlas: Atlas } | null = null
 
+  // One build of a page at a time: the background re-read and an edit's plan
+  // ask for the same page within moments of each other, and two builds of it
+  // cost the main thread twice.
+  const building = new Map<string, Promise<ScanPage | null>>()
   /**
    * `keep: false` — only HARVEST the page for the atlas (a letter the edited
    * page lacks): its pixels are not kept, so the page being edited is never
    * pushed out of the two-page cache by its own neighbours.
    */
-  // One build of a page at a time: the background re-read and an edit's plan
-  // ask for the same page within moments of each other, and two builds of it
-  // cost the main thread twice.
-  const building = new Map<string, Promise<ScanPage | null>>()
   function scanPageFor(pageIndex: number, keep = true): Promise<ScanPage | null> {
     const have = scanPages.get(pageIndex)
-    if (have && have.gen === genOf(pageIndex)) return Promise.resolve(have.sp)
+    if (have && have.gen === genOf(pageIndex)) {
+      // In use: its letters are the last the atlas lets go.
+      const h = harvests.get(pageIndex)
+      if (h) keepHarvest(pageIndex, h)
+      return Promise.resolve(have.sp)
+    }
     const key = `${pageIndex}:${genOf(pageIndex)}:${keep}`
     const pending = building.get(key)
     if (pending) return pending
@@ -795,7 +813,7 @@ function createOCR() {
           if (!li) unread.set(it.id, lastLineFailure())
         }
         sp = { gen, raster, pi, lines, unread }
-        harvests.set(pageIndex, { gen, h: harvestPage(pi, [...lines.values()].filter((l): l is LineInk => !!l), pageIndex) })
+        keepHarvest(pageIndex, { gen, h: harvestPage(pi, [...lines.values()].filter((l): l is LineInk => !!l), pageIndex) })
       }
     }
     if (!keep) return sp

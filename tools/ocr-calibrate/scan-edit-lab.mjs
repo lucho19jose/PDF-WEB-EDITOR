@@ -210,6 +210,17 @@ if (cmd === 'atlas') {
   const GA = await load('/src/utils/ocr/glyphAtlas.ts')
   const { atlas } = await pagesAndAtlas(GA)
   console.log(`atlas built (${ms()}): boldAt ${atlas.boldAt?.toFixed(4)} wordGapEm ${atlas.wordGapEm.toFixed(3)} spacing regular mu ${atlas.spacing.regular.mu.toFixed(3)} n ${atlas.spacing.regular.n} bold mu ${atlas.spacing.bold.mu.toFixed(3)} n ${atlas.spacing.bold.n}`)
+  {
+    // What the harvest holds, by page: the exemplars' pixel and shape arrays.
+    const byPage = new Map()
+    for (const list of atlas.byChar.values()) for (const e of list) {
+      const b = byPage.get(e.page) ?? { n: 0, bytes: 0 }
+      b.n++
+      b.bytes += e.t.byteLength + e.m.byteLength + e.shape.byteLength + 200
+      byPage.set(e.page, b)
+    }
+    console.log('held:', [...byPage].map(([p, b]) => `page ${p}: ${b.n} exemplars, ${(b.bytes / 1e6).toFixed(1)} MB`).join('; '))
+  }
   const rows = []
   for (const [ch, list] of [...atlas.byChar.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
     const b = list.filter(e => atlas.boldAt !== null && e.weight !== null && e.weight >= atlas.boldAt).length
