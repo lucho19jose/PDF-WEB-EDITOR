@@ -5207,6 +5207,23 @@ medoid "0" came from rows fitted at a 13.9 px em and the "930.00" rows at
 bar — so "930.00" was redrawn whole to become "1,050.00". Copies at the
 line's own size now speak for it from an 8% em difference (it was 20%).
 
+**A figure is sized by FIGURES first** (`figH`: the median height of a
+line's figures, on `lineMetrics`, every `Exemplar` and the request). The
+same face's figures stand at one height on every line, whatever the em fit
+made of a line of figures alone; by capital height, a purchase order's
+"930.00" rows (fitted 10% larger than its "1.00" rows) took their "1" re-
+weighed from the bold header, and a bold day cell's "12" came out in the
+regular figures, visibly lighter than the "05" it replaced. Old-style
+figures compare x-height-ish with x-height-ish the same way. Capital
+height and the figure's own height remain the fallbacks.
+
+**Each line's wanted letter is its own** (`wanting` keyed by line in
+`planScanEdits`). A synthesised letter is made in its line's look and looked
+up under the line's id; keyed by the letter alone, two edited amounts on one
+page wanting the same comma kept only the last line's want, and the other
+amount went on wanting its comma — a vector redraw in the middle of a
+column of scan edits.
+
 **Amounts in a column are set flush right even when all are as wide**
 (`amount` in `alignedRight`): a column of "930.00" down every row gives no
 left edge that differs, and amounts are set flush right; a code column as

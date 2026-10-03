@@ -941,6 +941,7 @@ function createOCR() {
           g = await synthGlyph(look, glyphRasterizer, atlas, w).catch(() => null) ?? undefined
           if (g) synthCache.set(key, g)
         }
+        if (import.meta.env.DEV) ((window as any).__synthLog ??= []).push({ page: pageIndex, line: w.line, char: w.char, face: look.family, score: +look.score.toFixed(2), made: !!g })
         if (g) synth.set(w.line ? `${w.line}|${wantKey(w)}` : wantKey(w), g)
       }
       if (synth.size) plan = planScanEdits(sp.pi, sp.lines, atlas, items, synth, sp.unread)

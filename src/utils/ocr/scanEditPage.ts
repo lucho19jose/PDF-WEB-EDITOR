@@ -388,7 +388,11 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
     const res = applyLineEdit(pl, li, atlas, item.text, w, { remove: item.removed, justifyTo: justifyFor(li), limitRight, synth, columnRight: alignedRight(lines.values(), li), pageLines })
     if (!res.ok) {
       modes[item.id] = `vector (${res.reason})`
-      for (const w of res.wanting ?? []) wanting.set(wantKey(w), w)
+      // Per LINE: each line's letter is made in that line's look and looked up
+      // under the line's id. Keyed by the letter alone, two lines wanting the
+      // same comma kept only the last line's want, and the first line of a
+      // purchase order's two edited amounts went on wanting its comma.
+      for (const w of res.wanting ?? []) wanting.set(`${w.line ?? ''}|${wantKey(w)}`, w)
       continue
     }
     handled.add(item.id)

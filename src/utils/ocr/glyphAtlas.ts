@@ -40,6 +40,8 @@ export interface Exemplar {
   emPx: number
   xh: number | null
   capH: number | null
+  /** The median height of its line's figures above the baseline, px (old-style figures stand lower than capitals). */
+  figH?: number | null
   /** Stem weight of the word it came from (stem / em). */
   weight: number | null
   page: number
@@ -99,7 +101,7 @@ export function vocabKey(token: string): string {
 }
 
 /** The x-height and cap height of a line, px, from its cut letters. */
-export function lineMetrics(li: LineInk, opts: { loose?: boolean } = {}): { xh: number | null; capH: number | null } {
+export function lineMetrics(li: LineInk, opts: { loose?: boolean } = {}): { xh: number | null; capH: number | null; figH: number | null } {
   const base = (x: number) => li.fit.y + li.fit.slope * (x - li.fit.centreX)
   const measure = (approx: boolean) => {
     const xs: number[] = [], caps: number[] = [], figures: number[] = []
@@ -118,7 +120,7 @@ export function lineMetrics(li: LineInk, opts: { loose?: boolean } = {}): { xh: 
     // Figures are not always cap height, though: old-style ones stand lower,
     // so a capital the line does show (the S of "S/ 250.00") outranks them.
     const capH = caps.length >= 2 ? med(caps) : figures.length >= 2 ? Math.max(med(figures)! / 0.98, caps[0] ?? 0) : null
-    return { xh: xs.length >= 3 ? med(xs) : null, capH }
+    return { xh: xs.length >= 3 ? med(xs) : null, capH, figH: figures.length >= 2 ? med(figures) : null }
   }
   const exact = measure(false)
   if (!opts.loose || (exact.xh !== null && exact.capH !== null)) return exact
@@ -128,7 +130,7 @@ export function lineMetrics(li: LineInk, opts: { loose?: boolean } = {}): { xh: 
   // word of "S/ 250.00" cut, and an "X" sized from the em came out the height
   // of a lowercase x.
   const loose = measure(true)
-  return { xh: exact.xh ?? loose.xh, capH: exact.capH ?? loose.capH }
+  return { xh: exact.xh ?? loose.xh, capH: exact.capH ?? loose.capH, figH: exact.figH ?? loose.figH }
 }
 
 /** The grid a shape is compared on: COLS × ROWS cells over [inkL, inkL + 1.1 em] × [base − 1.05 em, base + 0.35 em]. */
@@ -169,7 +171,7 @@ export function shapeAgreement(a: Float32Array, b: Float32Array): number {
 export function harvestLine(pi: PageInk, li: LineInk, page: number, out: Exemplar[]): void {
   const s = pi.s
   const base = (x: number) => li.fit.y + li.fit.slope * (x - li.fit.centreX)
-  const { xh, capH } = lineMetrics(li)
+  const { xh, capH, figH } = lineMetrics(li)
   for (const word of li.words) {
     // Only a word whose n-th run of ink is its n-th letter: see `LineWord.exact`.
     if (!word.cut || !word.exact) continue
@@ -183,7 +185,7 @@ export function harvestLine(pi: PageInk, li: LineInk, page: number, out: Exempla
       // "full stop", and an amount typed "1,050.00" printed "1,050000".
       if (/^[.,:;'·]$/.test(c.char) && (c.inkR - c.inkL + 1 > li.fit.emPx * 0.24 || (c.char !== ':' && c.char !== ';' && c.bottom - c.top > li.fit.emPx * 0.4))) continue
       const ex = cutExemplar(pi, li, c, k, base, word.weight, xh, capH, page)
-      if (ex) out.push(ex)
+      if (ex) { ex.figH = figH; out.push(ex) }
     }
   }
 }
@@ -483,6 +485,8 @@ export interface GlyphRequest {
   emPx: number
   xh: number | null
   capH?: number | null
+  /** The target line's figures' median height, px — what a figure is sized by first. */
+  figH?: number | null
   bold: boolean
   /**
    * The face the letter is wanted in, as the target line's own letters near
@@ -589,6 +593,12 @@ function sizeRatioOf(req: GlyphRequest, ex: Exemplar): number {
     // fall below the baseline, and a receipt's "1980" → "1985" judged by
     // their own heights had every figure of the page refused and set in
     // lining figures instead.
+    // Figures by FIGURES first, where both lines measured theirs: the same
+    // face's figures are the same height on every line, whatever the em fit
+    // made of a line of figures alone (a purchase order's "930.00" rows
+    // fitted 10% larger than its "1.00" rows, and a "1" from those came out
+    // re-weighed from the bold header instead).
+    if (req.figH && ex.figH) return req.figH / ex.figH
     if (req.capH && ex.capH) return req.capH / ex.capH
     const own = req.capH && !ex.xh ? ownCapHeight(ex) : null
     if (req.capH && own) return req.capH / own

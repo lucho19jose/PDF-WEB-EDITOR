@@ -1304,7 +1304,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   const notes: string[] = []
   const em = li.fit.emPx
   const base = (x: number) => li.fit.y + li.fit.slope * (x - li.fit.centreX)
-  const { xh, capH } = lineMetrics(li, { loose: true })
+  const { xh, capH, figH } = lineMetrics(li, { loose: true })
   const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }
   const touch = (p: number) => {
     const x = p % W, y = (p - x) / W
@@ -1564,7 +1564,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   for (const c of nc) {
     if (c.kind !== 'synth') continue
     const bold = boldOfWord(c.styleWord)
-    const req = { char: c.ch, emPx: em, xh, capH, bold, style: { line: li.id, refs: styleOf(c.styleWord) } }
+    const req = { char: c.ch, emPx: em, xh, capH, figH, bold, style: { line: li.id, refs: styleOf(c.styleWord) } }
     let pick = pickGlyph(atlas, req)
     let g: GlyphImage | null = null
     if (pick) {
