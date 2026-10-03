@@ -1689,21 +1689,44 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   // amount or a code keeps its spacing to the pixel and nothing after it
   // moves. Typeset by the gap model instead, "13,000.00" → "13,500.00" put
   // the new "5" two pixels right of the old "0" and moved ",00.00" with it.
+  // Every new character of the middle must be such a figure — one for one,
+  // between kept characters — and the kept ones between them stay where
+  // they are: "del 03 de abril al 01" → "del 04 de abril al 02" changes two
+  // figures, and typeset by the gap model it moved "de abril al 0" between
+  // them by the new "4"'s width.
   const sameCells = (() => {
-    if (pre < 1 || tail >= nc.length || tail <= pre) return false
-    const a = nc[pre - 1].old, b = nc[tail].old
-    if (b - a - 1 !== tail - pre) return false
-    for (let k = 0; k < tail - pre; k++) {
-      const c = nc[pre + k]
-      // An approximate cell is a share of a word's ink, not a figure's place.
-      if (c.kind === 'orig' || c.space !== oldSpace(a + 1 + k) || !/^[0-9]$/.test(c.ch) || !/^[0-9]$/.test(oldChars[a + 1 + k]) || li.cells[a + 1 + k].approx) return false
+    if (pre < 1 || tail >= nc.length || tail <= pre) return null
+    const slots = new Map<number, number>() // middle index → the old cell it takes
+    // A kept character keeps the space (or none) it had before it.
+    const sameSpace = (c: NewChar) => oldSpace(c.old) === c.space || inkWordBoundary(c.old) === c.space
+    if (!sameSpace(nc[tail])) return null
+    for (let j = pre; j < tail;) {
+      if (nc[j].kind === 'orig') {
+        // Kept characters keep their order, their neighbours and their spacing.
+        if (!sameSpace(nc[j]) || (nc[j - 1].kind === 'orig' && nc[j].old !== nc[j - 1].old + 1)) return null
+        j++
+        continue
+      }
+      let k = j
+      while (k < tail && nc[k].kind !== 'orig') k++
+      const a = nc[j - 1].old, b = nc[k].old
+      if (b - a - 1 !== k - j) return null
+      for (let q = 0; q < k - j; q++) {
+        const c = nc[j + q], oi = a + 1 + q
+        // An approximate cell is a share of a word's ink, not a figure's place.
+        if (c.space !== oldSpace(oi) || !/^[0-9]$/.test(c.ch) || !/^[0-9]$/.test(oldChars[oi]) || li.cells[oi].approx) return null
+        slots.set(j + q, oi)
+      }
+      j = k
     }
-    return true
+    if (nc[tail].old !== nc[tail - 1].old + 1 && nc[tail - 1].kind === 'orig') return null
+    return slots.size ? slots : null
   })()
   if (sameCells) {
-    const a = nc[pre - 1].old
-    for (let k = 0; k < tail - pre; k++) {
-      const c = nc[pre + k], cell = li.cells[a + 1 + k]
+    for (let j = pre; j < tail; j++) {
+      const c = nc[j]
+      if (c.kind === 'orig') { place(c, li.cells[c.old].inkL); continue }
+      const cell = li.cells[sameCells.get(j)!]
       place(c, cell.inkL + ((cell.inkR - cell.inkL) - widthOf(c)) / 2)
     }
     pen = nc[tail - 1].x + widthOf(nc[tail - 1])

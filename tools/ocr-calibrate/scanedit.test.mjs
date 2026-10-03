@@ -401,6 +401,41 @@ test('a number whose figures touch is cut by its pitch, and a changed figure tak
   assert.match(res.drawn, /^k+[gws]kkk$/, `drawn ${res.drawn}`)
 })
 
+test('two figures changed in one line are two swaps: the words between them keep their pixels', () => {
+  const W = 1300, H = 220, size = 11 / 0.36
+  const font = new mupdf.Font('Arimo', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Regular.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const set = (text, x, y) => {
+    const t = new mupdf.Text()
+    t.showString(font, [size, 0, 0, -size, x, y], text)
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  }
+  set('desarrollado del 03 de abril al 01 de mayo', 40, 80)
+  set('Fecha 2024 y 2026', 40, 150)
+  dev.close()
+  const g = pix.getPixels(), stride = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = g[y * stride + x], i = (y * W + x) * 4
+    rgba[i] = rgba[i + 1] = rgba[i + 2] = v
+    rgba[i + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Dates')
+  const pi = LI.preparePage(raster)
+  const box = (y0, y1) => ({ x: 30 * 0.36, y: y0 * 0.36, width: 1200 * 0.36, height: (y1 - y0) * 0.36 })
+  const li = LI.analyzeLine(pi, { id: 'd', text: 'desarrollado del 03 de abril al 01 de mayo', inkRect: box(52, 88), confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const other = LI.analyzeLine(pi, { id: 'f', text: 'Fecha 2024 y 2026', inkRect: box(122, 156), confidence: 95 })
+  assert.ok(other, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li, other], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, 'desarrollado del 04 de abril al 02 de mayo', work, {})
+  assert.ok(res.ok, res.reason)
+  assert.equal(res.drawn.replace(/k/g, '').length, 2, `drawn ${res.drawn}`)
+})
+
 test('a large bold title on white paper is edited without grey halos: its thick strokes are ink, not paper', () => {
   // A bilevel scan at 300 DPI (0.24 pt a pixel): a 45pt bold title, its stems
   // ~34 px wide — wider than the paper estimate's 3.6pt filter can see across.

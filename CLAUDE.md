@@ -4727,7 +4727,11 @@ a new figure came out wrong, each measured on the crops (glyph extents per
   ",00.00" with it. Figures replacing as many figures (each with the same
   space before it, from cut, not approximate, cells) now take the old ones'
   cells, centred where each stood — lining figures share one advance — and
-  the tail stays to the pixel: the edit rewrites one figure.
+  the tail stays to the pixel: the edit rewrites one figure. Kept characters
+  BETWEEN such figures stay put too, so two changes in one line are two
+  figure swaps: a certificate's "del 03 de abril al 01" → "del 04 de abril
+  al 02" moved "de abril al 0" by the new "4"'s width when typeset, and now
+  redraws the "4" and the "2" alone.
 - **Rounded onto the baseline.** Every borrowed glyph was placed at a whole
   pixel, half a pixel off the fitted baseline either way, so two neighbours
   could stand a pixel apart ("PYT000123": the first new "0" a pixel above the
