@@ -5201,6 +5201,58 @@ itself, where words' measured weights move by a few thousandths); the MSP
 suite is pixel-identical, and the cover's deletion comes back clean white.
 The rule costs about 0.4 s on a 300 DPI page.
 
+### The vector redraw on a condensed cover: no lost letter, and the face's width kept
+Deleting one letter of a condensed bold cover title ("NAPOLEON HILL" →
+"NAPOLEN HILL", red ground, so the vector path) erased the "H" of "HILL" and
+never drew it again. Three separate things, each found by following that one
+edit through the bake:
+
+- **The word split was wrong, and nothing checked it.** On the coloured
+  ground no word could be cut, so the line was split into words by its ink
+  and the reading shared out by width — and the split fell between the "H"
+  and the "I" (first word 230pt where the scan's is 199pt; second word 30%
+  narrower than its letters). The partial redraw widened the edit to the
+  whole first word, the "H" with it, and patched it out. `planPartial` now
+  refuses when the boundary at an edge of the edit is one LETTER off
+  (`boundaryOffByOne`): one word too wide and its neighbour too narrow, both
+  fitting once a letter crosses over (0.12 and 0.30 off; 0.01 and 0.05 with
+  the "H" moved). The run is then redrawn whole and nothing of it is lost.
+  A word's width error on its own is NOT the test, and was tried first: a
+  wide display face ("UNAJMA" in a techno face, its "U" and "N" half again the
+  advance table's width) is off by 0.3–0.5 letter by letter with every split
+  right, and the guard sent a partial redraw that kept four of the scan's
+  letters to a whole redraw in Helvetica.
+- **A whole-run redraw keeps the original's width.** Its size is the
+  letters' own once the cut has measured them, so a base-14 face set wider
+  than the scanned one ran a fifth past the box. The original words, measured
+  in the drawing face (`originalWidthAt10`), against the ink they took, give
+  the squeeze; the new text gets the same (`fitWidth`, never below 0.7), for
+  a left-aligned run neither restyled nor moved. The bake measures in the
+  base-14 face as well and falls back to it when the traced face cannot
+  measure a run exactly.
+- **A single text op dropped its fit.** The bake drew a group of one with
+  `addText`, which has no width to fit to; a fitted single op now goes
+  through `addTextRun` like a group.
+
+And in `groundFill`: a shape of the run that the patches only CLIP, most of it
+outside them, is left alone — a kept letter a misplaced boundary cuts into is
+not half-erased. (It did not save this "H", which the bad split had put wholly
+inside the patch; that is what the planner check is for.)
+
+Measured in the browser on that cover: before, `partial` with the "H"
+erased; after, `whole` with "NAPOLEN HILL" set condensed inside the old box,
+damage outside the plan 0 (was 7068 px with the plain whole-run redraw).
+
+**Known limitations, both on covers:** a STENCIL face whose letters break at
+a notch as wide as its letter spacing (the "N" of that "UNAJMA": 33px inside
+the letter, 26–33px between letters, at a 141px em) is split into ink words
+mid-letter by any gap threshold, and a partial redraw next to that letter
+cuts off its far half. A TWO-TONE title ("APOCALÍP" black, "SEX" grey on a
+green gradient) is measured on its dark half only: the ink box stops at the
+grey letters, the reading's last letters are shared over the black ink, and
+whichever redraw follows leaves the grey half on the page beside the new
+text.
+
 ### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
 Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)
 leaves a scan's words in the content stream as INVISIBLE text: render mode 3,

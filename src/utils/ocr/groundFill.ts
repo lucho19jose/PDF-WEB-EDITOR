@@ -237,7 +237,15 @@ export function groundFill(s: ScanRaster, rects: PxRect | PxRect[], emPx: number
       const edge = cx0 === 0 || cy0 === 0 || cx1 === W - 1 || cy1 === H - 1
       const picture = outFrac > 0.5 || (edge && outFrac > 0.25) || cy1 - cy0 + 1 > emPx * 1.6 || comp.length > emPx * emPx * 2.5
       if (debugComps) debugComps.push({ x: Math.round(cx + X0), y: Math.round(cy + Y0), w: cx1 - cx0 + 1, h: cy1 - cy0 + 1, area: comp.length, picture, edge, outFrac: Math.round(outFrac * 100) / 100 })
-      if (picture || lines.some(e => cx >= e.x0 && cx < e.x1 && cy >= e.y0 && cy < e.y1 && (!inOwn(cx, cy) || reach(e, cx, cy) < reach(ownBox, cx, cy)))) {
+      // A letter the patches only clip, most of it outside them, is one the
+      // edit KEEPS — the head or tail of a partial redraw — cut by a glyph
+      // cut that placed the boundary inside it. Erased up to the patch's edge
+      // it is lost: a boundary two thirds of the way into a kept letter left
+      // a sliver of it beside the redrawn stretch.
+      let within = 0
+      for (const j of comp) if (inside[j]) within++
+      const clipped = within > 0 && within < comp.length * 0.5
+      if (clipped || picture || lines.some(e => cx >= e.x0 && cx < e.x1 && cy >= e.y0 && cy < e.y1 && (!inOwn(cx, cy) || reach(e, cx, cy) < reach(ownBox, cx, cy)))) {
         if (picture) for (const j of comp) if (inBand(j)) bandPicture++
         for (const j of comp) { core[j] = 0; foreign[j] = 255 }
       } else if (cx < mine.x0 || cx > mine.x1 || cy < mine.y0 || cy > mine.y1) {

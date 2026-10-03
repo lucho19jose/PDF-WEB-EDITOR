@@ -446,6 +446,37 @@ export function bandRects(x0: number, x1: number, yAt: (x: number) => number, sl
   return out
 }
 
+/**
+ * Whether the boundary in front of `words[k]` sits one letter off the ink.
+ *
+ * A word's width against what its letters take is no test on its own: a
+ * display face is wider or narrower than the advance table letter by letter —
+ * the "U" and "N" of a wide techno "UNAJMA" each measured half again what the
+ * table expects, and its words were split right. A letter on the wrong side
+ * of a boundary shows as a PAIR: one word too wide by about a letter, the next
+ * too narrow by the same, and both fit once that letter crosses over (the
+ * "NAPOLEON | HILL" split 0.12 and 0.30 off, 0.01 and 0.05 with the "H"
+ * moved). A word the glyph cut took apart has its letters counted, and gives
+ * none up.
+ */
+function boundaryOffByOne(words: NonNullable<SpanCut['words']>, chars: string[], k: number): boolean {
+  const a = words[k - 1], b = words[k]
+  if (!a || !b || a.to !== b.from || (a.cut && b.cut)) return false
+  const adv = (from: number, to: number) => { let t = 0; for (let i = from; i < to; i++) t += expectedAdvance(chars[i]); return t }
+  let ink = 0, want = 0
+  for (const w of words) { ink += w.x1 - w.x0; want += adv(w.from, w.to) }
+  if (!(want > 0) || !(ink > 0)) return false
+  const s = ink / want
+  const err = (w: number, e: number) => Math.abs(w - s * e) / Math.max(s * e, 1e-6)
+  const wa = a.x1 - a.x0, wb = b.x1 - b.x0, ea = adv(a.from, a.to), eb = adv(b.from, b.to)
+  const now = Math.max(err(wa, ea), err(wb, eb))
+  if (now < 0.2) return false
+  const moved: number[] = []
+  if (!a.cut && a.to - a.from > 1) { const c = expectedAdvance(chars[a.to - 1]); moved.push(Math.max(err(wa, ea - c), err(wb, eb + c))) }
+  if (!b.cut && b.to - b.from > 1) { const c = expectedAdvance(chars[b.from]); moved.push(Math.max(err(wa, ea + c), err(wb, eb - c))) }
+  return moved.some(m => m < now * 0.5)
+}
+
 export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrTextItem[], pageWidth?: number): PartialOutcome {
   const { cut } = ctx
   if (item.vertical) return { reason: 'vertical run' }
@@ -474,6 +505,15 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   if (prefix > 0 && changed.from < n && cells[changed.from].x0 - cells[prefix - 1].x1 < TOUCH_PT) return { reason: 'head touches the changed letters' }
   if (suffix > 0 && changed.to > 0 && changed.to - 1 >= 0 && changed.to - 1 < n && changed.to - 1 >= changed.from && cells[n - suffix].x0 - cells[changed.to - 1].x1 < TOUCH_PT) return { reason: 'tail touches the changed letters' }
   if (suffix > 0 && changed.to === changed.from && prefix > 0 && cells[n - suffix].x0 - cells[prefix - 1].x1 < TOUCH_PT) return { reason: 'no room between head and tail' }
+  // An edit whose edge falls inside a word the cut could not take apart takes
+  // that whole word (`stretchOf`), so the edges sit on ink-word boundaries —
+  // and a boundary is only where the letters part if the reading's letters
+  // were shared among the ink words correctly. On a condensed cover title the
+  // ink split fell between the "H" and the "I" of "HILL", the "H" was counted
+  // with "NAPOLEON", and the patch over the edited word erased it.
+  if (cut.words && cut.words.some((w, k) => k > 0 && (w.from === prefix || w.from === n - suffix) && boundaryOffByOne(cut.words!, original, k))) {
+    return { reason: "the line's words do not fit its ink" }
+  }
 
   const sizePt = sizeOf(item, cut)
   const bearing = sizePt * 0.05

@@ -412,7 +412,21 @@ export function planOcrExport(
     const baselineY = baseline
       ? baseline.yAtCentre + baseline.slope * (x - (item.rect.x - ink.x) - baseline.centreX) + item.rect.y - ink.y
       : item.rect.y + item.rect.height - Math.max(1, item.rect.height * 0.2)
+    // A condensed face redrawn in a base-14 one is set wider than it was: the
+    // size is the letters' own once the cut has measured them, so the WIDTH
+    // has to give. The original words, as the drawing face sets them, against
+    // the ink they really took, say by how much — a cover's condensed
+    // "NAPOLEON HILL" came back a fifth wider and ran past its box. The new
+    // text is narrowed by the same factor (never below seven tenths), and only
+    // for a run neither restyled nor moved.
+    const originalAt10 = originalWidthAt10For?.(item) ?? null
+    let fitWidth: number | undefined
+    if (!item.restyled && item.align === 'left' && widthAt10 !== null && originalAt10 !== null && originalAt10 > 0 && ink.width > 4) {
+      const squeeze = ink.width / (originalAt10 * fontSize / 10)
+      if (squeeze < 0.95) fitWidth = widthAt10 * fontSize / 10 * Math.max(0.7, squeeze)
+    }
     texts.push({
+      ...(fitWidth ? { fitWidth } : {}),
       text: String(item.text),
       x: Number(x),
       y: Number(baselineY),

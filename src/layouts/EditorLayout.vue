@@ -698,12 +698,19 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
     // beside it by this width, where an estimate of half an em per character
     // let a traced calligraphic "中國銀行 X" run across its neighbour.
     const wholeItems = page.items.filter(i => i.edited && !i.removed && !i.vertical && !scanHandled.has(i.id))
+    // In the base-14 face as well: where the traced face cannot measure a run
+    // exactly (a glyph it lacks) the plain face's width still says how wide
+    // the substitute sets those words, which is what fitting it needs.
+    const n = wholeItems.length
     const wholeMeasured = await pdfEngine.measureRuns([
       ...wholeItems.map(item => ({ text: item.text, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item) })),
-      ...wholeItems.map(item => ({ text: item.originalText, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item) }))
+      ...wholeItems.map(item => ({ text: item.originalText, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic), faceId: faceIdFor(item) })),
+      ...wholeItems.map(item => ({ text: item.text, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic) })),
+      ...wholeItems.map(item => ({ text: item.originalText, fontSize: 10, fontName: base14(item.fontFamily, item.bold, item.italic) }))
     ])
-    const widthAt10 = new Map(wholeItems.map((item, i) => [item.id, wholeMeasured[i]?.exact ? wholeMeasured[i].width : null]))
-    const originalWidthAt10 = new Map(wholeItems.map((item, i) => [item.id, wholeMeasured[i + wholeItems.length]?.exact ? wholeMeasured[i + wholeItems.length].width : null]))
+    const exactOf = (i: number, j: number) => wholeMeasured[i]?.exact ? wholeMeasured[i].width : wholeMeasured[j]?.exact ? wholeMeasured[j].width : null
+    const widthAt10 = new Map(wholeItems.map((item, i) => [item.id, exactOf(i, i + 2 * n)]))
+    const originalWidthAt10 = new Map(wholeItems.map((item, i) => [item.id, exactOf(i + n, i + 3 * n)]))
     // How far each edited run's ink reaches OUTSIDE its box — an accent over
     // the caps, a bold letter's blurred fringe — read from the page as it is
     // now, so the patch covers it. Cut at the box, a deleted "PERÚ" left its
@@ -852,7 +859,10 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
         while (t.group && j < plan.texts.length && plan.texts[j].group === t.group) j++
         const run = plan.texts.slice(i, j)
         // addText takes a bottom-left origin baseline; OCR works top-left.
-        if (run.length > 1) {
+        // A single op with a width to fit goes the run's way too: addText has
+        // no width to fit to, and a whole-run redraw narrowed to a condensed
+        // face's width was drawn at its natural width.
+        if (run.length > 1 || run[0].fitWidth) {
           await pdfEngine.addTextRun(pageIndex, run.map(o => ({
             x: o.x, y: page.pageHeight - o.y, text: o.text, fontSize: o.fontSize, fontName: o.fontName,
             color: o.color, faceId: o.faceId, invisible: o.invisible, fitWidth: o.fitWidth, strokeWidth: o.strokeWidth, faceSkip: o.faceSkip, tracedStrokeWidth: o.tracedStrokeWidth
