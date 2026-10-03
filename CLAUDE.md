@@ -5276,6 +5276,90 @@ character AFTER each space — the name is the old one.) A line of FIGURES alone
 takes its digits' height as its cap height, or a capital set beside them was
 sized from the em at four fifths of their height.
 
+**A bowed line is followed, not fitted straight** (`fitBend` and
+`LineFit.bend` in wordSeg, read through `baselineAtOf` wherever a line's
+baseline is evaluated). A phone photo of a curled page bows its lines: on a
+CamScanner letter the letters' feet sag one to three pixels in the middle of
+most lines against their ends (up to 0.12 em at a 19 px em). Measured against
+the straight fit, the bold date "18/07/2022." at a line's risen end stood
+15.3 px tall where its figures are 13.5 — every bold digit the page printed
+elsewhere was then the wrong size for it, and changing the date synthesised
+two of its four new digits. A letter set on the straight fit at such an end
+also sits a pixel or two low. Knots every three ems or so, each the median
+foot of the letters within two ems of it, linear between and held beyond the
+ends; only where the knots stray from their own best straight line by a pixel
+and a twentieth of an em — on a flat scan the feet scatter by half a pixel,
+and those lines keep the straight fit exactly. The straight fit still decides
+whether the box holds two printed lines and whether the line is set on an arc
+(a seal's); the bend is added after both. A letter or a tail moved along a
+bowed line rises or falls with it (`base(x + dx) − base(x)`, not
+`slope × dx`).
+
+**The request's own line is its own style; the other lines compete among
+themselves** (`inStyle`). The face filter scored the requesting line as a
+perfect 1 and kept only lines within 0.05 of it — and one face agrees with
+itself across lines at 0.85–0.9, so every other line was shut out whenever
+the requesting line held a copy. On that letter's bold date the copy was the
+"8" of "18", touching its slash and so not whole, and no bold "8" printed
+elsewhere could stand in for it. The own line is now always kept and the
+others within 0.05 of the best OTHER line; where no other line can be scored,
+only the own line's copies, as before.
+
+**A copy doubted only across sizes is still its own line's best**
+(`ownLineOnly`). A small phone number's "7" agreed 0.64 with the body text's
+"7" — a third larger — and 0.65 with its "1", and was doubted; with no copy at
+its own size to vouch for it, an edit of the number synthesised its "7" where
+the line's own was there to borrow. Such a copy (its medoid another size, no
+peers, no more like another letter than its own) is picked for a request from
+its OWN line, and only when nothing else can be — the second pass, beside
+`peerVouched`.
+
+**A word the cutter cut is still cut on its runs when the two agree**
+(`exactRuns`, `runsAgree` in `addWord`). A word is exact when its ink falls
+into one run per letter, but its letters' boundaries came from the cutter,
+which places them by the letters' advances: on a notarial deed's bold
+"FBERERO" it put the F|B boundary four pixels into the B's stem, the B's piece
+straddled it and was divided by column, and the F took a strip of the stem.
+"FEBRERO" then erased the B and left the strip standing after the F —
+"F|EBRERO", at HEAD as well. The cutter's suspect flags stand; its boundaries
+give way to the runs when every run is about as wide as its letter
+(`runCellsOf`) AND lies mostly inside the cell the cutter gave that letter.
+The second condition is not decoration: without it, a typed text's re-read
+gave the ink of "G." the reading "ING." (its G, its stop and two specks made
+four runs), every letter cut on those runs "looked like" its label, and a
+table cell's "ING. CIVIL" + " X" printed "I. CIVIL X".
+
+**The lab gates synthesis like the app** (`look.score < 0.75`, as in
+`useOCR`). It synthesised from any fitted look, so a display title fitted at
+0.63 "passed" in the lab with a sans "I" and "Ó" set into a condensed serif
+word — an edit the app refuses and redraws as vectors. A lab result that
+synthesises has to be one the app would make.
+
+Measured for these four: the letter's 11-edit suite in the browser draws
+every edit on the scan with 0 px of damage outside the plan, the bold date
+from the page's own bold digits (was two synthesised) and the phone number's
+"7" from its own line; the lab A/B over 16 suites (235 edits) against HEAD
+takes synthesised letters from 45 to 36 and refusals from 27 to 26 (a
+reversed "FACTURA" drawn from page letters), and every changed plan was
+inspected — MSP's "30 de septiembre" now takes its "s" and "t" from the
+page's bold copies instead of re-weighing regular ones. `bend <page>` and
+`heights <page> <lineId...>` in the lab print a page's bows and a line's
+letter heights over its (bent) baseline.
+
+**A synthesised letter is re-weighed like for like** (`GlyphWant.stemChars`,
+`synthGlyph`). A word's stem is the median darkness summed across every stroke
+its letters cross, and a curve or a diagonal is crossed wider than a stem — in
+many faces a date's 0, 2, 3, 8 and 9 read heavier than its "1". Aiming a
+synthesised "1" at that raw median made it visibly bold beside the scan's own
+"1" on a service order's date. The target is now `have × pageStem / faceStem`:
+the same characters the word's stem was measured on (`stemSource` names them),
+rendered in the face and look that will draw the new letter and measured by the
+same rule (`stemRuns`), so the bias of the word's shapes cancels. Where those
+characters cannot be measured (fewer than four stems) the old target stands.
+Measured in the lab A/B: only synthesised glyphs change, and that "1" comes out
+at the scan's weight. The unit test pins the neutral case: a date printed
+exactly as the look prints it gets its "1" un-re-weighed (ink within 3%).
+
 **Text lighter than its ground is read on the INVERTED scan.** Reversed-out
 titles, a book cover's lettering and logo badges are not ink on paper: read as
 such, the paper estimate takes their white letters for paper, and an edit
@@ -6671,8 +6755,18 @@ scan smoke. `wrap="off"` on the textarea; the run is one line.
 
 ## Deploying
 `npm run build` → `dist/` (≈85 MB without `public/_sweep`, which is
-gitignored and must not be shipped: delete `dist/_sweep` before upload). What
-production MUST provide, all of which `public/.htaccess` does for Apache:
+gitignored and must not be shipped: delete `dist/_sweep` before upload).
+
+**Zip it with `tar.exe`, never `Compress-Archive`.** Windows PowerShell 5.1's
+`Compress-Archive` writes entry names with BACKSLASHES (241 of 246 entries in
+a build zip), and a Linux unzip extracts those as single files literally named
+`assets\index-….js` — the site then loads nothing. From inside `dist/`,
+`C:\Windows\System32\tar.exe -a -c -f <out>.zip <every top-level item>` writes
+forward slashes. Build from a commit in a throwaway `git worktree` (junction
+`node_modules` in, `cmd /c rmdir` it before removing the worktree) so the zip
+is what was pushed, not the working tree.
+
+What production MUST provide, all of which `public/.htaccess` does for Apache:
 - **Cross-origin isolation headers** — `Cross-Origin-Opener-Policy:
   same-origin` and `Cross-Origin-Embedder-Policy: credentialless` on every
   response. Without them there is no SharedArrayBuffer and the workers lose

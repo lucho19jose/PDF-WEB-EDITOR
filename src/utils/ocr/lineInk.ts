@@ -1,6 +1,6 @@
 import { pxRectOf, readerCtx, lumAt, type ScanRaster } from './scanRaster'
 import { pushPull } from './inpaint'
-import { fitLine, splitWords, alignCharsToWords, spaceBoundaries, type Blob, type LineFit } from './wordSeg'
+import { fitLine, fitBend, baselineAtOf, splitWords, alignCharsToWords, spaceBoundaries, type Blob, type LineFit } from './wordSeg'
 import { cutGlyphs, expectedAdvance } from './glyphCut'
 
 /**
@@ -1028,7 +1028,9 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     fit = { y: c.y1, slope: 0, centreX: (c.x0 + c.x1) / 2, emPx: emGuess }
   }
   const em = fit.emPx
-  const base = (x: number) => fit!.y + fit!.slope * (x - fit!.centreX)
+  // The straight fit judges whether this is one printed line, and a level
+  // one; the line's BEND (below) is added only once it has passed.
+  const straight = (x: number) => fit!.y + fit!.slope * (x - fit!.centreX)
   // A recognised "line" that is really two printed lines (the detector took
   // both in one box) has letters well clear of the fitted line on the other
   // side: the edit would be planned on one line's ink with both lines' text.
@@ -1036,7 +1038,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     let off = 0, total = 0
     for (const c of letters) {
       total++
-      const b = base(c.cx)
+      const b = straight(c.cx)
       if (c.y1 < b - em * 1.05 || c.y0 > b + em * 0.25) off++
     }
     if (total >= 6 && off > total * 0.3) return fail('the box holds more than one printed line')
@@ -1046,7 +1048,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   // an edit laid along it put the moved letters off the curve. The letters
   // standing on the fit in each third of the line, middle against ends.
   {
-    const sitting = band.filter(c => Math.abs(c.y1 - base(c.cx)) < em * 0.3).sort((a, b) => a.cx - b.cx)
+    const sitting = band.filter(c => Math.abs(c.y1 - straight(c.cx)) < em * 0.3).sort((a, b) => a.cx - b.cx)
     if (sitting.length >= 9) {
       const third = Math.floor(sitting.length / 3)
       const thirds = [sitting.slice(0, third), sitting.slice(third, sitting.length - third), sitting.slice(sitting.length - third)]
@@ -1056,8 +1058,8 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
       // middle of "RUC: 20319363221" read as the line bending — and tops alone
       // by capitals beside figures; a seal's "REPÚBLICA DEL PERÚ" bends both
       // (2.7 and 2.3 px on a 16.6 px em), its middle off BOTH ends the same way.
-      const [ba, bm, bb] = thirds.map(cs => med(cs.map(c => c.y1 - base(c.cx))))
-      const [ta, tm, tb] = thirds.map(cs => med(cs.map(c => c.y0 - base(c.cx))))
+      const [ba, bm, bb] = thirds.map(cs => med(cs.map(c => c.y1 - straight(c.cx))))
+      const [ta, tm, tb] = thirds.map(cs => med(cs.map(c => c.y0 - straight(c.cx))))
       const dB = bm - (ba + bb) / 2, dT = tm - (ta + tb) / 2
       arcDebug = { n: sitting.length, em, bottoms: [ba, bm, bb], tops: [ta, tm, tb], dB, dT }
       const bends = Math.abs(dB) > em * 0.12 && Math.abs(dT) > em * 0.08 && Math.sign(dB) === Math.sign(dT) &&
@@ -1065,6 +1067,11 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
       if (bends) return fail('the line is set on a curve')
     }
   }
+  // A phone photo of a curled page bows its lines; the letters' feet are
+  // followed where they stray from the straight fit by more than a scan's
+  // quantisation (`fitBend`).
+  fit.bend = fitBend(band.map(c => asBlob(c)), fit)
+  const base = baselineAtOf(fit)
 
   // Which ink is this line's: a component whose centre sits in the line's
   // letter band. A component far taller than a letter is a vertical rule or
@@ -1382,10 +1389,30 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     // letter deleted from a logo redrew the whole word, from letters the page
     // did not hold.
     const byRuns = cutExact ? null : runCellsOf(pieces, wordChars, em) ?? figureCellsOf(pieces, wordChars, em)
+    // And where the cutter DID cut it, one run per letter is still the truer
+    // boundary: the cutter places its cells by the letters' advances, and on a
+    // notarial deed's bold "FBERERO" it put the F|B boundary four pixels into
+    // the B's stem — the B's piece straddled it, was divided by column, and the
+    // F took a strip of the stem with it. The edit erased the B and left the
+    // strip standing beside the F: "FEBRERO" printed as "F|EBRERO". The
+    // cutter's verdicts (suspect cells) stand; its boundaries give way to the
+    // runs, when every run is about as wide as its letter can be — and lies
+    // mostly inside the cell the cutter gave its letter. A count that matches
+    // by accident does not: re-read with a typed text, the ink of "G." took
+    // the reading "ING." (its G, its stop and two specks for four runs), cut
+    // on those runs every letter "looked like" its label, and the line was
+    // re-read as "INING. CIVIL" — the N and G went from the page.
+    const exactRuns = cutExact ? runCellsOf(pieces, wordChars, em) : null
+    const runsAgree = !!exactRuns && exactRuns.every((r, i) => {
+      const c = cut!.cells[i]
+      return Math.min(r.x1, c.x1) - Math.max(r.x0, c.x0) >= (r.x1 - r.x0) * 0.5
+    })
     const ok = cutOk || !!byRuns
     let wordCells: { char: string; x0: number; x1: number; suspect: boolean }[]
     if (byRuns) {
       wordCells = byRuns
+    } else if (exactRuns && runsAgree) {
+      wordCells = exactRuns.map((c, i) => ({ ...c, suspect: !!cut!.cells[i].suspect }))
     } else if (ok) {
       wordCells = cut!.cells.map(c => ({ char: c.char, x0: c.x0, x1: c.x1, suspect: !!c.suspect }))
       // The cut's cells are inclusive of the box's pad; the word's ink is the truth at its ends.

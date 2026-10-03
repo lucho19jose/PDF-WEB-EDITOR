@@ -1133,3 +1133,123 @@ test('amounts in a column are set flush right even when every one is as wide as 
   assert.equal(SEP.alignedRight(lis, lis[2]), true, 'an amount in a column of amounts')
   assert.equal(SEP.alignedRight(lis, lis[3]), false, 'a code in a column of codes')
 })
+
+/**
+ * One line set letter by letter on a BOW, as a phone photo of a curled page
+ * prints it: the feet sag `sag` px in the middle against the ends.
+ */
+function bowedScan(text, sag) {
+  const W = 1200, H = 160, em = 25, x0 = 60, y0 = 90
+  const font = new mupdf.Font('Carlito', fs.readFileSync(ROOT + '/public/fonts/match/Carlito-Regular.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  let width = 0
+  for (const ch of text) width += font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0)), 0) * em
+  let x = x0
+  for (const ch of text) {
+    const u = (x - x0) / width * 2 - 1
+    const t = new mupdf.Text()
+    t.showString(font, [em, 0, 0, -em, x, y0 + sag * (1 - u * u)], ch)
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+    x += font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0)), 0) * em
+  }
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let p = 0; p < W * H; p++) {
+    const a = 1 - g[Math.floor(p / W) * st + (p % W)] / 255
+    for (let c = 0; c < 3; c++) rgba[p * 4 + c] = Math.round(248 * (1 - a * 0.9))
+    rgba[p * 4 + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Bowed')
+  return { raster, item: { id: 'b', text, inkRect: { x: (x0 - 6) * 0.36, y: (y0 - 24) * 0.36, width: (width + 12) * 0.36, height: 34 * 0.36 }, confidence: 95 }, x0, width }
+}
+
+test('a bowed line is measured and set on its own feet, not on a straight line through them', () => {
+  const text = 'Las partes firman el presente documento en la ciudad de Lima el 18/07/2022'
+  const flat = bowedScan(text, 0)
+  const flatLi = LI.analyzeLine(LI.preparePage(flat.raster), flat.item)
+  assert.ok(flatLi, LI.lastLineFailure())
+  assert.equal(flatLi.fit.bend, undefined, 'a straight line has no bend')
+  const { raster, item, x0, width } = bowedScan(text, 3)
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, item)
+  assert.ok(li, LI.lastLineFailure())
+  assert.ok(li.fit.bend, 'the bow was not found')
+  const base = WS.baselineAtOf(li.fit)
+  const sag = base(x0 + width / 2) - (base(x0 + width * 0.03) + base(x0 + width * 0.97)) / 2
+  assert.ok(Math.abs(sag - 3) < 1.2, `bend ${sag.toFixed(2)} px`)
+  // The date's figures stand at the risen end: measured on the bend, their
+  // height is the straight line's.
+  const fh = GA.lineMetrics(li).figH, fh0 = GA.lineMetrics(flatLi).figH
+  assert.ok(Math.abs(fh - fh0) < 0.8, `figures ${fh?.toFixed(2)} px against ${fh0?.toFixed(2)}`)
+  // A figure changed there sits on its neighbours' feet.
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, text.replace('2022', '2027'), work, {})
+  assert.ok(res.ok, res.reason)
+  const footOf = (data, xa, xb) => {
+    let foot = -1
+    for (let y = 0; y < raster.h; y++) for (let x = xa; x < xb; x++) if (data[(y * raster.w + x) * 4] < 120) foot = Math.max(foot, y)
+    return foot
+  }
+  const k = li.chars.length - 1
+  const last = li.cells[k], prev = li.cells[k - 1]
+  const newFoot = footOf(work, Math.floor(last.inkL) - 1, Math.ceil(last.inkR) + 2)
+  const prevFoot = footOf(raster.data, Math.floor(prev.inkL), Math.ceil(prev.inkR) + 1)
+  assert.ok(newFoot >= 0 && Math.abs(newFoot - prevFoot) <= 1, `the new 7 stands at ${newFoot}, its neighbour at ${prevFoot}`)
+})
+
+test('a figure made for a word printed in the look\'s own face is not re-weighed', async () => {
+  // The re-weigh compares like with like: the stem the WORD measures against
+  // the same characters measured in the face that will draw the new one. A
+  // word's stem is a median over every stroke its figures cross, and in many
+  // faces 0, 2, 3, 8 and 9 are crossed wider than a straight stem, so aiming
+  // a "1" at that raw median made it heavier than the page's own "1" (a
+  // service order's date, measured in the lab). Here the date IS the face as
+  // the look prints it, so the like-for-like target is the glyph as made.
+  const W = 900, H = 120, size = 34, sigma = 1.1, text = '10/08/2023'
+  const font = new mupdf.Font('Arimo-Regular', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Regular.ttf'))
+  const field = new Float32Array(W * H)
+  let x = 60
+  for (const ch of text) {
+    const g = GS.rasterizeGlyph(mupdf, font, ch, size)
+    if (g) {
+      const d = GS.printedDarkness(g, sigma, 1)
+      for (let yy = 0; yy < g.h; yy++) for (let xx = 0; xx < g.w; xx++) {
+        const X = Math.round(x) + xx - Math.round(g.inkL), Y = 80 - Math.round(g.baseY) + yy
+        if (X >= 0 && X < W && Y >= 0 && Y < H) field[Y * W + X] = Math.max(field[Y * W + X], d[yy * g.w + xx])
+      }
+    }
+    x += font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0)), 0) * size
+  }
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let p = 0; p < W * H; p++) {
+    const a = Math.min(1, field[p])
+    for (let c = 0; c < 3; c++) rgba[p * 4 + c] = Math.round(250 * (1 - a) + 20 * a)
+    rgba[p * 4 + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Date')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 'd', text, inkRect: { x: 50 * 0.36, y: (80 - size) * 0.36, width: (x - 50) * 0.36, height: size * 1.2 * 0.36 }, confidence: 98 })
+  assert.ok(li, LI.lastLineFailure())
+  const word = li.words[0]
+  assert.ok(word && word.weight !== null, 'the date has no measured stem')
+  const { capH } = GA.lineMetrics(li, { loose: true })
+  const fonts = new Map()
+  const rasterize = async (file, chars, emPx) => {
+    let f = fonts.get(file)
+    if (!f) { f = new mupdf.Font(file, fs.readFileSync(`${ROOT}/public/fonts/match/${file}.ttf`)); fonts.set(file, f) }
+    return chars.map(ch => GS.rasterizeGlyph(mupdf, f, ch, emPx))
+  }
+  const look = { family: 'Arimo', sigma, gamma: 1, score: 0.95, xhPerEm: 0.52, capPerEm: 0.716, regularAs: 'regular', boldAs: 'bold' }
+  const atlas = { stem: { regular: NaN, bold: NaN } }
+  const req = { char: '1', emPx: li.fit.emPx, xh: null, capH, bold: false, ink: [20, 20, 20], coreDark: li.coreDark }
+  const natural = await GS.synthGlyph(look, rasterize, atlas, req)
+  const made = await GS.synthGlyph(look, rasterize, atlas, { ...req, stem: word.weight, stemChars: text })
+  assert.ok(natural && made, 'no glyph')
+  const ink = (gl) => { let s = 0; for (let i = 0; i < gl.w * gl.h; i++) if (gl.m[i]) s += 1 - gl.t[i * 3] / 250; return s }
+  const a = ink(natural), b = ink(made)
+  assert.ok(Math.abs(b - a) <= a * 0.03, `made ${b.toFixed(1)} against ${a.toFixed(1)} as the face draws it`)
+})

@@ -275,6 +275,7 @@ if (cmd === 'edit') {
   const limitRight = s.w - Math.round(18 / Math.abs(s.toPage[0]))
   const optsFor = (li) => ({ justifyTo: SEP.justifiedMargin ? SEP.justifiedMargin(margin, lis, li) : margin, limitRight, columnRight: SEP.alignedRight ? SEP.alignedRight(lis, li) : false, pageLines: lis.filter(Boolean) })
   console.log('margins', JSON.stringify({ margin, limitRight }))
+  if (process.env.STYLELOG) globalThis.__inStyleLog = []
   for (const spec of suite) {
     const items = itemsOf(p)
     // `id` names the run outright, for text that occurs on more than one line.
@@ -293,7 +294,9 @@ if (cmd === 'edit') {
       look = await GS.fitScanLook(atlas, nodeRasterize(GS), { log: l => console.log(`   face ${l}`), near: { line: li.id, page: p, emPx: li.fit.emPx } })
       console.log(`   look: ${JSON.stringify(look)}`)
       const synth = new Map()
-      if (look) for (const w of res.wanting) {
+      // The app's gate (useOCR): no face prints like the line under 0.75.
+      if (look && look.score < 0.75) console.log(`   no face prints like this line (best ${look.family} at ${look.score.toFixed(2)})`)
+      if (look && look.score >= 0.75) for (const w of res.wanting) {
         const g = await GS.synthGlyph(look, nodeRasterize(GS), atlas, w)
         console.log(`   want "${w.char}" em ${w.emPx.toFixed(1)} xh ${w.xh?.toFixed(1)} capH ${w.capH?.toFixed(1)} bold ${w.bold} -> ${g ? `${g.w}x${g.h} ink ${g.inkL}-${g.inkR} base ${g.baseY}` : 'none'}`)
         if (g) synth.set(SE.wantKey(w), g)
@@ -301,6 +304,7 @@ if (cmd === 'edit') {
       res = editOn(SE, pi, li, atlas, next, work, { ...optsFor(li), synth })
     }
     const tookMs = Date.now() - t1
+    if (process.env.STYLELOG) { for (const l of globalThis.__inStyleLog ?? []) console.log('   style', l); globalThis.__inStyleLog = [] }
     if (!res.ok) { console.log(`${spec.label}: REFUSED ${res.reason}`); continue }
     console.log(`${spec.label}: ok ${tookMs}ms drawn=${res.drawn} box=${res.box ? [res.box.x0, res.box.y0, res.box.x1, res.box.y1].join(',') : '-'} ${res.notes.join('; ')}`)
     console.log(`   "${it.text.slice(0, 90)}"\n -> "${next.slice(0, 90)}"`)
@@ -708,6 +712,56 @@ if (cmd === 'cell') {
 }
 
 
+if (cmd === 'heights') {
+  // `heights <page> <lineId...>`: every cell's height over the fitted baseline,
+  // and the line's metrics — what sizes and weighs a letter brought to it.
+  const GA = await load('/src/utils/ocr/glyphAtlas.ts')
+  const p = Number(args[0])
+  const s = scanOf(p)
+  const pi = LI.preparePage(s)
+  for (const id of args.slice(1)) {
+    const it = itemsOf(p).find(i => i.id === id)
+    const li = it && LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+    if (!li) { console.log(id, 'not analysed'); continue }
+    const WS = await load('/src/utils/ocr/wordSeg.ts')
+    const base = WS.baselineAtOf(li.fit)
+    console.log(`${id} em ${li.fit.emPx.toFixed(1)} metrics ${JSON.stringify(GA.lineMetrics(li))}`)
+    console.log('  ' + li.cells.map(c => c.pix.length ? `${c.char}${c.approx ? '~' : ''}${c.suspect ? '!' : ''}:${(base((c.inkL + c.inkR) / 2) - c.top).toFixed(1)}/${(c.bottom - base((c.inkL + c.inkR) / 2)).toFixed(1)}` : `${c.char}:-`).join(' '))
+  }
+}
+
+
+if (cmd === 'bend') {
+  // `bend <page>`: how far each line's letters' feet stray from its straight
+  // fitted baseline — the median foot of each fifth of the line, in px and in
+  // ems. A phone photo of a curled page bows its lines.
+  const p = Number(args[0])
+  const s = scanOf(p)
+  const pi = LI.preparePage(s)
+  const SITS = /^[A-Za-z0-9ÁÉÍÓÚÑáéíóúñ]$/
+  const DESC = /^[gjpqyQJ]$/
+  const all = []
+  for (const it of itemsOf(p)) {
+    const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+    if (!li) continue
+    const base = (x) => li.fit.y + li.fit.slope * (x - li.fit.centreX)
+    const feet = li.cells.filter(c => c.pix.length && !c.approx && !c.suspect && SITS.test(c.char) && !DESC.test(c.char)).map(c => ({ x: (c.inkL + c.inkR) / 2, r: c.bottom + 1 - base((c.inkL + c.inkR) / 2) }))
+    if (feet.length < 15) continue
+    feet.sort((a, b) => a.x - b.x)
+    const n = 5, seg = []
+    for (let k = 0; k < n; k++) {
+      const part = feet.slice(Math.floor(k * feet.length / n), Math.floor((k + 1) * feet.length / n)).map(f => f.r).sort((a, b) => a - b)
+      seg.push(part[Math.floor(part.length / 2)])
+    }
+    const spread = Math.max(...seg) - Math.min(...seg)
+    all.push(spread / li.fit.emPx)
+    console.log(`${it.id.padEnd(9)} em ${li.fit.emPx.toFixed(1)} feet ${feet.length} fifths ${seg.map(v => v.toFixed(1)).join(' ')} spread ${spread.toFixed(1)}px ${(spread / li.fit.emPx).toFixed(3)}em  "${it.text.slice(0, 40)}"`)
+  }
+  all.sort((a, b) => a - b)
+  if (all.length) console.log(`lines ${all.length}: spread/em median ${all[Math.floor(all.length / 2)].toFixed(3)} p90 ${all[Math.floor(all.length * 0.9)].toFixed(3)} max ${all[all.length - 1].toFixed(3)}`)
+}
+
+
 if (cmd === 'tail') {
   // `tail <page> <suite.json> <label> <x0> <x1> <out.png>`: after one edit, a 6x crop of columns x0..x1 of its line.
   const GA = await load('/src/utils/ocr/glyphAtlas.ts')
@@ -883,7 +937,7 @@ if (cmd === 'explain') {
   const li = pages.get(Number(args[0])).lis.find(l => l.id === args[1])
   // LOOSE=1: the metrics an edit asks with (lineMetrics' loose fallback).
   const m = GA.lineMetrics(li, process.env.LOOSE ? { loose: true } : {})
-  const req = { char: args[2], emPx: li.fit.emPx, xh: m.xh, capH: m.capH, bold: args[3] === 'bold' }
+  const req = { char: args[2], emPx: li.fit.emPx, xh: m.xh, capH: m.capH, figH: m.figH, bold: args[3] === 'bold' }
   console.log('target', JSON.stringify(req), 'boldAt', atlas.boldAt)
   console.log(GA.explainPick(atlas, req).join('\n'))
   console.log('pick:', GA.pickGlyph(atlas, req)?.ex.lineId ?? null)

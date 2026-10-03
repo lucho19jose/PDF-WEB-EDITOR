@@ -325,7 +325,7 @@ async function fitOnRefs(refs: Exemplar[], boldRef: Set<Exemplar>, capRef: Map<E
 /** A line's core level as a darkness, 0..1 (lineInk's `CORE`). */
 const CORE_DARK = CORE / 255
 
-export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: Atlas, req: { char: string; emPx: number; xh: number | null; capH?: number | null; bold: boolean; ink: [number, number, number]; coreDark?: number; stem?: number | null; edge?: number | null }): Promise<GlyphImage | null> {
+export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: Atlas, req: { char: string; emPx: number; xh: number | null; capH?: number | null; bold: boolean; ink: [number, number, number]; coreDark?: number; stem?: number | null; stemChars?: string | null; edge?: number | null }): Promise<GlyphImage | null> {
   const face = MATCH_FACES.find(f => f.family === look.family)
   if (!face) return null
   const emRender = req.xh ? req.xh / look.xhPerEm : req.capH ? req.capH / look.capPerEm : req.emPx * 0.9
@@ -359,6 +359,7 @@ export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: At
   // pixels that print that dark. Aiming the glyph's 90th percentile at the
   // line's median toned a bold serif's "s" to four fifths of its neighbours'
   // stroke centres — a grey letter in a black word.
+  let bestK = 1
   if (req.coreDark) {
     const inkLum = (req.ink[0] * 299 + req.ink[1] * 587 + req.ink[2] * 114) / 1000 / 255
     const inkAbs = Math.max(0.3, 1 - inkLum)
@@ -367,7 +368,7 @@ export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: At
       for (let i = 0; i < d.length; i++) { const a = Math.min(1, d[i] * k) * inkAbs; if (a >= CORE_DARK) v.push(a) }
       return v.length >= 5 ? v.sort((a, b) => a - b)[Math.floor(v.length / 2)] : null
     }
-    let bestK = 1, bestErr = Infinity
+    let bestErr = Infinity
     for (let k = 0.7; k <= 2.0001; k += 0.05) {
       const m = coreMedian(k)
       if (m === null) continue
@@ -390,8 +391,33 @@ export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: At
   // letter on grey ink was thinned to the grey's share of the stem — an "X"
   // after "Bo08-190845" came out a hairline beside the figures.
   const inkShare = Math.max(0.3, 1 - (req.ink[0] * 299 + req.ink[1] * 587 + req.ink[2] * 114) / 1000 / 255)
-  const want = (req.stem ?? (req.bold ? atlas.stem.bold : atlas.stem.regular)) * req.emPx / inkShare
+  const pageStem = (req.stem ?? (req.bold ? atlas.stem.bold : atlas.stem.regular)) * req.emPx / inkShare
   const have = stemOf(d, g.w, g.h, g.baseY, emRender)
+  // Like against like: a word's stem is a median over every stroke its
+  // letters cross, and a curve or a diagonal is crossed wider than a stem.
+  // The face is measured on the SAME characters, printed as this glyph is,
+  // and the glyph takes the ratio of the page's word to the face's word —
+  // the letters' shapes cancel. Against the raw stem, a "1" put into
+  // "09/08/2023" was thickened to the crossings of its 0s, 9s and 8s.
+  let want = pageStem
+  if (req.stem != null && req.stemChars && have !== null) {
+    const chars = [...req.stemChars].filter(ch => ch.trim()).slice(0, 16)
+    if (chars.length >= 2) {
+      const gs = await rasterize(faceFile(face, heavy), chars, emRender)
+      const runs: number[] = []
+      for (const gi of gs) {
+        if (!gi) continue
+        const di = printedDarkness(gi, sigma, look.gamma)
+        if (bestK !== 1) for (let i = 0; i < di.length; i++) di[i] = Math.min(1, di[i] * bestK)
+        stemRuns(di, gi.w, gi.h, gi.baseY, emRender, runs)
+      }
+      if (runs.length >= 4) {
+        runs.sort((a, b) => a - b)
+        const faceStem = runs[Math.floor(runs.length / 2)]
+        if (faceStem > 0) want = have * pageStem / faceStem
+      }
+    }
+  }
   if (have !== null && Math.abs(want - have) > 0.25) {
     const delta = Math.max(-1.2, Math.min(1.2, want - have))
     img = reweighImage(img, delta, delta * 0.35)
@@ -402,6 +428,14 @@ export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: At
 /** A glyph's stem: darkness summed across each stroke a row of its x-height band crosses, the median. */
 function stemOf(d: Float32Array, w: number, h: number, baseY: number, emPx: number): number | null {
   const runs: number[] = []
+  stemRuns(d, w, h, baseY, emPx, runs)
+  if (runs.length < 3) return null
+  runs.sort((a, b) => a - b)
+  return runs[Math.floor(runs.length / 2)]
+}
+
+/** Every stroke crossing `stemOf` takes its median of, appended to `runs`. */
+function stemRuns(d: Float32Array, w: number, h: number, baseY: number, emPx: number, runs: number[]): void {
   // As lineInk's word weight: a crossing wider than a stem is a bar, not a stem.
   const maxRun = Math.max(4, emPx * 0.24)
   for (let y = Math.round(baseY - emPx * 0.38); y <= Math.round(baseY - emPx * 0.12); y++) {
@@ -413,9 +447,6 @@ function stemOf(d: Float32Array, w: number, h: number, baseY: number, emPx: numb
       else if (inRun) { if (sum > 0.5 && len <= maxRun) runs.push(sum); inRun = false; sum = 0; len = 0 }
     }
   }
-  if (runs.length < 3) return null
-  runs.sort((a, b) => a - b)
-  return runs[Math.floor(runs.length / 2)]
 }
 
 /** `stemOf`, for the lab's look report. */

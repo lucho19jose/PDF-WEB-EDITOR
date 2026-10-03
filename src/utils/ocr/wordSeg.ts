@@ -58,12 +58,79 @@ export function blobsOf(bm: InkBitmap): Blob[] {
   return out
 }
 
-/** A line's fitted baseline and size: y(x) = y + slope * (x - centreX). */
-export interface LineFit { y: number; slope: number; centreX: number; emPx: number }
+/**
+ * A line's fitted baseline and size: y(x) = y + slope * (x - centreX), plus
+ * the line's BEND where it has one (`fitBend`) — offsets at knots along x,
+ * interpolated linearly between them and held beyond the ends.
+ */
+export interface LineFit { y: number; slope: number; centreX: number; emPx: number; bend?: { xs: number[]; ys: number[] } }
 
-export const baselineAtOf = (f: Pick<LineFit, 'y' | 'slope' | 'centreX'>) => (x: number) => f.y + f.slope * (x - f.centreX)
+/** A bend's offset at x (0 without one). */
+export function bendAt(b: LineFit['bend'], x: number): number {
+  if (!b || !b.xs.length) return 0
+  const { xs, ys } = b
+  if (x <= xs[0]) return ys[0]
+  if (x >= xs[xs.length - 1]) return ys[ys.length - 1]
+  let k = 1
+  while (k < xs.length - 1 && xs[k] < x) k++
+  const t = (x - xs[k - 1]) / (xs[k] - xs[k - 1])
+  return ys[k - 1] + t * (ys[k] - ys[k - 1])
+}
+
+export const baselineAtOf = (f: Pick<LineFit, 'y' | 'slope' | 'centreX' | 'bend'>) =>
+  f.bend ? (x: number) => f.y + f.slope * (x - f.centreX) + bendAt(f.bend, x) : (x: number) => f.y + f.slope * (x - f.centreX)
 
 const median = (v: number[]) => { const s = [...v].sort((a, b) => a - b); return s[Math.floor(s.length / 2)] }
+
+/**
+ * Where a line's letters' feet stray from its straight baseline, when they
+ * stray by more than the scan's quantisation does. A phone photo of a curled
+ * page BOWS its lines: on a CamScanner letter the feet of most lines sag one
+ * to three pixels in the middle against their ends (a tenth of an em), and
+ * measured against the straight fit the figures of a bold date at the line's
+ * rising end stood 15.3 px tall where they are 13.5 — every bold copy of a
+ * digit the page holds was then the wrong size for it, and the edit
+ * synthesised two of its four digits. A letter set on the straight line at
+ * such an end also sits a pixel or two low.
+ *
+ * Knots every three ems or so, each the median foot of the letters sitting
+ * within two ems of it (overlapping windows: one letter's half-pixel of
+ * overshoot is not a bend). Only where the knots stray from their own best
+ * straight line by a pixel and a twentieth of an em: on a flat scan the feet
+ * scatter by half a pixel, and a line there keeps the straight fit exactly.
+ */
+export function fitBend(blobs: Blob[], fit: LineFit): LineFit['bend'] {
+  const em = fit.emPx
+  const straight = baselineAtOf({ y: fit.y, slope: fit.slope, centreX: fit.centreX })
+  const feet = blobs
+    .filter(b => { const h = b.y1 - b.y0; return b.area >= 4 && h >= em * 0.25 && h <= em * 1.4 && Math.abs(b.y1 - straight((b.x0 + b.x1) / 2)) <= em * 0.12 })
+    .map(b => ({ x: (b.x0 + b.x1) / 2, r: b.y1 - straight((b.x0 + b.x1) / 2) }))
+    .sort((a, b) => a.x - b.x)
+  if (feet.length < 15) return undefined
+  const span = feet[feet.length - 1].x - feet[0].x
+  if (span < em * 10) return undefined
+  const K = Math.max(3, Math.min(9, Math.round(span / (em * 3)) + 1))
+  const half = Math.max(em * 2, span / (K - 1) * 0.75)
+  const xs: number[] = [], ys: number[] = []
+  for (let k = 0; k < K; k++) {
+    const x = feet[0].x + span * k / (K - 1)
+    const near = feet.filter(f => Math.abs(f.x - x) <= half).map(f => f.r)
+    if (near.length < 4) continue
+    xs.push(x); ys.push(median(near))
+  }
+  if (xs.length < 3) return undefined
+  // How far the knots stray from their own best straight line: that, not
+  // their offset from the fit, is a bend.
+  const n = xs.length
+  const mx = xs.reduce((a, v) => a + v, 0) / n, my = ys.reduce((a, v) => a + v, 0) / n
+  let sxx = 0, sxy = 0
+  for (let i = 0; i < n; i++) { sxx += (xs[i] - mx) ** 2; sxy += (xs[i] - mx) * (ys[i] - my) }
+  const b = sxx > 0 ? sxy / sxx : 0
+  let dev = 0
+  for (let i = 0; i < n; i++) dev = Math.max(dev, Math.abs(ys[i] - (my + b * (xs[i] - mx))))
+  if (dev < Math.max(1, em * 0.05)) return undefined
+  return { xs, ys }
+}
 
 /**
  * The baseline through the bottoms of the line's letters, and the em.
@@ -167,7 +234,7 @@ export function fitLine(blobs: Blob[], emGuess: number, text: string): LineFit |
 
 /** Whether a blob belongs to the line: its centre inside the line's letter band. */
 export function ownedBy(b: Blob, fit: LineFit): boolean {
-  const base = fit.y + fit.slope * (b.cx - fit.centreX)
+  const base = baselineAtOf(fit)(b.cx)
   return b.cy >= base - fit.emPx * 1.0 && b.cy <= base + fit.emPx * 0.22
 }
 

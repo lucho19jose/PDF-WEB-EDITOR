@@ -1,6 +1,7 @@
 import { cellRegion, looseRegion, analyzeLine, edgeWidthOf, CORE, type PageInk, type LineInk } from './lineInk'
 import { pickGlyph, predictGap, lineMetrics, cellShapeOf, shapeOfCore, shapeAgreement, vocabKey, formKey, type Atlas, type Exemplar } from './glyphAtlas'
 import { expectedAdvance } from './glyphCut'
+import { baselineAtOf } from './wordSeg'
 
 /**
  * Editing a scanned line ON THE SCAN: the letters the edit keeps are the
@@ -327,6 +328,13 @@ export interface GlyphWant {
   line?: string
   /** Stem over em (lineInk's word weight) of the word it goes into — what its stems are re-weighed to; else the page's for its weight. */
   stem?: number | null
+  /**
+   * The characters that stem was measured on: the face is measured on the
+   * same ones, and the letter takes the RATIO — a word's stem depends on its
+   * letters' shapes (a curve or a diagonal is crossed wider than a stem), so
+   * a "1" re-weighed to the raw stem of "09/08/2023" came out bold.
+   */
+  stemChars?: string | null
   /** How soft the line's stroke edges print, px (`edgeWidthOf`): what the letter is blurred to. */
   edge?: number | null
 }
@@ -763,7 +771,7 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
       if (x > x1) x1 = x
       rows.set(y, (rows.get(y) ?? 0) + 1)
     }
-    const base = li.fit.y + li.fit.slope * ((x0 + x1) / 2 - li.fit.centreX)
+    const base = baselineAtOf(li.fit)((x0 + x1) / 2)
     for (let y = top + 1, above = rows.get(top) ?? 0; y < bottom; y++) {
       const n = rows.get(y) ?? 0
       if (!n) return above > 0 && above <= pix.length * 0.4 && y < base - em * 0.3 ? y : -1
@@ -834,7 +842,7 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
         if (y < top) top = y
         if (y > bottom) bottom = y
       }
-      const base = li.fit.y + li.fit.slope * ((x0 + x1) / 2 - li.fit.centreX)
+      const base = baselineAtOf(li.fit)((x0 + x1) / 2)
       const cutRow = topCut(pix)
       // An underline, or the rule under a table cell, runs through where a
       // descender would hang: the "p" of "Upgrade" came back a "u".
@@ -1303,7 +1311,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   const W = s.w
   const notes: string[] = []
   const em = li.fit.emPx
-  const base = (x: number) => li.fit.y + li.fit.slope * (x - li.fit.centreX)
+  const base = baselineAtOf(li.fit)
   const { xh, capH, figH } = lineMetrics(li, { loose: true })
   const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }
   const touch = (p: number) => {
@@ -1329,14 +1337,18 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   // The weight a redrawn character is set in: its word's, or the line's.
   const lineWeights = li.words.map(w => w.weight).filter((w): w is number => w !== null)
   const lineWeight = lineWeights.length ? [...lineWeights].sort((a, b) => a - b)[Math.floor(lineWeights.length / 2)] : null
-  const weightOfWord = (k: number): number | null => {
-    let w = li.words[k]?.weight ?? null
-    if (w === null) {
-      // A short word says nothing; its neighbours on the line do.
-      for (let d = 1; d < li.words.length && w === null; d++) w = li.words[k - d]?.weight ?? li.words[k + d]?.weight ?? null
+  /** The stem of word k (else its nearest measured neighbour's) and the characters it was measured on. */
+  const stemSource = (k: number): { w: number | null; chars: string | null } => {
+    const of = (i: number) => {
+      const wd = li.words[i]
+      return wd && wd.weight !== null ? { w: wd.weight, chars: li.chars.slice(wd.from, wd.to).join('') } : null
     }
-    return w ?? lineWeight
+    let r = of(k)
+    // A short word says nothing; its neighbours on the line do.
+    for (let d = 1; d < li.words.length && !r; d++) r = of(k - d) ?? of(k + d)
+    return r ?? { w: lineWeight, chars: null }
   }
+  const weightOfWord = (k: number): number | null => stemSource(k).w
   const boldOfWord = (k: number): boolean => {
     if (atlas.boldAt === null) return false
     return (weightOfWord(k) ?? 0) >= atlas.boldAt
@@ -1583,7 +1595,8 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
       // Neither weight on any harvested page: a glyph synthesised from the
       // matched face, if the caller has made one.
       if (lineEdge === undefined) lineEdge = edgeWidthOf(pi, li)
-      const want: GlyphWant = { char: c.ch, emPx: em, xh, capH, bold, ink: inkOverPaper, coreDark: li.coreDark, line: li.id, stem: weightOfWord(c.styleWord), edge: lineEdge }
+      const src = stemSource(c.styleWord)
+      const want: GlyphWant = { char: c.ch, emPx: em, xh, capH, bold, ink: inkOverPaper, coreDark: li.coreDark, line: li.id, stem: src.w, stemChars: src.chars, edge: lineEdge }
       const made = opts.synth?.get(`${li.id}|${wantKey(want)}`) ?? opts.synth?.get(wantKey(want))
       if (made) { g = made; c.drawnAs = 's' }
       else { missing.push(c.ch); wanting.push(want); continue }
@@ -1806,7 +1819,10 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     if (c.kind === 'orig') {
       const cell = li.cells[c.old]
       c.dx = Math.round(x - cell.inkL)
-      c.dy = Math.round(li.fit.slope * c.dx)
+      // Along the line's baseline, bend included: a letter moved along a
+      // bowed line rises or falls with it.
+      const cx = (cell.inkL + cell.inkR) / 2
+      c.dy = Math.round(base(cx + c.dx) - base(cx))
       c.x = cell.inkL + c.dx
       c.drawnAs = c.dx === 0 && c.dy === 0 ? 'k' : 'm'
     } else {
@@ -1939,7 +1955,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
         dxTail = 0
       }
     }
-    dyTail = Math.round(li.fit.slope * dxTail)
+    dyTail = Math.round(base(oldTailX + dxTail) - base(oldTailX))
     for (let j = tail; j < nc.length; j++) {
       const c = nc[j], cell = li.cells[c.old]
       c.dx = dxTail; c.dy = dyTail; c.x = cell.inkL + dxTail

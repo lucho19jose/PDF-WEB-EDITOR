@@ -1,5 +1,6 @@
 import { cellRegion, pageOfLine, type PageInk, type LineInk, type LineCell } from './lineInk'
 import { expectedAdvance } from './glyphCut'
+import { baselineAtOf } from './wordSeg'
 
 /**
  * The page's own letters, cut out of the scan, for typesetting an edit.
@@ -61,6 +62,15 @@ export interface Exemplar {
   doubt?: boolean
   /** Doubted against its letter's medoid, which is another size's (another face's), but its own size's copies agree with it: picked when nothing else can be. */
   peerVouched?: boolean
+  /**
+   * Doubted only on a comparison its size makes unreliable: its letter's
+   * medoid is another size, no copy at its own size can vouch for it, and it
+   * is no more like another letter than like its own (a small "7" agreed 0.64
+   * with the body text's 7 and 0.65 with its 1). For a request from its OWN
+   * line — the same face, size and weight by definition — it is still the
+   * best copy there is: picked there when nothing else can be.
+   */
+  ownLineOnly?: boolean
   /** Why: the letter it looks most like, with both agreements — for the lab. */
   doubtNote?: string
 }
@@ -102,7 +112,7 @@ export function vocabKey(token: string): string {
 
 /** The x-height and cap height of a line, px, from its cut letters. */
 export function lineMetrics(li: LineInk, opts: { loose?: boolean } = {}): { xh: number | null; capH: number | null; figH: number | null } {
-  const base = (x: number) => li.fit.y + li.fit.slope * (x - li.fit.centreX)
+  const base = baselineAtOf(li.fit)
   const measure = (approx: boolean) => {
     const xs: number[] = [], caps: number[] = [], figures: number[] = []
     for (const c of li.cells) {
@@ -170,7 +180,7 @@ export function shapeAgreement(a: Float32Array, b: Float32Array): number {
  */
 export function harvestLine(pi: PageInk, li: LineInk, page: number, out: Exemplar[]): void {
   const s = pi.s
-  const base = (x: number) => li.fit.y + li.fit.slope * (x - li.fit.centreX)
+  const base = baselineAtOf(li.fit)
   const { xh, capH, figH } = lineMetrics(li)
   for (const word of li.words) {
     // Only a word whose n-th run of ink is its n-th letter: see `LineWord.exact`.
@@ -326,10 +336,12 @@ function markDoubts(byChar: Map<string, Exemplar[]>, boldAt: number | null): Map
       // R's, where N's agree at ~0.9 — drawn in a reversed word, it printed as
       // an "A".
       if (own >= 0 && own < ownCohesion - 0.12 && other >= own - 0.03) ex.doubt = true
+      const crossSize = own >= 0 && (ex.emPx / ownEm > 1.2 || ownEm / ex.emPx > 1.2)
+      ex.ownLineOnly = !!ex.doubt && crossSize && !ex.peerVouched && other <= own + 0.02
       // Wider than its letter can be: the cell holds a neighbour as well
       // (";/" under "/"). A narrow letter's ink is far under its advance,
       // so only the upper side is tested.
-      if ((ex.inkR - ex.inkL) / ex.emPx > expectedAdvance(char) * 1.3 + 0.08) ex.doubt = true
+      if ((ex.inkR - ex.inkL) / ex.emPx > expectedAdvance(char) * 1.3 + 0.08) { ex.doubt = true; ex.ownLineOnly = false }
     }
   }
   return new Map(medoids.map(m => [`${m.char}|${m.bold}`, { shape: m.shape, cohesion: m.cohesion, emPx: m.emPx }]))
@@ -559,10 +571,21 @@ function inStyle(atlas: Atlas, req: GlyphRequest, copies: Exemplar[]): Exemplar[
     scores.set(line, v)
     return v
   }
-  const known = copies.map(ex => scoreOf(ex.lineId)).filter((v): v is number => v !== null)
-  if (!known.length) return copies
+  // The request's own line is in its own style by definition; the OTHER lines
+  // compete among themselves. Measured against the own line's perfect 1, every
+  // other line of the same face (0.85–0.9 is what one face agrees with itself
+  // across lines) fell outside the margin, and a single copy on the own line —
+  // the "8" of a bold "18/07/2022." that touches its slash, so not whole —
+  // shut out every bold "8" the page printed elsewhere: the digit was
+  // synthesised.
+  const own = req.style!.line
+  const known = copies.filter(ex => ex.lineId !== own).map(ex => scoreOf(ex.lineId)).filter((v): v is number => v !== null)
+  if (!known.length) {
+    const mine = copies.filter(ex => ex.lineId === own)
+    return mine.length ? mine : copies
+  }
   const top = Math.max(...known)
-  const kept = copies.filter(ex => { const v = scoreOf(ex.lineId); return v !== null && v >= top - 0.05 })
+  const kept = copies.filter(ex => { const v = scoreOf(ex.lineId); return ex.lineId === own || (v !== null && v >= top - 0.05) })
   return kept.length ? kept : copies
 }
 
@@ -651,14 +674,17 @@ export function pickGlyph(atlas: Atlas, req: GlyphRequest): PickedGlyph | null {
 function pickFrom(atlas: Atlas, req: GlyphRequest, vouched: boolean): PickedGlyph | null {
   const list = atlas.byChar.get(req.char)
   if (!list?.length) return null
-  if (vouched && !list.some(ex => ex.doubt && ex.peerVouched)) return null
+  // The second pass: copies doubted on grounds their own size or their own
+  // line answers for (`peerVouched`, `ownLineOnly`).
+  const fallback = (ex: Exemplar) => !!ex.doubt && (!!ex.peerVouched || (!!ex.ownLineOnly && ex.lineId === req.style?.line))
+  if (vouched && !list.some(fallback)) return null
   // Sizes compare on what both lines measured: the x-height, else the cap
   // height. The em a line's fit reports is the least reliable of the three —
   // 21 to 25 px across lines set in the same 9 pt face on one page.
   const sizeRatio = (ex: Exemplar) => sizeRatioOf(req, ex)
   const boldOf = (ex: Exemplar) => atlas.boldAt === null ? false : ex.weight === null ? null : ex.weight >= atlas.boldAt
   const compatible = inStyle(atlas, req, list.filter(ex => {
-    if (ex.doubt && !(vouched && ex.peerVouched)) return false
+    if (ex.doubt && !(vouched && fallback(ex))) return false
     const r = sizeRatio(ex)
     if (r < 0.9 || r > 1.11) return false
     const b = boldOf(ex)
@@ -750,7 +776,7 @@ export function shapeOfCore(pi: PageInk, li: LineInk, core: ArrayLike<number>): 
       t[i * 3 + c] = paper > 0 ? Math.min(255, Math.round(255 * s.data[p * 4 + c] / paper)) : 255
     }
   }
-  const baseY = li.fit.y + li.fit.slope * ((inkL + inkR) / 2 - li.fit.centreX) - y0
+  const baseY = baselineAtOf(li.fit)((inkL + inkR) / 2) - y0
   return shapeOf(t, m, w, h, baseY, inkL - x0, li.fit.emPx)
 }
 
@@ -758,7 +784,7 @@ export function shapeOfCore(pi: PageInk, li: LineInk, core: ArrayLike<number>): 
 export function cellShapeOf(pi: PageInk, li: LineInk, k: number): Float32Array | null {
   const c = li.cells[k]
   if (!c || !c.pix.length || c.inkR <= c.inkL) return null
-  const base = (x: number) => li.fit.y + li.fit.slope * (x - li.fit.centreX)
+  const base = baselineAtOf(li.fit)
   const ex = cutExemplar(pi, li, c, k, base, null, null, null, -1)
   return ex?.shape ?? null
 }
