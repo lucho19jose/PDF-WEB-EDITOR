@@ -4967,8 +4967,9 @@ tests below take it too),
 `tools/ocr-calibrate/scanedit.test.mjs` (node --test; alignment, push-pull, an
 end-to-end edit on a synthetic MuPDF-rendered scan asserting nothing outside
 the edited line changes, a correction that changes no pixel, a real edit not
-taken for one, the overlay mask's margins, the three-way merge, and an edit of
-a garbled reading landing on the ink it meant), `fidelity-driver.js`'s
+taken for one, the overlay mask's margins, the three-way merge, an edit of
+a garbled reading landing on the ink it meant, and a heavy title on white
+paper whose paper estimate stays white under its strokes), `fidelity-driver.js`'s
 `runAuto` (delete/reverse/
 append on readable runs of any scan, with damage and crops) and
 `public/_sweep/auto-corpus.js` (`start({ only })` runs `runAuto` over a staged

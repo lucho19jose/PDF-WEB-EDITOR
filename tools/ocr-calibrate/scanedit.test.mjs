@@ -349,3 +349,67 @@ test('a vector patch on a gradient is filled from the ground: the title goes, th
   assert.ok(left < letters * 0.01, `title pixels left: ${left} of ${letters}`)
   assert.equal(damaged, 0, 'the line beneath was touched')
 })
+
+test('a large bold title on white paper is edited without grey halos: its thick strokes are ink, not paper', () => {
+  // A bilevel scan at 300 DPI (0.24 pt a pixel): a 45pt bold title, its stems
+  // ~34 px wide — wider than the paper estimate's 3.6pt filter can see across.
+  const W = 1900, H = 320
+  const font = new mupdf.Font('Carlito', fs.readFileSync(ROOT + '/public/fonts/match/Carlito-Bold.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  // Set letter by letter with room between them, so the grown strokes below
+  // stay apart and every word still cuts one ink run per letter.
+  const t = new mupdf.Text()
+  let pen = 40
+  for (const ch of 'La estrategia') {
+    t.showString(font, [190, 0, 0, -190, pen, 230], ch)
+    pen += font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0))) * 190 + (ch === ' ' ? 30 : 22)
+  }
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = pix.getPixels(), stride = pix.getStride()
+  // Heavier than Carlito Bold: every stroke grown 8 px, so stems are ~37 px
+  // and letters touch, as on the cover this came from.
+  const ink = new Uint8Array(W * H)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (g[y * stride + x] < 128) ink[y * W + x] = 1
+  const heavy = new Uint8Array(W * H)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (!ink[y * W + x]) continue
+    for (let dy = -8; dy <= 8; dy++) for (let dx = -8; dx <= 8; dx++) {
+      const xx = x + dx, yy = y + dy
+      if (xx >= 0 && yy >= 0 && xx < W && yy < H && dx * dx + dy * dy <= 64) heavy[yy * W + xx] = 1
+    }
+  }
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = heavy[y * W + x] ? 0 : 255
+    const i = (y * W + x) * 4
+    rgba[i] = rgba[i + 1] = rgba[i + 2] = v
+    rgba[i + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.24, 0, 0, H * 0.24, 0, 0], W * 0.24, H * 0.24, 'Title')
+  const pi = LI.preparePage(raster)
+  // The paper under the title is the page's white: read as paper, a stem's
+  // black middle greyed the estimate round every letter.
+  let darkPaper = 0
+  for (let p = 0; p < W * H; p++) if (pi.paper[p * 3] < 230) darkPaper++
+  assert.equal(darkPaper, 0, 'paper estimated darker than the page under the title')
+  const li = LI.analyzeLine(pi, { id: 't', text: 'La estrategia', inkRect: { x: 30 * 0.24, y: 60 * 0.24, width: 1800 * 0.24, height: 230 * 0.24 }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, 'La estategia', work, {})
+  assert.ok(res.ok, res.reason)
+  // A black-and-white scan stays black and white: a grey pixel is the paper
+  // estimate's grey, printed round the letters moved and where they had been.
+  let changed = 0, grey = 0
+  for (let p = 0; p < W * H; p++) {
+    const i = p * 4
+    if (work[i] === raster.data[i]) continue
+    changed++
+    if (work[i] > 40 && work[i] < 215) grey++
+  }
+  assert.ok(changed > 2000, 'the edit drew something')
+  assert.ok(grey < changed * 0.02, `grey pixels: ${grey} of ${changed} changed`)
+})
