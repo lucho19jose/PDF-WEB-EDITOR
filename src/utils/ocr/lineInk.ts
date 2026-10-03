@@ -692,12 +692,21 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   // yellow ground — and an erase smeared yellow over the photograph. A
   // picture shows here as ink no letter can be: wide AND tall, or simply
   // vast. A thin rule or a table border is not one.
+  // Only what lies in the LINE's own band counts: the recogniser's box of a
+  // table's first row reaches past the rule into the speckled grey header
+  // above it, and that header — wide, tall, one component — refused the
+  // cell's "250.80" as set over a picture while the figures sat on clean
+  // white. The band is the letters' own: their median centre, ±0.6 em.
   {
+    const letterish = comps.filter(c => { const h = c.y1 - c.y0; return h >= emGuess * 0.3 && h <= emGuess * 1.2 && c.x1 - c.x0 <= emGuess * 1.5 })
+    const midY = letterish.length >= 2 ? median(letterish.map(c => c.cy)) : null
     let big = 0
     for (const c of comps) {
       const w = c.x1 - c.x0, h = c.y1 - c.y0
       if (w < emGuess * 0.5) continue
-      if ((w > emGuess * 3 && h > emGuess * 0.8) || h > emGuess * 2.2 || c.area > emGuess * emGuess * 2.5) big += c.area
+      if (!((w > emGuess * 3 && h > emGuess * 0.8) || h > emGuess * 2.2 || c.area > emGuess * emGuess * 2.5)) continue
+      if (midY === null) { big += c.area; continue }
+      for (const p of c.pix) { const y = (p - p % s.w) / s.w; if (Math.abs(y + 0.5 - midY) <= emGuess * 0.6) big++ }
     }
     if (big > W * H * 0.06) return fail('the line is set over a picture')
   }

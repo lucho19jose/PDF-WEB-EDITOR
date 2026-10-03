@@ -4881,7 +4881,13 @@ a book cover's sticker over a photograph of water, where the water read as
 ink against the sticker's yellow, so the plain-paper test (which samples only
 the light) saw a plain ground and an erase smeared yellow over the photo. Ink
 no letter can be — wide AND tall, or vast — covering 6% of the line's area
-says so; thin rules and table borders do not count.
+says so; thin rules and table borders do not count. Only its pixels in the
+LINE's band count — within 0.6 em of the median centre of the letter-sized
+pieces: the recogniser's box of a results table's first row reached past the
+rule into the speckled grey header above it, one wide tall component, and
+"250.80" was refused while its figures sat on clean white. (The same table
+read through a fixture exported before the page-size fix put every box a row
+off and failed two more cells — re-export before believing a lab refusal.)
 
 **Word gaps are measured where the READING has a space.** The ink's own word
 split also cuts one word at a wide letter gap ("ESTE | FAN | I" in a capitals
