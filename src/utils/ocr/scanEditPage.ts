@@ -396,6 +396,10 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
       continue
     }
     handled.add(item.id)
+    // Drawn, but with a copy from text in another kind of face: the letter is
+    // made in the line's look if a face prints like it, and the page planned
+    // again with it.
+    for (const w of res.wanting ?? []) wanting.set(`${w.line ?? ''}|${wantKey(w)}`, w)
     const reweighed = (res.drawn ?? '').split('w').length - 1
     const made = (res.drawn ?? '').split('s').length - 1
     const how = [reweighed ? `${reweighed} re-weighed` : '', made ? `${made} synthesised` : '', res.corrected ? `${res.corrected} corrected in the text` : ''].filter(Boolean).join(', ')

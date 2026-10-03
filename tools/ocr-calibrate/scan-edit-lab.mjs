@@ -276,6 +276,7 @@ if (cmd === 'edit') {
   const optsFor = (li) => ({ justifyTo: SEP.justifiedMargin ? SEP.justifiedMargin(margin, lis, li) : margin, limitRight, columnRight: SEP.alignedRight ? SEP.alignedRight(lis, li) : false, pageLines: lis.filter(Boolean) })
   console.log('margins', JSON.stringify({ margin, limitRight }))
   if (process.env.STYLELOG) globalThis.__inStyleLog = []
+  if (process.env.FBSLOG) globalThis.__fbsLog = []
   for (const spec of suite) {
     const items = itemsOf(p)
     // `id` names the run outright, for text that occurs on more than one line.
@@ -287,9 +288,13 @@ if (cmd === 'edit') {
     if (!li) { console.log(`${spec.label}: line not analysed`); continue }
     const next = it.text.replace(spec.from ?? spec.find ?? spec.exact, spec.to)
     const t1 = Date.now()
-    let res = editOn(SE, pi, li, atlas, next, work, optsFor(li))
-    if (!res.ok && res.wanting?.length) {
-      // Letters no page holds: fit the scan's look once, synthesise, retry.
+    // On a scratch copy: an edit drawn with copies from another kind of face
+    // also asks for its letters, and is planned again once they are made.
+    let scratch = work.slice()
+    let res = editOn(SE, pi, li, atlas, next, scratch, optsFor(li))
+    if (res.wanting?.length) {
+      // Letters no page holds (or holds only in another kind of face): fit
+      // the line's look, synthesise, retry.
       const GS = await load('/src/utils/ocr/glyphSynth.ts')
       look = await GS.fitScanLook(atlas, nodeRasterize(GS), { log: l => console.log(`   face ${l}`), near: { line: li.id, page: p, emPx: li.fit.emPx } })
       console.log(`   look: ${JSON.stringify(look)}`)
@@ -298,13 +303,23 @@ if (cmd === 'edit') {
       if (look && look.score < 0.75) console.log(`   no face prints like this line (best ${look.family} at ${look.score.toFixed(2)})`)
       if (look && look.score >= 0.75) for (const w of res.wanting) {
         const g = await GS.synthGlyph(look, nodeRasterize(GS), atlas, w)
-        console.log(`   want "${w.char}" em ${w.emPx.toFixed(1)} xh ${w.xh?.toFixed(1)} capH ${w.capH?.toFixed(1)} bold ${w.bold} -> ${g ? `${g.w}x${g.h} ink ${g.inkL}-${g.inkR} base ${g.baseY}` : 'none'}`)
+        console.log(`   want "${w.char}" em ${w.emPx.toFixed(1)} xh ${w.xh?.toFixed(1)} capH ${w.capH?.toFixed(1)} bold ${w.bold} edge ${w.edge?.toFixed(2)} stem ${w.stem?.toFixed(3)} ${w.stemChars ?? ""} -> ${g ? `${g.w}x${g.h} ink ${g.inkL}-${g.inkR} base ${g.baseY}` : 'none'}`)
+        if (g && process.env.EDGES) {
+          const inkD = Math.max(0.3, 1 - (w.ink[0] * 299 + w.ink[1] * 587 + w.ink[2] * 114) / 1000 / 255)
+          const ws = LI.strokeEdgeWidths((x, y) => g.m[y * g.w + x] ? (1 - g.t[(y * g.w + x) * 3] / 255) / inkD : 0, 0, g.w, 0, g.h, 0.5, w.emPx * 0.25).sort((a, b) => a - b)
+          console.log(`   made "${w.char}" edge ${ws.length ? ws[ws.length >> 1].toFixed(2) : '-'} (line ${w.edge?.toFixed(2)}) n=${ws.length}`)
+        }
         if (g) synth.set(SE.wantKey(w), g)
       }
-      res = editOn(SE, pi, li, atlas, next, work, { ...optsFor(li), synth })
+      if (synth.size || !res.ok) {
+        scratch = work.slice()
+        res = editOn(SE, pi, li, atlas, next, scratch, { ...optsFor(li), synth })
+      }
     }
+    if (res.ok) work.set(scratch)
     const tookMs = Date.now() - t1
     if (process.env.STYLELOG) { for (const l of globalThis.__inStyleLog ?? []) console.log('   style', l); globalThis.__inStyleLog = [] }
+    if (process.env.FBSLOG) { for (const l of globalThis.__fbsLog ?? []) console.log('  ', l); globalThis.__fbsLog = [] }
     if (!res.ok) { console.log(`${spec.label}: REFUSED ${res.reason}`); continue }
     console.log(`${spec.label}: ok ${tookMs}ms drawn=${res.drawn} box=${res.box ? [res.box.x0, res.box.y0, res.box.x1, res.box.y1].join(',') : '-'} ${res.notes.join('; ')}`)
     console.log(`   "${it.text.slice(0, 90)}"\n -> "${next.slice(0, 90)}"`)
@@ -712,6 +727,75 @@ if (cmd === 'cell') {
 }
 
 
+if (cmd === 'texture') {
+  // `texture <page>`: the paper's fine texture — its residual against a
+  // smoothed paper, and the autocorrelation peaks a periodic pattern (a
+  // security hatch) shows.
+  const p = Number(args[0])
+  const s = scanOf(p)
+  const pi = LI.preparePage(s)
+  const W = s.w, H = s.h, N = W * H
+  const P = new Float32Array(N)
+  for (let q = 0; q < N; q++) P[q] = (pi.paper[q * 3] * 299 + pi.paper[q * 3 + 1] * 587 + pi.paper[q * 3 + 2] * 114) / 1000
+  // Known paper: where the paper estimate IS the scan.
+  const known = new Uint8Array(N)
+  for (let q = 0, i = 0; q < N; q++, i += 4) { const l = (s.data[i] * 299 + s.data[i + 1] * 587 + s.data[i + 2] * 114) / 1000; known[q] = Math.abs(l - P[q]) < 0.5 && pi.dark[q] === 0 ? 1 : 0 }
+  const r = Number(process.env.R ?? 4)
+  // Box blur of P, radius r.
+  const tmp = new Float32Array(N), sm = new Float32Array(N)
+  for (let y = 0; y < H; y++) { let acc = 0; for (let x = -r; x <= r; x++) acc += P[y * W + Math.min(W - 1, Math.max(0, x))]; for (let x = 0; x < W; x++) { tmp[y * W + x] = acc / (2 * r + 1); acc += P[y * W + Math.min(W - 1, x + r + 1)] - P[y * W + Math.max(0, x - r)] } }
+  for (let x = 0; x < W; x++) { let acc = 0; for (let y = -r; y <= r; y++) acc += tmp[Math.min(H - 1, Math.max(0, y)) * W + x]; for (let y = 0; y < H; y++) { sm[y * W + x] = acc / (2 * r + 1); acc += tmp[Math.min(H - 1, y + r + 1) * W + x] - tmp[Math.max(0, y - r) * W + x] } }
+  const res = new Float32Array(N)
+  let ss = 0, n = 0
+  for (let q = 0; q < N; q++) if (known[q]) { res[q] = P[q] - sm[q]; ss += res[q] * res[q]; n++ }
+  console.log(`page ${W}x${H}, known paper ${(100 * n / N).toFixed(1)}%, residual rms ${Math.sqrt(ss / n).toFixed(2)} levels`)
+  const K = 12, peaks = []
+  for (let dy = 0; dy <= K; dy++) for (let dx = -K; dx <= K; dx++) {
+    if (dy === 0 && dx <= 0) continue
+    let num = 0, den = 0
+    for (let y = 0; y < H - dy; y += 2) for (let x = Math.max(0, -dx); x < Math.min(W, W - dx); x += 1) {
+      const a = y * W + x, b = (y + dy) * W + x + dx
+      if (!known[a] || !known[b]) continue
+      num += res[a] * res[b]; den += res[a] * res[a]
+    }
+    peaks.push({ dx, dy, c: den > 0 ? num / den : 0 })
+  }
+  peaks.sort((a, b) => b.c - a.c)
+  console.log('top autocorrelation:', peaks.slice(0, 12).map(q => `(${q.dx},${q.dy}) ${q.c.toFixed(2)}`).join('  '))
+}
+
+if (cmd === 'serif') {
+  // `serif <page>`: per line, how much wider its stems are at the foot than
+  // above it — a serif's slab against a sans stem — on its harvested letters.
+  const GA = await load('/src/utils/ocr/glyphAtlas.ts')
+  const { atlas, pages } = await pagesAndAtlas(GA)
+  const p = Number(args[0])
+  const byLine = new Map()
+  for (const list of atlas.byChar.values()) for (const ex of list) {
+    if (ex.page !== p || !/^[ITHFPlinmhr]$/.test(ex.char)) continue
+    const H = /[a-z]/.test(ex.char) && ex.char !== 'l' && ex.char !== 'h' ? ex.xh : ex.capH ?? (ex.char === 'l' || ex.char === 'h' ? ex.emPx * 0.7 : null)
+    if (!H || H < 6) continue
+    const row = (y) => { let s = 0; if (y < 0 || y >= ex.h) return 0; for (let x = 0; x < ex.w; x++) { const i = y * ex.w + x; if (ex.m[i]) s += 1 - (ex.t[i * 3] * 299 + ex.t[i * 3 + 1] * 587 + ex.t[i * 3 + 2] * 114) / 1000 / 255 } return s }
+    const b = Math.round(ex.baseY)
+    const foot = Math.max(row(b - 1), row(b - 2))
+    const mids = []
+    for (let y = Math.round(ex.baseY - 0.4 * H); y <= Math.round(ex.baseY - 0.22 * H); y++) mids.push(row(y))
+    mids.sort((a, q) => a - q)
+    const mid = mids[mids.length >> 1]
+    if (!(mid > 0.5)) continue
+    const l = byLine.get(ex.lineId) ?? []
+    l.push({ ch: ex.char, r: foot / mid, doubt: !!ex.doubt })
+    byLine.set(ex.lineId, l)
+  }
+  const pg = pages.get(p)
+  for (const li of pg.lis) {
+    const l = byLine.get(li.id)
+    if (!l) continue
+    const rs = l.map(e => e.r).sort((a, q) => a - q)
+    console.log(`${li.id.padEnd(10)} n=${String(l.length).padStart(2)} median ${rs[rs.length >> 1].toFixed(2)}  ${l.map(e => `${e.ch}${e.r.toFixed(1)}${e.doubt ? '?' : ''}`).join(' ').slice(0, 90)}  | ${li.text.slice(0, 50)}`)
+  }
+}
+
 if (cmd === 'heights') {
   // `heights <page> <lineId...>`: every cell's height over the fitted baseline,
   // and the line's metrics — what sizes and weighs a letter brought to it.
@@ -938,9 +1022,14 @@ if (cmd === 'explain') {
   // LOOSE=1: the metrics an edit asks with (lineMetrics' loose fallback).
   const m = GA.lineMetrics(li, process.env.LOOSE ? { loose: true } : {})
   const req = { char: args[2], emPx: li.fit.emPx, xh: m.xh, capH: m.capH, figH: m.figH, bold: args[3] === 'bold' }
+  // FACE=serif|sans: the kind of face the request wants (`faceAt` around the line's words otherwise).
+  const face = process.env.FACE ?? (GA.faceAt ? GA.faceAt(atlas, li.id, (li.words[0].x0 + li.words[li.words.length - 1].x1) / 2, li.fit.emPx) : null)
+  if (face) req.style = { line: li.id, refs: [], face }
   console.log('target', JSON.stringify(req), 'boldAt', atlas.boldAt)
-  console.log(GA.explainPick(atlas, req).join('\n'))
-  console.log('pick:', GA.pickGlyph(atlas, req)?.ex.lineId ?? null)
+  const faces = (atlas.byChar.get(args[2]) ?? []).map(ex => GA.faceAt ? GA.faceAt(atlas, ex.lineId, ex.x0 + (ex.inkL + ex.inkR) / 2, ex.emPx) : null)
+  console.log(GA.explainPick(atlas, req).map((l, k) => `${l} face=${faces[k]}`).join('\n'))
+  const pk = GA.pickGlyph(atlas, req)
+  console.log('pick:', pk ? `${pk.ex.lineId} x0=${pk.ex.x0}` : null)
 }
 
 

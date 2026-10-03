@@ -422,7 +422,60 @@ export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: At
     const delta = Math.max(-1.2, Math.min(1.2, want - have))
     img = reweighImage(img, delta, delta * 0.35)
   }
+  if (req.edge) img = sharpenTo(img, req.ink, req.edge, emRender)
   return img
+}
+
+/**
+ * A letter made as crisp as the line it goes into. No blur at all still
+ * leaves a rendered glyph's edges about a pixel wide (its anti-aliasing), and
+ * re-weighing it adds a part-dark column on each side; a bilevel scan's own
+ * letters measure 0.6 px — a registry page's made "H" came out at 1.3, a soft
+ * letter in a sharp heading. Its darkness is steepened about the middle
+ * (`0.5 + k (d − 0.5)`, which keeps the ink a stroke holds) until its edges
+ * measure as the line's do. Never softened: what is softer already was
+ * blurred to the line by the search above.
+ */
+function sharpenTo(img: GlyphImage, ink: [number, number, number], edge: number, emPx: number): GlyphImage {
+  const c = [0, 1, 2].reduce((a, b) => (255 - ink[b] > 255 - ink[a] ? b : a), 0)
+  const span = Math.max(1, 255 - ink[c])
+  const d0 = new Float32Array(img.w * img.h)
+  for (let i = 0; i < d0.length; i++) d0[i] = img.m[i] ? Math.max(0, Math.min(1, (255 - img.t[i * 3 + c]) / span)) : 0
+  const edgeOf = (d: Float32Array) => {
+    const ws = strokeEdgeWidths((x, y) => d[y * img.w + x], 0, img.w, 0, img.h, 0.5, emPx * 0.25)
+    if (ws.length < 8) return null
+    ws.sort((a, b) => a - b)
+    return ws[ws.length >> 1]
+  }
+  const e0 = edgeOf(d0)
+  if (e0 === null || e0 <= edge + 0.15) return img
+  const steep = (k: number) => {
+    const d = new Float32Array(d0.length)
+    for (let i = 0; i < d.length; i++) if (d0[i] > 0) d[i] = Math.max(0, Math.min(1, 0.5 + k * (d0[i] - 0.5)))
+    return d
+  }
+  let bestK = 1, bestErr = e0 - edge
+  // 0.6 px is a step with nothing between ink and paper: a bilevel scan
+  // (fax, a registry's archive copy). Its letters hold no grey at all, and
+  // a made one is thresholded like them — steepened only part of the way,
+  // the "H" kept grey serif rows the scan's letters never show.
+  if (edge <= 0.65) bestK = 1000
+  else for (let k = 1.25; k <= 4.001; k += 0.25) {
+    const e = edgeOf(steep(k))
+    if (e === null) continue
+    const err = Math.abs(e - edge)
+    if (err < bestErr - 1e-9) { bestErr = err; bestK = k }
+  }
+  if (bestK === 1) return img
+  const d = steep(bestK)
+  const t = new Uint8ClampedArray(img.t.length).fill(255)
+  const m = new Uint8Array(img.m.length)
+  for (let i = 0; i < d.length; i++) {
+    if (d[i] < 0.015) continue
+    m[i] = 1
+    for (let ch = 0; ch < 3; ch++) t[i * 3 + ch] = 255 * (1 - d[i] * (1 - ink[ch] / 255))
+  }
+  return { ...img, t, m }
 }
 
 /** A glyph's stem: darkness summed across each stroke a row of its x-height band crosses, the median. */

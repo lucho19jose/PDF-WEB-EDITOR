@@ -5360,6 +5360,92 @@ Measured in the lab A/B: only synthesised glyphs change, and that "1" comes out
 at the scan's weight. The unit test pins the neutral case: a date printed
 exactly as the look prints it gets its "1" un-re-weighed (ink within 3%).
 
+**A letter is never borrowed from text set in the other kind of face**
+(`footRatio`, `faceAt` in glyphAtlas; `GlyphRequest.style.face`). A registry
+page sets its headings in a serif and its body in a sans, and "SIGA TICS" →
+"SIGA TECH" drew the "E" and the "H" from the body: a sans "E" and "H" inside
+a serif heading, visible at a glance. The shape scores could not see it — one
+coarse grid per letter, and a sans "E" agreed 0.76 with the heading's letters
+where one face agrees 0.78 with itself across a table's lines. What does
+separate them is the FOOT of a stem: a serif widens it into a slab, a sans
+leaves it as wide as the stem. `footRatio` (the darker of the last two rows
+over the median of the lower stem, on I T H F P i l) read 1.9–2.3 on every
+serif line of that page and exactly 1.0 on every sans one; across twelve other
+documents sans lines sit at 0.8–1.2 and serif capitals at 1.5–2.9. n, m and r
+are left out: at body sizes their serifs are a pixel and merge into the stem
+(a Times paragraph read 0.5 to 1.4 on them). `faceAt` classes a place on a
+line by the median of the five nearest stem feet within eight ems — two at
+least, and under 0.75 is a baseline a pixel off, not a face — and where that
+stretch cannot tell, by all the line's feet (three at least): a serif
+paragraph shows its feet somewhere along the line even where a stretch holds
+none, and a sans amount line ("(CIEN MIL CON 00/100 SOLES)") went unclassed
+at its "E" and lent it to the serif heading. Three things hang off it:
+- **`pickFrom` drops copies set in the other class**, and a letter the page
+  holds only there is MADE in the line's own look (Caladea Bold at 0.87 for
+  that heading). The foreign copy is a stand-in, used only where the letter
+  cannot be made (no face prints like the line, or the line may not take that
+  many made letters — the gate swaps made letters back to their copies before
+  refusing). Such an edit succeeds and still reports `wanting`;
+  `planScanEdits` collects wants from successful lines too, and `useOCR`
+  harvests more pages for them, makes them and plans again.
+- **Doubts are judged within a face.** `markDoubts` compares each copy with
+  its letter's medoid, and the medoid is whichever face holds more copies:
+  the heading's serif bold "E"s agreed 0.57 with the body's sans "E" and 0.74
+  with a "D", every one was doubted, and even a page holding serif "E"s gave
+  the sans one. When the medoid's face (its own, or that of two thirds of the
+  copies like it — the medoid may stand where no stem foot is near) is the
+  other class, the copy's peers in ITS face vouch for it (`faceVouched`) —
+  and only for a request KNOWN to want that face. Vouched for anyone, they
+  filled in for a one-word bold sans header (one stem foot: its face cannot
+  be told) and drew serif letters into it. Telling such a word's face from
+  its letters' SHAPES was tried and dropped: on a bold serif title the coarse
+  grid scored the sans lines 0.92 against the serif ones' 0.86.
+- **A made letter is as crisp as its line** (`sharpenTo` in glyphSynth). No
+  blur still leaves a rendered glyph's edges about a pixel wide, and
+  re-weighing adds part-dark columns; that page is a bilevel archive copy
+  (edges 0.6 px) and its made "H" measured 1.3, a soft letter in a sharp
+  heading. Its darkness is steepened about the middle until its edges
+  measure like the line's; a line at 0.6 px has nothing between ink and
+  paper, and the letter is thresholded. On such a line the sub-pixel baseline
+  shift (a cubic resample that puts grey rows into a glyph) is not made: the
+  glyph lands on the nearest whole pixel, as the scan's own letters do.
+
+**A regular paper texture is kept under the ink** (`paperTexture` in
+lineInk, `PageInk.texture`). The registry page is printed on security paper
+with a hatch of dots at an eight-pixel pitch. Push-pull filled an erased
+letter with the paper's smoothed level, a clean patch in the hatch; and a
+letter borrowed from elsewhere carried the hatch of where it was taken (its
+fringe's transmittance against the smooth fill), a faint box of misaligned
+dots 3–5 levels darker round every new letter. Where the paper's residual
+against its own blur repeats on a lattice — autocorrelation over 0.6 at a
+shift of three pixels or more, measured on 48 px windows of plain paper (the
+hatch measured 1.00 at (8,0) and (0,8)) — every pixel the fill made takes the
+residual of the nearest lattice translate that is plain paper.
+`relaxErased` then relaxes the hole's LEVEL only: the residual comes off
+every value first and goes back on the hole after, or the harmonic fill
+smooths it away again. Selective by construction: of eight other documents,
+five have under a level of residual and stop at the first test, and the two
+grainy ones peak at 0.18 and 0.32. It costs about 1.5 s once, on the
+textured page.
+
+Measured: lab A/B over 18 suites (246 edits) against the last commit: 15
+changed, all inspected — the registry heading (its own serif "E", a crisp
+made serif "H"), its "CIENTO CINCUENTA" and "ESTATUTOS" now from same-face
+lines (the base drew letters with grey fringes from the other face), its
+other edits by the hatch alone (no pixel by more than 40 levels), and
+synthesised letters elsewhere crisper. The four browser corpora (ocr, ocr2,
+ocr3, ocr4: 261 automatic edits) are unchanged in damage, edits on the scan
+and read-back; one page makes one letter fewer. The registry suite draws
+10/10 on the scan with no damage. **Known limitation:** a reversed one-word
+bold sans header on a page whose body is serif (a service order's
+"Descripción") still takes serif letters from the body — one stem foot
+cannot tell its face, so no filter applies; that was so before this change
+as well. Lab: `serif <page>` prints each line's stem-foot
+ratios, `texture <page>` the paper's residual and autocorrelation peaks,
+`explain` takes FACE=serif|sans and prints each copy's face, and `edit`
+prints made letters' edge widths with EDGES=1 and plans again with made
+letters when an edit drew foreign copies.
+
 **Text lighter than its ground is read on the INVERTED scan.** Reversed-out
 titles, a book cover's lettering and logo badges are not ink on paper: read as
 such, the paper estimate takes their white letters for paper, and an edit

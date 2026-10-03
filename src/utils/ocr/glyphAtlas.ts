@@ -63,6 +63,13 @@ export interface Exemplar {
   /** Doubted against its letter's medoid, which is another size's (another face's), but its own size's copies agree with it: picked when nothing else can be. */
   peerVouched?: boolean
   /**
+   * Doubted only against a medoid set in the other kind of face (`faceAt`),
+   * and its peers in its own face vouch for it: picked when nothing else can
+   * be, for a request known to want this face — never for one whose face is
+   * unknown, where it would put a serif letter in a sans word.
+   */
+  faceVouched?: FaceClass
+  /**
    * Doubted only on a comparison its size makes unreliable: its letter's
    * medoid is another size, no copy at its own size can vouch for it, and it
    * is no more like another letter than like its own (a small "7" agreed 0.64
@@ -276,7 +283,27 @@ export function grownSet(W: number, H: number, core: ArrayLike<number>, r: numbe
  */
 function markDoubts(byChar: Map<string, Exemplar[]>, boldAt: number | null): Map<string, { shape: Float32Array; cohesion: number; emPx?: number }> {
   const boldOf = (ex: Exemplar) => boldAt !== null && ex.weight !== null && ex.weight >= boldAt
-  const medoids: { char: string; bold: boolean; shape: Float32Array; cohesion: number; emPx: number }[] = []
+  const faceCache = new Map<Exemplar, FaceClass | null>()
+  const faceOf = (ex: Exemplar) => {
+    if (!faceCache.has(ex)) faceCache.set(ex, faceAt({ byChar }, ex.lineId, ex.x0 + (ex.inkL + ex.inkR) / 2, ex.emPx))
+    return faceCache.get(ex)!
+  }
+  // A class's face: its medoid's, else what two thirds of the copies LIKE the
+  // medoid are set in, of those whose face can be told (the medoid itself may
+  // stand where no stem foot is near enough to tell; the copies of the other
+  // face are the ones it does not look like).
+  const classFace = (best: Exemplar, members: Exemplar[], cohesion: number): FaceClass | null => {
+    const f = faceOf(best)
+    if (f) return f
+    let serif = 0, sans = 0
+    for (const m of members) {
+      if (shapeAgreement(m.shape, best.shape) < cohesion - 0.05) continue
+      const g = faceOf(m)
+      if (g === 'serif') serif++; else if (g === 'sans') sans++
+    }
+    return serif + sans >= 2 ? (serif >= 2 * sans ? 'serif' : sans >= 2 * serif ? 'sans' : null) : null
+  }
+  const medoids: { char: string; bold: boolean; shape: Float32Array; cohesion: number; emPx: number; face: FaceClass | null }[] = []
   for (const [char, list] of byChar) {
     for (const bold of [false, true]) {
       const members = list.filter(ex => boldOf(ex) === bold)
@@ -293,20 +320,29 @@ function markDoubts(byChar: Map<string, Exemplar[]>, boldAt: number | null): Map
         // How closely the class's own copies agree with it: the bar another
         // letter's copy has to clear to be mistaken for one of them.
         const agreements = sample.filter(e => e !== best).map(e => shapeAgreement(e.shape, best!.shape)).sort((a, b) => a - b)
-        medoids.push({ char, bold, shape: best.shape, cohesion: agreements[Math.floor(agreements.length / 2)] ?? 0.85, emPx: best.emPx })
+        const cohesion = agreements[Math.floor(agreements.length / 2)] ?? 0.85
+        medoids.push({ char, bold, shape: best.shape, cohesion, emPx: best.emPx, face: classFace(best, members, cohesion) })
       }
     }
   }
   for (const [char, list] of byChar) {
     for (const ex of list) {
       const bold = boldOf(ex)
-      let own = -1, ownCohesion = 0.85, ownEm = 0, other = -1, otherChar = '', otherCohesion = 0.85
+      let own = -1, ownCohesion = 0.85, ownEm = 0, ownFace: FaceClass | null = null, other = -1, otherChar = '', otherCohesion = 0.85
       for (const m of medoids) {
         if (m.bold !== bold) continue
         const a = shapeAgreement(ex.shape, m.shape)
-        if (m.char === char) { own = a; ownCohesion = m.cohesion; ownEm = m.emPx }
+        if (m.char === char) { own = a; ownCohesion = m.cohesion; ownEm = m.emPx; ownFace = m.face }
         else if (a > other) { other = a; otherChar = m.char; otherCohesion = m.cohesion }
       }
+      // The medoid set in the other kind of face — a registry page's serif
+      // headings beside its sans body, at one size — is no measure of this
+      // copy either: its serif bold "E"s agreed 0.57 with the body's sans
+      // "E" and 0.74 with a "D", every one was doubted, and a heading's
+      // edit borrowed the sans "E". Its peers are then the copies in its OWN
+      // kind of face.
+      const face = own >= 0 && ownFace ? faceOf(ex) : null
+      const otherFace = face !== null && face !== ownFace
       // A page sets its title in one face and its body in another, and the
       // letter's medoid is whichever face holds more copies: a book cover's
       // serif "I"s agreed 0.49 with the title's sans "I" and were doubted, so
@@ -316,16 +352,20 @@ function markDoubts(byChar: Map<string, Exemplar[]>, boldAt: number | null): Map
       // picker, never a reason to prefer it: un-doubted outright, such copies
       // were picked over true ones (a re-weighed regular "7" over the page's
       // bold one) on a page whose medoids were fine.
-      if (own < 0 || ex.emPx / ownEm > 1.2 || ownEm / ex.emPx > 1.2) {
+      if (own < 0 || ex.emPx / ownEm > 1.2 || ownEm / ex.emPx > 1.2 || otherFace) {
         const peers = list.filter(o => o !== ex && boldOf(o) === bold && o.emPx >= ex.emPx / 1.2 && o.emPx <= ex.emPx * 1.2 &&
-          (o.lineId !== ex.lineId || Math.abs(o.x0 - ex.x0) > ex.emPx)).slice(0, 12)
+          (o.lineId !== ex.lineId || Math.abs(o.x0 - ex.x0) > ex.emPx) && (!otherFace || faceOf(o) === face)).slice(0, 12)
         if (peers.length) {
           const ag = peers.map(o => shapeAgreement(ex.shape, o.shape)).sort((a, b) => a - b)
           const mid = ag[Math.floor(ag.length / 2)]
-          if (mid >= 0.8 && mid > other + 0.02) ex.peerVouched = true
+          if (mid >= 0.8 && mid > other + 0.02) {
+            // Vouched for its face alone, it serves a request for that face only.
+            if (otherFace && !(own < 0 || ex.emPx / ownEm > 1.2 || ownEm / ex.emPx > 1.2)) ex.faceVouched = face!
+            else ex.peerVouched = true
+          }
         }
       }
-      ex.doubtNote = `own ${own.toFixed(2)} vs "${otherChar}" ${other.toFixed(2)}${ex.peerVouched ? ' (peers vouch)' : ''}`
+      ex.doubtNote = `own ${own.toFixed(2)} vs "${otherChar}" ${other.toFixed(2)}${ex.peerVouched ? ' (peers vouch)' : ex.faceVouched ? ` (${ex.faceVouched} peers vouch)` : ''}`
       // A letter with no established shape of its own is doubted only when it
       // would pass for a TYPICAL copy of another letter: a bold "5" agrees with
       // the bold "6" at 0.8, where the 6s agree with each other at ~0.88.
@@ -504,7 +544,7 @@ export interface GlyphRequest {
    * The face the letter is wanted in, as the target line's own letters near
    * it show it: copies are taken from lines whose letters look like these.
    */
-  style?: { line: string; refs: { char: string; shape: Float32Array }[] }
+  style?: { line: string; refs: { char: string; shape: Float32Array }[]; face?: FaceClass | null }
 }
 
 export interface PickedGlyph {
@@ -535,6 +575,82 @@ function copiesOnLine(atlas: Atlas, line: string): Map<string, Exemplar[]> {
     lineIndex.set(atlas, idx)
   }
   return idx.get(line) ?? new Map()
+}
+
+/**
+ * Letters whose stem stands alone on the baseline: a serif face widens that
+ * foot into a slab, a sans face leaves it as wide as the stem. The lowercase
+ * n, m and r are left out: at body sizes their serifs are a pixel and merge
+ * into the stem (a Times paragraph read 0.5 to 1.4 on them).
+ */
+const FOOT_CHARS = /^[ITHFPil]$/
+
+/**
+ * How much darker the last rows of a letter's stem are than its lower stem:
+ * about 2 under a serif's slab, about 1 for a sans stem. Null for a letter
+ * that shows no lone stem foot, or one too small to tell.
+ */
+export function footRatio(ex: Pick<Exemplar, 'char' | 't' | 'm' | 'w' | 'h' | 'baseY' | 'emPx' | 'xh' | 'capH'>): number | null {
+  if (!FOOT_CHARS.test(ex.char)) return null
+  const H = ex.char === 'i' ? ex.xh : (ex.capH ?? ex.emPx * 0.7)
+  if (!H || H < 6) return null
+  const row = (y: number) => {
+    if (y < 0 || y >= ex.h) return 0
+    let s = 0
+    for (let x = 0; x < ex.w; x++) {
+      const i = y * ex.w + x
+      if (ex.m[i]) s += 1 - (ex.t[i * 3] * 299 + ex.t[i * 3 + 1] * 587 + ex.t[i * 3 + 2] * 114) / 1000 / 255
+    }
+    return s
+  }
+  const b = Math.round(ex.baseY)
+  const foot = Math.max(row(b - 1), row(b - 2))
+  const mids: number[] = []
+  for (let y = Math.round(ex.baseY - 0.4 * H); y <= Math.round(ex.baseY - 0.22 * H); y++) mids.push(row(y))
+  if (!mids.length) return null
+  mids.sort((a, q) => a - q)
+  const mid = mids[mids.length >> 1]
+  return mid > 0.5 ? foot / mid : null
+}
+
+export type FaceClass = 'serif' | 'sans'
+
+/** Each source line's stem feet (centre x in page px, `footRatio`), per letter map — doubted copies included: a doubt is about which letter, not which face. */
+const footIndex = new WeakMap<Map<string, Exemplar[]>, Map<string, { x: number; r: number }[]>>()
+
+/**
+ * Whether the text around `x` on a line is set in a serif face or a sans one,
+ * by the stem feet of its letters within eight ems, the five nearest: their
+ * median over 1.5 is a serif's slab, between 0.75 and 1.2 a sans stem (under
+ * 0.75 is a baseline found a pixel or two off, not a face). Two at least;
+ * null when it cannot be told.
+ */
+export function faceAt(atlas: Pick<Atlas, 'byChar'>, line: string, x: number, emPx: number): FaceClass | null {
+  let idx = footIndex.get(atlas.byChar)
+  if (!idx) {
+    idx = new Map()
+    for (const list of atlas.byChar.values()) for (const ex of list) {
+      const r = footRatio(ex)
+      if (r === null) continue
+      let l = idx.get(ex.lineId)
+      if (!l) { l = []; idx.set(ex.lineId, l) }
+      l.push({ x: ex.x0 + (ex.inkL + ex.inkR) / 2, r })
+    }
+    footIndex.set(atlas.byChar, idx)
+  }
+  const all = idx.get(line) ?? []
+  const classOf = (fs: { r: number }[]): FaceClass | null => {
+    if (fs.length < 2) return null
+    const rs = fs.map(f => f.r).sort((a, b) => a - b)
+    const med = rs.length % 2 ? rs[rs.length >> 1] : (rs[rs.length / 2 - 1] + rs[rs.length / 2]) / 2
+    return med >= 1.5 ? 'serif' : med <= 1.2 && med >= 0.75 ? 'sans' : null
+  }
+  const near = all.filter(f => Math.abs(f.x - x) <= 8 * emPx)
+    .sort((a, b) => Math.abs(a.x - x) - Math.abs(b.x - x)).slice(0, 5)
+  // Too few within reach, or no clear answer there: the line's own feet, all
+  // of them — a paragraph line set in one face shows them somewhere along it
+  // even where a stretch holds none, or holds two a baseline found off.
+  return classOf(near) ?? (all.length >= 3 ? classOf(all) : null)
 }
 
 /**
@@ -676,19 +792,31 @@ function pickFrom(atlas: Atlas, req: GlyphRequest, vouched: boolean): PickedGlyp
   if (!list?.length) return null
   // The second pass: copies doubted on grounds their own size or their own
   // line answers for (`peerVouched`, `ownLineOnly`).
-  const fallback = (ex: Exemplar) => !!ex.doubt && (!!ex.peerVouched || (!!ex.ownLineOnly && ex.lineId === req.style?.line))
+  const fallback = (ex: Exemplar) => !!ex.doubt && (!!ex.peerVouched || (!!ex.faceVouched && ex.faceVouched === req.style?.face) || (!!ex.ownLineOnly && ex.lineId === req.style?.line))
   if (vouched && !list.some(fallback)) return null
   // Sizes compare on what both lines measured: the x-height, else the cap
   // height. The em a line's fit reports is the least reliable of the three —
   // 21 to 25 px across lines set in the same 9 pt face on one page.
   const sizeRatio = (ex: Exemplar) => sizeRatioOf(req, ex)
   const boldOf = (ex: Exemplar) => atlas.boldAt === null ? false : ex.weight === null ? null : ex.weight >= atlas.boldAt
+  // A copy from text set in the other kind of face — a sans "H" for a serif
+  // heading — is no copy at all: the letter is then made in the line's own
+  // look, and only where it cannot be is such a copy used (`applyLineEdit`).
+  // The shape scores cannot see this: one coarse grid per letter, and a sans
+  // "E" agreed 0.76 with a serif title's letters where copies of one face
+  // agree 0.78 across the lines of a table.
+  const face = req.style?.face
+  const otherFace = face ? (ex: Exemplar) => {
+    const f = faceAt(atlas, ex.lineId, ex.x0 + (ex.inkL + ex.inkR) / 2, ex.emPx)
+    return f !== null && f !== face
+  } : () => false
   const compatible = inStyle(atlas, req, list.filter(ex => {
     if (ex.doubt && !(vouched && fallback(ex))) return false
     const r = sizeRatio(ex)
     if (r < 0.9 || r > 1.11) return false
     const b = boldOf(ex)
-    return b === null ? false : b === req.bold
+    if (b === null || b !== req.bold) return false
+    return !otherFace(ex)
   }))
   if (!compatible.length) return null
   // The copies closest in size first, among which the medoid is chosen.

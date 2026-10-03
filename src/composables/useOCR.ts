@@ -901,7 +901,9 @@ function createOCR() {
     const t2 = performance.now()
     let plan = planScanEdits(sp.pi, sp.lines, atlas, items, undefined, sp.unread)
     if (import.meta.env.DEV) ((window as any).__scanEditTimes ??= []).push({ page: pageIndex, scanPage: Math.round(t1 - t0), atlas: Math.round(t2 - t1), plan: Math.round(performance.now() - t2) })
-    const wanting = Object.values(plan.modes).some(m => m.includes('no letter on the page'))
+    // A letter no page holds, or holds only in another kind of face: the rest
+    // of the document may print it in this one.
+    const wanting = plan.wanting.length > 0 || Object.values(plan.modes).some(m => m.includes('no letter on the page'))
     if (wanting) {
       const others = [...useOcrStore().pages.keys()]
         .filter(q => q !== pageIndex && harvests.get(q)?.gen !== genOf(q))

@@ -30,6 +30,8 @@ export interface PageInk {
   dark: Uint8Array
   /** Faint straight lines taken as paper (a notebook's grid), 1 where one runs; the plain-paper tests look past them. */
   lines?: Uint8Array
+  /** A paper's regular fine texture (a security hatch), RGB residual over its smoothed level, 3 a pixel — only where the page has one (`paperTexture`). */
+  texture?: Int8Array
 }
 
 /** Ideographs (and full-width forms): composed of radicals, so stacked pieces are their nature, not a sign of a broken letter. */
@@ -337,6 +339,7 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
   const ch = [new Float32Array(N), new Float32Array(N), new Float32Array(N)]
   for (let p = 0, i = 0; p < N; p++, i += 4) { ch[0][p] = d[i]; ch[1][p] = d[i + 1]; ch[2][p] = d[i + 2] }
   pushPull(ch, known, s.w, s.h)
+  const texture = opts.strokes !== false ? paperTexture(ch, known, s.w, s.h) : null
   // Most pages are plain paper and hold no ground: skip the region pass.
   if (grounds) fillGrounds(ch, known, d, L, C, ground, s.w, s.h)
   if (anyLine) for (let p = 0, i = 0; p < N; p++, i += 4) {
@@ -356,8 +359,10 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
   // What the plain-paper tests look past is the line AND its fringe: a
   // scanned grid line is blurred, its pale edges are paper of the grid's tint,
   // and counted as the page's paper they read every squared page as rough.
-  if (!anyLine) return { s, paper, dark }
-  return { s, paper, dark, lines: band }
+  const out: PageInk = { s, paper, dark }
+  if (anyLine) out.lines = band
+  if (texture) out.texture = texture
+  return out
 }
 
 const invertedPages = new WeakMap<PageInk, PageInk>()
@@ -621,6 +626,106 @@ export function edgeWidthOf(pi: PageInk, li: LineInk): number | null {
   ws.sort((a, b) => a - b)
   return ws[ws.length >> 1]
 }
+/**
+ * A paper whose fine texture is a REGULAR pattern — a registry certificate's
+ * security hatch, a halftone screen — keeps that pattern under the ink.
+ * Push-pull fills an erased letter with the paper's smoothed level, and a
+ * hatch of dots at an eight-pixel pitch then shows a clean patch wherever a
+ * letter was; worse, a letter borrowed from elsewhere carried the hatch of
+ * where it was taken (its fringe's transmittance against the smooth fill), a
+ * faint box of misaligned dots around every new letter. Where the paper's
+ * residual against its own blur repeats on a lattice (autocorrelation over
+ * 0.6 at a shift of three pixels or more, measured on windows of plain
+ * paper), every unknown pixel takes the residual of the nearest lattice
+ * translate that is plain paper, on top of the smooth fill.
+ */
+function paperTexture(ch: Float32Array[], known: Float32Array, W: number, H: number): Int8Array | null {
+  const N = W * H
+  const R = 6
+  const blur = (src: Float32Array): Float32Array => {
+    const tmp = new Float32Array(N), out = new Float32Array(N), k = 2 * R + 1
+    for (let y = 0; y < H; y++) {
+      const o = y * W
+      let acc = 0
+      for (let x = -R; x <= R; x++) acc += src[o + Math.min(W - 1, Math.max(0, x))]
+      for (let x = 0; x < W; x++) { tmp[o + x] = acc / k; acc += src[o + Math.min(W - 1, x + R + 1)] - src[o + Math.max(0, x - R)] }
+    }
+    for (let x = 0; x < W; x++) {
+      let acc = 0
+      for (let y = -R; y <= R; y++) acc += tmp[Math.min(H - 1, Math.max(0, y)) * W + x]
+      for (let y = 0; y < H; y++) { out[y * W + x] = acc / k; acc += tmp[Math.min(H - 1, y + R + 1) * W + x] - tmp[Math.max(0, y - R) * W + x] }
+    }
+    return out
+  }
+  const lum = new Float32Array(N)
+  for (let p = 0; p < N; p++) lum[p] = (ch[0][p] * 299 + ch[1][p] * 587 + ch[2][p] * 114) / 1000
+  const sm = blur(lum)
+  const res = new Float32Array(N)
+  let ss = 0, n = 0
+  for (let p = 0; p < N; p++) if (known[p] === 1) { res[p] = lum[p] - sm[p]; ss += res[p] * res[p]; n++ }
+  if (n < N * 0.2 || Math.sqrt(ss / n) < 1) return null
+  // Windows of plain paper to measure the pattern on.
+  const WIN = 48, K = 12
+  const wins: { x: number; y: number }[] = []
+  for (let gy = 0; gy < 10 && wins.length < 40; gy++) for (let gx = 0; gx < 10 && wins.length < 40; gx++) {
+    const x = Math.round(K + (W - WIN - 2 * K) * (gx + 0.5) / 10), y = Math.round((H - WIN - K) * (gy + 0.5) / 10)
+    if (x < K || y < 0 || x + WIN + K > W || y + WIN + K > H) continue
+    let k = 0
+    for (let yy = y; yy < y + WIN + K; yy += 2) for (let xx = x - K; xx < x + WIN + K; xx += 2) if (known[yy * W + xx] === 1) k++
+    if (k >= (WIN + K) * (WIN + 2 * K) / 4 * 0.95) wins.push({ x, y })
+  }
+  if (wins.length < 6) return null
+  const corr = (dx: number, dy: number) => {
+    let num = 0, den = 0
+    for (const w of wins) for (let y = w.y; y < w.y + WIN; y++) for (let x = w.x; x < w.x + WIN; x++) {
+      const a = y * W + x, b = a + dy * W + dx
+      if (known[a] !== 1 || known[b] !== 1) continue
+      num += res[a] * res[b]; den += res[a] * res[a]
+    }
+    return den > 0 ? num / den : 0
+  }
+  const peaks: { dx: number; dy: number; c: number; len: number }[] = []
+  for (let dy = 0; dy <= K; dy++) for (let dx = -K; dx <= K; dx++) {
+    if (dy === 0 && dx <= 0) continue
+    const len = Math.hypot(dx, dy)
+    if (len < 3) continue
+    peaks.push({ dx, dy, c: corr(dx, dy), len })
+  }
+  const best = Math.max(...peaks.map(q => q.c))
+  if (!(best >= 0.6)) return null
+  const strong = peaks.filter(q => q.c >= best - 0.08).sort((a, b) => a.len - b.len)
+  const v1 = strong[0]
+  const v2 = strong.find(q => q.dx * v1.dy - q.dy * v1.dx !== 0)
+  if (!v2) return null
+  const offsets: { dx: number; dy: number; len: number }[] = []
+  const M = 14
+  for (let a = -M; a <= M; a++) for (let b = -M; b <= M; b++) {
+    if (!a && !b) continue
+    const dx = a * v1.dx + b * v2.dx, dy = a * v1.dy + b * v2.dy
+    const len = Math.hypot(dx, dy)
+    if (len <= 96) offsets.push({ dx, dy, len })
+  }
+  offsets.sort((a, b) => a.len - b.len)
+  const smC = ch.map(c => blur(c))
+  // The residual every pixel carries, kept with the page: what relaxing an
+  // erased hole (a smooth harmonic fill) has to add back.
+  const tex = new Int8Array(N * 3)
+  for (let p = 0; p < N; p++) if (known[p] === 1) for (let c = 0; c < 3; c++) tex[p * 3 + c] = Math.max(-127, Math.min(127, Math.round(ch[c][p] - smC[c][p])))
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const p = y * W + x
+    if (known[p] === 1) continue
+    for (const o of offsets) {
+      const X = x + o.dx, Y = y + o.dy
+      if (X < 0 || Y < 0 || X >= W || Y >= H) continue
+      const q = Y * W + X
+      if (known[q] !== 1) continue
+      for (let c = 0; c < 3; c++) { const r = ch[c][q] - smC[c][q]; ch[c][p] += r; tex[p * 3 + c] = Math.max(-127, Math.min(127, Math.round(r))) }
+      break
+    }
+  }
+  return tex
+}
+
 /** The last analysis's fragmentation measure — for the lab. */
 let fragDebug: unknown = null
 export function lastFragTest(): unknown { const v = fragDebug; fragDebug = null; return v }

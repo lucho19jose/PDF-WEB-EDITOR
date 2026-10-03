@@ -1253,3 +1253,75 @@ test('a figure made for a word printed in the look\'s own face is not re-weighed
   const a = ink(natural), b = ink(made)
   assert.ok(Math.abs(b - a) <= a * 0.03, `made ${b.toFixed(1)} against ${a.toFixed(1)} as the face draws it`)
 })
+
+/** Lines of text drawn by MuPDF on white paper at 200 DPI: `[font file, size px, x, baseline y, text]`. */
+function printedPage(W, H, lines, paper = (x, y) => 250) {
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  for (const [file, size, x, y, text] of lines) {
+    const font = new mupdf.Font(file, fs.readFileSync(`${ROOT}/public/fonts/match/${file}.ttf`))
+    const t = new mupdf.Text()
+    t.showString(font, [size, 0, 0, -size, x, y], text)
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  }
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const a = 1 - g[y * st + x] / 255, p = (y * W + x) * 4, v = Math.round(paper(x, y) * (1 - a) + 15 * a)
+    rgba[p] = rgba[p + 1] = rgba[p + 2] = v
+    rgba[p + 3] = 255
+  }
+  return R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Printed')
+}
+
+test('a serif heading never borrows a sans letter silently: it asks for the letter in its own face', () => {
+  // The registry page's shape: a serif bold heading over a sans body, and
+  // the edit needs an "E" and an "H" only the body prints.
+  const raster = printedPage(1400, 360, [
+    ['Tinos-Bold', 44, 60, 100, 'SIGA TICS'],
+    ['Arimo-Bold', 44, 60, 260, 'ESTE HECHO HOY TECHO'],
+  ])
+  const pi = LI.preparePage(raster)
+  const items = [
+    { id: 'h', text: 'SIGA TICS', inkRect: { x: 50 * 0.36, y: 60 * 0.36, width: 340 * 0.36, height: 50 * 0.36 }, confidence: 99 },
+    { id: 'b', text: 'ESTE HECHO HOY TECHO', inkRect: { x: 50 * 0.36, y: 220 * 0.36, width: 720 * 0.36, height: 50 * 0.36 }, confidence: 99 },
+  ]
+  const lis = items.map(it => LI.analyzeLine(pi, it))
+  for (const li of lis) assert.ok(li, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, lis, 0)])
+  const [hx, bx] = [lis[0], lis[1]].map(li => (li.words[0].x0 + li.words[li.words.length - 1].x1) / 2)
+  assert.equal(GA.faceAt(atlas, 'h', hx, lis[0].fit.emPx), 'serif')
+  assert.equal(GA.faceAt(atlas, 'b', bx, lis[1].fit.emPx), 'sans')
+  const res = SE.applyLineEdit(pi, lis[0], atlas, 'SIGA TECH', raster.data.slice(), {})
+  assert.ok(res.ok, res.reason)
+  const asked = new Set((res.wanting ?? []).map(w => w.char))
+  assert.ok(asked.has('E') && asked.has('H'), `asked for ${[...asked].join(',') || 'nothing'}`)
+})
+
+test('a security hatch continues through an erased word', () => {
+  // Faint dots at a four-pixel pitch over the whole sheet (ten levels: a
+  // registry page's hatch is six), a line of text over them.
+  const hatch = (x, y) => (x % 4 === 0 && y % 4 === 0) ? 240 : 250
+  const raster = printedPage(1400, 520, [['Arimo-Regular', 40, 60, 260, 'HATCH TEXT HERE']], hatch)
+  const pi = LI.preparePage(raster)
+  assert.ok(pi.texture, 'the hatch was not found')
+  const li = LI.analyzeLine(pi, { id: 't', text: 'HATCH TEXT HERE', inkRect: { x: 50 * 0.36, y: 220 * 0.36, width: 520 * 0.36, height: 50 * 0.36 }, confidence: 99 })
+  assert.ok(li, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, 'HATCH HERE', work, {})
+  assert.ok(res.ok, res.reason)
+  // Where "TEXT" was, the dots are back: the hatch positions print darker
+  // than the paper between them, as everywhere else on the sheet.
+  const w = li.words[1]
+  let dots = 0, dotSum = 0, rest = 0, restSum = 0
+  for (let y = Math.round(w.y0 ?? 225); y < 262; y++) for (let x = Math.round(w.x0) + 2; x < Math.round(w.x1) - 2; x++) {
+    const v = work[(y * 1400 + x) * 4]
+    if (raster.data[(y * 1400 + x) * 4] < 200) continue
+    if (x % 4 === 0 && y % 4 === 0) { dots++; dotSum += v } else { rest++; restSum += v }
+  }
+  assert.ok(dots >= 20, `only ${dots} dot positions measured`)
+  assert.ok(restSum / rest - dotSum / dots >= 6, `dots ${(dotSum / dots).toFixed(1)} against paper ${(restSum / rest).toFixed(1)}`)
+})

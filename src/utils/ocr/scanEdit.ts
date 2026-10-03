@@ -1,5 +1,5 @@
 import { cellRegion, looseRegion, analyzeLine, edgeWidthOf, CORE, type PageInk, type LineInk } from './lineInk'
-import { pickGlyph, predictGap, lineMetrics, cellShapeOf, shapeOfCore, shapeAgreement, vocabKey, formKey, type Atlas, type Exemplar } from './glyphAtlas'
+import { pickGlyph, predictGap, lineMetrics, cellShapeOf, shapeOfCore, shapeAgreement, vocabKey, formKey, faceAt, type Atlas, type Exemplar, type FaceClass, type GlyphRequest } from './glyphAtlas'
 import { expectedAdvance } from './glyphCut'
 import { baselineAtOf } from './wordSeg'
 
@@ -276,6 +276,8 @@ interface NewChar {
   dy: number
   glyph?: GlyphImage
   drawnAs?: string
+  /** A synthesised glyph's stand-in: the page's copy from text in the other kind of face, used if the line may not take that many made letters. */
+  alt?: { glyph: GlyphImage; drawnAs: string }
 }
 
 /** Longest common subsequence alignment of two character lists, preferring contiguous runs: the matched index pairs. */
@@ -1573,35 +1575,51 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     return refs
   }
   let lineEdge: number | null | undefined
+  // Serif or sans, as the line's own letters around each word show it.
+  const faces = new Map<number, FaceClass | null>()
+  const faceOfWord = (k: number): FaceClass | null => {
+    if (!faces.has(k)) { const w = li.words[k]; faces.set(k, w ? faceAt(atlas, li.id, (w.x0 + w.x1) / 2, em) : null) }
+    return faces.get(k)!
+  }
+  // A copy from the page in either weight, as a glyph for this line.
+  const fromPage = (req: GlyphRequest): { glyph: GlyphImage; drawnAs: string } | null => {
+    const pick = pickGlyph(atlas, req)
+    if (pick) return { glyph: toned(scaleImage(imageOf(pick.ex), pick.scale), pick.ex.inkT, inkOverPaper), drawnAs: pick.scale === 1 ? 'g' : 'w' }
+    // The page has the letter only in the other weight: re-weigh it.
+    const other = pickGlyph(atlas, { ...req, bold: !req.bold })
+    if (!other) return null
+    const d = stemPx(req.bold) - stemPx(!req.bold)
+    return { glyph: matchCore(toned(reweighImage(scaleImage(imageOf(other.ex), other.scale), d, d * 0.35), other.ex.inkT, inkOverPaper), li.coreDark, inkOverPaper), drawnAs: 'w' }
+  }
   for (const c of nc) {
     if (c.kind !== 'synth') continue
     const bold = boldOfWord(c.styleWord)
-    const req = { char: c.ch, emPx: em, xh, capH, figH, bold, style: { line: li.id, refs: styleOf(c.styleWord) } }
-    let pick = pickGlyph(atlas, req)
-    let g: GlyphImage | null = null
-    if (pick) {
-      g = toned(scaleImage(imageOf(pick.ex), pick.scale), pick.ex.inkT, inkOverPaper)
-      c.drawnAs = pick.scale === 1 ? 'g' : 'w'
-    } else {
-      // The page has the letter only in the other weight: re-weigh it.
-      const other = pickGlyph(atlas, { ...req, bold: !bold })
-      if (other) {
-        const d = stemPx(bold) - stemPx(!bold)
-        g = matchCore(toned(reweighImage(scaleImage(imageOf(other.ex), other.scale), d, d * 0.35), other.ex.inkT, inkOverPaper), li.coreDark, inkOverPaper)
-        c.drawnAs = 'w'
-      }
-    }
-    if (!g) {
-      // Neither weight on any harvested page: a glyph synthesised from the
-      // matched face, if the caller has made one.
-      if (lineEdge === undefined) lineEdge = edgeWidthOf(pi, li)
-      const src = stemSource(c.styleWord)
-      const want: GlyphWant = { char: c.ch, emPx: em, xh, capH, bold, ink: inkOverPaper, coreDark: li.coreDark, line: li.id, stem: src.w, stemChars: src.chars, edge: lineEdge }
-      const made = opts.synth?.get(`${li.id}|${wantKey(want)}`) ?? opts.synth?.get(wantKey(want))
-      if (made) { g = made; c.drawnAs = 's' }
-      else { missing.push(c.ch); wanting.push(want); continue }
-    }
-    c.glyph = g
+    const face = faceOfWord(c.styleWord)
+    const req: GlyphRequest = { char: c.ch, emPx: em, xh, capH, figH, bold, style: { line: li.id, refs: styleOf(c.styleWord), face } }
+    const found = fromPage(req)
+    if (found) { c.glyph = found.glyph; c.drawnAs = found.drawnAs; continue }
+    // Neither weight on any harvested page, in this kind of face: a glyph
+    // synthesised from the matched face, if the caller has made one.
+    if (lineEdge === undefined) lineEdge = edgeWidthOf(pi, li)
+    const src = stemSource(c.styleWord)
+    const want: GlyphWant = { char: c.ch, emPx: em, xh, capH, bold, ink: inkOverPaper, coreDark: li.coreDark, line: li.id, stem: src.w, stemChars: src.chars, edge: lineEdge }
+    const made = opts.synth?.get(`${li.id}|${wantKey(want)}`) ?? opts.synth?.get(wantKey(want))
+    // The page's copy from text set in the other kind of face — a sans "H"
+    // for a serif heading: what a registry page's title was given, an "H" and
+    // an "E" from the body text standing out of "SIGA TECH" at a glance. Made
+    // in the line's own look instead whenever it can be; the copy is used only
+    // where it cannot (no face prints like the line, or the line may not take
+    // that many made letters).
+    const foreign = face ? fromPage({ ...req, style: { ...req.style!, face: null } }) : null
+    if (made) {
+      c.glyph = made
+      c.drawnAs = 's'
+      if (foreign) c.alt = foreign
+    } else if (foreign) {
+      c.glyph = foreign.glyph
+      c.drawnAs = foreign.drawnAs
+      wanting.push(want)
+    } else { missing.push(c.ch); wanting.push(want) }
   }
   if (missing.length) return { ok: false, reason: `no letter on the page for ${[...new Set(missing)].map(ch => `"${ch}"`).join(', ')}`, notes, wanting }
   // A synthesised letter is the last resort, and it shows: a word made mostly
@@ -1612,8 +1630,12 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   // and counting them refused "seis (6)" — the parentheses and the 6 made,
   // three of seven — while a plan redrawing twenty more letters passed.
   {
-    const made = nc.filter(c => c.drawnAs === 's' && /\p{L}/u.test(c.ch)).length
+    const madeLetters = () => nc.filter(c => c.drawnAs === 's' && /\p{L}/u.test(c.ch)).length
     const drawn = nc.filter(c => c.kind === 'synth' && /\p{L}/u.test(c.ch)).length
+    // Over the limit, a made letter that has a page copy in the other kind of
+    // face takes that copy: it was the drawing before such copies gave way.
+    if (madeLetters() > Math.max(2, drawn * 0.25)) for (const c of nc) if (c.drawnAs === 's' && c.alt) { c.glyph = c.alt.glyph; c.drawnAs = c.alt.drawnAs }
+    const made = madeLetters()
     if (made > Math.max(2, drawn * 0.25)) return { ok: false, reason: `too many letters the page does not hold (${made} of ${drawn})`, notes }
   }
 
@@ -2230,6 +2252,10 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   for (const [i, c] of movers) printShifted(cellRegion(li, i, W), c.dx, c.dy)
   for (const k of tailLoose) printShifted(looseRegion(li, k, W), dxTail, dyTail)
   for (const r of tailRules) printShifted(ruleRegion(r), dxTail, dyTail)
+  // A bilevel scan's letters hold no grey, and a sub-pixel shift (below) is a
+  // resample that puts grey rows into a glyph: there each lands on the whole
+  // pixel nearest its baseline, as the scan's own letters do.
+  let bilevel: boolean | undefined
   for (const c of nc) {
     if (c.kind !== 'synth' || !c.glyph) continue
     const g = c.glyph
@@ -2240,7 +2266,11 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     const yExact = base(cx) - g.baseY
     const Y0 = Math.floor(yExact), fy = yExact - Y0
     const X = Math.round(c.x - g.inkL)
-    if (fy > 0.2 && fy < 0.8) printGlyph(work, W, s.h, shiftDown(g, fy), X, Y0, touch)
+    if (fy > 0.2 && fy < 0.8 && bilevel === undefined) {
+      if (lineEdge === undefined) lineEdge = edgeWidthOf(pi, li)
+      bilevel = lineEdge !== null && lineEdge <= 0.65
+    }
+    if (fy > 0.2 && fy < 0.8 && !bilevel) printGlyph(work, W, s.h, shiftDown(g, fy), X, Y0, touch)
     else printGlyph(work, W, s.h, g, X, fy >= 0.8 ? Y0 + 1 : Y0, touch)
   }
   for (const plan of ulPlans) if (plan) plan.print(work, pi, touch)
@@ -2256,6 +2286,9 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   if (nc.some(c => c.drawnAs === 'w')) notes.push('some letters re-weighed or re-sized from the page')
   return {
     ok: true, notes, words,
+    // Letters drawn from text in another kind of face: the caller makes them
+    // in the line's look if it can, and plans again.
+    wanting: wanting.length ? wanting : undefined,
     box: box.x0 < box.x1 ? box : undefined,
     drawn: nc.map(c => c.drawnAs ?? '?').join(''),
     debug: { layout: layoutLog, underlines: ulPlans.map(p => p ? p.span : 'unchanged') }
@@ -2285,13 +2318,18 @@ function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W
   const free = new Uint8Array(bw * bh)
   const v = [new Float32Array(bw * bh), new Float32Array(bw * bh), new Float32Array(bw * bh)]
   const src = pi.s.data
+  // A paper with a regular texture is relaxed on its LEVEL: the residual is
+  // taken off every value first and put back on the hole afterwards, or the
+  // harmonic fill smooths a security hatch into a clean patch.
+  const tex = pi.texture
+  const tx = (p: number, c: number) => tex ? tex[p * 3 + c] : 0
   for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
     const p = (y0 + y) * W + x0 + x, j = y * bw + x
     // A grid line through the hole is the grid (`PageInk.lines`): held, not relaxed away.
-    if (erase.has(p) && pi.lines?.[p]) { for (let c = 0; c < 3; c++) { v[c][j] = pi.paper[p * 3 + c]; work[p * 4 + c] = pi.paper[p * 3 + c] } }
-    else if (erase.has(p) && held?.(p)) { for (let c = 0; c < 3; c++) v[c][j] = work[p * 4 + c] }
-    else if (erase.has(p)) { free[j] = 1; for (let c = 0; c < 3; c++) v[c][j] = work[p * 4 + c] }
-    else for (let c = 0; c < 3; c++) v[c][j] = pi.dark[p] < 50 ? src[p * 4 + c] : pi.paper[p * 3 + c]
+    if (erase.has(p) && pi.lines?.[p]) { for (let c = 0; c < 3; c++) { v[c][j] = pi.paper[p * 3 + c] - tx(p, c); work[p * 4 + c] = pi.paper[p * 3 + c] } }
+    else if (erase.has(p) && held?.(p)) { for (let c = 0; c < 3; c++) v[c][j] = work[p * 4 + c] - tx(p, c) }
+    else if (erase.has(p)) { free[j] = 1; for (let c = 0; c < 3; c++) v[c][j] = work[p * 4 + c] - tx(p, c) }
+    else for (let c = 0; c < 3; c++) v[c][j] = (pi.dark[p] < 50 ? src[p * 4 + c] : pi.paper[p * 3 + c]) - tx(p, c)
   }
   const idx: number[] = []
   for (let j = 0; j < bw * bh; j++) if (free[j]) idx.push(j)
@@ -2308,7 +2346,7 @@ function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W
   }
   for (const j of idx) {
     const x = j % bw, y = (j - x) / bw, p = (y0 + y) * W + x0 + x
-    for (let c = 0; c < 3; c++) work[p * 4 + c] = v[c][j]
+    for (let c = 0; c < 3; c++) work[p * 4 + c] = v[c][j] + tx(p, c)
   }
 }
 
