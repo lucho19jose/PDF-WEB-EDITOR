@@ -273,7 +273,7 @@ if (cmd === 'edit') {
   const SEP = await load('/src/utils/ocr/scanEditPage.ts')
   const margin = SEP.textMargin ? SEP.textMargin(lis) : null
   const limitRight = s.w - Math.round(18 / Math.abs(s.toPage[0]))
-  const optsFor = (li) => ({ justifyTo: SEP.justifiedMargin ? SEP.justifiedMargin(margin, lis, li) : margin, limitRight })
+  const optsFor = (li) => ({ justifyTo: SEP.justifiedMargin ? SEP.justifiedMargin(margin, lis, li) : margin, limitRight, columnRight: SEP.alignedRight ? SEP.alignedRight(lis, li) : false, pageLines: lis.filter(Boolean) })
   console.log('margins', JSON.stringify({ margin, limitRight }))
   for (const spec of suite) {
     const items = itemsOf(p)

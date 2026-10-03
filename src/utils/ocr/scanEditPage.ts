@@ -318,6 +318,31 @@ export function justifiedMargin(margin: number | null, lines: Iterable<LineInk |
   return null
 }
 
+/**
+ * Whether a line of figures is one of a COLUMN set flush right: another line
+ * of figures near it ends where it ends and starts somewhere else — an
+ * amounts column with no rule beside it, "13,000.00" over "0.00" over
+ * "13,000.00". Such a line keeps its right edge when an edit changes its
+ * length; set from its start instead, "2,500.00" ran out past the column.
+ */
+export function alignedRight(lines: Iterable<LineInk | null>, li: LineInk): boolean {
+  const figures = (o: LineInk) => {
+    const d = o.chars.filter(ch => /[0-9]/.test(ch)).length
+    return d >= 2 && d >= o.chars.length * 0.6
+  }
+  if (!li.cells.length || !figures(li)) return false
+  const em = li.fit.emPx
+  const right = (o: LineInk) => Math.max(...o.cells.map(c => c.inkR))
+  const left = (o: LineInk) => Math.min(...o.cells.map(c => c.inkL))
+  const r0 = right(li), l0 = left(li)
+  for (const o of lines) {
+    if (!o || o === li || !o.cells.length || !!o.inverted !== !!li.inverted || !figures(o)) continue
+    if (Math.abs(o.fit.y - li.fit.y) > em * 6 || Math.abs(o.fit.emPx - em) > em * 0.3) continue
+    if (Math.abs(right(o) - r0) <= Math.max(2, em * 0.12) && Math.abs(left(o) - l0) > em * 0.5) return true
+  }
+  return false
+}
+
 export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, atlas: Atlas, items: OcrTextItem[], synth?: Map<string, GlyphImage>, unread?: Map<string, string>): ScanEditPlan {
   const s = pi.s
   // .slice(), not Uint8ClampedArray.from: `from` walks the iterator and took
@@ -330,6 +355,7 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
   const justifyFor = (li: LineInk) => justifiedMargin(margin, lines.values(), li)
   // And no line may run off the paper: a quarter inch from its edge at most.
   const limitRight = s.w - Math.round(18 / Math.abs(s.toPage[0] || 1))
+  const pageLines = [...lines.values()].filter((o): o is LineInk => !!o)
   const done: { item: OcrTextItem; box: { x0: number; y0: number; x1: number; y1: number }; words: { text: string; x0: number; x1: number; base: number }[]; li: LineInk }[] = []
   let workInv: Uint8ClampedArray | null = null
   for (const item of items) {
@@ -353,7 +379,7 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
     // of its own, and folded back into this one below.
     const pl = li.inverted ? invertedPage(pi) : pi
     const w = li.inverted ? (workInv ??= pl.s.data.slice()) : work
-    const res = applyLineEdit(pl, li, atlas, item.text, w, { remove: item.removed, justifyTo: justifyFor(li), limitRight, synth })
+    const res = applyLineEdit(pl, li, atlas, item.text, w, { remove: item.removed, justifyTo: justifyFor(li), limitRight, synth, columnRight: alignedRight(lines.values(), li), pageLines })
     if (!res.ok) {
       modes[item.id] = `vector (${res.reason})`
       for (const w of res.wanting ?? []) wanting.set(wantKey(w), w)

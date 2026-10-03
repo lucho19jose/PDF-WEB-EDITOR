@@ -12,7 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import fs from 'node:fs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..').replace(/\\/g, '/')
-let server, SE, R, LI, GA, IP, GR, GS, mupdf
+let server, SE, R, LI, GA, IP, GR, GS, SEP, WS, mupdf
 
 before(async () => {
   const { createServer } = await import(pathToFileURL(ROOT + '/node_modules/vite/dist/node/index.js').href)
@@ -29,6 +29,8 @@ before(async () => {
   IP = await loadOcr('inpaint.ts')
   GR = await loadOcr('glyphRaster.ts')
   GS = await loadOcr('glyphSynth.ts')
+  SEP = await loadOcr('scanEditPage.ts')
+  WS = await loadOcr('wordSeg.ts')
   mupdf = await import(pathToFileURL(ROOT + '/node_modules/mupdf/dist/mupdf.js').href)
 })
 after(async () => { await server?.close() })
@@ -888,4 +890,148 @@ test('a large bold title on white paper is edited without grey halos: its thick 
   }
   assert.ok(changed > 2000, 'the edit drew something')
   assert.ok(grey < changed * 0.02, `grey pixels: ${grey} of ${changed} changed`)
+})
+
+test('a rounded box\'s side is carved off whole: its blurred edge column and the corner it curves round are the border\'s', () => {
+  // The shape a form's day cell gave, at a 28.5 px em: the box's left side
+  // three columns of solid ink with a fringe column inked over its lower third
+  // only, and at its foot the corner curving away towards the bottom rule
+  // (whose straight run the rule mask has already taken). The baseline is at
+  // row 36; the letters' band runs from row 14 to row 39.
+  const pageW = 200, pix = []
+  const at = (x, y) => pix.push(y * pageW + x)
+  for (let y = 6; y <= 45; y++) for (const x of [16, 17, 18]) at(x, y)
+  for (let y = 28; y <= 41; y++) at(15, y)
+  for (const [y, x0, x1] of [[40, 19, 19], [41, 19, 19], [42, 19, 20], [43, 19, 21], [44, 19, 23], [45, 19, 26], [46, 21, 30]]) for (let x = x0; x <= x1; x++) at(x, y)
+  const xs = pix.map(p => p % pageW), ys = pix.map(p => (p - p % pageW) / pageW)
+  const c = { pix, x0: Math.min(...xs), x1: Math.max(...xs) + 1, y0: Math.min(...ys), y1: Math.max(...ys) + 1, area: pix.length, cx: xs.reduce((a, b) => a + b, 0) / pix.length, cy: ys.reduce((a, b) => a + b, 0) / pix.length }
+  const ends = { base: 36, onRule: () => false }
+  // A piece taller than any letter may step over its blurred edge column.
+  const carved = LI.carveBorder(c, pageW, 14, 39, 5, ends, 2)
+  assert.ok(carved, 'the side was not carved')
+  assert.ok(carved.rest.length < 4, `${carved.rest.length} pixels left over — the corner would be taken for a letter`)
+  // Without that allowance there is no full column at the piece's edge.
+  assert.equal(LI.carveBorder(c, pageW, 14, 39, 5, ends, 0), null)
+  // A bold "l" whose stem ends a pixel under the baseline is not a border: a
+  // piece no taller than a letter gets no allowance for its edge columns.
+  const l = []
+  for (let y = 13; y <= 40; y++) for (const x of [50, 51]) l.push(y * pageW + x)
+  for (let y = 15; y <= 38; y++) { l.push(y * pageW + 49); l.push(y * pageW + 52) }
+  for (let y = 30; y <= 36; y++) for (const x of [53, 54]) l.push(y * pageW + x)
+  const lx = l.map(p => p % pageW), ly = l.map(p => (p - p % pageW) / pageW)
+  const lc = { pix: l, x0: Math.min(...lx), x1: Math.max(...lx) + 1, y0: Math.min(...ly), y1: Math.max(...ly) + 1, area: l.length, cx: 51, cy: 27 }
+  assert.equal(LI.carveBorder(lc, pageW, 14, 39, 4, ends, 0), null)
+})
+
+test('an amount in a column set flush right grows to the left, its figures on the column\'s pitch', () => {
+  // 200 DPI: "13,000.00" over "0.00" over "13,000.00", each set flush right
+  // against the same edge with no rule beside them; a line below gives the
+  // page its "2" and "5". "0.00" is retyped "2,500.00".
+  const W = 520, H = 230, size = 22, xr = 420
+  const font = new mupdf.Font('Arimo', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Regular.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const widthOf = (s) => [...s].reduce((t, ch) => t + font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0)), 0) * size, 0)
+  const lines = [['13,000.00', 50], ['0.00', 90], ['13,000.00', 130], ['25 52 2,5 5.2', 190]]
+  for (const [text, y] of lines) {
+    const t = new mupdf.Text()
+    t.showString(font, [size, 0, 0, -size, text.startsWith('25') ? 40 : xr - widthOf(text), y], text)
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  }
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let p = 0; p < W * H; p++) {
+    const a = 1 - g[Math.floor(p / W) * st + (p % W)] / 255
+    for (let c = 0; c < 3; c++) rgba[p * 4 + c] = Math.round(250 * (1 - a) + 30 * a)
+    rgba[p * 4 + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Column')
+  const pi = LI.preparePage(raster)
+  const lis = lines.map(([text, y], k) => {
+    const x0 = text.startsWith('25') ? 36 : xr - widthOf(text) - 4
+    return LI.analyzeLine(pi, { id: `a${k}`, text, inkRect: { x: x0 * 0.36, y: (y - 20) * 0.36, width: (text.startsWith('25') ? 200 : widthOf(text) + 8) * 0.36, height: 26 * 0.36 }, confidence: 95 })
+  })
+  lis.forEach((li, k) => assert.ok(li, `line ${k}: ${LI.lastLineFailure()}`))
+  assert.equal(SEP.alignedRight(lis, lis[1]), true)
+  assert.equal(SEP.alignedRight(lis, lis[3]), false)
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, lis, 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, lis[1], atlas, '2,500.00', work, { columnRight: true, pageLines: lis })
+  assert.ok(res.ok, res.reason)
+  // The ink runs of the edited line against the line above: tabular figures
+  // flush right, so "2,500.00" sits figure for figure under "3,000.00".
+  const runsOf = (data, y0, y1) => {
+    const out = []
+    let start = -1
+    for (let x = 0; x <= W; x++) {
+      let ink = false
+      if (x < W) for (let y = y0; y < y1 && !ink; y++) if (data[(y * W + x) * 4] < 150) ink = true
+      if (ink && start < 0) start = x
+      if (!ink && start >= 0) { out.push((start + x - 1) / 2); start = -1 }
+    }
+    return out
+  }
+  const above = runsOf(raster.data, 30, 56), edited = runsOf(work, 70, 96)
+  assert.equal(edited.length, 8, `runs ${edited.join(' ')}`)
+  const tail = above.slice(-8)
+  for (let k = 0; k < 8; k++) assert.ok(Math.abs(edited[k] - tail[k]) <= 1, `figure ${k} at ${edited[k]}, the column has it at ${tail[k]}`)
+})
+
+test('an amount retyped as another of the same shape keeps its separators and every figure\'s place', () => {
+  // 200 DPI, bold: "16,949.15" retyped "21,186.44" — as many characters, the
+  // separators where they were. A second line gives the page its new figures.
+  const W = 520, H = 180, size = 26
+  const font = new mupdf.Font('Arimo', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Bold.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  for (const [text, y] of [['16,949.15', 60], ['21 86 48 2,1 4.4', 140]]) {
+    const t = new mupdf.Text()
+    t.showString(font, [size, 0, 0, -size, 40, y], text)
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  }
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let p = 0; p < W * H; p++) {
+    const a = 1 - g[Math.floor(p / W) * st + (p % W)] / 255
+    for (let c = 0; c < 3; c++) rgba[p * 4 + c] = Math.round(250 * (1 - a) + 25 * a)
+    rgba[p * 4 + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Amount')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 'n', text: '16,949.15', inkRect: { x: 34 * 0.36, y: 36 * 0.36, width: 160 * 0.36, height: 30 * 0.36 }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const li2 = LI.analyzeLine(pi, { id: 'd', text: '21 86 48 2,1 4.4', inkRect: { x: 34 * 0.36, y: 116 * 0.36, width: 300 * 0.36, height: 30 * 0.36 }, confidence: 95 })
+  assert.ok(li2, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li, li2], 0)])
+  const res = SE.applyLineEdit(pi, li, atlas, '21,186.44', raster.data.slice(), { pageLines: [li, li2] })
+  assert.ok(res.ok, res.reason)
+  // The comma and the stop are the scan's own, where they were.
+  assert.equal(res.drawn[2], 'k', `drawn ${res.drawn}`)
+  assert.equal(res.drawn[6], 'k', `drawn ${res.drawn}`)
+  const oldX0 = li.cells[0].inkL, oldX1 = li.cells[li.cells.length - 1].inkR
+  const nw = res.words[0]
+  assert.ok(Math.abs(nw.x0 - oldX0) <= 2 && Math.abs(nw.x1 - oldX1) <= 2, `the amount spans ${nw.x0}-${nw.x1}, it spanned ${oldX0}-${oldX1}`)
+})
+
+test('a line of old-style figures is sized by its letters, not by figures taken for capitals', () => {
+  // "Fecha: 28/08/2025" set with old-style figures: the 2s and 0s stand at the
+  // x-height, the 8s rise, the 5 and the slashes hang below the baseline. The
+  // box's width says an em of 14 px.
+  const base = 100, xh = 7, asc = 10
+  const glyphs = [['F', base - 9.7, base], ['e', base - xh, base], ['c', base - xh, base], ['h', base - asc, base], ['a', base - xh, base],
+    ['2', base - xh, base], ['8', base - asc, base], ['/', base - asc, base + 2], ['0', base - xh, base], ['8', base - asc, base],
+    ['/', base - asc, base + 2], ['2', base - xh, base], ['0', base - xh, base], ['2', base - xh, base], ['5', base - xh, base + 3]]
+  const blobs = glyphs.map(([, y0, y1], k) => ({ x0: 10 + k * 8, x1: 16 + k * 8, y0, y1, area: 30, cx: 13 + k * 8, cy: (y0 + y1) / 2, w: 1 }))
+  const fit = WS.fitLine(blobs, 14, 'Fecha: 28/08/2025')
+  assert.ok(fit, 'no fit')
+  assert.ok(Math.abs(fit.emPx - 13.5) < 1, `em ${fit.emPx.toFixed(1)}`)
+  // The same line in lining figures — every figure at the capitals' height —
+  // keeps the capitals' measure.
+  const lining = glyphs.map(([ch, y0, y1], k) => ({ x0: 10 + k * 8, x1: 16 + k * 8, y0: /[0-9]/.test(ch) ? base - 9.7 : y0, y1: /[0-9]/.test(ch) ? base : y1, area: 30, cx: 13 + k * 8, cy: base - 5, w: 1 }))
+  const fit2 = WS.fitLine(lining, 14, 'Fecha: 28/08/2025')
+  assert.ok(Math.abs(fit2.emPx - 9.7 / 0.72) < 1, `em ${fit2.emPx.toFixed(1)}`)
 })

@@ -1071,6 +1071,18 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   const own = new Set<number>()
   /** Where vertical rules stand in the line's band — a cell's borders. */
   const borders: number[] = []
+  // How thick the band's horizontal rules are: a box's sides are drawn with
+  // the same pen as its top and bottom.
+  const penThick = (() => {
+    const ns: number[] = []
+    for (const r of components(ruleMask, W, H, roi.x0, roi.y0, s.w)) {
+      if (r.x1 - r.x0 < ruleLen) continue
+      const cols = new Map<number, number>()
+      for (const p of r.pix) { const x = p % s.w; cols.set(x, (cols.get(x) ?? 0) + 1) }
+      ns.push(median([...cols.values()]))
+    }
+    return ns.length ? median(ns) : 0
+  })()
   for (let c of comps) {
     // A cell's text set hard against its border welds the first letter to
     // the border, and the piece is too wide to be a rule: "ING. CIVIL" took
@@ -1086,7 +1098,12 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
         }
         return false
       }
-      const carved = carveBorder(c, s.w, Math.round(b0 - em * 0.78), Math.round(b0 + Math.max(2, em * 0.1)), Math.max(2, Math.round(em * 0.15)), { base: Math.round(b0), onRule })
+      // A piece taller than any letter — a box's side running from its top
+      // rule round a corner into its bottom one — may be as thick as the
+      // box's pen, and its blurred edge columns are its own.
+      const tall = c.y1 - c.y0 >= em * 1.3
+      const maxW = Math.max(2, Math.round(em * 0.15), tall ? Math.min(Math.round(em * 0.3), penThick + 1) : 0)
+      const carved = carveBorder(c, s.w, Math.round(b0 - em * 0.78), Math.round(b0 + Math.max(2, em * 0.1)), maxW, { base: Math.round(b0), onRule }, tall ? 2 : 0)
       if (carved) {
         for (const p of carved.rule) protect.add(p)
         borders.push(carved.x)
@@ -1757,7 +1774,7 @@ function peelWord(pieces: Comp[], chars: string[], em: number): { from: number; 
  * `maxW` of them, and not the whole piece: the rule's pixels, the rest, and
  * where the rule stands. Null when neither edge holds one.
  */
-function carveBorder(c: Comp, pageW: number, top: number, bottom: number, maxW: number, ends?: { base: number; onRule: (x: number, y: number) => boolean }): { rule: number[]; rest: number[]; x: number } | null {
+export function carveBorder(c: Comp, pageW: number, top: number, bottom: number, maxW: number, ends?: { base: number; onRule: (x: number, y: number) => boolean }, fringe = 0): { rule: number[]; rest: number[]; x: number } | null {
   if (c.y0 > top || c.y1 - 1 < (ends ? ends.base : bottom)) return null
   const cols = new Map<number, number[]>()
   for (const p of c.pix) {
@@ -1781,17 +1798,67 @@ function carveBorder(c: Comp, pageW: number, top: number, bottom: number, maxW: 
     return !!ends && last >= ends.base && ends.onRule(x, last)
   }
   for (const dir of [1, -1]) {
-    const start = dir > 0 ? c.x0 : c.x1 - 1
+    const edge = dir > 0 ? c.x0 : c.x1 - 1
+    // A scanned border is ringed by blur, and its outermost column or two are
+    // inked only where the stroke ran darkest — the border's all the same. A
+    // form's day cell had its left border's fringe inked over a third of its
+    // height, so no column at the very edge was "full" and the border became
+    // the "0" of "05". Only on a piece taller than any letter (`fringe`): a
+    // bold "l" whose stem ends two pixels under the fitted baseline is "full"
+    // too, and stepping past its edge columns carved it as a border.
+    let skip = 0
+    while (skip < fringe && !full(edge + dir * skip)) skip++
+    const start = edge + dir * skip
     let n = 0
     while (n <= maxW && full(start + dir * n)) n++
-    if (!n || n > maxW || n >= c.x1 - c.x0 - 1) continue
+    if (!n || n > maxW || skip + n >= c.x1 - c.x0 - 1) continue
     const ruleCols = new Set<number>()
-    for (let k = 0; k < n; k++) ruleCols.add(start + dir * k)
+    for (let k = 0; k < skip + n; k++) ruleCols.add(edge + dir * k)
     const rule: number[] = [], rest: number[] = []
     for (const p of c.pix) (ruleCols.has(p % pageW) ? rule : rest).push(p)
+    // What is left of the piece wholly outside the letters' band, touching
+    // the border, is the border's too: a rounded box's corner curving from it
+    // into the rule under the text. Left as a piece of its own it sat below
+    // the baseline at the cell's edge, a column run of its own — and taken as
+    // the first letter.
+    const lo = ends ? ends.base + 1 : bottom
+    moveOutsideBand(rule, rest, ruleCols, pageW, top, lo)
     return { rule, rest, x: start + dir * (n - 1) / 2 }
   }
   return null
+}
+
+/** Moves the components of `rest` lying wholly above row `top` or below row `lo` that touch a column of `cols` into `rule`. */
+function moveOutsideBand(rule: number[], rest: number[], cols: Set<number>, pageW: number, top: number, lo: number): void {
+  if (!rest.length) return
+  const left = new Set(rest)
+  const ruleSet = new Set(rule)
+  const keep: number[] = []
+  for (const seed of rest) {
+    if (!left.has(seed)) continue
+    left.delete(seed)
+    const comp = [seed]
+    for (let k = 0; k < comp.length; k++) {
+      const p = comp[k], x = p % pageW
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue
+        if ((dx < 0 && x === 0) || (dx > 0 && x === pageW - 1)) continue
+        const q = p + dy * pageW + dx
+        if (left.has(q)) { left.delete(q); comp.push(q) }
+      }
+    }
+    let y0 = Infinity, y1 = -Infinity, touches = false
+    for (const p of comp) {
+      const x = p % pageW, y = (p - x) / pageW
+      if (y < y0) y0 = y
+      if (y > y1) y1 = y
+      if (!touches) for (const dx of [-1, 1]) if (cols.has(x + dx) && (ruleSet.has(p + dx) || ruleSet.has(p + dx - pageW) || ruleSet.has(p + dx + pageW))) touches = true
+    }
+    if (touches && (y0 >= lo || y1 <= top)) { for (const p of comp) rule.push(p) }
+    else for (const p of comp) keep.push(p)
+  }
+  rest.length = 0
+  for (const p of keep) rest.push(p)
 }
 
 /** Whether a piece's rows line up on one straight line (a rule's do; a curve's bow): each row's centre within `tol` px of the fit. */

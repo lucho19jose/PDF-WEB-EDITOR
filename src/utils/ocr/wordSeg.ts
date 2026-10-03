@@ -142,9 +142,26 @@ export function fitLine(blobs: Blob[], emGuess: number, text: string): LineFit |
   const xShare = chars.filter(c => /[acemnorsuvwxz]/.test(c)).length / Math.max(1, chars.length)
   // Prose: the x-height band is the lower part of the heights; capitals only:
   // every letter is a capital.
-  const em = xShare >= 0.25
+  let em = xShare >= 0.25
     ? heights[Math.floor(heights.length * Math.min(0.45, xShare * 0.6))] / 0.52
     : median(heights) / 0.72
+  // OLD-STYLE figures stand at the x-height and hang below the baseline (3,
+  // 4, 5, 7, 9), so a line that is mostly figures measures its x-height where
+  // it takes it for capitals: a receipt's "Fecha: 28/08/2025" came out at
+  // 9.6 px of em where its letters and its box say 14, every figure was then
+  // too wide to cut, and an edit redrew the date from glyphs of the wrong
+  // size. Said by the ink, not assumed: more pieces hang below the line than
+  // the reading has descending letters, and the box's width disagrees.
+  {
+    const visible = chars.length
+    const digits = chars.filter(c => /[0-9]/.test(c)).length
+    if (visible && digits >= 2 && digits >= visible * 0.3 && em < emGuess * 0.85) {
+      const descending = chars.filter(c => /[gjpqyQJ(),;]/.test(c)).length
+      const hanging = letters.filter(b => b.y1 - (y + slope * ((b.x0 + b.x1) / 2 - centreX)) > emGuess * 0.12).length
+      const alt = median(heights) / 0.52
+      if (hanging > descending && Math.abs(alt - emGuess) < Math.abs(em - emGuess) && alt <= emGuess * 1.25) em = alt
+    }
+  }
   return { y, slope, centreX, emPx: em > 4 ? em : emGuess }
 }
 

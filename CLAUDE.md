@@ -5114,6 +5114,83 @@ letter edited by hand, which also showed: a justified line that takes a
 longer word closes its gaps to about 0.2 em, the same as MSP's — tight but
 accepted there — rather than running past the margin.
 
+**New figures are set on the figures' PITCH, centre to centre.** Lining
+figures share one advance and a stop or comma takes about half of one, so
+an amount's characters sit at fixed centre distances whatever their ink
+widths (a "1" is narrow ink in a full cell). The pair model sets ink GAPS,
+and a figure the page never printed — synthesised, or one of a pair never
+observed — came out a pixel or two off: "0.00" retyped "2,500.00" opened a
+gap after the comma that "13,000.00" above it does not have. `gapBefore`
+places a figure or separator next to a figure on the pitch the line's own
+figures measure, or, with fewer than three pairs of its own ("0.00" has
+one), the page's lines at its size (`pageLines`, ±8% em); a stop or comma
+without a sample of its own is three quarters of a pitch from its figures.
+The chain runs on exact centres (`figCentre`) and is rounded once per
+figure: rounded at every step, three new figures drifted a pixel and a half
+off their column.
+
+**Figures changed for figures are aligned by POSITION** (`positional` in
+`applyOnPixels`). When every word of the new text has the old word's length
+and every changed character is a figure where a figure stood — an amount, a
+date, a code — character k of each word is character k of the old one:
+whatever did not change (the separators, a figure that happens to stay)
+keeps its pixels, and every new figure takes its predecessor's cell
+(`sameSpan`). The value alignment paired the "1" of "16,949.15" with the
+"1" of "21,186.44": the comma between them could not be kept, the word fell
+under the "kept too little" rule and was redrawn whole. Such a word is not
+redrawn for keeping little — what it keeps is in its own place. And a
+number laid in its old cells is not then set flush right: a new last
+figure narrower than the old one is not a shorter number, and the shift
+moved the kept separators a pixel.
+
+**A kept character that is plainly its label's LOOK-ALIKE is kept**
+(`lookAlike` in scanEdit). The kept-letter check redraws a word when one of
+its kept letters plainly is another letter — that is how a shifted reading
+(")laves" over "claves") is caught. A receipt's code "B008-190845", read
+"Bo08", tripped it: its zero is an old-style one, shaped like an "o", and
+matched the page's "0" at 0.98 against "o" at 0.21; changing the code's last
+figure redrew all eleven characters and synthesised the "B". Characters drawn
+alike by design (B/8, o/0, l/1, S/5, Z/2, G/6, g/9, case pairs) say nothing
+about a shift, and keeping their pixels shows exactly what the page showed.
+
+**Old-style figures are sized as x-height glyphs** (`fitLine` in wordSeg).
+A line that is mostly figures is measured as capitals (`median / 0.72`), and
+old-style figures stand at the x-height: "Fecha: 28/08/2025" on a Raleway
+receipt fitted a 9.6 px em where its letters and its box's width say 14, so
+every figure was too wide to cut and an edit redrew the date from glyphs of
+the wrong size. When a line is a third figures or more, its em is under 0.85
+of the width's guess, and more of its pieces hang below the baseline than its
+reading has descending characters (g j p q y Q J ( ) , ;), the x-height
+measure (`median / 0.52`) is taken if it is nearer the guess. Lining figures
+sit on the baseline and keep the capitals' measure: the em guard decides,
+the hanging count only confirms. A slash is NOT counted as descending: it
+hangs in some faces and not in others (not in this receipt's), and counted,
+the date line's one hanging "5" no longer outnumbered its two slashes.
+
+**An amount in a column set flush right grows to the LEFT** (`alignedRight`
+in scanEditPage, `columnRight` in `applyLineEdit`). `flushRight` already
+kept the right edge of a figure line ending against a cell's vertical rule;
+a payment checklist's amounts column has no rule, and "0.00" under
+"13,000.00" retyped "2,500.00" ran out past the column. A line of figures
+(60% digits) is in such a column when another line of figures within six
+ems, at its size, ends where it ends (within 0.12 em) and starts elsewhere.
+
+**A box's side is carved off whole, rounded corner and blurred edge
+included** (`carveBorder`). A form's day cell ("05" under "Dia") is a box
+whose left side runs down from the cell above and curves into the bottom
+rule. The carve demands columns inked unbroken through the letters' band,
+and the side's outer column was inked over a third of it (blur), so no
+column at the very edge qualified; the side and its corner stayed one
+piece, the two touching figures one run, and the cut took the side for the
+"0" and "05" for the "5". Changing the day to "12" erased the border and
+printed the "1" where it had stood. On a piece taller than any letter (1.3
+em), two blurred edge columns may be stepped over and the side may be as
+thick as the band's horizontal rules plus one; what is left wholly outside
+the letters' band touching the carved columns — the corner — is the
+border's too. Only on such a piece: stepping over the edge columns of a
+bold "l" whose stem ends two pixels under the fitted baseline carved it as
+a border, and reshuffled a whole MSP line's word split.
+
 **Word gaps are measured where the READING has a space.** The ink's own word
 split also cuts one word at a wide letter gap ("ESTE | FAN | I" in a capitals
 cell); counted as word gaps those gave a page of table cells a 0.15 em word

@@ -278,6 +278,12 @@ interface NewChar {
 }
 
 /** Longest common subsequence alignment of two character lists, preferring contiguous runs: the matched index pairs. */
+/** Characters drawn alike by design: at a small size their shapes cannot tell them apart. */
+const LOOK_ALIKE = ['B8', 'O0', 'o0', 'D0', 'Q0', 'I1', 'l1', 'i1', 'Il', 'S5', 's5', 'Z2', 'z2', 'G6', 'b6', 'g9', 'q9', 'Oo', 'Ss', 'Zz', 'Cc', 'Vv', 'Ww', 'Xx', 'Uu']
+function lookAlike(a: string, b: string): boolean {
+  return LOOK_ALIKE.some(p => (p[0] === a && p[1] === b) || (p[0] === b && p[1] === a))
+}
+
 export function alignChars(a: string[], b: string[]): [number, number][] {
   const n = a.length, m = b.length
   // score[i][j]: best (matches * 4 + adjacency bonuses) aligning a[i:] and b[j:].
@@ -340,6 +346,10 @@ export interface EditOptions {
   justifyTo?: number | null
   /** No line may end past this (px) — the paper's edge less a margin. */
   limitRight?: number | null
+  /** The line is one of a column of figures set flush right (`alignedRight` in scanEditPage): it keeps its right edge. */
+  columnRight?: boolean
+  /** The page's analysed lines: what the line's own figures are too few to measure, its size's lines measure. */
+  pageLines?: LineInk[]
 }
 
 /**
@@ -1333,7 +1343,39 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   }
 
   // 1. Align, then decide per old word: intact, partially kept, or redrawn.
-  const pairs = alignChars(oldChars, newList.map(c => c.ch))
+  // An edit that only changes FIGURES for figures — every word the same
+  // length, every changed character a figure where a figure stood: an amount,
+  // a date, a code — is aligned position by position, so every character
+  // keeps its place and whatever did not change (a separator, a figure that
+  // happens to stay) keeps its pixels. Aligned by value instead, "16,949.15"
+  // → "21,186.44" paired the "1" of "16" with the "1" of "21": the comma
+  // could not be kept and the number was redrawn whole.
+  const positional = (() => {
+    const tokens = (n: number, spaceBefore: (i: number) => boolean) => {
+      const out: { from: number; to: number }[] = []
+      for (let i = 0; i < n; i++) {
+        if (!out.length || spaceBefore(i)) out.push({ from: i, to: i + 1 })
+        else out[out.length - 1].to = i + 1
+      }
+      return out
+    }
+    const a = tokens(oldChars.length, i => li.spaceAfter.has(i)), b = tokens(newList.length, j => newList[j].space)
+    if (!a.length || a.length !== b.length) return null
+    const out: [number, number][] = []
+    let changed = false
+    for (let t = 0; t < a.length; t++) {
+      const n = a[t].to - a[t].from
+      if (b[t].to - b[t].from !== n) return null
+      for (let q = 0; q < n; q++) {
+        const x = oldChars[a[t].from + q], y = newList[b[t].from + q].ch
+        if (x === y) { out.push([a[t].from + q, b[t].from + q]); continue }
+        if (!/^[0-9]$/.test(x) || !/^[0-9]$/.test(y)) return null
+        changed = true
+      }
+    }
+    return changed ? out : null
+  })()
+  const pairs = positional ?? alignChars(oldChars, newList.map(c => c.ch))
   const matchOfOld = new Int32Array(oldChars.length).fill(-1)
   const matchOfNew = new Int32Array(newList.length).fill(-1)
   for (const [i, j] of pairs) { matchOfOld[i] = j; matchOfNew[j] = i }
@@ -1387,7 +1429,9 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     while (w.from + prefix < w.to && matchOfOld[w.from + prefix] >= 0 && (prefix === 0 || matchOfOld[w.from + prefix] === matchOfOld[w.from + prefix - 1] + 1)) prefix++
     while (w.to - 1 - suffix >= w.from + prefix && matchOfOld[w.to - 1 - suffix] >= 0 && (suffix === 0 || matchOfOld[w.to - 1 - suffix] === matchOfOld[w.to - suffix] - 1)) suffix++
     const edgesOnly = prefix + suffix === kept
-    if (!(edgesOnly && kept >= 1) && (kept < len * 0.6 || kept < (lastJ - firstJ + 1) * 0.6)) { redraw[k] = 1; return }
+    // Figures changed in place keep whatever stayed, however little: each
+    // kept character is in its own place, not picked out of the old word.
+    if (!positional && !(edgesOnly && kept >= 1) && (kept < len * 0.6 || kept < (lastJ - firstJ + 1) * 0.6)) { redraw[k] = 1; return }
     // The letters kept have to BE their labels. An exact cut is one ink run
     // per character, which a misreading can still satisfy: ink "claves" read
     // ")laves" cuts cleanly, and keeping its ")" kept a "c". A kept letter
@@ -1430,14 +1474,22 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
         // The medoid may be another face's (a title's): copies of the letter
         // at this line's size, from other words, speak for it too.
         if (own < 0.75 && m.emPx && (li.fit.emPx / m.emPx > 1.2 || m.emPx / li.fit.emPx > 1.2)) own = Math.max(own, peerAgreement(oldChars[i], bold, shape, li.cells[i].x0, li.cells[i].x1))
-        if (own < 0.5 || bestOther(shape, oldChars[i]).best >= Math.max(0.75, own + 0.15)) { redraw[k] = 1; return }
+        // Unless what it plainly is is the label's look-alike: the ink of a
+        // receipt's "B008" was read "Bo08", and its zero — an old-style one,
+        // shaped like an "o" — is the right pixels to keep wherever the edit
+        // does not touch it. A shifted reading pairs letters that look nothing
+        // alike (")" on a "c"), and that is what this check is for.
+        const other = bestOther(shape, oldChars[i])
+        if ((own < 0.5 || other.best >= Math.max(0.75, own + 0.15)) && !(other.best >= 0.75 && lookAlike(oldChars[i], other.bestCh))) { redraw[k] = 1; return }
         continue
       }
       // The page has no established shape for the label — a ")" is rare —
       // but the ink may plainly be ANOTHER letter's: that is the mislabel
       // above, and with nothing to check the ")" against, the "c" was kept.
+      // Not when the other letter is the label's look-alike: a small "B" IS
+      // shaped like an "8".
       const { best, bestCh } = bestOther(shape, oldChars[i])
-      if (bestCh && best >= 0.8) { redraw[k] = 1; return }
+      if (bestCh && best >= 0.8 && !lookAlike(oldChars[i], bestCh)) { redraw[k] = 1; return }
     }
   })
 
@@ -1661,12 +1713,64 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     tail = nc.length - 1
     while (tail > pre && scanGap(tail)) tail--
   }
+  // Figures are set on a PITCH: lining figures share one advance, and a stop
+  // or a comma between two takes its own. Centre to centre, as this line's
+  // figures measure it (a "1" is narrow ink in a full-width cell, so ink gaps
+  // vary where centres do not). Typeset by the pair model instead, "0.00"
+  // retyped "2,500.00" opened a gap after the comma that "13,000.00" above it
+  // does not have.
+  const isFig = (ch: string) => /^[0-9]$/.test(ch)
+  const isSep = (ch: string) => ch === '.' || ch === ','
+  // The line's own figures first; a line with few of them ("0.00" has one
+  // pair) borrows the page's lines at its size, whose figures were set from
+  // the same table — one pair is a pixel's rounding either way, and three new
+  // figures to its left carried that error three times.
+  const pitch = (() => {
+    const samples = (o: LineInk) => {
+      const dd: number[] = [], ds: number[] = [], sd: number[] = []
+      for (let i = 1; i < o.cells.length; i++) {
+        const a = o.cells[i - 1], b = o.cells[i]
+        if (o.spaceAfter.has(i) || a.approx || b.approx || a.suspect || b.suspect || a.inkR < a.inkL || b.inkR < b.inkL) continue
+        const d = (b.inkL + b.inkR) / 2 - (a.inkL + a.inkR) / 2
+        if (d <= 0 || d > em) continue
+        if (isFig(a.char) && isFig(b.char)) dd.push(d)
+        else if (isFig(a.char) && isSep(b.char)) ds.push(d)
+        else if (isSep(a.char) && isFig(b.char)) sd.push(d)
+      }
+      return { dd, ds, sd }
+    }
+    const own = samples(li)
+    const page = { dd: [] as number[], ds: [] as number[], sd: [] as number[] }
+    for (const o of opts.pageLines ?? []) {
+      if (o === li || !!o.inverted !== !!li.inverted || Math.abs(o.fit.emPx - em) > em * 0.08) continue
+      const v = samples(o)
+      page.dd.push(...v.dd); page.ds.push(...v.ds); page.sd.push(...v.sd)
+    }
+    const med = (v: number[]) => v.length ? [...v].sort((x, y) => x - y)[Math.floor(v.length / 2)] : null
+    const pick = (mine: number[], theirs: number[], need: number) => med(mine.length >= need ? mine : [...mine, ...theirs])
+    const P = pick(own.dd, page.dd, 3)
+    if (P === null) return null
+    // A stop or comma is half a figure's advance in every common face, so the
+    // centres either side of one sit three quarters of a pitch from it.
+    return { P, S1: pick(own.ds, page.ds, 2) ?? P * 0.75, S2: pick(own.sd, page.sd, 2) ?? P * 0.75 }
+  })()
+  /** Where a figure laid on the pitch was MEANT to be centred, before rounding. */
+  const figCentre = new Map<number, number>()
   /** The gap before nc[j] when it is not the scan's own. */
   const gapBefore = (j: number): number => {
     const c = nc[j], p = nc[j - 1]
     if (p.anchorR >= 0 && c.anchorL === p.anchorR + 1) {
       const i = c.anchorL
       if (oldSpace(i) === c.space || inkWordBoundary(i) === c.space) return oldGap(i)
+    }
+    if (pitch && !c.space && (isFig(p.ch) || isFig(c.ch)) && (isFig(p.ch) || isSep(p.ch)) && (isFig(c.ch) || isSep(c.ch))) {
+      const d = isFig(p.ch) && isFig(c.ch) ? pitch.P : isFig(p.ch) ? pitch.S1 : pitch.S2
+      gapNotes.set(j, 'f')
+      // Chained on the exact centres, not the rounded places: rounded at every
+      // step, three figures drifted a pixel and a half off their column.
+      const from = figCentre.get(j - 1) ?? p.x + widthOf(p) / 2
+      figCentre.set(j, from + d)
+      return from + d - widthOf(c) / 2 - (p.x + widthOf(p))
     }
     // A new letter right after one that stays, where the old text broke: the
     // gap the break had. The line's typical word gap is the wrong figure — on
@@ -1875,12 +1979,18 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   let rigid = true
   const oldLeft = li.cells.length ? Math.min(...li.cells.map(c => c.inkL)) : 0
   const flushRight = (() => {
+    // Figures set in the old ones' cells already keep the number's extent: a
+    // new last figure narrower than the old one is not a shorter number.
+    if (sameCells || sameSpan !== null) return false
     if (!clean || !nc.length || Math.abs(newRight - oldRight) < 1) return false
     const visible = oldChars.filter(ch => ch.trim())
     const digits = visible.filter(ch => /[0-9]/.test(ch)).length
     if (digits < 2 || digits < visible.length * 0.6) return false
     const right = li.borders.filter(x => x >= oldRight - 1 && x <= oldRight + em * 1.5)
-    if (!right.length) return false
+    // No rule beside it, but a column of figures ending where it ends
+    // (`columnRight`): "0.00" under "13,000.00" typed as "2,500.00" grew out
+    // past the column's edge.
+    if (!right.length) return !!opts.columnRight
     const left = li.borders.filter(x => x <= oldLeft + 1).sort((a, b) => b - a)[0]
     return left === undefined || oldLeft - left > (Math.min(...right) - oldRight) * 2
   })()
