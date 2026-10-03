@@ -156,7 +156,7 @@ if (cmd === 'lines' || cmd === 'debug') {
     if (!li) { console.log(`${it.id.padEnd(9)} FAIL ${LI.lastLineFailure()}  "${it.text.slice(0, 50)}"`); continue }
     words += li.words.length; cut += li.words.filter(w => w.cut).length
     const ws = li.words.map(w => `${li.chars.slice(w.from, w.to).join('')}${w.cut ? '' : '~'}${w.weight ? '/' + w.weight.toFixed(3) : ''}`).join(' ')
-    if (process.env.PALE && LI.lastPaleTest) console.log('     pale', JSON.stringify(LI.lastPaleTest()), 'smooth', JSON.stringify(LI.lastSmoothTest?.()))
+    if (process.env.PALE) console.log('     smooth', JSON.stringify(LI.lastSmoothTest?.() ?? null))
     if (process.env.INK && LI.lastInkTest) { const m = LI.lastInkTest(); if (m) { const so = [...m].sort((x, y) => x - y); console.log('     ink', m.join(' ')) } }
     if (process.env.FRAG) console.log('   frag', JSON.stringify(LI.lastFragTest?.()))
     console.log(`${it.id.padEnd(9)} em ${li.fit.emPx.toFixed(1)} sl ${li.fit.slope.toFixed(4)} gaps ${li.letterGapPx}/${li.wordGapPx} core ${li.coreLevel} rules ${li.rules.length} cut ${li.words.filter(w => w.cut).length}/${li.words.length} | ${ws.slice(0, 160)}`)

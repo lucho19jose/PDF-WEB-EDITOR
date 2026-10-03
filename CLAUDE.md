@@ -5159,6 +5159,41 @@ grey smear on a cover — the gate keeps such lines as recognised.
 the dev server missed a copied `scanEdit.ts` and kept serving its old
 transform, the new import failed, and the app came up with no stores at all.
 
+### A title's thick strokes are ink, and ink brighter than its ground cannot be printed
+`preparePage` finds ink with a 3.6pt max filter and fills it from the paper
+around it. A stem wider than the filter's reach is never seen through: on a
+300 DPI bilevel cover the 45pt bold title's stems are 34 px, their middles
+were read as PAPER, and the estimate around every letter came out grey —
+deleting one letter printed grey halos round the letters it moved and left a
+grey smear where the line had ended. A near-black pixel with white paper
+(247 or more) on BOTH sides along one axis, within 24pt, is now ink too: the
+inside of a stroke, or of letters that touch (dark runs of 80 px on that
+title).
+
+Each limit on that rule was measured, and each was a failure first:
+
+- **Only on white paper** — a page whose non-ink pixels are 240 or more at the
+  median and 225 or more at the 10th percentile, and white paper on both
+  sides of the pixel. Applied anywhere, a certificate's patterned light-blue
+  ground (243 at its lightest) stopped reading as a gradient, and two of its
+  lines were let through and edited badly: a moved word carried a pale box of
+  smoothed ground, and "ALTIMETRÍA" came back "ALLTIMETRA". The old estimate
+  had refused them for the wrong reason, but rightly.
+- **Never on the inverted page** — lettering reversed out of a band
+  ("OFFERS" in yellow on purple, "PIENSE" in white on red) was let through
+  the same way and came back pinkish, with the old letters' drop shadows left
+  as ghost rings and colour fringes as red specks.
+- **Ink brighter than its ground in any channel is refused** ("the lettering
+  is a colour its ground cannot be printed with"): letters are printed as ink
+  MULTIPLIED onto the paper, channel by channel, and a product is never
+  brighter than the paper. Yellow on purple, read inverted, is blue on green
+  — its blue channel above the ground's — and that is what came back pinkish.
+
+On 22 recorded documents the analysis changes on one page only (the cover
+itself, where words' measured weights move by a few thousandths); the MSP
+suite is pixel-identical, and the cover's deletion comes back clean white.
+The rule costs about 0.4 s on a 300 DPI page.
+
 ### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
 Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)
 leaves a scan's words in the content stream as INVISIBLE text: render mode 3,

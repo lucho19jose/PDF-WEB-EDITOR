@@ -65,13 +65,52 @@ export function maxFilter1D(src: Uint8Array, w: number, h: number, r: number, al
   }
 }
 
+/** Whether a page is printed on white paper: its non-ink pixels mostly at 240 or above, few below 225. */
+function whitePaper(L: Uint8Array, inkish: Uint8Array): boolean {
+  const v: number[] = []
+  for (let p = 0; p < L.length; p += 7) if (!inkish[p]) v.push(L[p])
+  if (v.length < 100) return false
+  v.sort((a, b) => a - b)
+  return v[Math.floor(v.length * 0.1)] >= 225 && v[Math.floor(v.length * 0.5)] >= 240
+}
+
+/**
+ * The brightest pixel within `r` on each side of every pixel along one axis:
+ * `before[p]` over the r pixels before p, `after[p]` over the r after; pixels
+ * off the page count as 0. Windows of r by van Herk / Gil-Werman, O(n).
+ */
+function sideMax(L: Uint8Array, w: number, h: number, r: number, alongRows: boolean): { before: Uint8Array; after: Uint8Array } {
+  const N = w * h
+  const before = new Uint8Array(N), after = new Uint8Array(N)
+  const n = alongRows ? w : h, lines = alongRows ? h : w
+  const len = n + 2 * r
+  const line = new Uint8Array(len), g = new Uint8Array(len), hh = new Uint8Array(len)
+  for (let l = 0; l < lines; l++) {
+    line.fill(0)
+    for (let i = 0; i < n; i++) line[i + r] = alongRows ? L[l * w + i] : L[i * w + l]
+    for (let i = 0; i < len; i++) g[i] = i % r === 0 ? line[i] : Math.max(g[i - 1], line[i])
+    for (let i = len - 1; i >= 0; i--) hh[i] = (i % r === r - 1 || i === len - 1) ? line[i] : Math.max(hh[i + 1], line[i])
+    for (let i = 0; i < n; i++) {
+      // Padded index of pixel i is i + r; the r before it start at i, the r
+      // after it at i + r + 1. A window [a, a + r - 1] is max(hh[a], g[a + r - 1]).
+      const a0 = i, a1 = i + r + 1
+      const vb = Math.max(hh[a0], g[a0 + r - 1])
+      const va = Math.max(hh[a1], g[a1 + r - 1])
+      const p = alongRows ? l * w + i : i * w + l
+      before[p] = vb
+      after[p] = va
+    }
+  }
+  return { before, after }
+}
+
 /**
  * The paper and the darkness for a whole page. The paper is estimated in two
  * steps: a max filter wider than any stroke finds how bright the paper is
  * around each pixel, which marks what is ink; then every inked pixel (with a
  * margin for its fringe) is filled from the true paper around it (`pushPull`).
  */
-export function preparePage(s: ScanRaster): PageInk {
+export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): PageInk {
   const N = s.w * s.h
   const L = new Uint8Array(N)
   const d = s.data
@@ -86,6 +125,28 @@ export function preparePage(s: ScanRaster): PageInk {
   for (let p = 0; p < N; p++) {
     const diff = B[p] - L[p]
     if (diff > Math.max(12, B[p] * 0.08)) inkish[p] = 255
+  }
+  // Strokes wider than that: a 45pt bold title's stems are 8pt wide, their
+  // middles never saw paper inside the filter, and read as paper they greyed
+  // the estimate around every letter — an edit printed grey halos round the
+  // letters it moved and left a grey smear where they had been. A near-black
+  // pixel with far brighter paper on BOTH sides along one axis, within 24pt,
+  // is the inside of a stroke (letters that touch make dark runs four ems of a
+  // stem long). Only on a page of WHITE paper: a band of colour has paper on
+  // one side only, and a tinted, patterned ground (a certificate) measured
+  // this way let lines through whose ground the edit cannot match — the old
+  // estimate refused them, rightly. Not on the inverted page either: cover
+  // titles reversed out of a band were let through with drop shadows and
+  // colour fringes the edit cannot reproduce.
+  if (opts.strokes !== false && whitePaper(L, inkish)) {
+    const R2 = Math.max(R + 1, Math.round(24 * pxPerPt))
+    // Paper this white on both sides: a light tint (a certificate's pattern, 243)
+    // is not white paper.
+    const bright = (side: number, l: number) => side >= 247 && side >= l + 80
+    for (const rows of [true, false]) {
+      const { before, after } = sideMax(L, s.w, s.h, R2, rows)
+      for (let p = 0; p < N; p++) if (!inkish[p] && L[p] < 90 && bright(before[p], L[p]) && bright(after[p], L[p])) inkish[p] = 255
+    }
   }
   // The paper is sampled BEYOND the haze around the letters: a scan's strokes
   // are ringed by blur and JPEG ringing a few levels darker than the paper out
@@ -125,7 +186,7 @@ export function invertedPage(pi: PageInk): PageInk {
     const d = pi.s.data
     const data = new Uint8ClampedArray(d.length)
     for (let i = 0; i < d.length; i += 4) { data[i] = 255 - d[i]; data[i + 1] = 255 - d[i + 1]; data[i + 2] = 255 - d[i + 2]; data[i + 3] = d[i + 3] }
-    inv = preparePage({ ...pi.s, data })
+    inv = preparePage({ ...pi.s, data }, { strokes: false })
     invertedPages.set(pi, inv)
   }
   return inv
@@ -1047,6 +1108,15 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     if (ps.length) {
       const rs = ps.map(p => s.data[p * 4]), gs = ps.map(p => s.data[p * 4 + 1]), bs = ps.map(p => s.data[p * 4 + 2])
       inkRgb[0] = median(rs); inkRgb[1] = median(gs); inkRgb[2] = median(bs)
+      // Letters are printed as ink MULTIPLIED onto the paper, channel by
+      // channel, and a product never comes out brighter than the paper. Ink
+      // brighter than its ground in any channel cannot be printed that way:
+      // yellow lettering on a purple cover (read inverted: blue on green)
+      // came back pinkish white, its old letters left as ghosts.
+      for (let c = 0; c < 3; c++) {
+        const ground = median(ps.map(p => pi.paper[p * 3 + c]))
+        if (inkRgb[c] > ground + 24) return fail('the lettering is a colour its ground cannot be printed with')
+      }
     }
   }
 
