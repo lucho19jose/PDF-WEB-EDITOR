@@ -320,7 +320,7 @@ provide('ocrController', {
   scanChanged: ocrScanChanged
 })
 
-async function runOcrNow(pageIndex: number, lang: string, opts: { repair?: boolean } = {}) {
+async function runOcrNow(pageIndex: number, lang: string) {
   editorStore.setStatus('Recognising text on this page...')
 
   // OCR reads its own render of THIS page at its own resolution. The visible
@@ -412,10 +412,9 @@ async function runOcrNow(pageIndex: number, lang: string, opts: { repair?: boole
     ? `No text was recognised on this page${by}${note}`
     : `${result.items.length} text areas detected${by}${sideways} — ${result.confidence}% average confidence${note}${textLines ? `; ${textLines} line${textLines > 1 ? 's are' : ' is'} real text, edited with the text tool` : ''}. Click one to select it, click again to edit, drag to move.`)
   // The runs re-read from the page's own letters, in the background, so the
-  // editor opens on what the page says (see `repairReadings`). Not while a
-  // whole document is recognised: its text layer is written from the runs as
-  // they stand, and the re-read would only slow every page down.
-  if (opts.repair !== false && result.items.length) {
+  // editor opens on what the page says (see `repairReadings`). Whatever reads
+  // the runs by their text waits for it (`ocr.settleRepairs`).
+  if (result.items.length) {
     const said = editorStore.statusMessage
     void ocr.repairReadings(pageIndex).then(n => {
       if (!n) return
@@ -1730,7 +1729,11 @@ async function recognizeDocument(opts: RecognizeDocumentOptions): Promise<void> 
       if (hasLayer && !opts.replaceExisting) { why.layer++; p.skipped++; p.done++; continue }
 
       p.stage = `Recognising page ${pi + 1}…`
-      await runOcrNow(pi, opts.lang, { repair: false })
+      await runOcrNow(pi, opts.lang)
+      // The layer is written from the runs: from the readings the page's own
+      // letters give, not the recogniser's ("Lostérminos queenel").
+      p.stage = `Reading page ${pi + 1} again from its own letters…`
+      await ocr.settleRepairs()
       const items = ocrStore.itemsFor(pi).filter(i => i.text.trim() && !i.removed)
       if (!items.length) { why.nothing++; p.skipped++; p.done++; continue }
 

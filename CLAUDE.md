@@ -5079,6 +5079,9 @@ bold letters the atlas cannot tell apart every repair it made was wrong
   that word (`lookalikeFix`, only for words the re-read changed).
 - **A small letter followed by a capital inside one word** ("eL") is refused
   unless the reading had that shape already.
+- **Ink taller than any letter, that looks like none, is drawn OVER the
+  word** — a signature's stroke, a stamp's edge — and the word under it is
+  not re-read from its runs: "Add-Ons" came back "Adddnns".
 - **An accented vowel is also read from the letter under its mark**: judged
   whole, the mark outweighs the vowel. (It did not fix "número" → "nómero":
   this page's "u" under its accent matches the "o" medoid 0.73 against 0.70 —
@@ -5093,9 +5096,10 @@ bold letters the atlas cannot tell apart every repair it made was wrong
   "N2" kept the "2" of "2039277697", which came back "039277697".
 
 Measured with `repairall <page>` (every line's reading beside its repair):
-MSP 19/30/14 lines repaired on its three pages, the errors left are
-"Professional", "Perdú", "Adddnns", "Regaláas", "v/o" and "nómero" (most of
-them replacing words the recogniser had wrong too); the form 12 repairs, every
+MSP 18/29/15 lines repaired on its three pages; the errors left are
+"Regaláas" (for "Regalías"), "v/o" (for "y/o") and "nómero", each replacing a
+word the recogniser had wrong too ("Professional", which looked like one, is
+what the scan says); the form 12 repairs, every
 one wrong (an amount among them, "13,000.00" → "1 3,000 00"), to none; a
 certificate 6, all wrong, to none. The MSP edit suites draw exactly the same
 pixels; `scanedit.test.mjs` passes.
@@ -5116,21 +5120,44 @@ baked.
   baked, not the selected one (an editor may be open on it), and still read
   as they were analysed. It yields between lines and stops if the page is
   recognised again.
-- **Not during "Reconocer texto en este archivo"**: that writes its text
-  layer from the runs as they stand, and the re-read would add seconds to
-  every page (`runOcrNow(…, { repair: false })`).
+- **Only prose, and never a figure** (`repairIsDisplayable`): three ink
+  words, fifteen letters, mostly small letters, the same digits before and
+  after, and no mark put in front of a line that began with a word (a bullet
+  read as the "*" the page has). On a table of names in capitals every repair the re-read made
+  was wrong — a cell border or a speck after a name has no label, the
+  alignment shifts the letters onto it, and a name came back with two letters
+  inserted; and an RUC came back with a "5" in the wrong place, which reads
+  as the document's number, not as a typo. An edit's own repair is not held
+  to this: the user is changing that line, and the repair only steers where
+  the change lands.
+- **"Reconocer texto en este archivo" waits for it** before writing each
+  page's layer (`settleRepairs`), so the searchable text is the corrected
+  reading as well — a couple of seconds a page on top of recognition.
+- **The page analysis it needs yields every eight lines**, and two callers
+  asking for the same page share one build (`scanPageFor`): it now runs the
+  moment recognition ends, where before it ran as one block of a second and a
+  half at the first edit.
 - **Whatever looks runs up by their text waits for it**: the editing
   assistant's `recognise` awaits `settleRepairs()`, and so does the fidelity
   driver (`__pdfHooks.ocrController.settleRepairs`). A suite entry may carry
   an `alt` lookup for the line as the re-read leaves it ("USD 30.00" comes
   back "USD 630.00", "de 026" comes back "de 2026").
 
-Measured in the browser on the MSP appendix: 17 of page 1's 57 lines read
-again in the background, the editor opening on "Los términos que en el
-presente Apéndice sean, serán términos definidos …"; the 14-edit suite
-stays on the scan with no damage, and the edits that used to read back only
-through a repaired reading ("misread amount", "count in prose") read back as
-typed.
+Measured on the MSP appendix: 16, 28 and 14 lines of its three pages read
+again (`BG=1 repairall <page>` in the lab), the editor opening on "Los
+términos que en el presente Apéndice sean, serán términos definidos …"; in
+the browser the 14-edit suite stays on the scan with no damage, and a page
+recognised with "Reconocer texto" carries "Niveles de Corrección, paquetes de
+actualización" in its layer where the recogniser read "Corrcción,aquetes de
+actualizción". Over 17 other recorded documents the gate lets 2 lines through
+(and the bullet rule then none); a table of 496 names, none. The OCR sweep
+(51 documents) is unchanged on the scan path; without the gate a short
+heading's changed reading moved a deletion onto the wrong letters and left a
+grey smear on a cover — the gate keeps such lines as recognised.
+
+**After `cp` into `src/`, rewrite the file once** (read and write it back):
+the dev server missed a copied `scanEdit.ts` and kept serving its old
+transform, the new import failed, and the app came up with no stores at all.
 
 ### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
 Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)

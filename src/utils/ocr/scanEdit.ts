@@ -957,7 +957,11 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
     // stroke read as the wrong one of "l", "I", "L" — unless the reading had
     // that shape already.
     const oddCase = /\p{Ll}\p{Lu}/u.test(text) && !/\p{Ll}\p{Lu}/u.test(old)
-    const ok = text !== old && text.length > 0 && scored.length > 0 && meanFit <= 0.33 && !oddCase && changes <= Math.max(2, Math.ceil(Math.max(old.length, text.length) * 0.5))
+    // Ink taller than any letter, that looks like none, is something drawn
+    // over the word — a signature's stroke, a stamp's edge — and the word
+    // under it cannot be read from its runs: "Add-Ons" came back "Adddnns".
+    const marked = mine.some(o => o.run >= 0 && runs[o.run].g.rise + runs[o.run].g.drop > 1.25 && runs[o.run].a1 < 0.6)
+    const ok = text !== old && text.length > 0 && scored.length > 0 && meanFit <= 0.33 && !oddCase && !marked && changes <= Math.max(2, Math.ceil(Math.max(old.length, text.length) * 0.5))
     log?.(`"${old}" -> "${text}" ${mine.map(o => `${o.op}${o.text ? ':' + o.text : ''}`).join(' ')} fit ${meanFit.toFixed(2)}${ok ? '' : text === old ? '' : ' REFUSED'}`)
     // The runs of a word read differently, each with its three best letters.
     if (log && text !== old) for (const o of mine) {
@@ -1041,6 +1045,43 @@ export function repairReading(pi: PageInk, li: LineInk, atlas: Atlas, log?: (lin
     return ln ? { text, li: ln, repaired } : null
   }
   return null
+}
+
+/**
+ * Whether a repaired reading may stand in for the recogniser's where nobody
+ * asked for it — the reading the editor opens on for a line the user has not
+ * touched (`repairReadings` in useOCR). Held to more than an edit's repair:
+ *
+ * - **Prose only** — three ink words, fifteen letters, mostly small letters.
+ *   That is where the recogniser loses the spaces and letters at word joins,
+ *   and where the page's letters read well. A table of names in capitals is
+ *   neither: a cell border or a speck after a name has no label, the
+ *   alignment shifts the letters onto it, and "TAHIWA" came back "TAHIHIWA".
+ * - **No figure changes** — a wrong letter in a word reads as a typo; a wrong
+ *   figure in an amount or an ID number reads as the document's, and an RUC
+ *   came back with a "5" in the wrong place.
+ *
+ * An edit's own repair (`applyLineEdit`) is not held to this: the user is
+ * changing the line, and the repair only steers where the change lands.
+ */
+export function repairIsDisplayable(li: LineInk, text: string): boolean {
+  if (!isProseLine(li)) return false
+  // A mark put in front of a line the recogniser started on a word is a
+  // bullet read as the nearest glyph the page has ("*" for "•").
+  const first = text.trim().split(/\s+/)[0] ?? ''
+  if (first && !/[\p{L}\p{N}]/u.test(first) && !li.text.trim().startsWith(first)) return false
+  return li.text.replace(/\D/g, '') === text.replace(/\D/g, '')
+}
+
+/**
+ * A line of prose: three ink words, fifteen letters, mostly small letters —
+ * asked BEFORE a line is re-read for the editor, so a page of table cells
+ * costs nothing (the re-read of 500 cells took a dense page 17 s longer).
+ */
+export function isProseLine(li: LineInk): boolean {
+  const letters = [...li.text].filter(c => /\p{L}/u.test(c))
+  const lower = letters.filter(c => /\p{Ll}/u.test(c)).length
+  return li.words.length >= 3 && letters.length >= 15 && lower >= letters.length * 0.5
 }
 
 /** Strokes the shapes cannot tell apart in most faces. */

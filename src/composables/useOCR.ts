@@ -16,7 +16,7 @@ import { scanRasterOf, isUpright, type ScanRaster } from '@/utils/ocr/scanRaster
 import { preparePage, analyzeLine, lastLineFailure, pageOfLine, type PageInk, type LineInk } from '@/utils/ocr/lineInk'
 import { harvestPage, atlasFrom, type PageHarvest, type Atlas } from '@/utils/ocr/glyphAtlas'
 import { planScanEdits, inkAwareFallback, type ScanEditPlan, type FallbackOps, type PixelOverlay } from '@/utils/ocr/scanEditPage'
-import { wantKey, repairReading, type GlyphImage } from '@/utils/ocr/scanEdit'
+import { wantKey, repairReading, repairIsDisplayable, isProseLine, type GlyphImage } from '@/utils/ocr/scanEdit'
 import { fitScanLook, synthGlyph, type Rasterize, type ScanLook, type LookNear } from '@/utils/ocr/glyphSynth'
 import { useOcrStore } from '@/stores/ocr'
 
@@ -745,7 +745,21 @@ function createOCR() {
    * page lacks): its pixels are not kept, so the page being edited is never
    * pushed out of the two-page cache by its own neighbours.
    */
-  async function scanPageFor(pageIndex: number, keep = true): Promise<ScanPage | null> {
+  // One build of a page at a time: the background re-read and an edit's plan
+  // ask for the same page within moments of each other, and two builds of it
+  // cost the main thread twice.
+  const building = new Map<string, Promise<ScanPage | null>>()
+  function scanPageFor(pageIndex: number, keep = true): Promise<ScanPage | null> {
+    const have = scanPages.get(pageIndex)
+    if (have && have.gen === genOf(pageIndex)) return Promise.resolve(have.sp)
+    const key = `${pageIndex}:${genOf(pageIndex)}:${keep}`
+    const pending = building.get(key)
+    if (pending) return pending
+    const p: Promise<ScanPage | null> = scanPageForNow(pageIndex, keep).finally(() => { building.delete(key) })
+    building.set(key, p)
+    return p
+  }
+  async function scanPageForNow(pageIndex: number, keep: boolean): Promise<ScanPage | null> {
     const gen = genOf(pageIndex)
     const have = scanPages.get(pageIndex)
     if (have && have.gen === gen) return have.sp
@@ -767,8 +781,15 @@ function createOCR() {
         // A run a bake already finalised reads its NEW text over ink the scan
         // still shows the old way: analysed, it would teach the atlas the
         // wrong letters, and it cannot be redrawn from the scan anyway.
+        // A page is analysed as soon as it is recognised, in the background
+        // (`repairReadings`): a few lines at a time, so the tab stays live.
+        let n = 0
         for (const it of page.items) {
           if (it.vertical || it.baked) continue
+          if (++n % 8 === 0) {
+            await new Promise(r => setTimeout(r, 0))
+            if (genOf(pageIndex) !== gen) return null
+          }
           const li = analyzeLine(pi, { id: it.id, text: it.originalText, inkRect: it.inkRect, confidence: it.confidence })
           lines.set(it.id, li)
           if (!li) unread.set(it.id, lastLineFailure())
@@ -791,7 +812,8 @@ function createOCR() {
    * "Lostérminos queenel presente Apéndice … deinidos" — and a user editing
    * that edits a garbled line, while the letters it lost are on the page
    * beside the ones it kept (`repairReading`; every gate it applies applies
-   * here, so a line whose shapes the atlas cannot read is left as read).
+   * here, so a line whose shapes the atlas cannot read is left as read — and
+   * `repairIsDisplayable` on top: prose only, never a changed figure).
    *
    * Only runs nobody has touched: not edited, moved, restyled or baked, not
    * the one selected (an editor may be open on it), and still read as they
@@ -823,9 +845,9 @@ function createOCR() {
       if (genOf(pageIndex) !== gen) return n
       const it = store.pages.get(pageIndex)?.items.find(i => i.id === id)
       if (!it || it.edited || it.removed || it.baked || it.vertical || it.restyled || store.selectedId === id ||
-          it.text !== it.originalText || it.originalText !== li.text) continue
+          it.text !== it.originalText || it.originalText !== li.text || !isProseLine(li)) continue
       const rep = repairReading(pageOfLine(sp.pi, li), li, atlas)
-      if (!rep || rep.text === it.text) continue
+      if (!rep || rep.text === it.text || !repairIsDisplayable(li, rep.text)) continue
       store.updateItem(id, { text: rep.text, originalText: rep.text })
       sp.lines.set(id, rep.li)
       n++

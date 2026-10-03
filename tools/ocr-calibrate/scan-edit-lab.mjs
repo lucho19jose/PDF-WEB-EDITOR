@@ -447,6 +447,8 @@ if (cmd === 'repairall') {
     n++
     const r = SE.repairReading(pi, li, atlas)
     if (!r) continue
+    // BG=1: only what the editor would show for an untouched line.
+    if (process.env.BG && !SE.repairIsDisplayable(li, r.text)) continue
     changed++
     console.log(`${li.id}\n  ocr: "${li.text}"\n  fix: "${r.text}"  (${r.repaired} word${r.repaired > 1 ? 's' : ''})`)
   }
