@@ -1763,11 +1763,40 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     if (nc[tail].old !== nc[tail - 1].old + 1 && nc[tail - 1].kind === 'orig') return null
     return slots.size ? slots : null
   })()
+  // A number redrawn whole in the same characters' places — its figures
+  // touched its separators, so it could not keep any of them — takes the old
+  // characters' cells one for one: figure for figure, every other character
+  // the same. Set at the spacing model's gaps instead, a bold "18/07/2022."
+  // whose slashes touched its figures came back "25/07/2022." letter-spaced.
+  const sameSpan = sameCells ? null : (() => {
+    if (tail <= pre) return null
+    const from = pre > 0 ? (nc[pre - 1].kind === 'orig' ? nc[pre - 1].old + 1 : -1) : 0
+    const to = tail < nc.length ? nc[tail].old : oldChars.length
+    if (from < 0 || to - from !== tail - pre) return null
+    for (let q = 0; q < tail - pre; q++) {
+      const c = nc[pre + q], oi = from + q
+      const ok = c.ch === oldChars[oi] || (/^[0-9]$/.test(c.ch) && /^[0-9]$/.test(oldChars[oi]))
+      // Approximate cells too: lining figures share one advance, so a share of
+      // the run by advance is the figure's place, and the span keeps its extent.
+      if (!ok || (q > 0 && c.space !== oldSpace(oi))) return null
+      if (c.kind === 'orig' && c.old !== oi) return null
+    }
+    // Only a number: figures, and its separators.
+    if (!nc.slice(pre, tail).every(c => /^[0-9.,:/-]$/.test(c.ch)) || !nc.slice(pre, tail).some(c => /^[0-9]$/.test(c.ch))) return null
+    return from
+  })()
   if (sameCells) {
     for (let j = pre; j < tail; j++) {
       const c = nc[j]
       if (c.kind === 'orig') { place(c, li.cells[c.old].inkL); continue }
       const cell = li.cells[sameCells.get(j)!]
+      place(c, cell.inkL + ((cell.inkR - cell.inkL) - widthOf(c)) / 2)
+    }
+    pen = nc[tail - 1].x + widthOf(nc[tail - 1])
+  } else if (sameSpan !== null) {
+    for (let j = pre; j < tail; j++) {
+      const c = nc[j], cell = li.cells[sameSpan + j - pre]
+      if (c.kind === 'orig') { place(c, cell.inkL); continue }
       place(c, cell.inkL + ((cell.inkR - cell.inkL) - widthOf(c)) / 2)
     }
     pen = nc[tail - 1].x + widthOf(nc[tail - 1])
@@ -1777,7 +1806,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
   const oldTailX = tail < nc.length ? li.cells[nc[tail].old].inkL : Infinity
   if (tail < nc.length) {
     // A line whose first letters went starts where it always started.
-    const x = tail === 0 ? li.cells[0].inkL : sameCells ? oldTailX : pen + gapBefore(tail)
+    const x = tail === 0 ? li.cells[0].inkL : sameCells || sameSpan !== null ? oldTailX : pen + gapBefore(tail)
     dxTail = Math.round(x - oldTailX)
     // A change about as wide as what it replaced ("5" → "6") keeps the tail
     // where it is: the difference goes into the gaps either side of the

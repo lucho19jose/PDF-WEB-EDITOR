@@ -779,6 +779,53 @@ test('a full stop fainter than its figures is the line\'s: changing the figure b
   assert.ok(ink >= 3, `no stop left (${ink} inked pixels)`)
 })
 
+test('a number redrawn whole keeps its characters\' places: a date whose figures touch is not set letter-spaced', () => {
+  // 200 DPI, bold, set tight enough that the stops touch the figures: the
+  // date cannot keep any of its letters and is redrawn whole.
+  const W = 700, H = 200, size = 12 / 0.36
+  const font = new mupdf.Font('Carlito', fs.readFileSync(ROOT + '/public/fonts/match/Carlito-Bold.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  // Character by character, the date's set tight enough that every
+  // character touches the next: one run of ink.
+  let x = 40
+  const t = new mupdf.Text()
+  const text = 'en fecha 20.07.2022.'
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    const adv = font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0)), 0) * size
+    t.showGlyph(font, [size, 0, 0, -size, x, 80], font.encodeCharacter(ch.codePointAt(0)), ch.codePointAt(0), 0)
+    x += i >= 9 ? adv - 3 : adv
+  }
+  // A second line, set normally, holds the page's own copies of the date's characters.
+  const t2 = new mupdf.Text()
+  t2.showString(font, [size, 0, 0, -size, 40, 160], 'el 20 de 07 . 2022 . 7')
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.fillText(t2, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let p = 0; p < W * H; p++) {
+    const a = 1 - g[Math.floor(p / W) * st + (p % W)] / 255
+    for (let c = 0; c < 3; c++) rgba[p * 4 + c] = Math.round(252 * (1 - a) + 25 * a)
+    rgba[p * 4 + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Date')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 'd', text: 'en fecha 20.07.2022.', inkRect: { x: 30 * 0.36, y: 45 * 0.36, width: (x - 20) * 0.36, height: 50 * 0.36 }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  // The date is the last ten characters of the reading.
+  const oldX0 = li.cells[li.cells.length - 11].inkL, oldX1 = li.cells[li.cells.length - 1].inkR
+  const li2 = LI.analyzeLine(pi, { id: 'c', text: 'el 20 de 07 . 2022 . 7', inkRect: { x: 30 * 0.36, y: 125 * 0.36, width: 420 * 0.36, height: 50 * 0.36 }, confidence: 95 })
+  assert.ok(li2, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li, li2], 0)])
+  const res = SE.applyLineEdit(pi, li, atlas, 'en fecha 22.07.2022.', raster.data.slice(), {})
+  assert.ok(res.ok, res.reason)
+  const nw = res.words[res.words.length - 1]
+  assert.ok(Math.abs(nw.x0 - oldX0) <= 1 && Math.abs(nw.x1 - oldX1) <= 2, `the date spans ${nw.x0}-${nw.x1}, it spanned ${oldX0}-${oldX1}`)
+})
+
 test('a large bold title on white paper is edited without grey halos: its thick strokes are ink, not paper', () => {
   // A bilevel scan at 300 DPI (0.24 pt a pixel): a 45pt bold title, its stems
   // ~34 px wide — wider than the paper estimate's 3.6pt filter can see across.

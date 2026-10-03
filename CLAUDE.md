@@ -5096,6 +5096,24 @@ MSP: every edit as before but for a pixel's shift where a redrawn word
 picked a slightly different copy, and "30 de septiembre" set at the scan's
 own gap before the date rather than the line's typical one.
 
+**A number redrawn whole keeps its characters' places** (`sameSpan` in
+`applyLineEdit`). A bold "18/07/2022." whose slashes touched its figures
+could keep none of them — not exact, so redrawn whole — and the redraw was
+set at the spacing model's gaps: the touching original came back
+"25/07/2022." letter-spaced, wider than the date it replaced. When the
+changed stretch replaces exactly as many old characters, figure for figure
+and every other character the same (a number and its separators), each new
+glyph is centred in the old character's cell and anything after it stays
+put — `sameCells` did this only for figures between kept characters.
+Approximate cells count here, unlike there: lining figures share one
+advance, so a share of the run by advance IS a figure's place, and the span
+keeps its extent either way. On MSP the "5" of "APÉNDICE 25" now sits in
+the old "4"'s cell (it was set a pixel tight against the "2") and the
+underline under it ends where it did. Seen on a scanned service-acceptance
+letter edited by hand, which also showed: a justified line that takes a
+longer word closes its gaps to about 0.2 em, the same as MSP's — tight but
+accepted there — rather than running past the margin.
+
 **Word gaps are measured where the READING has a space.** The ink's own word
 split also cuts one word at a wide letter gap ("ESTE | FAN | I" in a capitals
 cell); counted as word gaps those gave a page of table cells a 0.15 em word
