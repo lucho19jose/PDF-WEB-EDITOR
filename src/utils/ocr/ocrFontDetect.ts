@@ -31,6 +31,13 @@ const NEUTRAL: FaceCues = {
   strokeRatio: 0, slant: 0, contrast: 0, measured: false
 }
 
+/** Whether text in `color` on `background` (0–1 RGB) is lighter than its ground. */
+export function isLightOnDark(color: readonly number[] | undefined, background: readonly number[] | undefined): boolean {
+  if (!color || !background) return false
+  const lum = (c: readonly number[]) => 0.299 * (c[0] ?? 0) + 0.587 * (c[1] ?? 0) + 0.114 * (c[2] ?? 0)
+  return lum(color) > lum(background) + 0.08
+}
+
 /**
  * Regular runs 0.055–0.095 of the em, bold 0.136–0.150 — measured across
  * Helvetica, Times and Courier at both sizes. The gap is wide and the midpoint
@@ -50,12 +57,18 @@ const MONO_CONTRAST = 2.05
  * @param rect     the run's box in CANVAS pixels
  * @param emPx     the run's font size in canvas pixels
  * @param baselineY the run's baseline in canvas pixels, absolute
+ * @param lightOnDark the run is lighter than its ground (`isLightOnDark`):
+ *   its ink is the LIGHT side of the split. Measured the other way the ground
+ *   between the letters reads as stems — a cover's letter-spaced "NATURE",
+ *   light on blue, came out heavier than any bold, at the stroke cap, and
+ *   every glyph redrawn for it was stroked into a blob.
  */
 export function detectFace(
   ctx: CanvasRenderingContext2D,
   rect: { x: number; y: number; width: number; height: number },
   emPx: number,
-  baselineY: number
+  baselineY: number,
+  lightOnDark = false
 ): FaceCues {
   const x0 = Math.max(0, Math.floor(rect.x))
   const y0 = Math.max(0, Math.floor(rect.y))
@@ -90,7 +103,7 @@ export function detectFace(
   for (let row = 0; row < h; row++) {
     let run = 0
     for (let col = 0; col <= w; col++) {
-      const ink = col < w && gray[row * w + col] < threshold
+      const ink = col < w && (lightOnDark ? gray[row * w + col] > threshold : gray[row * w + col] < threshold)
       if (ink) {
         run++
         inkX.push(col)

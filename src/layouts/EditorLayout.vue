@@ -96,7 +96,7 @@ import { planOcrExport, base14 } from '@/utils/ocr/ocrExport'
 import { stretchOf, sizeOf, weightPlan } from '@/utils/ocr/partialRedraw'
 import { cropToPng } from '@/utils/ocr/pixelCrop'
 import { measureHalo } from '@/utils/ocr/ocrSampling'
-import { detectFace } from '@/utils/ocr/ocrFontDetect'
+import { detectFace, isLightOnDark } from '@/utils/ocr/ocrFontDetect'
 import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
 import { snapItemsToTextLayer, dropRunsOnVisibleText } from '@/utils/ocr/snapToLayer'
 import type { RecognizeDocumentOptions, RecognizeProgress } from '@/components/dialogs/OcrRecognizeDialog.vue'
@@ -663,7 +663,7 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
       const measureRatio = hctx ? (x0: number, x1: number) => {
         const r = item.inkRect
         const emPx = sizeOf(item, cut) * k
-        const cues = detectFace(hctx, { x: x0 * k, y: r.y * k, width: (x1 - x0) * k, height: r.height * k }, emPx, (r.y + r.height * 0.8) * k)
+        const cues = detectFace(hctx, { x: x0 * k, y: r.y * k, width: (x1 - x0) * k, height: r.height * k }, emPx, (r.y + r.height * 0.8) * k, isLightOnDark(item.color, item.background))
         return cues.measured && cues.strokeRatio > 0 ? cues.strokeRatio : null
       } : undefined
       return [item.id, weightPlan(item, cut, ch => face?.glyphs.get(ch)?.weight, measureRatio)]
@@ -757,7 +757,7 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
         // A scan edit's overlays are where it was allowed to change pixels.
         patches: [...plan.patches, ...[...(scanPlan?.overlays ?? []), ...(inkAware?.overlays ?? [])].map(o => ({ rect: o.rect, item: o.item, overlay: true }))],
         images: plan.images,
-        texts: [...plan.texts, ...(scanPlan?.texts ?? [])].map(t => ({ text: t.text, x: t.x, y: t.y, fontSize: t.fontSize, invisible: !!t.invisible, group: t.group })),
+        texts: [...plan.texts, ...(scanPlan?.texts ?? [])].map(t => ({ text: t.text, x: t.x, y: t.y, fontSize: t.fontSize, invisible: !!t.invisible, group: t.group, fontName: t.fontName, faceId: t.faceId, fitWidth: t.fitWidth, strokeWidth: t.strokeWidth, tracedStrokeWidth: t.tracedStrokeWidth, faceSkip: t.faceSkip })),
         modes: pageModes
       }))
     }

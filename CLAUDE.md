@@ -5470,6 +5470,22 @@ traced FROM (`strokeRatioOfImage`). At HALF the nominal width — potrace leaves
 many short segments and a round-joined stroke puffs every one, so 0.37pt
 took the title to 0.197 em where 0.185pt lands it on the scan's 0.172.
 
+**On light lettering the ink is the LIGHT side.** `detectFace` split ink from
+ground at the midpoint and called the darker side ink, so on a reversed title
+it measured the GROUND: the blue between the letters of a cover's
+letter-spaced "NATURE" read as stems, the run came out heavier than any bold,
+the stroke went to its cap (0.05 em — 3.3pt on a traced glyph at 132pt, 6.6pt
+on a fallback one) and every redrawn letter's serifs melted into blobs.
+`detectFace` takes `lightOnDark` (`isLightOnDark(color, background)`, from the
+colours the recogniser and the bake already sample) and measures the light
+side. Measured on the four reversed-text covers: "NATURE X" redraws with the
+traced letters' own thin serifs and a regular X (damage 22 497 → 13 744 px),
+"OFFERS X" 86 660 → 62 868, "$100M X" 7 918 → 5 762. The same wrong polarity
+had marked every reversed run bold and measured its slant on the ground.
+**Known:** the traced "$100M" is visibly thinner than the scan's extra-bold
+figures; the wrong stroke used to hide that, and the trace's own weight there
+is not fixed.
+
 ### The patch covers the ink's HALO, measured
 Deleting "MINERA SHOUXIN PERÚ S.A." left the accent of the Ú on the page: the
 ink box stops at the caps and the fixed 12% pad did not reach two rows up.

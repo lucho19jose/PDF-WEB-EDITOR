@@ -1,7 +1,7 @@
 import { ref } from 'vue'
 import type { OcrPageResult, OcrTextItem, OcrAlign, ScannedVerdict } from '@/utils/ocr/ocrTypes'
 import { sampleLineColors, samplePatchColor } from '@/utils/ocr/ocrSampling'
-import { detectFace, advancesAreUniform } from '@/utils/ocr/ocrFontDetect'
+import { detectFace, advancesAreUniform, isLightOnDark } from '@/utils/ocr/ocrFontDetect'
 import type { OcrEngine, OcrEngineId, OcrLine, OcrRecognition, OcrWord, OcrBox } from '@/utils/ocr/ocrEngine'
 import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
 import { TesseractEngine } from '@/utils/ocr/engines/tesseractEngine'
@@ -1562,7 +1562,7 @@ function createOCR() {
         const baseY = line.baseline
           ? (line.baseline.y0 + line.baseline.y1) / 2
           : bb.y1 - pxRect.height * 0.2
-        const cues = detectFace(ctx, pxRect, emPx, baseY)
+        const cues = detectFace(ctx, pxRect, emPx, baseY, isLightOnDark(color, background))
         const uniform = advancesAreUniform(run.flatMap(w => w.symbols ?? []), text)
         const face = chooseFace(cues, uniform, undefined)
         // The em has to be re-derived once the family is known: it comes

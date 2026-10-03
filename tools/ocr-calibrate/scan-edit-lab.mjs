@@ -878,7 +878,8 @@ if (cmd === 'explain') {
   const GA = await load('/src/utils/ocr/glyphAtlas.ts')
   const { pages, atlas } = await pagesAndAtlas(GA)
   const li = pages.get(Number(args[0])).lis.find(l => l.id === args[1])
-  const m = GA.lineMetrics(li)
+  // LOOSE=1: the metrics an edit asks with (lineMetrics' loose fallback).
+  const m = GA.lineMetrics(li, process.env.LOOSE ? { loose: true } : {})
   const req = { char: args[2], emPx: li.fit.emPx, xh: m.xh, capH: m.capH, bold: args[3] === 'bold' }
   console.log('target', JSON.stringify(req), 'boldAt', atlas.boldAt)
   console.log(GA.explainPick(atlas, req).join('\n'))
