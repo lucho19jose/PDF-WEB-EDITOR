@@ -4317,9 +4317,13 @@ pixels:
   named such as handwriting in a form's blank, the line's own rules); only the
   middle is typeset — new gaps from the line's own word gap or a fitted
   letter-gap model `g ≈ μ + R[a] + L[b]`. A justified line (it ended at the
-  page's right margin) is respaced over its word gaps (−25%/+60% each), but only
+  page's right margin) is respaced over its word gaps (−30%/+60% each), but only
   when it is CLEAN (no loose ink, no rule of its own); otherwise a tail that
-  would leave the paper is refused.
+  would leave the paper is refused. The gaps after the change take the
+  difference alone while they take it lightly (a tenth of their width when
+  closing, a quarter when opening); past that EVERY gap of the line gives its
+  share, the words before the change included (see "A justified line is
+  re-justified whole" below).
 - **Underlines** are carried: extended with the rule's own columns and end cap
   under new letters of the SAME word, trimmed where letters went. A rule is an
   underline only when letters cover 45%+ of it — a form's blank is left alone.
@@ -4676,6 +4680,26 @@ line was then respaced to its margin — 26 000 pixels rewritten for one figure.
 A difference of up to two pixels (or 0.08 em) is split between the gaps either
 side of the change, as a figure set in the same advance; the overlay is the
 figure's box alone.
+
+**A justified line is re-justified whole when the change is large.** Only the
+gaps after the change used to give way, a quarter of each at most: "el 31 de
+agosto de 2026" → "el 30 de septiembre de 2026" closed the gaps after the date
+to "porlas" and "quesu" and still ran the line 18 px past the margin, and
+"veinte" → "veinticinco" ran 15 px past it — in a justified paragraph a line
+sticking out of the margin is the first thing an eye catches. A difference the
+gaps after the change take lightly (a tenth of their width closing, a quarter
+opening) still stays there and the words before it keep their pixels; past
+that every gap of the line takes the same share, up to three tenths closing,
+and the words before the change are moved too, as a typesetter re-justifies.
+Measured on the MSP appendix: both lines end at the margin with every gap
+5–7 px (was 7–8 before the change and 6 after it), and inserting "y uno" into
+the same line overshoots by 7 px where it overshot by 31. A line still past
+the scan's own pixels after that, where no overlay can draw it, is refused
+("the edit would run the line off the paper") and the vector redraw sets it
+smaller; before, it was drawn there with a note and its end clipped away.
+Only the image's edge is the bar: refused 6pt short of it, an "X" appended to
+a book cover's "NATURE" went from the page's own letters (damage 0) to a
+redraw in another face (22 497 px).
 
 **Letters that stand apart are the cut** (`runCellsOf` in lineInk). The cutter
 refuses a line under 16 px of em ("too small to trace" — a floor for outlines,
@@ -5086,7 +5110,10 @@ bold letters the atlas cannot tell apart every repair it made was wrong
 - **An accented vowel is also read from the letter under its mark**: judged
   whole, the mark outweighs the vowel. (It did not fix "número" → "nómero":
   this page's "u" under its accent matches the "o" medoid 0.73 against 0.70 —
-  the shape grid barely sees an open top. Known.)
+  the shape grid barely sees an open top. `lookalikeFix` now does: its pairs
+  include ó/ú, á/í and v/y besides i/l/I, so a re-read word the document reads
+  nowhere, one such swap from a word it reads twice, is that word. A v/y swap
+  needs three characters — "va" and "ya" are both words.)
 - **Over a rule, a descender is cut off**: an underline or a table cell's
   rule runs where a descender hangs, so such a run may show none and a
   descender label is never replaced by a letter without one ("Upgrade" came
@@ -5098,8 +5125,10 @@ bold letters the atlas cannot tell apart every repair it made was wrong
 
 Measured with `repairall <page>` (every line's reading beside its repair):
 MSP 18/29/15 lines repaired on its three pages; the errors left are
-"Regaláas" (for "Regalías"), "v/o" (for "y/o") and "nómero", each replacing a
-word the recogniser had wrong too ("Professional", which looked like one, is
+"Regaláas" (for "Regalías") and "v/o" (for "y/o") — "nómero" is now read
+"número" by the wider look-alike pairs; the other two appear nowhere else
+on the three pages the lab reads, so there is no second reading to defer
+to — each replacing a word the recogniser had wrong too ("Professional", which looked like one, is
 what the scan says); the form 12 repairs, every
 one wrong (an amount among them, "13,000.00" → "1 3,000 00"), to none; a
 certificate 6, all wrong, to none. The MSP edit suites draw exactly the same

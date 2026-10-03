@@ -1085,7 +1085,7 @@ export function isProseLine(li: LineInk): boolean {
 }
 
 /** Strokes the shapes cannot tell apart in most faces. */
-const LOOKALIKE: Record<string, string[]> = { i: ['l'], l: ['i', 'I'], I: ['l'] }
+const LOOKALIKE: Record<string, string[]> = { i: ['l'], l: ['i', 'I'], I: ['l'], 'ó': ['ú'], 'ú': ['ó'], 'á': ['í'], 'í': ['á'], v: ['y'], y: ['v'] }
 
 /**
  * A word the re-read made that the document reads nowhere, one lookalike
@@ -1103,6 +1103,8 @@ function lookalikeFix(li: LineInk, text: string, atlas: Atlas, log?: (line: stri
     if (core.length < 2 || old.has(core) || (forms.get(core) ?? 0) > 0) return tok
     const chars = [...core]
     for (let i = 0; i < chars.length; i++) for (const alt of LOOKALIKE[chars[i]] ?? []) {
+      // "va" and "ya" are both words: a two-letter v/y swap decides nothing.
+      if ((alt === 'v' || alt === 'y') && chars.length < 3) continue
       const v = [...chars.slice(0, i), alt, ...chars.slice(i + 1)].join('')
       if ((forms.get(v) ?? 0) >= 2) {
         log?.(`"${core}" read as "${v}", a word of the document`)
@@ -1709,22 +1711,38 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     if (!clean) return { ok: false, reason: 'the edit would run the line off the paper', notes }
     rigid = false
     const delta = target - newRight
-    const gaps: number[] = []
-    for (let j = Math.max(1, pre); j < nc.length; j++) {
+    const isGap = (j: number) => {
       const c = nc[j], p = nc[j - 1]
-      const inkGap = c.kind === 'orig' && p.kind === 'orig' && c.old === p.old + 1 && inkWordBoundary(c.old)
-      if (c.space || inkGap) gaps.push(j)
+      return c.space || (c.kind === 'orig' && p.kind === 'orig' && c.old === p.old + 1 && inkWordBoundary(c.old))
     }
-    const gapWidth = (j: number) => nc[j].x - (nc[j - 1].x + widthOf(nc[j - 1]))
-    const capOf = (j: number) => Math.max(0, gapWidth(j)) * (delta > 0 ? 0.6 : 0.25)
+    const gapWidth = (j: number) => Math.max(0, nc[j].x - (nc[j - 1].x + widthOf(nc[j - 1])))
+    const after: number[] = [], all: number[] = []
+    for (let j = 1; j < nc.length; j++) if (isGap(j)) { all.push(j); if (j >= pre) after.push(j) }
+    // The gaps after the change take the difference while they take it
+    // lightly, and the words before it keep their pixels. Past that the whole
+    // line is respaced, every gap by the same share, as a typesetter
+    // re-justifies: on "el 30 de septiembre de 2026" the gaps after the date
+    // alone closed to "porlas" and the line still ran 18px past its margin.
+    const afterWidth = after.reduce((t, j) => t + gapWidth(j), 0)
+    const light = Math.abs(delta) <= afterWidth * (delta > 0 ? 0.25 : 0.12)
+    const gaps = light || all.length === after.length ? after : all
+    const capOf = (j: number) => gapWidth(j) * (delta > 0 ? 0.6 : 0.3)
     const total = gaps.reduce((t, j) => t + capOf(j), 0)
     const f = total > 0 ? Math.min(1, Math.abs(delta) / total) : 0
     for (const j of gaps) extra[j] = Math.sign(delta) * capOf(j) * f
     const left = Math.abs(delta) - total * f
-    pen = pre > 0 ? nc[pre - 1].x + widthOf(nc[pre - 1]) : -Infinity
-    newRight = layoutRun(pre, nc.length, pen, extra)
+    const from = gaps === after ? pre : 1
+    pen = from > 0 ? nc[from - 1].x + widthOf(nc[from - 1]) : -Infinity
+    newRight = layoutRun(from, nc.length, pen, extra)
     if (left >= 1) notes.push(`the line could not be respaced by ${Math.round(left)} px`)
   }
+  // Respaced as far as it goes and still past the scan's own pixels, where
+  // no overlay can draw it: the end of the line would not be on the page at
+  // all. The vector redraw can set it smaller. Only the image's edge — a
+  // margin short of it is still paper, and a cover sets its title there
+  // (refused 6pt short of the edge, an "X" appended to a cover's "NATURE"
+  // went from the page's own letters to a redraw in another face).
+  if (newRight > s.w - 1 && newRight > oldRight) return { ok: false, reason: 'the edit would run the line off the paper', notes }
   const layoutLog = nc.map((c, j) => `${gapNotes.get(j) ?? ''}${c.ch}${c.kind === 'orig' ? (c.drawnAs) : 'g'}@${c.x}+${Math.round(widthOf(c))}`)
   layoutLog.push(`optical target ${opticalTarget?.toFixed(1) ?? '-'}`)
 
