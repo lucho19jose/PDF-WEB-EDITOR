@@ -610,6 +610,16 @@ export function findCorrections(pi: PageInk, li: LineInk, atlas: Atlas, newText:
     const runs = columnRuns(pi, li, w.from, w.to)
     const letters = [...tok]
     if (runs.length !== letters.length) return
+    // Each run IS one letter of the token, so none may be wider than a
+    // letter: two that touch make one run, and deleting the first of them
+    // ("VIRTUDES" → "VIRTUES" in a bold serif, its D against its E) left as
+    // many runs as the token has letters — taken for a correction, the edit
+    // changed the text and drew nothing.
+    for (let r = 0; r < letters.length; r++) {
+      let lo = Infinity, hi = -Infinity
+      for (const p of runs[r]) { const x = p % pi.s.w; if (x < lo) lo = x; if (x > hi) hi = x }
+      if ((hi - lo + 1) / li.fit.emPx > expectedAdvance(letters[r]) * 1.3 + 0.12) return
+    }
     const bold = atlas.boldAt !== null && (w.weight ?? 0) >= atlas.boldAt
     // Old letters by position, when the reading only SUBSTITUTED letters.
     const sameLength = old.length === letters.length
@@ -1384,6 +1394,20 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     // label less well than the page's best copies do: at 14 px of em every
     // letter does, and "SIST" in a code was redrawn for an "I" at 0.67.
     const bold = boldOfWord(k)
+    const peerAgreement = (ch: string, isBold: boolean, shape: Float32Array, cx0: number, cx1: number) => {
+      const ag: number[] = []
+      for (const ex of atlas.byChar.get(ch) ?? []) {
+        if (ex.doubt && !ex.peerVouched) continue
+        if ((atlas.boldAt !== null && ex.weight !== null && ex.weight >= atlas.boldAt) !== isBold) continue
+        if (ex.emPx < li.fit.emPx / 1.2 || ex.emPx > li.fit.emPx * 1.2) continue
+        if (ex.lineId === li.id && ex.x0 < cx1 && ex.x0 + ex.w > cx0) continue
+        ag.push(shapeAgreement(shape, ex.shape))
+        if (ag.length >= 8) break
+      }
+      if (!ag.length) return -1
+      ag.sort((a, b) => a - b)
+      return ag[Math.floor(ag.length / 2)]
+    }
     const bestOther = (shape: Float32Array, ch: string) => {
       let best = 0, bestCh = ''
       for (const [key, med] of atlas.medoids) {
@@ -1400,7 +1424,10 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
       const shape = cellShapeOf(pi, li, i)
       if (!shape) continue
       if (m) {
-        const own = shapeAgreement(shape, m.shape)
+        let own = shapeAgreement(shape, m.shape)
+        // The medoid may be another face's (a title's): copies of the letter
+        // at this line's size, from other words, speak for it too.
+        if (own < 0.75 && m.emPx && (li.fit.emPx / m.emPx > 1.2 || m.emPx / li.fit.emPx > 1.2)) own = Math.max(own, peerAgreement(oldChars[i], bold, shape, li.cells[i].x0, li.cells[i].x1))
         if (own < 0.5 || bestOther(shape, oldChars[i]).best >= Math.max(0.75, own + 0.15)) { redraw[k] = 1; return }
         continue
       }

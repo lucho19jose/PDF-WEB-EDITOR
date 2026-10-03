@@ -715,7 +715,7 @@ function paperRoughness(pi: PageInk, roi: { x0: number; y0: number; x1: number; 
  * cannot be shared among the words) — the caller then leaves the line to the
  * vector redraw.
  */
-export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRect: { x: number; y: number; width: number; height: number }; confidence?: number }, opts: { inverted?: boolean } = {}): LineInk | null {
+export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRect: { x: number; y: number; width: number; height: number }; confidence?: number }, opts: { inverted?: boolean; growX?: [number, number] } = {}): LineInk | null {
   failedBecause = ''
   const s = pi.s
   const text = item.text
@@ -730,7 +730,8 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   if (chars.length <= 2) emGuess = Math.max(emGuess, boxH / 1.2)
   emGuess = Math.min(emGuess, boxH * 1.6)
   const padY = Math.round(emGuess * 0.9), padX = Math.round(emGuess * 0.6)
-  const roi = { x0: Math.max(0, box.x0 - padX), y0: Math.max(0, box.y0 - padY), x1: Math.min(s.w, box.x1 + padX), y1: Math.min(s.h, box.y1 + padY) }
+  const [growL, growR] = opts.growX ?? [0, 0]
+  const roi = { x0: Math.max(0, box.x0 - padX - growL), y0: Math.max(0, box.y0 - padY), x1: Math.min(s.w, box.x1 + padX + growR), y1: Math.min(s.h, box.y1 + padY) }
   const W = roi.x1 - roi.x0, H = roi.y1 - roi.y0
   const at = (x: number, y: number) => (roi.y0 + y) * s.w + roi.x0 + x
   // Light text on a dark ground — a title reversed out of a band of colour,
@@ -993,6 +994,8 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   // letter band. A component far taller than a letter is a vertical rule or
   // two lines' strokes welded together; only its pixels inside the band are
   // the line's.
+  /** A flat stroke: a dash, an underscore, a rule's stub — long, and no taller than a quarter em. */
+  const isDash = (c: Comp) => c.y1 - c.y0 <= Math.max(2, em * 0.25) && c.x1 - c.x0 >= em * 0.3
   const ownPieces: Comp[] = []
   const protect = new Set<number>()
   const own = new Set<number>()
@@ -1022,7 +1025,10 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
       }
     }
     const h = c.y1 - c.y0, w = c.x1 - c.x0
-    const inX = c.cx >= box.x0 - em * 0.6 && c.cx <= box.x1 + em * 0.6
+    // A dash the region was widened for (see below) is the line's however
+    // far it runs on: it starts inside the margin the line owns.
+    const inX = (c.cx >= box.x0 - em * 0.6 && c.cx <= box.x1 + em * 0.6) ||
+      (isDash(c) && ((growR > 0 && c.x0 <= box.x1 + em * 0.6 && c.x1 > box.x1) || (growL > 0 && c.x1 >= box.x0 - em * 0.6 && c.x0 < box.x0)))
     if (h > em * 1.45 && w < em * 0.3) {
       for (const p of c.pix) protect.add(p)
       const b0 = base(c.cx)
@@ -1158,6 +1164,31 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     if (on < c.pix.length * 0.6) continue
     for (const p of c.pix) { protect.add(p); own.delete(p) }
     ownPieces.splice(i, 1)
+  }
+
+  // A dash of the line's own cut off by the region's edge runs on past it,
+  // and the part outside belonged to no line: a book cover's closing "—",
+  // longer than the recogniser's box, was split when the tail moved — half of
+  // it went with "ESTOICAS", half stayed where it was. The line is read again
+  // on a region two ems wider on that side, once. Only a dash — a flat
+  // stroke that runs on past the edge and ENDS within an em and a half:
+  // widened for any piece at the edge (a cover's specks, a title's last
+  // letter) the line read differently and some could no longer be read at
+  // all, and widened for a form's blank, its underline running on for ems,
+  // a date typed into it was set somewhere else.
+  if (!opts.growX) {
+    const runsOn = (c: Comp, x: number, dir: number) => {
+      let longest = 0
+      for (let y = c.y0; y < c.y1; y++) {
+        let n = 0
+        for (let xx = x; xx >= 0 && xx < s.w && n <= em * 1.5 + 1; xx += dir, n++) if (pi.dark[y * s.w + xx] < 60) break
+        longest = Math.max(longest, n)
+      }
+      return longest >= 1 && longest <= em * 1.5
+    }
+    const needL = roi.x0 > 0 && ownPieces.some(c => c.x0 <= roi.x0 && isDash(c) && runsOn(c, roi.x0 - 1, -1))
+    const needR = roi.x1 < s.w && ownPieces.some(c => c.x1 >= roi.x1 && isDash(c) && runsOn(c, roi.x1, 1))
+    if (needL || needR) return analyzeLine(pi, item, { ...opts, growX: [needL ? Math.round(em * 2) : 0, needR ? Math.round(em * 2) : 0] })
   }
 
   // Words: the line's own ink split at its word gaps, then the reading

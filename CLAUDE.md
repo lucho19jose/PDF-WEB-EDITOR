@@ -4995,6 +4995,50 @@ the unforced alignment only if that leaves nothing to fit. Left out, the
 bullet is the line's loose ink: it stays where it is before the first change
 and travels with the tail after the last.
 
+**A dash the recogniser boxed short is read whole.** A book cover's
+"—LAS 4 VIRTUDES ESTOICAS—" came with a box that stopped inside the closing
+dash, past even the 0.6 em the line's region adds: the part of the dash
+outside the region belonged to no line, so deleting the "D" moved the
+dash's inside half with "ESTOICAS" and left the outside half where it was —
+two dashes, a gap between them. When an owned piece at the region's left or
+right edge is a DASH (no taller than a quarter em, at least 0.3 em long)
+that visibly runs on past the edge and ENDS within an em and a half,
+`analyzeLine` reads the line again once on a region two ems wider on that
+side, and owns a dash that starts inside its margin however far it runs.
+Both limits were learned from the corpus: widened for ANY piece at the edge
+(a cover's specks, a title's last letter) the line read differently and
+some lines could no longer be read at all; widened for a form's blank, its
+underline running on for ems, a date typed into it was set somewhere else
+(MSP's "Fecha: ____" fill moved 47 px).
+
+**A letter is judged against its own face, not the page's commonest.** A
+cover sets its title in a big sans and its subtitle in a small serif, and a
+letter's medoid is whichever face holds more copies: the subtitle's serif
+"I"s agreed 0.49 with the title's sans "I", looked more like an "L", and
+were doubted — so deleting the "D" of "VIRTUDES" redrew the whole word (a
+kept "I" scored under 0.5) and synthesised its "I", blurrier and paler than
+the scan's. Two changes, both only where the medoid is another SIZE (on a
+page, size goes with face; more than 20% apart):
+- `markDoubts` marks a doubted copy `peerVouched` when the copies of its
+  letter at its own size from OTHER words agree with it (median 0.8+, and
+  more than with any other letter). `pickGlyph` uses such copies only when
+  nothing else can be picked. Un-doubted outright they were picked over true
+  copies on MSP — a re-weighed regular "7" and "0" where the page's own bold
+  ones had been, visibly lighter than the bold digits beside them.
+- The kept-letter check in `applyLineEdit` accepts a kept letter that its
+  own size's copies (doubted ones the peers vouch for included) agree with.
+Measured: the cover's "VIRTUES" keeps every letter of the scan; MSP's edits
+are pixel-identical.
+
+**A correction cannot hold two letters in one run.** `findCorrections`
+reads a token as what the ink already says when the word's ink falls into
+as many column runs as the token has letters. Two letters that touch make
+one run, so deleting the first of them ("VIRTUDES" → "VIRTUES" in a bold
+serif, its D against its E) left exactly as many runs as letters — and with
+no CHANGED letter to check the shape of, it passed: the edit changed the
+text layer and drew nothing. Each run must now be no wider than its letter
+(its advance × 1.3 + 0.12 em).
+
 **Word gaps are measured where the READING has a space.** The ink's own word
 split also cuts one word at a wide letter gap ("ESTE | FAN | I" in a capitals
 cell); counted as word gaps those gave a page of table cells a 0.15 em word

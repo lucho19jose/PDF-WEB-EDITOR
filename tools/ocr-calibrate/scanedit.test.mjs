@@ -571,6 +571,82 @@ test('a bullet the reading does not name takes no label: the line is read from t
   assert.ok(Math.abs(li.ink[1] - li.ink[0]) < 20, `ink ${li.ink}`)
 })
 
+test('a dash the recogniser boxed short is the line\'s whole: an edit moves all of it, none is left behind', () => {
+  // 200 DPI: "—LAS 4 VIRTUDES ESTOICAS—" in a serif, its box ending well
+  // inside the closing dash (recognisers routinely stop short of one).
+  const W = 1500, H = 160, size = 14 / 0.36
+  const font = new mupdf.Font('Tinos', fs.readFileSync(ROOT + '/public/fonts/match/Tinos-Bold.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const t = new mupdf.Text()
+  t.showString(font, [size, 0, 0, -size, 60, 100], '—LAS 4 VIRTUDES ESTOICAS—')
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  let inkR = 0
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4, a = 1 - g[y * st + x] / 255
+    for (let c = 0; c < 3; c++) rgba[i + c] = Math.round(252 * (1 - a) + 20 * a)
+    rgba[i + 3] = 255
+    if (a > 0.5) inkR = Math.max(inkR, x + 1)
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Dash')
+  const pi = LI.preparePage(raster)
+  // Where the closing dash starts: the last run of inked columns.
+  const inked = (x) => { for (let y = 0; y < H; y++) if (g[y * st + x] < 128) return true; return false }
+  let dashStart = inkR - 1
+  while (dashStart > 0 && inked(dashStart - 1)) dashStart--
+  // The box stops a quarter em into the dash, as the cover's did.
+  const box = { x: 55 * 0.36, y: 68 * 0.36, width: (dashStart + size * 0.25 - 55) * 0.36, height: 40 * 0.36 }
+  const li = LI.analyzeLine(pi, { id: 'd', text: '—LAS 4 VIRTUDES ESTOICAS—', inkRect: box, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const last = li.cells[li.cells.length - 1]
+  assert.ok(last.x1 >= inkR - 2, `the closing dash's cell ends at ${last.x1}, the ink at ${inkR}`)
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, '—LAS 4 VIRTUES ESTOICAS—', work, {})
+  assert.ok(res.ok, res.reason)
+  // Where the moved dash no longer reaches, nothing of it may remain.
+  let newR = 0
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (work[(y * W + x) * 4] < 120) newR = Math.max(newR, x + 1)
+  assert.ok(newR < inkR - size * 0.4, `ink still reaches ${newR}, the old dash ended at ${inkR}`)
+})
+
+test('deleting a letter that touches its neighbour is drawn, not taken for a correction', () => {
+  // A bold serif's "D" and "E" touch in "VIRTUDES": the word is seven ink
+  // runs, as many as "VIRTUES" has letters.
+  const W = 900, H = 140, size = 14 / 0.36
+  const font = new mupdf.Font('Tinos', fs.readFileSync(ROOT + '/public/fonts/match/Tinos-Bold.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const t = new mupdf.Text()
+  t.showString(font, [size, 0, 0, -size, 40, 90], 'LAS VIRTUDES ESTOICAS')
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4, a = 1 - g[y * st + x] / 255
+    for (let c = 0; c < 3; c++) rgba[i + c] = Math.round(252 * (1 - a) + 20 * a)
+    rgba[i + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Touch')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 't', text: 'LAS VIRTUDES ESTOICAS', inkRect: { x: 30 * 0.36, y: 50 * 0.36, width: 760 * 0.36, height: 50 * 0.36 }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  assert.equal(SE.findCorrections(pi, li, atlas, 'LAS VIRTUES ESTOICAS').size, 0)
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, 'LAS VIRTUES ESTOICAS', work, {})
+  assert.ok(res.ok, res.reason)
+  let changed = 0
+  for (let i = 0; i < work.length; i += 4) if (Math.abs(work[i] - raster.data[i]) > 40) changed++
+  assert.ok(changed > 200, `only ${changed} pixels changed`)
+})
+
 test('a large bold title on white paper is edited without grey halos: its thick strokes are ink, not paper', () => {
   // A bilevel scan at 300 DPI (0.24 pt a pixel): a 45pt bold title, its stems
   // ~34 px wide — wider than the paper estimate's 3.6pt filter can see across.

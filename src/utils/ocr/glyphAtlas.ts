@@ -57,6 +57,8 @@ export interface Exemplar {
    * off. Never picked.
    */
   doubt?: boolean
+  /** Doubted against its letter's medoid, which is another size's (another face's), but its own size's copies agree with it: picked when nothing else can be. */
+  peerVouched?: boolean
   /** Why: the letter it looks most like, with both agreements — for the lab. */
   doubtNote?: string
 }
@@ -78,7 +80,7 @@ export interface Atlas {
   /** Median stem weight (stem / em) of the regular words and of the bold ones. */
   stem: { regular: number; bold: number }
   /** Each established letter's medoid shape and how closely its copies agree with it, keyed `char|bold`. */
-  medoids: Map<string, { shape: Float32Array; cohesion: number }>
+  medoids: Map<string, { shape: Float32Array; cohesion: number; emPx?: number }>
   /** How often each word (`vocabKey`) is read on the pages — what the document says elsewhere. */
   vocab?: Map<string, number>
   /** The same, case kept (`formKey`). */
@@ -254,9 +256,9 @@ export function grownSet(W: number, H: number, core: ArrayLike<number>, r: numbe
  * closely) holds the wrong ink under its label. Copies are compared on a
  * sample of up to 40 per class — enough to find a medoid.
  */
-function markDoubts(byChar: Map<string, Exemplar[]>, boldAt: number | null): Map<string, { shape: Float32Array; cohesion: number }> {
+function markDoubts(byChar: Map<string, Exemplar[]>, boldAt: number | null): Map<string, { shape: Float32Array; cohesion: number; emPx?: number }> {
   const boldOf = (ex: Exemplar) => boldAt !== null && ex.weight !== null && ex.weight >= boldAt
-  const medoids: { char: string; bold: boolean; shape: Float32Array; cohesion: number }[] = []
+  const medoids: { char: string; bold: boolean; shape: Float32Array; cohesion: number; emPx: number }[] = []
   for (const [char, list] of byChar) {
     for (const bold of [false, true]) {
       const members = list.filter(ex => boldOf(ex) === bold)
@@ -273,21 +275,39 @@ function markDoubts(byChar: Map<string, Exemplar[]>, boldAt: number | null): Map
         // How closely the class's own copies agree with it: the bar another
         // letter's copy has to clear to be mistaken for one of them.
         const agreements = sample.filter(e => e !== best).map(e => shapeAgreement(e.shape, best!.shape)).sort((a, b) => a - b)
-        medoids.push({ char, bold, shape: best.shape, cohesion: agreements[Math.floor(agreements.length / 2)] ?? 0.85 })
+        medoids.push({ char, bold, shape: best.shape, cohesion: agreements[Math.floor(agreements.length / 2)] ?? 0.85, emPx: best.emPx })
       }
     }
   }
   for (const [char, list] of byChar) {
     for (const ex of list) {
       const bold = boldOf(ex)
-      let own = -1, ownCohesion = 0.85, other = -1, otherChar = '', otherCohesion = 0.85
+      let own = -1, ownCohesion = 0.85, ownEm = 0, other = -1, otherChar = '', otherCohesion = 0.85
       for (const m of medoids) {
         if (m.bold !== bold) continue
         const a = shapeAgreement(ex.shape, m.shape)
-        if (m.char === char) { own = a; ownCohesion = m.cohesion }
+        if (m.char === char) { own = a; ownCohesion = m.cohesion; ownEm = m.emPx }
         else if (a > other) { other = a; otherChar = m.char; otherCohesion = m.cohesion }
       }
-      ex.doubtNote = `own ${own.toFixed(2)} vs "${otherChar}" ${other.toFixed(2)}`
+      // A page sets its title in one face and its body in another, and the
+      // letter's medoid is whichever face holds more copies: a book cover's
+      // serif "I"s agreed 0.49 with the title's sans "I" and were doubted, so
+      // an edit of the body synthesised its "I". Copies of the letter at its
+      // own size (on a page, the size goes with the face) from OTHER words
+      // that agree with it vouch for it (`peerVouched`) — a fallback for the
+      // picker, never a reason to prefer it: un-doubted outright, such copies
+      // were picked over true ones (a re-weighed regular "7" over the page's
+      // bold one) on a page whose medoids were fine.
+      if (own < 0 || ex.emPx / ownEm > 1.2 || ownEm / ex.emPx > 1.2) {
+        const peers = list.filter(o => o !== ex && boldOf(o) === bold && o.emPx >= ex.emPx / 1.2 && o.emPx <= ex.emPx * 1.2 &&
+          (o.lineId !== ex.lineId || Math.abs(o.x0 - ex.x0) > ex.emPx)).slice(0, 12)
+        if (peers.length) {
+          const ag = peers.map(o => shapeAgreement(ex.shape, o.shape)).sort((a, b) => a - b)
+          const mid = ag[Math.floor(ag.length / 2)]
+          if (mid >= 0.8 && mid > other + 0.02) ex.peerVouched = true
+        }
+      }
+      ex.doubtNote = `own ${own.toFixed(2)} vs "${otherChar}" ${other.toFixed(2)}${ex.peerVouched ? ' (peers vouch)' : ''}`
       // A letter with no established shape of its own is doubted only when it
       // would pass for a TYPICAL copy of another letter: a bold "5" agrees with
       // the bold "6" at 0.8, where the 6s agree with each other at ~0.88.
@@ -304,7 +324,7 @@ function markDoubts(byChar: Map<string, Exemplar[]>, boldAt: number | null): Map
       if ((ex.inkR - ex.inkL) / ex.emPx > expectedAdvance(char) * 1.3 + 0.08) ex.doubt = true
     }
   }
-  return new Map(medoids.map(m => [`${m.char}|${m.bold}`, { shape: m.shape, cohesion: m.cohesion }]))
+  return new Map(medoids.map(m => [`${m.char}|${m.bold}`, { shape: m.shape, cohesion: m.cohesion, emPx: m.emPx }]))
 }
 
 /** Otsu's split of a list of values; null when they do not divide. */
@@ -609,15 +629,20 @@ function ownCapHeight(ex: Exemplar): number | null {
  * line). Null when the pages hold no trustworthy copy.
  */
 export function pickGlyph(atlas: Atlas, req: GlyphRequest): PickedGlyph | null {
+  return pickFrom(atlas, req, false) ?? pickFrom(atlas, req, true)
+}
+
+function pickFrom(atlas: Atlas, req: GlyphRequest, vouched: boolean): PickedGlyph | null {
   const list = atlas.byChar.get(req.char)
   if (!list?.length) return null
+  if (vouched && !list.some(ex => ex.doubt && ex.peerVouched)) return null
   // Sizes compare on what both lines measured: the x-height, else the cap
   // height. The em a line's fit reports is the least reliable of the three —
   // 21 to 25 px across lines set in the same 9 pt face on one page.
   const sizeRatio = (ex: Exemplar) => sizeRatioOf(req, ex)
   const boldOf = (ex: Exemplar) => atlas.boldAt === null ? false : ex.weight === null ? null : ex.weight >= atlas.boldAt
   const compatible = inStyle(atlas, req, list.filter(ex => {
-    if (ex.doubt) return false
+    if (ex.doubt && !(vouched && ex.peerVouched)) return false
     const r = sizeRatio(ex)
     if (r < 0.9 || r > 1.11) return false
     const b = boldOf(ex)
