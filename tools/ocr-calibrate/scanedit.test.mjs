@@ -436,6 +436,141 @@ test('two figures changed in one line are two swaps: the words between them keep
   assert.equal(res.drawn.replace(/k/g, '').length, 2, `drawn ${res.drawn}`)
 })
 
+test('on squared paper the grid is paper: an edit neither erases it nor carries it with the letters', () => {
+  // 200 DPI: a notebook's light blue grid every 40 px, 2 px lines, with a
+  // line of dark blue text across it.
+  const W = 1100, H = 200, size = 13 / 0.36
+  const font = new mupdf.Font('Arimo', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Regular.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const t = new mupdf.Text()
+  t.showString(font, [size, 0, 0, -size, 40, 120], 'La matriz escalonada es: real')
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = pix.getPixels(), stride = pix.getStride()
+  const grid = new Uint8Array(W * H)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (x % 40 < 2 || y % 40 < 2) grid[y * W + x] = 1
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4, a = 1 - g[y * stride + x] / 255
+    const base = grid[y * W + x] ? [150, 190, 235] : [252, 252, 250]
+    const ink = [20, 30, 120]
+    for (let c = 0; c < 3; c++) rgba[i + c] = Math.round(base[c] * (1 - a) + ink[c] * a)
+    rgba[i + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Grid')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 'g', text: 'La matriz escalonada es: real', inkRect: { x: 30 * 0.36, y: 82 * 0.36, width: 1000 * 0.36, height: 50 * 0.36 }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, 'La matriz eslonada es: real', work, {})
+  assert.ok(res.ok, res.reason)
+  // Every grid pixel the new text does not cover keeps its colour: none
+  // erased to white where the old letters stood, none moved with them.
+  // Within two pixels of a letter, before or after the edit, what shows is
+  // the letter's edge or the grid it uncovered: not judged.
+  const nearLetter = new Uint8Array(W * H)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4
+    if (work[i + 2] >= 200 && raster.data[i + 2] >= 200) continue
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+      const xx = x + dx, yy = y + dy
+      if (xx >= 0 && yy >= 0 && xx < W && yy < H) nearLetter[yy * W + xx] = 1
+    }
+  }
+  let lost = 0, gridSeen = 0
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (!grid[y * W + x] || nearLetter[y * W + x]) continue
+    const i = (y * W + x) * 4
+    gridSeen++
+    if (Math.abs(work[i] - raster.data[i]) > 30 || Math.abs(work[i + 1] - raster.data[i + 1]) > 30) lost++
+  }
+  assert.ok(gridSeen > 1000)
+  assert.ok(lost < 20, `grid pixels changed: ${lost}`)
+})
+
+test('a small tinted button is paper of its own colour: its letters are not measured against the panel around it', () => {
+  // 252 DPI (3.5 px a point), as a dashboard screenshot placed on A4: a
+  // light-blue button 36 px tall and 137 wide on a lighter panel, "Last 3
+  // days" in it at 6pt and a chevron at its right end. The paper filter's
+  // radius (3.6pt) is a third of the button's height, so its edge band read
+  // as ink and the margin round the letters took the rest: the paper under
+  // the letters came from the panel, and every letter an edit moved carried
+  // a box of the button's colour over it.
+  const pxPerPt = 3.5, W = 420, H = 140
+  const bx0 = 60, by0 = 50, bw = 137, bh = 36
+  const font = new mupdf.Font('F', fs.readFileSync(ROOT + '/public/fonts/match/Carlito-Regular.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const t = new mupdf.Text()
+  const px = 6 * pxPerPt, baseY = Math.round(by0 + bh / 2 + px * 0.33)
+  t.showString(font, [px, 0, 0, -px, bx0 + 3 * pxPerPt, baseY], 'Last 3 days')
+  t.showString(font, [px, 0, 0, -px, bx0 + bw - 16, baseY - 3], 'v')
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const panel = [239, 246, 252], ground = [199, 224, 244], ink = [60, 110, 160]
+  const inB = (x, y) => x >= bx0 && x < bx0 + bw && y >= by0 && y < by0 + bh
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4, a = 1 - g[y * st + x] / 255, base = inB(x, y) ? ground : panel
+    for (let c = 0; c < 3; c++) rgba[i + c] = Math.round(base[c] * (1 - a) + ink[c] * a)
+    rgba[i + 3] = 255
+  }
+  const k = 1 / pxPerPt
+  const raster = R.scanRasterOf(W, H, rgba, [W * k, 0, 0, H * k, 0, 0], W * k, H * k, 'Btn')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 'b', text: 'Last 3 days', inkRect: { x: (bx0 + 6) * k, y: (by0 + 4) * k, width: 100 * k, height: (bh - 8) * k }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const est = [0, 0, 0]
+  let n = 0
+  for (const c of li.cells) if (c) for (const p of c.pix) { for (let q = 0; q < 3; q++) est[q] += pi.paper[p * 3 + q]; n++ }
+  for (let q = 0; q < 3; q++) assert.ok(Math.abs(est[q] / n - ground[q]) <= 4, `paper under the letters ${est.map(v => Math.round(v / n))} against the button's ${ground}`)
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, 'Last days', work, {})
+  assert.ok(res.ok, res.reason)
+})
+
+test('a bullet the reading does not name takes no label: the line is read from the first letter after it', () => {
+  // 200 DPI: a solid green disc, an ordinary word space, then "49.7% good"
+  // in grey — the recogniser reads the text and drops the bullet.
+  const W = 900, H = 160, size = 12 / 0.36
+  const font = new mupdf.Font('Arimo', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Regular.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const t = new mupdf.Text()
+  t.showString(font, [size, 0, 0, -size, 90, 100], '49.7% good')
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = new Uint8Array(pix.getPixels()), st = pix.getStride()
+  const disc = { cx: 64, cy: 88, r: 12 }
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4, a = 1 - g[y * st + x] / 255
+    const dd = Math.hypot(x + 0.5 - disc.cx, y + 0.5 - disc.cy)
+    const da = Math.max(0, Math.min(1, disc.r - dd + 0.5))
+    const grey = [90, 90, 90], green = [10, 140, 40], paper = [253, 253, 251]
+    for (let c = 0; c < 3; c++) {
+      let v = paper[c] * (1 - a) + grey[c] * a
+      v = v * (1 - da) + green[c] * da
+      rgba[i + c] = Math.round(v)
+    }
+    rgba[i + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Bullet')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 'b', text: '49.7% good', inkRect: { x: 40 * 0.36, y: 60 * 0.36, width: 420 * 0.36, height: 55 * 0.36 }, confidence: 98 })
+  assert.ok(li, LI.lastLineFailure())
+  assert.ok(li.cells[0].x0 > disc.cx + disc.r, `the "4" starts at ${li.cells[0].x0}, on the bullet`)
+  // The line's ink is the letters' grey, not the bullet's green.
+  assert.ok(Math.abs(li.ink[1] - li.ink[0]) < 20, `ink ${li.ink}`)
+})
+
 test('a large bold title on white paper is edited without grey halos: its thick strokes are ink, not paper', () => {
   // A bilevel scan at 300 DPI (0.24 pt a pixel): a 45pt bold title, its stems
   // ~34 px wide — wider than the paper estimate's 3.6pt filter can see across.

@@ -28,6 +28,8 @@ export interface PageInk {
   paper: Uint8ClampedArray
   /** Darkness against the pixel's own paper, 0 (paper) .. 255 (black): 255 · (1 − L / L_paper). */
   dark: Uint8Array
+  /** Faint straight lines taken as paper (a notebook's grid), 1 where one runs; the plain-paper tests look past them. */
+  lines?: Uint8Array
 }
 
 /** Ideographs (and full-width forms): composed of radicals, so stacked pieces are their nature, not a sign of a broken letter. */
@@ -61,6 +63,83 @@ export function maxFilter1D(src: Uint8Array, w: number, h: number, r: number, al
       const v = a > b ? a : b
       if (alongRows) src[l * w + i] = v
       else src[i * w + l] = v
+    }
+  }
+}
+
+/** The darkest closed level a GROUND may have: anything darker is a stroke or a band of colour. */
+const GROUND_MIN = 150
+
+/**
+ * The paper under a restored ground's letters, from that ground's OWN known
+ * pixels. The page's fill reaches past a ground's edge into whatever surrounds
+ * it, and on a button barely taller than its words the surround is most of
+ * what it finds. A ground is the region a closed level runs through without a
+ * step (neighbours within 2 levels), seeded where the closing restored it; it
+ * must be flat (closed levels within 6) and mostly bare (half its pixels on
+ * the ground level), which a photograph is not. One with too few known pixels
+ * takes the median of its bare pixels, letters' margins included.
+ */
+function fillGrounds(ch: Float32Array[], known: Float32Array, d: Uint8ClampedArray, L: Uint8Array, C: Uint8Array, ground: Uint8Array, w: number, h: number): void {
+  const N = w * h
+  const seg = new Int32Array(N).fill(-1)
+  const stack = new Int32Array(N)
+  let id = 0
+  for (let s0 = 0; s0 < N; s0++) {
+    if (!ground[s0] || seg[s0] >= 0) continue
+    let top = 0
+    stack[top++] = s0
+    seg[s0] = id
+    let x0 = w, y0 = h, x1 = 0, y1 = 0, area = 0, bare = 0, lo = 255, hi = 0, nKnown = 0
+    while (top) {
+      const p = stack[--top]
+      const x = p % w, y = (p - x) / w
+      area++
+      if (Math.abs(L[p] - C[p]) <= 6) bare++
+      if (known[p] >= 1) nKnown++
+      if (C[p] < lo) lo = C[p]
+      if (C[p] > hi) hi = C[p]
+      if (x < x0) x0 = x
+      if (x > x1) x1 = x
+      if (y < y0) y0 = y
+      if (y > y1) y1 = y
+      const cp = C[p]
+      if (x > 0) { const q = p - 1; if (seg[q] < 0 && C[q] >= GROUND_MIN && Math.abs(C[q] - cp) <= 2) { seg[q] = id; stack[top++] = q } }
+      if (x < w - 1) { const q = p + 1; if (seg[q] < 0 && C[q] >= GROUND_MIN && Math.abs(C[q] - cp) <= 2) { seg[q] = id; stack[top++] = q } }
+      if (y > 0) { const q = p - w; if (seg[q] < 0 && C[q] >= GROUND_MIN && Math.abs(C[q] - cp) <= 2) { seg[q] = id; stack[top++] = q } }
+      if (y < h - 1) { const q = p + w; if (seg[q] < 0 && C[q] >= GROUND_MIN && Math.abs(C[q] - cp) <= 2) { seg[q] = id; stack[top++] = q } }
+    }
+    const me = id++
+    // The page's own paper, or a gradient that drifted across it: the page's fill is right there.
+    if (area > N * 0.25 || hi - lo > 6 || bare < area * 0.5 || nKnown === area) continue
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1
+    if (nKnown >= Math.max(12, area * 0.02)) {
+      const sub = [new Float32Array(bw * bh), new Float32Array(bw * bh), new Float32Array(bw * bh)]
+      const sk = new Float32Array(bw * bh)
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        const p = y * w + x, q = (y - y0) * bw + (x - x0)
+        if (seg[p] === me && known[p] >= 1) { sk[q] = 1; for (let c = 0; c < 3; c++) sub[c][q] = ch[c][p] }
+      }
+      pushPull(sub, sk, bw, bh)
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        const p = y * w + x
+        if (seg[p] !== me || known[p] >= 1) continue
+        const q = (y - y0) * bw + (x - x0)
+        for (let c = 0; c < 3; c++) ch[c][p] = sub[c][q]
+      }
+    } else {
+      // No known pixel to speak of: the median colour of the ground's bare pixels.
+      const vals: number[][] = [[], [], []]
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        const p = y * w + x
+        if (seg[p] === me && Math.abs(L[p] - C[p]) <= 3) for (let c = 0; c < 3; c++) vals[c].push(d[p * 4 + c])
+      }
+      if (vals[0].length < 12) continue
+      const med = vals.map(v => { v.sort((a, b) => a - b); return v[v.length >> 1] })
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        const p = y * w + x
+        if (seg[p] === me && known[p] < 1) for (let c = 0; c < 3; c++) ch[c][p] = med[c]
+      }
     }
   }
 }
@@ -121,6 +200,27 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
   const B = L.slice()
   maxFilter1D(B, s.w, s.h, R, true)
   maxFilter1D(B, s.w, s.h, R, false)
+  // A flat light GROUND smaller than the page — a dashboard's button, a
+  // shaded table cell — is darker than the paper around it, and within R of
+  // its edge the filter saw that paper: a band all round its inside read as
+  // ink. On a button barely taller than its words the band and the margin
+  // around the letters left none of the button known, its paper came from the
+  // panel outside, and every letter an edit moved carried a box of the
+  // button's colour over the panel's (ocr3/021: "Last 3 days" → "Last days").
+  // A closing (the max filter, then a min filter as wide) brings back any
+  // ground wider than the filter; where it is light, flat and the pixel itself
+  // is that ground, the pixel is paper. A thick black stem is closed too, and
+  // stays ink: its closed level is dark.
+  const C = new Uint8Array(N)
+  for (let p = 0; p < N; p++) C[p] = 255 - B[p]
+  maxFilter1D(C, s.w, s.h, R, true)
+  maxFilter1D(C, s.w, s.h, R, false)
+  for (let p = 0; p < N; p++) C[p] = 255 - C[p]
+  const ground = new Uint8Array(N)
+  let grounds = 0
+  for (let p = 0; p < N; p++) {
+    if (B[p] - C[p] > 12 && C[p] >= GROUND_MIN && Math.abs(L[p] - C[p]) <= 6) { ground[p] = 1; B[p] = C[p]; grounds++ }
+  }
   const inkish = new Uint8Array(N)
   for (let p = 0; p < N; p++) {
     const diff = B[p] - L[p]
@@ -148,6 +248,72 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
       for (let p = 0; p < N; p++) if (!inkish[p] && L[p] < 90 && bright(before[p], L[p]) && bright(after[p], L[p])) inkish[p] = 255
     }
   }
+  const line = new Uint8Array(N)
+  const bridges: { p: number; a: number; b: number; t: number }[] = []
+  // A notebook's GRID is paper: faint, thin, straight lines running on long
+  // past any letter. Read as ink, it was filled in under the letters and the
+  // line's regions took its pieces with them — an edit on squared paper moved
+  // grid segments along with the moved words and left white gaps in the grid
+  // where they had stood. Taken as paper, a moved letter's grid pixels are
+  // transmittance one (they stay put) and an erased one is refilled with the
+  // grid. Faint: well short of a letter's core and not hugging one (the haze
+  // along an underline or a dark rule stays ink, or trimming it would leave a
+  // ghost). Thin: a line, not a band — a light grey title's stems are
+  // thicker. Long: 8pt and more unbroken, which no letter's stroke is.
+  // Not on the inverted page: a cover's art reversed holds long faint
+  // strokes of its own, and taken as paper they made a reversed author line
+  // read as set on rough ground.
+  if (opts.strokes !== false) {
+    // Judged on the pixel's own lightness: inside a stroke wider than the
+    // filter the local maximum is the stroke itself, and against it a bold
+    // title's stem edges read "faint".
+    const nearDark = new Uint8Array(N)
+    for (let p = 0; p < N; p++) if (L[p] < 120) nearDark[p] = 1
+    maxFilter1D(nearDark, s.w, s.h, 2, true)
+    maxFilter1D(nearDark, s.w, s.h, 2, false)
+    const faint = (p: number) => inkish[p] && !nearDark[p]
+    const minRun = Math.max(12, Math.round(8 * pxPerPt))
+    const scan = (rows: boolean, m: Uint8Array) => {
+      const outer = rows ? s.h : s.w, inner = rows ? s.w : s.h
+      const at = (o: number, i: number) => rows ? o * s.w + i : i * s.w + o
+      for (let o = 2; o < outer - 2; o++) {
+        let start = -1
+        for (let i = 0; i <= inner; i++) {
+          const on = i < inner && faint(at(o, i))
+          if (on && start < 0) start = i
+          if (!on && start >= 0) {
+            if (i - start >= minRun) {
+              // Thin: two pixels either side across it are mostly not faint ink.
+              let thick = 0
+              for (let k = start; k < i; k++) if (faint(at(o - 2, k)) && faint(at(o + 2, k))) thick++
+              if (thick < (i - start) * 0.3) for (let k = start; k < i; k++) m[at(o, k)] = 1
+            }
+            start = -1
+          }
+        }
+        // Where a letter crosses the line it is still the line: a gap of up
+        // to 40pt between two of its stretches is bridged, its paper the
+        // line's own colour from one end to the other.
+        let last = -1
+        for (let i = 0; i < inner; i++) {
+          if (!m[at(o, i)]) continue
+          if (last >= 0 && i - last > 1 && i - last - 1 <= maxGap) {
+            const a = at(o, last), b = at(o, i)
+            for (let k = last + 1; k < i; k++) { m[at(o, k)] = 1; bridges.push({ p: at(o, k), a, b, t: (k - last) / (i - last) }) }
+          }
+          last = i
+        }
+      }
+    }
+    const maxGap = Math.round(40 * pxPerPt)
+    const lineH = new Uint8Array(N), lineV = new Uint8Array(N)
+    scan(true, lineH)
+    scan(false, lineV)
+    for (let p = 0; p < N; p++) if (lineH[p] || lineV[p]) line[p] = 1
+    const bridged = new Uint8Array(N)
+    for (const b of bridges) bridged[b.p] = 1
+    for (let p = 0; p < N; p++) if (line[p] && !bridged[p]) inkish[p] = 0
+  }
   // The paper is sampled BEYOND the haze around the letters: a scan's strokes
   // are ringed by blur and JPEG ringing a few levels darker than the paper out
   // to ~4 px at 200 DPI (measured: 248–252 at 2–4 px from the ink, 254 beyond
@@ -156,11 +322,28 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
   const grow = Math.max(2, Math.round(1.8 * pxPerPt))
   maxFilter1D(inkish, s.w, s.h, grow, true)
   maxFilter1D(inkish, s.w, s.h, grow, false)
+  // A grid line next to a letter is still the grid: its paper is its own
+  // colour, unless it is the letter's own core. But it is no source for the
+  // paper AROUND it: filled from the line's tint as well as the white, the
+  // paper under a letter beside a grid line came out a grey smudge. The fill
+  // sees the line and its blurred fringe as unknown; the line's own pixels
+  // take back their colour afterwards.
+  let anyLine = false
+  for (let p = 0; p < N; p++) if (line[p]) { anyLine = true; break }
+  const band = anyLine ? line.slice() : line
+  if (anyLine) { maxFilter1D(band, s.w, s.h, 2, true); maxFilter1D(band, s.w, s.h, 2, false) }
   const known = new Float32Array(N)
-  for (let p = 0; p < N; p++) known[p] = inkish[p] ? 0 : 1
+  for (let p = 0; p < N; p++) known[p] = !inkish[p] && !band[p] ? 1 : 0
   const ch = [new Float32Array(N), new Float32Array(N), new Float32Array(N)]
   for (let p = 0, i = 0; p < N; p++, i += 4) { ch[0][p] = d[i]; ch[1][p] = d[i + 1]; ch[2][p] = d[i + 2] }
   pushPull(ch, known, s.w, s.h)
+  // Most pages are plain paper and hold no ground: skip the region pass.
+  if (grounds) fillGrounds(ch, known, d, L, C, ground, s.w, s.h)
+  if (anyLine) for (let p = 0, i = 0; p < N; p++, i += 4) {
+    if (band[p] && (!inkish[p] || (line[p] && B[p] - L[p] < 110))) { ch[0][p] = d[i]; ch[1][p] = d[i + 1]; ch[2][p] = d[i + 2] }
+  }
+  // A bridge across ink is the line it continues, its colour from one end to the other.
+  for (const b of bridges) for (let c = 0; c < 3; c++) ch[c][b.p] = d[b.a * 4 + c] * (1 - b.t) + d[b.b * 4 + c] * b.t
   const paper = new Uint8ClampedArray(N * 3)
   const dark = new Uint8Array(N)
   for (let p = 0; p < N; p++) {
@@ -170,7 +353,11 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
     const t = lp > 1 ? L[p] / lp : 1
     dark[p] = t >= 1 ? 0 : Math.round((1 - t) * 255)
   }
-  return { s, paper, dark }
+  // What the plain-paper tests look past is the line AND its fringe: a
+  // scanned grid line is blurred, its pale edges are paper of the grid's tint,
+  // and counted as the page's paper they read every squared page as rough.
+  if (!anyLine) return { s, paper, dark }
+  return { s, paper, dark, lines: band }
 }
 
 const invertedPages = new WeakMap<PageInk, PageInk>()
@@ -466,9 +653,26 @@ export function lastSmoothTest(): unknown { const v = smoothDebug; smoothDebug =
 function paperRoughness(pi: PageInk, roi: { x0: number; y0: number; x1: number; y1: number }, em: number): number {
   const s = pi.s, W = roi.x1 - roi.x0, H = roi.y1 - roi.y0
   const P = new Float32Array(W * H)
+  const lumAtP = (p: number) => (pi.paper[p * 3] * 299 + pi.paper[p * 3 + 1] * 587 + pi.paper[p * 3 + 2] * 114) / 1000
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const p = (roi.y0 + y) * s.w + roi.x0 + x
-    P[y * W + x] = (pi.paper[p * 3] * 299 + pi.paper[p * 3 + 1] * 587 + pi.paper[p * 3 + 2] * 114) / 1000
+    let v = lumAtP(p)
+    // A grid line's paper is the grid: bridged with the paper a few pixels
+    // off it, or every squared page reads as rough as a photograph.
+    if (pi.lines?.[p]) {
+      let best = -1
+      const px = roi.x0 + x, py = roi.y0 + y
+      for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+        for (let k = 1; k <= 12; k++) {
+          const qx = px + dx * k, qy = py + dy * k
+          if (qx < 0 || qy < 0 || qx >= s.w || qy >= s.h) break
+          const q = qy * s.w + qx
+          if (!pi.lines[q]) { best = Math.max(best, lumAtP(q)); break }
+        }
+      }
+      if (best >= 0) v = best
+    }
+    P[y * W + x] = v
   }
   const r = Math.max(3, Math.round(em * 0.5))
   // Separable box blur with edge clamping, via running sums.
@@ -496,7 +700,7 @@ function paperRoughness(pi: PageInk, roi: { x0: number; y0: number; x1: number; 
   const res: number[] = []
   for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 2) {
     const p = (roi.y0 + y) * s.w + roi.x0 + x
-    if (pi.dark[p] >= FRINGE) continue
+    if (pi.dark[p] >= FRINGE || pi.lines?.[p]) continue
     res.push(Math.abs(P[y * W + x] - blur[y * W + x]))
   }
   if (res.length < 20) return Infinity
@@ -563,7 +767,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     const lums: number[] = []
     for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 3) {
       const p = at(x, y)
-      if (pi.dark[p] >= FRINGE) continue
+      if (pi.dark[p] >= FRINGE || pi.lines?.[p]) continue
       lums.push((pi.paper[p * 3] * 299 + pi.paper[p * 3 + 1] * 587 + pi.paper[p * 3 + 2] * 114) / 1000)
     }
     if (lums.length > 40) {
@@ -961,6 +1165,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   const blobs: Blob[] = ownPieces.map(c => ({ x0: c.x0, x1: c.x1, y0: c.y0, y1: c.y1, area: c.area, cx: c.cx, cy: c.cy }))
   const split = splitWords(blobs, fit)
   if (!split.words.length) return fail('no words')
+  markBullets(split.words, ownPieces, em, text, s.w)
   const spaceAfter = spaceBoundaries(text)
   const matches = alignCharsToWords(split.words, chars, spaceAfter)
   if (!matches) return fail('the reading does not fit the words')
@@ -1110,10 +1315,17 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   const wordGaps: number[] = []
   for (let i = 1; i < words.length; i++) if (spaceAfter.has(words[i].from)) wordGaps.push(words[i].x0 - words[i - 1].x1)
 
-  // The ink colour: the darkest pixels of the line's cores.
+  // The ink colour: the darkest pixels of the line's LETTERS' cores. A bullet
+  // the reading never named is ink of the line too — and a solid green disc
+  // in front of "49.7% good" outweighed the grey letters, so an "X" appended
+  // to them came out green. Every pixel of the line only when its letters
+  // give too few.
   const inkRgb: [number, number, number] = [0, 0, 0]
   {
-    const ps = [...own].sort((a, b) => pi.dark[b] - pi.dark[a]).slice(0, Math.max(8, Math.floor(own.size * 0.3)))
+    const letterPix: number[] = []
+    for (const c of cells) if (c && /[\p{L}\p{N}]/u.test(c.char)) for (const p of c.pix) letterPix.push(p)
+    const pool = letterPix.length >= 24 ? letterPix : [...own]
+    const ps = [...pool].sort((a, b) => pi.dark[b] - pi.dark[a]).slice(0, Math.max(8, Math.floor(pool.length * 0.3)))
     if (ps.length) {
       const rs = ps.map(p => s.data[p * 4]), gs = ps.map(p => s.data[p * 4 + 1]), bs = ps.map(p => s.data[p * 4 + 2])
       inkRgb[0] = median(rs); inkRgb[1] = median(gs); inkRgb[2] = median(bs)
@@ -1456,6 +1668,52 @@ function columnRuns(pieces: Comp[]): number {
     end = Math.max(end, x1)
   }
   return runs
+}
+
+/** What a recogniser may write for a bullet: one of these at the reading's end means it named the bullet. */
+const BULLET_LIKE = /[•·●◦▪■□○◆◇►▸‣⁃∙*oO0–—-]/
+
+/**
+ * Marks the ink word at either end of a line that is a list BULLET the
+ * reading does not name: one piece, about square, solid (most of its box
+ * inked) and with no counter. A letter that is all of that does not exist —
+ * an "o" or a "0" has a hole, an "l" or an "I" is thin, a full stop is a fifth
+ * of the size.
+ */
+function markBullets(words: { x0: number; x1: number; bullet?: boolean }[], pieces: Comp[], em: number, text: string, pageW: number): void {
+  const t = text.trim()
+  if (!t || words.length < 2) return
+  const isBullet = (w: { x0: number; x1: number }) => {
+    const ps = pieces.filter(c => c.x0 >= w.x0 - 1 && c.x1 <= w.x1 + 1)
+    if (ps.length !== 1) return false
+    const c = ps[0]
+    const bw = c.x1 - c.x0, bh = c.y1 - c.y0
+    if (bh < em * 0.3 || bh > em * 1.1 || bw < bh * 0.65 || bw > bh * 1.5) return false
+    if (c.area < bw * bh * 0.68) return false
+    // No counter: every pixel of the box the piece does not cover is
+    // reached from the box's edge.
+    const inBox = new Uint8Array(bw * bh)
+    for (const p of c.pix) { const x = p % pageW - c.x0, y = (p - (p % pageW)) / pageW - c.y0; inBox[y * bw + x] = 1 }
+    const seen = new Uint8Array(bw * bh)
+    const stack: number[] = []
+    for (let x = 0; x < bw; x++) for (const y of [0, bh - 1]) { const q = y * bw + x; if (!inBox[q] && !seen[q]) { seen[q] = 1; stack.push(q) } }
+    for (let y = 0; y < bh; y++) for (const x of [0, bw - 1]) { const q = y * bw + x; if (!inBox[q] && !seen[q]) { seen[q] = 1; stack.push(q) } }
+    while (stack.length) {
+      const q = stack.pop()!
+      const x = q % bw, y = (q - x) / bw
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const xx = x + dx, yy = y + dy
+        if (xx < 0 || yy < 0 || xx >= bw || yy >= bh) continue
+        const r = yy * bw + xx
+        if (!inBox[r] && !seen[r]) { seen[r] = 1; stack.push(r) }
+      }
+    }
+    let holes = 0
+    for (let q = 0; q < bw * bh; q++) if (!inBox[q] && !seen[q]) holes++
+    return holes < 2
+  }
+  if (!BULLET_LIKE.test(t[0]) && isBullet(words[0])) words[0].bullet = true
+  if (!BULLET_LIKE.test(t[t.length - 1]) && isBullet(words[words.length - 1])) words[words.length - 1].bullet = true
 }
 
 function compOf(pix: number[], pageW: number): Comp {

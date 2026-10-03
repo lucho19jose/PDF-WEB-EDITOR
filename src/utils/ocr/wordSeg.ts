@@ -154,7 +154,11 @@ export function ownedBy(b: Blob, fit: LineFit): boolean {
   return b.cy >= base - fit.emPx * 1.0 && b.cy <= base + fit.emPx * 0.22
 }
 
-export interface InkWord { x0: number; x1: number; top: number; bottom: number }
+export interface InkWord {
+  x0: number; x1: number; top: number; bottom: number
+  /** A list bullet the reading does not name (`markBullets`): it may be left out at an end wherever it stands. */
+  bullet?: boolean
+}
 
 export interface WordSplit { words: InkWord[]; threshold: number; letterGapPx: number; wordGapPx: number }
 
@@ -235,7 +239,7 @@ export interface WordMatch { word: number; from: number; to: number; /** |ink �
  * price — a stray mark the recogniser rightly ignored. Null when even the best
  * sharing leaves the widths far from the letters.
  */
-export function alignCharsToWords(words: { x0: number; x1: number }[], chars: string[], spaceAfter: Set<number>): WordMatch[] | null {
+export function alignCharsToWords(words: { x0: number; x1: number; bullet?: boolean }[], chars: string[], spaceAfter: Set<number>): WordMatch[] | null {
   // Ink at either END of the line that the reading never named — the
   // handwriting in a form's blank the recogniser boxed with the printed line
   // and did not read — takes part in the width scale the fit is judged by,
@@ -250,15 +254,28 @@ export function alignCharsToWords(words: { x0: number; x1: number }[], chars: st
   const totalAdv = chars.reduce((t, c) => t + expectedAdvance(c), 0)
   const emEst = totalAdv > 0 ? words.reduce((t, w) => t + (w.x1 - w.x0), 0) / totalAdv : 0
   const apart = (i: number) => i > 0 && i < words.length && words[i].x0 - words[i - 1].x1 >= emEst
-  let best: { cost: number; out: WordMatch[] } | null = null
-  for (let a = 0; a <= 2; a++) for (let b = 0; b <= 2; b++) {
-    if (a + b >= words.length) continue
-    if ((a > 0 && !apart(a)) || (b > 0 && !apart(words.length - b))) continue
-    const res = alignOn(words.slice(a, words.length - b), chars, spaceAfter)
-    if (!res) continue
-    const cost = res.cost + (a + b) * TRIM_COST
-    if (!best || cost < best.cost - 1e-9) best = { cost, out: res.out.map(m => ({ ...m, word: m.word + a })) }
+  // A bullet the recogniser did not read sits an ordinary word space from the
+  // text, and given the first label it shifted every label after it by one:
+  // "● 49.7% good" read "49.7% good" put the "4" on the disc, and an "X"
+  // appended to it was toned green. It may be left out however close it is.
+  // And it MUST be: its width is a letter's, so it fits a label about as well
+  // as the trim costs, and the "4" went on it anyway.
+  const startOk = (a: number) => apart(a) || words.slice(0, a).every(w => w.bullet)
+  const endOk = (b: number) => apart(words.length - b) || words.slice(words.length - b).every(w => w.bullet)
+  const search = (minA: number, minB: number) => {
+    let best: { cost: number; out: WordMatch[] } | null = null
+    for (let a = minA; a <= 2; a++) for (let b = minB; b <= 2; b++) {
+      if (a + b >= words.length) continue
+      if ((a > 0 && !startOk(a)) || (b > 0 && !endOk(b))) continue
+      const res = alignOn(words.slice(a, words.length - b), chars, spaceAfter)
+      if (!res) continue
+      const cost = res.cost + (a + b) * TRIM_COST
+      if (!best || cost < best.cost - 1e-9) best = { cost, out: res.out.map(m => ({ ...m, word: m.word + a })) }
+    }
+    return best
   }
+  const minA = words[0]?.bullet ? 1 : 0, minB = words.length > 1 && words[words.length - 1]?.bullet ? 1 : 0
+  const best = ((minA || minB) && search(minA, minB)) || search(0, 0)
   return best ? best.out : null
 }
 

@@ -4900,6 +4900,101 @@ rule into the speckled grey header above it, one wide tall component, and
 read through a fixture exported before the page-size fix put every box a row
 off and failed two more cells — re-export before believing a lab refusal.)
 
+**On squared paper the grid is paper.** A student's notes on squared paper
+(ocr3/020 and 023) had their grid read as ink: every grid line within reach
+of a letter was filled in under the letters as if it were a stroke, and the
+line analysis gave its pieces to the nearest letters — so an edit moved grid
+segments along with the moved words and left white gaps in the grid where
+they had stood ("x1+2x2+x3+x4=0" → "x1+2x2x3+x4=0" broke four lines of it).
+`preparePage` now finds FAINT, THIN, LONG straight lines — lighter than 120
+and not within two pixels of anything darker, a few pixels thick at most,
+unbroken over 8pt — and takes them as paper. Where a letter crosses one, the
+line is bridged across it (up to 40pt), its paper the line's own colour from
+one end to the other, so a moved letter's grid pixels are transmittance one
+(they stay put) and an erased letter is refilled WITH the grid. "Faint" is
+judged on the pixel's own lightness: against the local maximum a bold
+title's stem edges read faint, and the thinness test alone let a large
+title's crossbars through. Three things the real pages needed that the
+synthetic one did not:
+- **The line is no source for the paper AROUND it.** Taken as known paper,
+  the grid fed the fill under every letter beside it, and the paper estimate
+  came out with grey smudges at each crossing — an erase would have painted
+  them. The fill sees the line and its blurred fringe (two pixels each side)
+  as unknown; afterwards the line's own pixels take back their colour.
+- **The plain-paper tests look past the line AND its fringe**
+  (`PageInk.lines` is the widened band): a scanned grid line is blurred, its
+  pale edges are paper of the grid's tint, and counted as the page's paper
+  they read every squared page as rough — "x1+2x2+x3+x4=0" and "La matriz
+  escalonada es:" were refused as "not plain paper" where they had been
+  edited on the scan before. `paperRoughness` bridges a line pixel with the
+  first paper outward from it, `relaxErased` holds a line pixel inside an
+  erased hole at the grid's colour instead of relaxing it into the white.
+- **Not on the inverted page.** A cover's art reversed holds long faint
+  strokes of its own; taken as paper there they made a reversed author line
+  (ocr3/008, "W. Chan Kim • Renée Mauborgne") read as set on rough ground.
+Measured with a synthetic squared page (scanedit.test.mjs): 66 grid pixels
+changed by an edit before, under 20 after; the MSP appendix is
+pixel-identical. **Known:** handwriting on squared paper cuts unreliably —
+"escalonada" → "eslonada" removes the wrong letters and reads "esnada" —
+at HEAD before this change as well; the grid is now kept round it.
+
+**The ink colour is the LETTERS'.** New letters are toned to the line's ink,
+and that was the darkest pixels of ALL the line's own ink — a bullet the
+reading never named included. A dashboard's solid green disc in front of
+"49.7% good" outweighed the grey letters, and an "X" appended to them came
+out green. It is now taken from the cores of the line's letter and figure
+cells, and from every pixel of the line only when those give fewer than 24.
+
+**A small tinted ground is paper of its own colour.** The paper filter is a
+max over 3.6pt, so a ground darker than what surrounds it — a dashboard's
+light-blue button, a shaded table cell — has a band of that width inside its
+edge that read as ink. On a button barely taller than its words (ocr3/021,
+"Last 3 days": 36 px tall at 3.5 px a point, a 13 px band top and bottom)
+the band and the margin round the letters left NONE of the button known, the
+paper under the letters came from the panel outside, and every letter an
+edit moved carried a box of ground × ground/panel over the button — measured
+(166,204,236) on (199,224,244), exactly that product. Two steps:
+- **A closing restores the ground.** The max filter followed by a min filter
+  as wide brings back any region wider than the filter; where it lowered the
+  paper level by more than 12, the closed level is light (150+) and the pixel
+  itself is that ground within 6 levels, the pixel is paper. A thick black
+  stem is closed too and stays ink: its closed level is dark.
+- **A restored ground is filled from its OWN known pixels** (`fillGrounds`):
+  the region a closed level runs through without a step (neighbours within 2
+  levels), push-pulled inside its own bounding box with only its own pixels
+  known, or — when the margins leave it almost none — the median of its bare
+  pixels. It must be flat (closed levels within 6) and mostly bare (half its
+  pixels at the ground level), which keeps chart bars, gradients and photos
+  on the page's fill; and under a quarter of the page, which keeps the page's
+  own paper there.
+Measured on the dashboard: the paper under the button's letters matches the
+button everywhere (it was 8+ levels lighter round "days"), and "Last 3 days"
+→ "Last days" moves the word with no box. Costs ~190 ms a page (the closing
+125, the fills 66 on a 5.6 MP raster), paid once per page — and nothing on a
+page with no ground, which skips the region pass. The MSP appendix is
+pixel-identical.
+
+**A bullet the reading does not name takes no label.** Recognisers drop list
+bullets more often than not, and the alignment of the reading to the ink
+then gave the bullet the line's first label and shifted every label after it
+by one: "● 49.7% good" read "49.7% good" put the "4" on the disc, the "9" on
+the real "4", and so on — an edit of the number would have rewritten the
+wrong figures, deleting its first character would have deleted the bullet,
+and the line's ink colour came out the bullet's, so an "X" appended to grey
+text was green. The same dashboard's legend dots took the "Se" of
+"Sessions" and the "C" of "Chrome". An end ink word may already be left out
+when a blank of an em sets it apart; a bullet sits an ordinary word space
+from its text. `markBullets` (lineInk) marks an end ink word that is ONE
+piece, about square (0.65–1.5), solid (68%+ of its box inked), 0.3–1.1 em
+tall and with no counter — no letter is all of that: an "o" or a "0" has a
+hole, an "l" is thin, a full stop a fifth the size — unless the reading's own
+end character is bullet-like (then the reading named it). `alignCharsToWords`
+must then leave it out (its width is a letter's, so it fits a label about as
+well as the trim costs, and the label went on it anyway), falling back to
+the unforced alignment only if that leaves nothing to fit. Left out, the
+bullet is the line's loose ink: it stays where it is before the first change
+and travels with the tail after the last.
+
 **Word gaps are measured where the READING has a space.** The ink's own word
 split also cuts one word at a wide letter gap ("ESTE | FAN | I" in a capitals
 cell); counted as word gaps those gave a page of table cells a 0.15 em word

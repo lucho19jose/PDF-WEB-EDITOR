@@ -2029,7 +2029,9 @@ function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W
   const src = pi.s.data
   for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
     const p = (y0 + y) * W + x0 + x, j = y * bw + x
-    if (erase.has(p)) { free[j] = 1; for (let c = 0; c < 3; c++) v[c][j] = work[p * 4 + c] }
+    // A grid line through the hole is the grid (`PageInk.lines`): held, not relaxed away.
+    if (erase.has(p) && pi.lines?.[p]) { for (let c = 0; c < 3; c++) { v[c][j] = pi.paper[p * 3 + c]; work[p * 4 + c] = pi.paper[p * 3 + c] } }
+    else if (erase.has(p)) { free[j] = 1; for (let c = 0; c < 3; c++) v[c][j] = work[p * 4 + c] }
     else for (let c = 0; c < 3; c++) v[c][j] = pi.dark[p] < 50 ? src[p * 4 + c] : pi.paper[p * 3 + c]
   }
   const idx: number[] = []
