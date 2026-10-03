@@ -13,10 +13,10 @@ import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance, type GlyphCutR
 import { toSpanCut, toSpanCutFromWords, stretchOf, sizeOf, type SpanCut } from '@/utils/ocr/partialRedraw'
 import { segmentLine, baselineAtOf, type LineWords } from '@/utils/ocr/wordSeg'
 import { scanRasterOf, isUpright, type ScanRaster } from '@/utils/ocr/scanRaster'
-import { preparePage, analyzeLine, lastLineFailure, type PageInk, type LineInk } from '@/utils/ocr/lineInk'
+import { preparePage, analyzeLine, lastLineFailure, pageOfLine, type PageInk, type LineInk } from '@/utils/ocr/lineInk'
 import { harvestPage, atlasFrom, type PageHarvest, type Atlas } from '@/utils/ocr/glyphAtlas'
 import { planScanEdits, inkAwareFallback, type ScanEditPlan, type FallbackOps, type PixelOverlay } from '@/utils/ocr/scanEditPage'
-import { wantKey, type GlyphImage } from '@/utils/ocr/scanEdit'
+import { wantKey, repairReading, type GlyphImage } from '@/utils/ocr/scanEdit'
 import { fitScanLook, synthGlyph, type Rasterize, type ScanLook, type LookNear } from '@/utils/ocr/glyphSynth'
 import { useOcrStore } from '@/stores/ocr'
 
@@ -782,6 +782,55 @@ function createOCR() {
     scanPages.set(pageIndex, { gen, sp })
     while (scanPages.size > 2) scanPages.delete(scanPages.keys().next().value!)
     return sp
+  }
+
+  /**
+   * The page's runs re-read from its own letters, so the editor opens on what
+   * the page says rather than on what the recogniser made of it. PaddleOCR
+   * drops the spaces and letters at word joins of small body text —
+   * "Lostérminos queenel presente Apéndice … deinidos" — and a user editing
+   * that edits a garbled line, while the letters it lost are on the page
+   * beside the ones it kept (`repairReading`; every gate it applies applies
+   * here, so a line whose shapes the atlas cannot read is left as read).
+   *
+   * Only runs nobody has touched: not edited, moved, restyled or baked, not
+   * the one selected (an editor may be open on it), and still read as they
+   * were analysed. Each run is a store update of its reading AND its original,
+   * so it is not an edit and nothing is baked. Yields between lines, and stops
+   * when the page is recognised again.
+   */
+  const repairing = new Set<Promise<number>>()
+  function repairReadings(pageIndex: number): Promise<number> {
+    const p: Promise<number> = repairReadingsNow(pageIndex).finally(() => { repairing.delete(p) })
+    repairing.add(p)
+    return p
+  }
+  /** Every re-read in progress, finished — for drivers that look runs up by their reading. */
+  async function settleRepairs(): Promise<void> {
+    while (repairing.size) await Promise.allSettled([...repairing])
+  }
+  async function repairReadingsNow(pageIndex: number): Promise<number> {
+    const gen = genOf(pageIndex)
+    const sp = await scanPageFor(pageIndex)
+    if (!sp || genOf(pageIndex) !== gen) return 0
+    const atlas = currentAtlas()
+    if (!atlas) return 0
+    const store = useOcrStore()
+    let n = 0
+    for (const [id, li] of [...sp.lines]) {
+      if (!li) continue
+      await new Promise(r => setTimeout(r, 0))
+      if (genOf(pageIndex) !== gen) return n
+      const it = store.pages.get(pageIndex)?.items.find(i => i.id === id)
+      if (!it || it.edited || it.removed || it.baked || it.vertical || it.restyled || store.selectedId === id ||
+          it.text !== it.originalText || it.originalText !== li.text) continue
+      const rep = repairReading(pageOfLine(sp.pi, li), li, atlas)
+      if (!rep || rep.text === it.text) continue
+      store.updateItem(id, { text: rep.text, originalText: rep.text })
+      sp.lines.set(id, rep.li)
+      n++
+    }
+    return n
   }
 
   /** The atlas over every page harvested so far (of the current recognitions). */
@@ -1796,5 +1845,5 @@ function createOCR() {
     engines.clear()
   }
 
-  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, spanCutFor, forgetSpanCut, setPageRenderer, setScanLoader, setGlyphRasterizer, planScanEditsFor, inkAwareFallbackFor, forgetTraceRaster, cutFor, debugCuts, faceOf, facesOf, reset, destroy }
+  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, spanCutFor, forgetSpanCut, setPageRenderer, setScanLoader, setGlyphRasterizer, planScanEditsFor, inkAwareFallbackFor, repairReadings, settleRepairs, forgetTraceRaster, cutFor, debugCuts, faceOf, facesOf, reset, destroy }
 }

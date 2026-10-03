@@ -106,6 +106,9 @@ async function ensureRecognised(pageIndex) {
   store('editor').setTool('edit')
   await sleep(200)
   await withTimeout(window.__pdfHooks.ocrController.recognise(pageIndex), 240000, 'recognise')
+  // The app re-reads the runs from the page's own letters in the background;
+  // the suite's lookups have to see the readings it settles on.
+  await withTimeout(window.__pdfHooks.ocrController.settleRepairs?.() ?? Promise.resolve(), 120000, 're-read')
   return ocrStore.resultFor(pageIndex)
 }
 
@@ -124,8 +127,13 @@ function lumOf(canvas) {
 
 function findItem(pageIndex, spec) {
   const items = store('ocr').itemsFor(pageIndex).filter(i => !i.vertical && !i.removed)
-  if (spec.exact != null) return items.find(i => i.originalText.trim() === spec.exact) ?? items.find(i => norm(i.originalText) === norm(spec.exact))
-  return items.find(i => i.originalText.includes(spec.find)) ?? items.find(i => norm(i.originalText).includes(norm(spec.find)))
+  const hit = spec.exact != null
+    ? items.find(i => i.originalText.trim() === spec.exact) ?? items.find(i => norm(i.originalText) === norm(spec.exact))
+    : items.find(i => i.originalText.includes(spec.find)) ?? items.find(i => norm(i.originalText).includes(norm(spec.find)))
+  // `alt`: the same edit against the line as the app re-reads it from the
+  // page's own letters ("USD 30.00" comes back "USD 630.00").
+  if (hit || !spec.alt) return hit ? { item: hit, spec } : null
+  return findItem(pageIndex, { ...spec, ...spec.alt, alt: undefined })
 }
 
 async function applyEdit(item, newText) {
@@ -306,11 +314,13 @@ export async function runSuite({ url, edits, load = true }) {
       report.edits.push(row)
       try {
         await gotoPage(spec.page + 1)
-        const item = findItem(spec.page, spec)
-        if (!item) { row.error = 'run not found'; continue }
+        const found = findItem(spec.page, spec)
+        if (!found) { row.error = 'run not found'; continue }
+        const item = found.item
+        const use = found.spec
         row.id = item.id
         row.original = item.originalText
-        const next = item.text.replace(spec.from ?? spec.find ?? spec.exact, spec.to)
+        const next = item.text.replace(use.from ?? use.find ?? use.exact, use.to)
         if (next === item.text) { row.error = 'edit made no change'; continue }
         row.text = next
         row.inkRect = { ...item.inkRect }

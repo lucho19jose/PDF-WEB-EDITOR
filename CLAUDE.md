@@ -5100,6 +5100,38 @@ one wrong (an amount among them, "13,000.00" → "1 3,000 00"), to none; a
 certificate 6, all wrong, to none. The MSP edit suites draw exactly the same
 pixels; `scanedit.test.mjs` passes.
 
+### The editor opens on the page's own reading
+PaddleOCR loses the spaces and letters at the joins of small body text, so the
+editor opened a contract's lines as "Lostérminos queenel presente Apéndice
+sean,serán términos deinidos" and the user edited THAT: every change landed in
+a garbled line, and whatever they did not retype stayed garbled in the text
+layer. After a page is recognised, `repairReadings` (useOCR) re-reads every
+untouched run from the page's own letters in the background — the same
+`repairReading` an edit uses, with all of its gates, so a line whose shapes
+the atlas cannot read stays as recognised — and stores the result as the
+run's text AND its original: it is the reading, not an edit, and nothing is
+baked.
+
+- **Only runs nobody has touched**: not edited, removed, moved, restyled or
+  baked, not the selected one (an editor may be open on it), and still read
+  as they were analysed. It yields between lines and stops if the page is
+  recognised again.
+- **Not during "Reconocer texto en este archivo"**: that writes its text
+  layer from the runs as they stand, and the re-read would add seconds to
+  every page (`runOcrNow(…, { repair: false })`).
+- **Whatever looks runs up by their text waits for it**: the editing
+  assistant's `recognise` awaits `settleRepairs()`, and so does the fidelity
+  driver (`__pdfHooks.ocrController.settleRepairs`). A suite entry may carry
+  an `alt` lookup for the line as the re-read leaves it ("USD 30.00" comes
+  back "USD 630.00", "de 026" comes back "de 2026").
+
+Measured in the browser on the MSP appendix: 17 of page 1's 57 lines read
+again in the background, the editor opening on "Los términos que en el
+presente Apéndice sean, serán términos definidos …"; the 14-edit suite
+stays on the scan with no damage, and the edits that used to read back only
+through a repaired reading ("misread amount", "count in prose") read back as
+typed.
+
 ### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
 Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)
 leaves a scan's words in the content stream as INVISIBLE text: render mode 3,

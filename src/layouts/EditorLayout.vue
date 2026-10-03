@@ -313,13 +313,14 @@ function ocrScanChanged(pageIndex: number) {
 
 provide('ocrController', {
   isScanLike: isScanLikePage,
-  recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG),
+  // The assistant reads runs by their text: it waits for the re-read to settle.
+  recognise: async (pageIndex: number) => { await runOcrNow(pageIndex, OCR_DEFAULT_LANG); await ocr.settleRepairs() },
   busy: ocr.busy,
   scanMoved: ocrScanMoved,
   scanChanged: ocrScanChanged
 })
 
-async function runOcrNow(pageIndex: number, lang: string) {
+async function runOcrNow(pageIndex: number, lang: string, opts: { repair?: boolean } = {}) {
   editorStore.setStatus('Recognising text on this page...')
 
   // OCR reads its own render of THIS page at its own resolution. The visible
@@ -410,6 +411,23 @@ async function runOcrNow(pageIndex: number, lang: string) {
   editorStore.setStatus(result.items.length === 0
     ? `No text was recognised on this page${by}${note}`
     : `${result.items.length} text areas detected${by}${sideways} — ${result.confidence}% average confidence${note}${textLines ? `; ${textLines} line${textLines > 1 ? 's are' : ' is'} real text, edited with the text tool` : ''}. Click one to select it, click again to edit, drag to move.`)
+  // The runs re-read from the page's own letters, in the background, so the
+  // editor opens on what the page says (see `repairReadings`). Not while a
+  // whole document is recognised: its text layer is written from the runs as
+  // they stand, and the re-read would only slow every page down.
+  if (opts.repair !== false && result.items.length) {
+    const said = editorStore.statusMessage
+    void ocr.repairReadings(pageIndex).then(n => {
+      if (!n) return
+      // The bytes did not change, so the state they match now carries the new
+      // readings — or an undo would hand the old, garbled ones back. Not while
+      // an edit is still waiting for its bake: the bytes do not match that yet.
+      if (!pagesNeedingLive().length) appliedMeta = captureOcrMeta()
+      if (editorStore.statusMessage === said) {
+        editorStore.setStatus(`${said} ${n} misread line${n > 1 ? 's were' : ' was'} read again from the page's own letters.`)
+      }
+    }).catch(() => {})
+  }
 }
 
 /**
@@ -1712,7 +1730,7 @@ async function recognizeDocument(opts: RecognizeDocumentOptions): Promise<void> 
       if (hasLayer && !opts.replaceExisting) { why.layer++; p.skipped++; p.done++; continue }
 
       p.stage = `Recognising page ${pi + 1}…`
-      await runOcrNow(pi, opts.lang)
+      await runOcrNow(pi, opts.lang, { repair: false })
       const items = ocrStore.itemsFor(pi).filter(i => i.text.trim() && !i.removed)
       if (!items.length) { why.nothing++; p.skipped++; p.done++; continue }
 
@@ -1775,7 +1793,7 @@ provide('recognizeProgress', recognizeProgress)
 // Vue internals they used to walk to these, so they are put on window like
 // __pdfEngine and __pdfViewer already are.
 ;(window as any).__pdfHooks = {
-  ocrController: { isScanLike: isScanLikePage, recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG), busy: ocr.busy },
+  ocrController: { isScanLike: isScanLikePage, recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG), busy: ocr.busy, settleRepairs: ocr.settleRepairs },
   bakeOcrEdits, runOcrOnPage, undo, redo, ocr, recognizeDocument, recognizeProgress
 }
 // The editing assistant is built HERE because every mutation it makes has to
@@ -1784,7 +1802,8 @@ provide('recognizeProgress', recognizeProgress)
 const assistant = createAssistant({
   pdfEngine, ocr,
   syncAfterEdit, pushUndo, forgetOcr,
-  recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG),
+  // The assistant reads runs by their text: it waits for the re-read to settle.
+  recognise: async (pageIndex: number) => { await runOcrNow(pageIndex, OCR_DEFAULT_LANG); await ocr.settleRepairs() },
   isScanLike: isScanLikePage,
   undo, rotatePage, deletePage, duplicatePage, insertBlankPage, movePage,
   confirmCloud: () => new Promise<boolean>(resolve => {

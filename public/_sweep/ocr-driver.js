@@ -198,6 +198,8 @@ export async function runPdf(entry, opts = {}) {
         editor.setTool('edit'); await sleep(300)
         const r0 = performance.now()
         await withTimeout(P.ocrController.recognise(pageIndex), 240000, 'recognise')
+        // The runs are re-read from the page's letters in the background.
+        await withTimeout(P.ocrController.settleRepairs?.() ?? Promise.resolve(), 120000, 're-read')
         page.recogMs = Math.round(performance.now() - r0)
         const result = ocrStore.resultFor(pageIndex)
         if (!result) { page.error = 'no result: ' + editor.statusMessage; continue }
