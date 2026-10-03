@@ -126,7 +126,13 @@ function lumOf(canvas) {
 }
 
 function findItem(pageIndex, spec) {
-  const items = store('ocr').itemsFor(pageIndex).filter(i => !i.vertical && !i.removed)
+  let items = store('ocr').itemsFor(pageIndex).filter(i => !i.vertical && !i.removed)
+  // `at: [x, y]`: the same text printed in several places — take the copy
+  // nearest that point (page points, top-left).
+  if (spec.at) {
+    const d = (i) => Math.hypot(i.inkRect.x - spec.at[0], i.inkRect.y - spec.at[1])
+    items = [...items].sort((a, b) => d(a) - d(b))
+  }
   const hit = spec.exact != null
     ? items.find(i => i.originalText.trim() === spec.exact) ?? items.find(i => norm(i.originalText) === norm(spec.exact))
     : items.find(i => i.originalText.includes(spec.find)) ?? items.find(i => norm(i.originalText).includes(norm(spec.find)))
