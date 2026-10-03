@@ -1,4 +1,4 @@
-import { cellRegion, looseRegion, analyzeLine, CORE, type PageInk, type LineInk } from './lineInk'
+import { cellRegion, looseRegion, analyzeLine, edgeWidthOf, CORE, type PageInk, type LineInk } from './lineInk'
 import { pickGlyph, predictGap, lineMetrics, cellShapeOf, shapeOfCore, shapeAgreement, vocabKey, formKey, type Atlas, type Exemplar } from './glyphAtlas'
 import { expectedAdvance } from './glyphCut'
 
@@ -321,6 +321,8 @@ export interface GlyphWant {
   line?: string
   /** Stem over em (lineInk's word weight) of the word it goes into — what its stems are re-weighed to; else the page's for its weight. */
   stem?: number | null
+  /** How soft the line's stroke edges print, px (`edgeWidthOf`): what the letter is blurred to. */
+  edge?: number | null
 }
 
 /** The key a synthesised glyph is cached under: the same letter at the same size and weight is the same glyph. */
@@ -1506,6 +1508,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     styleRefs.set(k, refs)
     return refs
   }
+  let lineEdge: number | null | undefined
   for (const c of nc) {
     if (c.kind !== 'synth') continue
     const bold = boldOfWord(c.styleWord)
@@ -1527,7 +1530,8 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     if (!g) {
       // Neither weight on any harvested page: a glyph synthesised from the
       // matched face, if the caller has made one.
-      const want: GlyphWant = { char: c.ch, emPx: em, xh, capH, bold, ink: inkOverPaper, coreDark: li.coreDark, line: li.id, stem: weightOfWord(c.styleWord) }
+      if (lineEdge === undefined) lineEdge = edgeWidthOf(pi, li)
+      const want: GlyphWant = { char: c.ch, emPx: em, xh, capH, bold, ink: inkOverPaper, coreDark: li.coreDark, line: li.id, stem: weightOfWord(c.styleWord), edge: lineEdge }
       const made = opts.synth?.get(`${li.id}|${wantKey(want)}`) ?? opts.synth?.get(wantKey(want))
       if (made) { g = made; c.drawnAs = 's' }
       else { missing.push(c.ch); wanting.push(want); continue }

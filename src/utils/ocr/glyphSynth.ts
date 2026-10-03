@@ -2,7 +2,7 @@ import type { Atlas, Exemplar } from './glyphAtlas'
 import type { GlyphImage } from './scanEdit'
 import { reweighImage } from './scanEdit'
 import type { RasterGlyph } from './glyphRaster'
-import { CORE } from './lineInk'
+import { CORE, strokeEdgeWidths } from './lineInk'
 export type { RasterGlyph } from './glyphRaster'
 export { rasterizeGlyph } from './glyphRaster'
 
@@ -325,7 +325,7 @@ async function fitOnRefs(refs: Exemplar[], boldRef: Set<Exemplar>, capRef: Map<E
 /** A line's core level as a darkness, 0..1 (lineInk's `CORE`). */
 const CORE_DARK = CORE / 255
 
-export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: Atlas, req: { char: string; emPx: number; xh: number | null; capH?: number | null; bold: boolean; ink: [number, number, number]; coreDark?: number; stem?: number | null }): Promise<GlyphImage | null> {
+export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: Atlas, req: { char: string; emPx: number; xh: number | null; capH?: number | null; bold: boolean; ink: [number, number, number]; coreDark?: number; stem?: number | null; edge?: number | null }): Promise<GlyphImage | null> {
   const face = MATCH_FACES.find(f => f.family === look.family)
   if (!face) return null
   const emRender = req.xh ? req.xh / look.xhPerEm : req.capH ? req.capH / look.capPerEm : req.emPx * 0.9
@@ -333,7 +333,24 @@ export async function synthGlyph(look: ScanLook, rasterize: Rasterize, atlas: At
   const heavy = req.bold ? (look.boldAs ?? 'bold') === 'bold' : look.regularAs === 'bold'
   const [g] = await rasterize(faceFile(face, heavy), [req.char], emRender)
   if (!g) return null
-  const d = printedDarkness(g, look.sigma, look.gamma)
+  // Blurred as soft as the LINE's own edges, measured the same way on both.
+  // The look's blur is fitted on the page's references, and a face that does
+  // not quite match correlates better blurred: a cover's crisp 44 px "RYAN"
+  // was given an "X" at the grid's softest, fitted on small lowercase
+  // elsewhere on the page — a blurred letter beside sharp ones.
+  let sigma = look.sigma
+  if (req.edge) {
+    let best = Infinity
+    for (let s = 0; s <= 2.501; s += 0.1) {
+      const dd = printedDarkness(g, s, look.gamma)
+      const ws = strokeEdgeWidths((x, y) => dd[y * g.w + x], 0, g.w, 0, g.h, 0.5, emRender * 0.25)
+      if (ws.length < 8) continue
+      ws.sort((a, b) => a - b)
+      const err = Math.abs(ws[ws.length >> 1] - req.edge)
+      if (err < best - 1e-9) { best = err; sigma = s }
+    }
+  }
+  const d = printedDarkness(g, sigma, look.gamma)
   // Its stems as dark as the line's own: the blur leaves a rendered stem's
   // core short of full ink, and a synthesised letter read grey beside the
   // scan's. The cores' darkness over the ink's is what a stem has to reach.

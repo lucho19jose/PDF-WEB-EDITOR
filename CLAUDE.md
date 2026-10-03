@@ -5039,6 +5039,22 @@ no CHANGED letter to check the shape of, it passed: the edit changed the
 text layer and drew nothing. Each run must now be no wider than its letter
 (its advance × 1.3 + 0.12 em).
 
+**A synthesised letter is as soft as the LINE's edges.** The look's blur is
+fitted on the page's reference letters, and those may come from anywhere on
+the page: a cover's crisp 44 px "RYAN" has no lowercase to judge by, the
+references fell to small lowercase elsewhere, and a face that does not quite
+match correlates BETTER blurred — the fit took the grid's softest (1.3 px)
+and the appended "X" came out a blur beside sharp capitals. `edgeWidthOf`
+(lineInk) measures the line itself: the median 20–80% width of its letters'
+stroke edges, each stroke against its own peak so grey and black ink are
+measured alike (`strokeEdgeWidths`). The want carries it (`GlyphWant.edge`)
+and `synthGlyph` picks the blur, 0 to 2.5 px, whose rendered glyph measures
+the same by the same rule; the look's blur stands only where the line gives
+under a dozen edges. Measured on a page built like the cover
+(scanedit.test.mjs): the "X"'s edges went from 2.28 px to within 0.6 px of
+the line's 1.05; on the cover itself the "X" is now as crisp as "RYAN", and
+MSP's one synthesised "W" comes out a little sharper beside its "L" and "E".
+
 **Word gaps are measured where the READING has a space.** The ink's own word
 split also cuts one word at a wide letter gap ("ESTE | FAN | I" in a capitals
 cell); counted as word gaps those gave a page of table cells a 0.15 em word

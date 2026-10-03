@@ -12,7 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import fs from 'node:fs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..').replace(/\\/g, '/')
-let server, SE, R, LI, GA, IP, GR, mupdf
+let server, SE, R, LI, GA, IP, GR, GS, mupdf
 
 before(async () => {
   const { createServer } = await import(pathToFileURL(ROOT + '/node_modules/vite/dist/node/index.js').href)
@@ -28,6 +28,7 @@ before(async () => {
   GA = await loadOcr('glyphAtlas.ts')
   IP = await loadOcr('inpaint.ts')
   GR = await loadOcr('glyphRaster.ts')
+  GS = await loadOcr('glyphSynth.ts')
   mupdf = await import(pathToFileURL(ROOT + '/node_modules/mupdf/dist/mupdf.js').href)
 })
 after(async () => { await server?.close() })
@@ -645,6 +646,88 @@ test('deleting a letter that touches its neighbour is drawn, not taken for a cor
   let changed = 0
   for (let i = 0; i < work.length; i += 4) if (Math.abs(work[i] - raster.data[i]) > 40) changed++
   assert.ok(changed > 200, `only ${changed} pixels changed`)
+})
+
+test('a synthesised letter is as sharp as the line it goes into, not as the page\'s other text', async () => {
+  // 200 DPI: a crisp line of big bold capitals that wants an "X", and three
+  // lines of small lowercase printed soft — what the look is fitted on, the
+  // capitals giving no lowercase to judge by.
+  const W = 1400, H = 520
+  const bold = new mupdf.Font('B', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Bold.ttf'))
+  const reg = new mupdf.Font('R', fs.readFileSync(ROOT + '/public/fonts/match/Arimo-Regular.ttf'))
+  const draw = (font, size, x, y, s) => {
+    const p = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+    p.clear(255)
+    const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, p)
+    const t = new mupdf.Text()
+    t.showString(font, [size, 0, 0, -size, x, y], s)
+    dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+    dev.close()
+    const g = new Uint8Array(p.getPixels()), st = p.getStride(), out = new Float32Array(W * H)
+    for (let yy = 0; yy < H; yy++) for (let xx = 0; xx < W; xx++) out[yy * W + xx] = 1 - g[yy * st + xx] / 255
+    return out
+  }
+  const blur = (f, sigma) => {
+    const r = Math.ceil(sigma * 3), k = []
+    let sum = 0
+    for (let i = -r; i <= r; i++) { k.push(Math.exp(-(i * i) / (2 * sigma * sigma))); sum += k[k.length - 1] }
+    const tmp = new Float32Array(W * H), out = new Float32Array(W * H)
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { let a = 0; for (let i = -r; i <= r; i++) { const xx = Math.min(W - 1, Math.max(0, x + i)); a += f[y * W + xx] * k[i + r] } tmp[y * W + x] = a / sum }
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { let a = 0; for (let i = -r; i <= r; i++) { const yy = Math.min(H - 1, Math.max(0, y + i)); a += tmp[yy * W + x] * k[i + r] } out[y * W + x] = a / sum }
+    return out
+  }
+  const sentence = 'the quick brown dog sounds rather timid'
+  const layers = [draw(bold, 60, 60, 110, 'RYAN')]
+  for (const y of [250, 330, 410]) layers.push(blur(draw(reg, 30, 60, y, sentence), 1.3))
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let p = 0; p < W * H; p++) {
+    let a = 0
+    for (const l of layers) a = Math.max(a, l[p])
+    for (let c = 0; c < 3; c++) rgba[p * 4 + c] = Math.round(252 * (1 - a) + 20 * a)
+    rgba[p * 4 + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W * 0.36, 0, 0, H * 0.36, 0, 0], W * 0.36, H * 0.36, 'Soft')
+  const pi = LI.preparePage(raster)
+  const items = [{ id: 'big', text: 'RYAN', inkRect: { x: 50 * 0.36, y: 60 * 0.36, width: 200 * 0.36, height: 60 * 0.36 }, confidence: 98 }]
+  for (const [k, y] of [250, 330, 410].entries()) items.push({ id: 's' + k, text: sentence, inkRect: { x: 50 * 0.36, y: (y - 26) * 0.36, width: 600 * 0.36, height: 36 * 0.36 }, confidence: 98 })
+  const lis = items.map(it => LI.analyzeLine(pi, it))
+  for (const li of lis) assert.ok(li, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, lis, 0)])
+  const res = SE.applyLineEdit(pi, lis[0], atlas, 'RYAN X', raster.data.slice(), {})
+  const want = res.wanting?.find(w => w.char === 'X')
+  assert.ok(want, `no X wanted: ${res.reason}`)
+  const fonts = new Map()
+  const rasterize = async (file, chars, emPx) => {
+    let f = fonts.get(file)
+    if (!f) { f = new mupdf.Font(file, fs.readFileSync(`${ROOT}/public/fonts/match/${file}.ttf`)); fonts.set(file, f) }
+    return chars.map(ch => GS.rasterizeGlyph(mupdf, f, ch, emPx))
+  }
+  const look = await GS.fitScanLook(atlas, rasterize, { near: { line: 'big', page: 0, emPx: lis[0].fit.emPx } })
+  assert.ok(look, 'no look')
+  const g = await GS.synthGlyph(look, rasterize, atlas, want)
+  assert.ok(g, 'no glyph')
+  // The 20–80% width of the strokes' edges, the median over rows.
+  const edgeOf = (get, x0, x1, y0, y1) => {
+    const ws = []
+    for (let y = y0; y < y1; y++) {
+      let x = x0
+      while (x < x1) {
+        if (get(x, y) < 0.06) { x++; continue }
+        let j = x, peak = 0
+        while (j < x1 && get(j, y) >= 0.06) { peak = Math.max(peak, get(j, y)); j++ }
+        if (peak >= 0.5) {
+          const at = (level, from, step) => { let k = from; while (get(k, y) < level) k += step; const v0 = get(k - step, y); return k - step + step * (level - v0) / (get(k, y) - v0) }
+          ws.push(at(peak * 0.8, x, 1) - at(peak * 0.2, x, 1), at(peak * 0.2, j - 1, -1) - at(peak * 0.8, j - 1, -1))
+        }
+        x = j + 1
+      }
+    }
+    ws.sort((a, b) => a - b)
+    return ws[ws.length >> 1]
+  }
+  const lineEdge = edgeOf((x, y) => 1 - raster.data[(y * W + x) * 4] / 255, 50, 260, 70, 112)
+  const glyphEdge = edgeOf((x, y) => x < 0 || y < 0 || x >= g.w || y >= g.h ? 0 : 1 - g.t[(y * g.w + x) * 3] / 255, 1, g.w - 1, 1, g.h - 1)
+  assert.ok(Math.abs(glyphEdge - lineEdge) <= 0.6, `the X's edges ${glyphEdge.toFixed(2)} px, the line's ${lineEdge.toFixed(2)} px`)
 })
 
 test('a large bold title on white paper is edited without grey halos: its thick strokes are ink, not paper', () => {

@@ -545,6 +545,76 @@ export function cellRegion(li: LineInk, k: number, pageW: number, erase?: { dark
 /** Why the last line analysis returned null — for the lab. */
 let failedBecause = ''
 export function lastLineFailure(): string { return failedBecause }
+
+/**
+ * The 20–80% widths of the stroke edges along the rows of a box: for every
+ * run of darkness a row crosses, its rise and its fall, each measured between
+ * the points where it reaches a fifth and four fifths of the run's OWN peak —
+ * so a grey line and a black one are measured alike. A run must peak at
+ * `minPeak` and be 2 px wide at half its peak (a stem, not a hairline); an
+ * edge wider than `maxW` is a gradient, not an edge.
+ */
+export function strokeEdgeWidths(get: (x: number, y: number) => number, x0: number, x1: number, y0: number, y1: number, minPeak: number, maxW: number): number[] {
+  const out: number[] = []
+  const n = x1 - x0
+  if (n < 3) return out
+  const v = new Float32Array(n)
+  const crossUp = (from: number, to: number, level: number) => {
+    let k = from
+    while (k < to && v[k] < level) k++
+    const vp = k > 0 ? v[k - 1] : 0
+    return k - 1 + (v[k] - vp > 1e-6 ? (level - vp) / (v[k] - vp) : 1)
+  }
+  const crossDown = (from: number, to: number, level: number) => {
+    let k = from
+    while (k > to && v[k] < level) k--
+    const vn = k < n - 1 ? v[k + 1] : 0
+    return k + 1 - (v[k] - vn > 1e-6 ? (level - vn) / (v[k] - vn) : 1)
+  }
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) v[x - x0] = get(x, y)
+    let i = 1
+    while (i < n - 1) {
+      if (v[i] < 0.06) { i++; continue }
+      let j = i, peak = 0, pk = i
+      while (j < n && v[j] >= 0.06) { if (v[j] > peak) { peak = v[j]; pk = j } j++ }
+      if (peak >= minPeak && j < n) {
+        let a = i, b = j - 1
+        while (a < pk && v[a] < peak / 2) a++
+        while (b > pk && v[b] < peak / 2) b--
+        if (b - a + 1 >= 2) {
+          const up = crossUp(i, pk, peak * 0.8) - crossUp(i, pk, peak * 0.2)
+          const down = crossDown(j - 1, pk, peak * 0.2) - crossDown(j - 1, pk, peak * 0.8)
+          if (up > 0 && up <= maxW) out.push(up)
+          if (down > 0 && down <= maxW) out.push(down)
+        }
+      }
+      i = j + 1
+    }
+  }
+  return out
+}
+
+/**
+ * How soft the line prints: the median 20–80% width of its letters' stroke
+ * edges, px. Null when its letters give too few edges to say.
+ */
+export function edgeWidthOf(pi: PageInk, li: LineInk): number | null {
+  const s = pi.s
+  const ws: number[] = []
+  const minPeak = Math.max(0.25, li.coreDark * 0.7)
+  for (const c of li.cells) {
+    if (!c || c.suspect || c.approx || !/[\p{L}\p{N}]/u.test(c.char)) continue
+    let y0 = Infinity, y1 = -Infinity
+    for (const p of c.pix) { const y = (p - (p % s.w)) / s.w; if (y < y0) y0 = y; if (y > y1) y1 = y }
+    if (!(y1 > y0)) continue
+    const x0 = Math.max(0, c.x0 - 3), x1 = Math.min(s.w, c.x1 + 3)
+    for (const w of strokeEdgeWidths((x, y) => pi.dark[y * s.w + x] / 255, x0, x1, y0, y1 + 1, minPeak, li.fit.emPx * 0.25)) ws.push(w)
+  }
+  if (ws.length < 12) return null
+  ws.sort((a, b) => a - b)
+  return ws[ws.length >> 1]
+}
 /** The last analysis's fragmentation measure — for the lab. */
 let fragDebug: unknown = null
 export function lastFragTest(): unknown { const v = fragDebug; fragDebug = null; return v }
