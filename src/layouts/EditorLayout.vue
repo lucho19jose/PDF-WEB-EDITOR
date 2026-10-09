@@ -1869,6 +1869,18 @@ const assistant = createAssistant({
 })
 provide('assistant', assistant)
 ;(window as any).__pdfHooks.assistant = assistant
+/**
+ * The OCR controls own the properties while a recognised page is on screen —
+ * THIS page. Keyed on `layerVisible` alone it kept them on every page of the
+ * document once any one page had been recognised, text pages included.
+ * (It lived in the old main tool bar, which the Acrobat shell replaced.)
+ */
+watch(
+  () => [ocrStore.layerVisible, docStore.currentPage, ocrStore.pages] as const,
+  ([visible, page]) => { editorStore.ocrMode = visible && ocrStore.itemsFor(page - 1).length > 0 },
+  { immediate: true }
+)
+
 // ===== THE ACROBAT SHELL =====
 const acroCommands = useAcroCommands({
   pdfEngine, syncAfterEdit, pushUndo, forgetOcr, loadBytes, flushOpenEditor, bakeOcrEdits

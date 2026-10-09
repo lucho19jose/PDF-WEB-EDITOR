@@ -58,14 +58,41 @@ npm run preview    # Preview production build
 
 ```
 App.vue
-└── EditorLayout.vue (q-layout)
-    ├── MainToolbar.vue (q-header)
-    ├── PageThumbnails.vue (q-drawer left)
-    ├── EditorPage.vue (q-page-container) — provides pdfViewer + pdfEngine
-    │   └── PDFViewer.vue (canvas rendering)
-    │       └── TextBlockOverlay.vue (clickable text blocks + inline editor)
+└── EditorLayout.vue (q-layout) — provides pdfViewer, pdfEngine, acroShell, pickFiles
+    ├── q-header: AcroMenuBar · AcroTabBar · AcroToolbar · AcroToolOptions (open tool's bar)
+    ├── EditorPage.vue (q-page-container)
+    │   ├── HomeView (Inicio) / ToolsView (Herramientas)
+    │   └── workspace: AcroLeftPane · PDFViewer or OrganizePages · AcroRightPane · AcroToolRail
+    │       └── PDFViewer.vue → TextBlockOverlay · AnnotationLayer · OcrTextLayer · SearchHighlights
+    ├── AcroDialogs (header/footer, watermark, crop, protect, export, combine, …)
     └── StatusBar.vue (q-footer)
 ```
+
+### The Acrobat shell
+The UI copies Acrobat DC's dark theme (colours sampled from it, in
+`src/css/acrobat.scss`). An Acrobat TOOL (Editar PDF, Organizar páginas,
+Comentar…) lives in `useUiStore().activeTool` and selects a set of editor
+tools and panels; the editor store's `currentTool` is still what the editing
+layers read. `acroShell.ts` is the switchboard every control calls
+(`openTool`, zoom, save, close); `useAcroCommands.ts` holds the new document
+commands, each run the way every edit is (op queue → undo point on success →
+`forgetOcr` when the page structure changed → one save→reload). Their engine
+side is ONE worker message, `acro`, dispatched in `worker/acroTools.ts`;
+`node tools/acro/acro-smoke.mjs` drives all of it through the real worker.
+
+- **Header/footer, watermark and background are tagged marked content**
+  (`/AcroHeaderFooter BMC … EMC`, etc.), so Update/Remove find and replace
+  them instead of stacking copies. A watermark's text is also recorded on the
+  page (`/AcroWatermarkText`) and `filterWatermark` drops its fragments from
+  extraction: it is an artifact, never offered as editable text.
+- **Protection is applied to the written file only** (`saveProtected`,
+  AES-256); the engine keeps the plain document. A protected file is opened
+  by asking for its password and unlocking it (`unlock`).
+- **Quasar's responsive classes bite**: `.xs .sm .md .lg .xl` hide an element
+  outside that breakpoint. A button styled `class="acro-pill sm"` simply never
+  appeared — use `pill-sm`.
+- **A dialog closes itself only while it is still the open one** (`closeIf`):
+  the previous dialog's hide event lands after the next one was asked for.
 
 ### Ask where to save BEFORE saving, not after
 Both ways of writing a file out — `showSaveFilePicker` and a programmatic

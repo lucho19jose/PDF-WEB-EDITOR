@@ -56,6 +56,32 @@
         </template>
       </section>
 
+      <!-- Agregar imagen: where the next picture goes and how wide it is. -->
+      <section v-if="editorStore.currentTool === 'image'">
+        <h6>Imagen</h6>
+        <div class="row-line">
+          <span class="lbl">Colocar</span>
+          <select v-model="editorStore.imagePlacement" class="acro-input grow">
+            <option value="below">Debajo de la línea</option>
+            <option value="above">Encima de la línea</option>
+          </select>
+        </div>
+        <div class="row-line">
+          <span class="lbl">Ajuste</span>
+          <select v-model="editorStore.imageWrap" class="acro-input grow">
+            <option value="inline">En línea con el texto</option>
+            <option value="front">Delante del texto</option>
+            <option value="behind">Detrás del texto</option>
+          </select>
+        </div>
+        <div class="row-line">
+          <span class="lbl">Ancho</span>
+          <input v-model.number="editorStore.imageWidthPct" type="range" min="10" max="100" step="5" class="grow" />
+          <span class="lbl">{{ editorStore.imageWidthPct }}%</span>
+        </div>
+        <div class="faint">Haga clic en una línea de la página para colocar la imagen.</div>
+      </section>
+
       <section>
         <h6>Objetos</h6>
         <div class="row-line">
@@ -305,6 +331,7 @@ h6 { margin: 8px 0 12px; font-size: 12px; font-weight: 700; letter-spacing: 0.02
 .link-btn.plain { color: #e6e6e6; margin-bottom: 10px; display: flex; }
 .link-btn.danger { color: #ff8a8a; margin-left: 12px; }
 .small-gap { font-size: 12px; color: #c8c8c8; }
+.lbl { font-size: 12px; color: #c8c8c8; min-width: 48px; }
 
 .comments-head { display: flex; align-items: center; font-weight: 700; font-size: 14px; padding: 6px 0 8px; }
 .search { width: 100%; height: 28px; margin-bottom: 10px; }

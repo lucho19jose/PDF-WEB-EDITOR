@@ -139,3 +139,12 @@ select.acro-input option { background: #3a3a3a; color: #eee; }
 /* Bounding boxes ("Mostrar cuadros delimitadores") while editing. */
 .acro-bboxes .text-block { outline: 1px solid rgba(70, 140, 220, 0.55); outline-offset: 0; }
 .acro-bboxes .cimg-hit { outline: 1px solid rgba(70, 140, 220, 0.55); }
+
+/* Quasar's plugin dialogs (confirmations, the password prompt) in Acrobat's dress. */
+.q-dialog-plugin { border-radius: 4px; font-family: var(--acro-font); }
+.q-dialog-plugin .q-card__actions .q-btn {
+  border-radius: 16px; text-transform: none; font-weight: 700; padding: 0 14px; min-height: 32px;
+}
+.q-dialog-plugin .q-card__actions .q-btn--flat { color: #e8e8e8 !important; border: 2px solid #d0d0d0; }
+.q-dialog-plugin .q-card__actions .q-btn--unelevated, .q-dialog-plugin .q-card__actions .q-btn--standard { background: var(--acro-blue) !important; color: #fff !important; }
+.q-dialog-plugin .q-radio__inner, .q-dialog-plugin .q-field--focused .q-field__control { color: var(--acro-blue) !important; }

@@ -36,9 +36,9 @@
               <label class="acro-field">Texto del pie de página derecho<textarea v-model="hf.fr" class="acro-input ta" @focus="hfFocus = 'fr'" /></label>
             </div>
             <div class="inline actions-row">
-              <button class="acro-pill outline sm" @click="hfInsert('<<1>>')">Insertar número de página</button>
-              <button class="acro-pill outline sm" @click="hfInsert('Página <<1>> de <<n>>')">Página X de N</button>
-              <button class="acro-pill outline sm" @click="hfInsert('<<fecha>>')">Insertar fecha</button>
+              <button class="acro-pill outline pill-sm" @click="hfInsert('<<1>>')">Insertar número de página</button>
+              <button class="acro-pill outline pill-sm" @click="hfInsert('Página <<1>> de <<n>>')">Página X de N</button>
+              <button class="acro-pill outline pill-sm" @click="hfInsert('<<fecha>>')">Insertar fecha</button>
               <label class="acro-field">Iniciar en <input v-model.number="hf.start" type="number" min="1" class="acro-input num" /></label>
             </div>
             <PageRangePicker v-model="hf.pages" subset />
@@ -149,7 +149,7 @@
             <label class="acro-field">Izquierda <input v-model.number="crop.left" type="number" step="0.1" min="0" class="acro-input num" /></label>
             <label class="acro-field">Derecha <input v-model.number="crop.right" type="number" step="0.1" min="0" class="acro-input num" /></label>
           </div>
-          <button class="acro-pill outline sm q-mt-sm" @click="crop.top = crop.bottom = crop.left = crop.right = 0">Restablecer a 0 (quitar el recorte)</button>
+          <button class="acro-pill outline pill-sm q-mt-sm" @click="crop.top = crop.bottom = crop.left = crop.right = 0">Restablecer a 0 (quitar el recorte)</button>
         </fieldset>
         <PageRangePicker v-model="crop.pages" :initial="crop.initial" />
       </div>
@@ -224,7 +224,7 @@
           <div class="pr"><span>Seguridad:</span>{{ ui.protection ? 'Contraseña al guardar (AES-256)' : meta.encryption && meta.encryption !== 'None' ? meta.encryption : 'Sin seguridad' }}</div>
           <div class="pr"><span>Firmas digitales:</span>{{ docStore.signatures.length || 'Ninguna' }}</div>
         </div>
-        <button class="acro-pill outline sm q-mt-md" @click="meta.Title = meta.Author = meta.Subject = meta.Keywords = ''">
+        <button class="acro-pill outline pill-sm q-mt-md" @click="meta.Title = meta.Author = meta.Subject = meta.Keywords = ''">
           Quitar información oculta (título, autor, asunto y palabras clave)
         </button>
       </div>
@@ -241,7 +241,7 @@
       <div class="acro-card-title">Combinar archivos</div>
       <div class="acro-card-body">
         <div class="inline">
-          <button class="acro-pill primary sm" @click="addCombineFiles"><q-icon name="add" size="16px" /> Agregar archivos</button>
+          <button class="acro-pill primary pill-sm" @click="addCombineFiles"><q-icon name="add" size="16px" /> Agregar archivos</button>
           <label v-if="docStore.loaded" class="acro-check"><input v-model="combineWithOpen" type="checkbox" /> Incluir el documento abierto ({{ docStore.fileName }})</label>
         </div>
         <div class="combine-list" @dragover.prevent @drop.prevent="dropCombine">
@@ -872,7 +872,7 @@ watch(() => ui.dialog, async d => {
 .ta { height: 44px; padding: 4px 6px; resize: vertical; font-family: inherit; }
 .hf-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }
 .actions-row { margin-bottom: 12px; }
-.acro-pill.sm { height: 26px; font-size: 12px; padding: 0 12px; font-weight: 600; }
+.acro-pill.pill-sm { height: 26px; font-size: 12px; padding: 0 12px; font-weight: 600; }
 .crop-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
 .perm-grid { display: grid; grid-template-columns: 1fr; gap: 6px; margin-top: 10px; }
 .note { color: #a8a8a8; font-size: 12px; line-height: 1.5; }
