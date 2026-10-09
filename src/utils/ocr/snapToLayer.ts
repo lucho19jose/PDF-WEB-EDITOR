@@ -44,6 +44,44 @@ export function snapItemsToTextLayer(items: OcrTextItem[], blocks: TextBlock[]):
   return { items: out, snapped }
 }
 
+/**
+ * Runs the recogniser read off the page's REAL, visible text are dropped.
+ *
+ * The OCR raster is a render of the whole page, so it holds every word the
+ * page draws as text as well as the scan's: a signed scan's "Intellisign ID…"
+ * strip (real Helvetica, stamped once per signing pass, two IDs over each
+ * other) came back as a run "Ihtteli ggm1D:1962…". Editing that run paints
+ * paper over real text and draws a guess on top — while the words stay in the
+ * file for every extractor and the text tool still offers the block. Real
+ * text is edited as text. A run counts as read off it when most of its ink
+ * (60%, sampled on a grid) lies inside visible blocks; invisible blocks (a
+ * searchable layer, which the recogniser's runs are meant to stand for) do
+ * not count.
+ */
+export function dropRunsOnVisibleText(items: OcrTextItem[], blocks: TextBlock[]): { items: OcrTextItem[]; dropped: number } {
+  const visible = blocks.filter(b => !b.invisible && b.text.trim())
+  if (!items.length || !visible.length) return { items, dropped: 0 }
+  const boxes = visible.map(b => [
+    Math.min(b.bbox[0], b.bbox[2]), Math.min(b.bbox[1], b.bbox[3]),
+    Math.max(b.bbox[0], b.bbox[2]), Math.max(b.bbox[1], b.bbox[3])
+  ])
+  const NX = 24, NY = 6
+  const kept = items.filter(item => {
+    const r = item.inkRect ?? item.rect
+    if (!(r.width > 0) || !(r.height > 0)) return true
+    let inside = 0
+    for (let j = 0; j < NY; j++) {
+      const y = r.y + (j + 0.5) * r.height / NY
+      for (let i = 0; i < NX; i++) {
+        const x = r.x + (i + 0.5) * r.width / NX
+        if (boxes.some(([x0, y0, x1, y1]) => x >= x0 && x <= x1 && y >= y0 && y <= y1)) inside++
+      }
+    }
+    return inside < 0.6 * NX * NY
+  })
+  return { items: kept, dropped: items.length - kept.length }
+}
+
 const fold = (s: string) => s.normalize('NFC').toLowerCase()
 const noSpace = (s: string) => s.replace(/\s+/g, '')
 

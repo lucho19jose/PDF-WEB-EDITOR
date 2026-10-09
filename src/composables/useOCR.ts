@@ -12,6 +12,7 @@ import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces,
 import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance, type GlyphCutResult } from '@/utils/ocr/glyphCut'
 import { toSpanCut, sizeOf, type SpanCut } from '@/utils/ocr/partialRedraw'
 import { useOcrStore } from '@/stores/ocr'
+import { STAMP_TEXT_COVERAGE } from '@/utils/textCoverage'
 
 /**
  * Recognising the text in a scanned page.
@@ -39,7 +40,7 @@ const PDF_DPI = 72
  */
 const SCANNED_TEXT_THRESHOLD = 12
 /** Text covering less of the paper than this is a stamp or a footer, not a text page. */
-const SCANNED_TEXT_COVERAGE = 0.02
+const SCANNED_TEXT_COVERAGE = STAMP_TEXT_COVERAGE
 
 /**
  * The tallest symbol box of a line WITH descenders, as a fraction of the em.

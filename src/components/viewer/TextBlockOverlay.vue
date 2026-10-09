@@ -113,6 +113,7 @@ import { useOcrStore } from '@/stores/ocr'
 import { enqueueOp } from '@/utils/opQueue'
 import { groupIntoRows, resolveCollisions, planReflow, planPushDown, type Rect } from '@/utils/layoutCollision'
 import { hexToRgb01, rgb01ToHex } from '@/utils/color'
+import { textCoverage, areaOnPaper, STAMP_TEXT_COVERAGE } from '@/utils/textCoverage'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
 import type { TextBlock, TextChar, BlockTransformOp, BlockStyleOp } from '@/engine/types'
 
@@ -518,6 +519,22 @@ const addTextEditorStyle = computed(() => ({
 const pageRotated = ref(false)
 /** The page carries invisible (searchable-layer) text that was filtered out of `blocks`. */
 const hiddenLayer = ref(false)
+/** The page is a picture of a document (the layout's coverage verdict), whatever stamp text it carries. */
+const scanLike = ref(false)
+
+/**
+ * Whether a page's visible text is only a STAMP over a picture that fills the
+ * paper — a signed scan. Under the stamp bar of coverage (`textCoverage`, the
+ * measure the scan verdict uses), with one content image covering 85% of the
+ * paper or more: a full-page scan leaves no margin, a document's photo does,
+ * and a photo page keeps its photo as an object to move.
+ */
+async function isStampOverPicture(pageIndex: number, data: TextBlock[], size: { width: number; height: number } | null): Promise<boolean> {
+  if (!size || !data.length || textCoverage(data, size) >= STAMP_TEXT_COVERAGE) return false
+  const paper = Math.max(1, size.width * size.height)
+  const images = await pdfEngine.listContentImages(pageIndex)
+  return images.some(img => areaOnPaper(img.rect, size) >= paper * 0.85)
+}
 
 /**
  * @param announce say how many blocks were found.
@@ -566,13 +583,34 @@ async function loadBlocks(announce = false) {
     }
     // A page with nothing to edit may be a picture of a document. Say so, and
     // say what to do — "0 text blocks found" reads as a dead end.
-    if ((data.length === 0 || hiddenLayer.value) && editorStore.currentTool === 'edit' && ocrController) {
+    //
+    // A page whose only text is a STAMP over a full-page picture is one too:
+    // a signing service stamps every page of a signed scan with its ID strip,
+    // as real text, once per signing pass. With that one visible block the
+    // verdict was never asked, so on the YOFC delivery note a click on the
+    // photographed title selected the whole scan as an image ("drag to move
+    // it") and recognition never started. The scan verdict judges text by
+    // COVERAGE and caches per page, and the annotation layer reads the same
+    // cached verdict to make the scan paper in every tool — so it is asked
+    // only where a stamp sits on a picture that fills the page: a document
+    // page whose photo leaves margins keeps its photo as an object.
+    scanLike.value = false
+    if (ocrController && (data.length === 0 || hiddenLayer.value || await isStampOverPicture(pageIndex, data, size))) {
       const isScan = await ocrController.isScanLike(pageIndex)
-      if (isScan && pageIndex === docStore.currentPage - 1) {
+      if (pageIndex !== docStore.currentPage - 1) return
+      scanLike.value = isScan
+      if (isScan && editorStore.currentTool === 'edit') {
         editorStore.setStatus(ocrStore.itemsFor(pageIndex).length > 0
           ? 'Scanned page: click a recognised line to edit it'
           : 'This page is a scan — click on the text to recognise it')
       }
+    } else if (editorStore.currentTool === 'edit' && data.length > 0 && size && !hiddenLayer.value &&
+               textCoverage(data, size) < STAMP_TEXT_COVERAGE && ocrStore.itemsFor(pageIndex).length === 0) {
+      // Only a stamp is text here and no picture fills the page: the words
+      // the reader sees are drawn as SHAPES (two pages of the YOFC request
+      // print their table as 9 MB of outlined glyphs). A click has nothing to
+      // open, and nothing said why.
+      editorStore.setStatus('Little of this page is text — if the words you see are drawn as shapes or pictures, use Detectar texto (OCR) to make them editable')
     }
   } catch (err: any) {
     console.error('Failed to load text blocks:', err)
@@ -2089,7 +2127,7 @@ function onMarqueeEnd() {
   // is the request: recognise it and open the line under the pointer.
   if (!dragged) {
     if (!m.additive) { clearSelection(); emit('bandCleared') }
-    if (editorStore.currentTool === 'edit' && (blocks.value.length === 0 || hiddenLayer.value) && ocrController && !ocrController.busy.value) {
+    if (editorStore.currentTool === 'edit' && (blocks.value.length === 0 || hiddenLayer.value || scanLike.value) && ocrController && !ocrController.busy.value) {
       const pageIndex = docStore.currentPage - 1
       if (ocrStore.itemsFor(pageIndex).length === 0) {
         ocrController.isScanLike(pageIndex).then(isScan => {

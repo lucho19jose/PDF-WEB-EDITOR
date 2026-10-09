@@ -380,7 +380,14 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   const padTop = Math.max(1, ink.height * 0.12, (halo?.top ?? 0) + 0.5)
   const padBottom = Math.max(1, ink.height * 0.12, (halo?.bottom ?? 0) + 0.5)
   const padX = Math.max(1, ink.height * 0.15)
-  const padHead = prefix > 0 ? Math.min(1, Math.max(0.4, gapBefore / 2)) : padX
+  // The pad is held inside the gap the scan really has between the kept head
+  // and the first REPLACED letter, never the gap the new text will have.
+  // Deleting the U of "PERU S.A.C." puts a word gap after "PER" (4.4pt, so a
+  // 1pt pad) while R and U sat 0.8pt apart: the patch began inside the U and
+  // its left stem stayed on the page as a grey bar after "PER".
+  const padHead = prefix > 0
+    ? Math.min(Math.min(1, Math.max(0.4, gapBefore / 2)), oldSpan ? Math.max(0, (oldSpan.x0 - headEnd) / 2) : Infinity)
+    : padX
   const patchX0 = prefix > 0 ? headEnd + padHead : ink.x - padX
 
   // The words the scan keeps drawing are put back into the page as INVISIBLE
@@ -452,7 +459,9 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
 
   const newTail0 = (st.text.length ? inkEnd : headEnd) + gapAfter
   const dx = newTail0 - tailStart
-  const padTail = Math.min(1, Math.max(0.4, gapAfter / 2))
+  // Same rule at the tail: never past halfway into the gap the scan has
+  // between the last replaced letter and the kept tail.
+  const padTail = Math.min(Math.min(1, Math.max(0.4, gapAfter / 2)), oldSpan ? Math.max(0, (tailStart - oldSpan.x1) / 2) : Infinity)
   // Fits when the tail keeps at least 40% of the gap before it (a word gap
   // closing from 6.5pt to 4 is invisible; a letter gap of 1.6pt yields a
   // pixel), or opens by up to a space's worth — BETWEEN words. Inside a word
@@ -488,7 +497,7 @@ export function planPartial(item: OcrTextItem, ctx: PartialContext, all: OcrText
   return {
     mode: 'partial+shift',
     patches: [{ rect: [patchX0, ink.y - padTop, Math.max(inkRight, inkRight + dx) + padX, ink.y + ink.height + padBottom], color: plain(item.background), item: item.id }],
-    images: [{ srcRect: src, dstRect: dst }],
+    images: [{ srcRect: src, dstRect: dst, inkX0: tailStart, paper: plain(item.background) }],
     texts: textOp(dx)
   }
 }

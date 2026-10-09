@@ -79,6 +79,9 @@ export interface TextOp {
 export interface ImageOp {
   srcRect: RectT
   dstRect: RectT
+  /** Where the moved words' own ink starts (page x): anything left of it in the crop is a neighbour's, and is painted `paper`. */
+  inkX0?: number
+  paper?: [number, number, number]
 }
 
 export interface OcrExportPlan {

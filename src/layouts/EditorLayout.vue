@@ -98,12 +98,13 @@ import { cropToPng } from '@/utils/ocr/pixelCrop'
 import { measureHalo } from '@/utils/ocr/ocrSampling'
 import { detectFace } from '@/utils/ocr/ocrFontDetect'
 import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
-import { snapItemsToTextLayer } from '@/utils/ocr/snapToLayer'
+import { snapItemsToTextLayer, dropRunsOnVisibleText } from '@/utils/ocr/snapToLayer'
 import type { RecognizeDocumentOptions, RecognizeProgress } from '@/components/dialogs/OcrRecognizeDialog.vue'
 import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
 import { getMuPDFBridge } from '@/engine/bridge'
 import { enqueueOp, settleTransactions, transactionOpen, beginTransaction } from '@/utils/opQueue'
+import { textCoverage, areaOnPaper } from '@/utils/textCoverage'
 import MainToolbar from '@/components/toolbar/MainToolbar.vue'
 import PageThumbnails from '@/components/sidebar/PageThumbnails.vue'
 import StatusBar from '@/components/common/StatusBar.vue'
@@ -215,19 +216,7 @@ async function textLayerOf(pageIndex: number): Promise<{ chars: number; coverage
     const blocks = (await pdfEngine.getTextBlocks(pageIndex)).filter(b => !b.invisible)
     const chars = blocks.reduce((n, b) => n + b.text.trim().length, 0)
     const size = await pdfEngine.getPageSize(pageIndex)
-    const G = 64
-    const grid = new Uint8Array(G * G)
-    for (const b of blocks) {
-      if (!b.text.trim()) continue
-      const x0 = Math.max(0, Math.floor(Math.min(b.bbox[0], b.bbox[2]) / size.width * G))
-      const x1 = Math.min(G - 1, Math.floor(Math.max(b.bbox[0], b.bbox[2]) / size.width * G))
-      const y0 = Math.max(0, Math.floor(Math.min(b.bbox[1], b.bbox[3]) / size.height * G))
-      const y1 = Math.min(G - 1, Math.floor(Math.max(b.bbox[1], b.bbox[3]) / size.height * G))
-      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) grid[y * G + x] = 1
-    }
-    let touched = 0
-    for (const v of grid) touched += v
-    return { chars, coverage: touched / (G * G) }
+    return { chars, coverage: textCoverage(blocks, size) }
   } catch (_) { return { chars: 0, coverage: 0 } }
 }
 
@@ -246,13 +235,7 @@ async function isScanLikePage(pageIndex: number): Promise<boolean> {
       // image hanging off the edge cannot count for more than it shows.
       const images = await pdfEngine.listContentImages(pageIndex)
       let covered = 0
-      for (const img of images) {
-        const x0 = Math.max(0, Math.min(img.rect[0], img.rect[2]))
-        const x1 = Math.min(size.width, Math.max(img.rect[0], img.rect[2]))
-        const y0 = Math.max(0, Math.min(img.rect[1], img.rect[3]))
-        const y1 = Math.min(size.height, Math.max(img.rect[1], img.rect[3]))
-        if (x1 > x0 && y1 > y0) covered += (x1 - x0) * (y1 - y0)
-      }
+      for (const img of images) covered += areaOnPaper(img.rect, size)
       verdict = covered >= paper * 0.5
     }
   } catch (_) { verdict = false }
@@ -372,7 +355,10 @@ async function runOcrNow(pageIndex: number, lang: string) {
     // for letter, the run takes the layer's spacing.
     if (result && result.items.length) {
       const blocks = await pdfEngine.getTextBlocks(pageIndex).catch(() => [])
-      result = { ...result, items: snapItemsToTextLayer(result.items, blocks).items }
+      // A run read off the page's own VISIBLE text (a signing service's ID
+      // strip over the scan) is that text read twice: it is edited as text.
+      const own = dropRunsOnVisibleText(result.items, blocks)
+      result = { ...result, items: snapItemsToTextLayer(own.items, blocks).items }
     }
   } finally {
     stopProgress()
@@ -504,8 +490,17 @@ async function applyOcrLiveNow(pageIndex: number) {
       await enqueueOp(() => pdfEngine.setPageContent(pageIndex, p.bytes, { xobjects: p.xobjects, fonts: p.fonts }))
     }
     const edits = ocrStore.itemsFor(pageIndex).some(i => (i.edited || i.removed) && !i.baked)
-    if (edits) await bakeOcrEdits({ live: true, pages: [pageIndex] })
-    else { docStore.markModified(); await syncAfterEdit() }
+    try {
+      if (edits) await bakeOcrEdits({ live: true, pages: [pageIndex] })
+      else { docStore.markModified(); await syncAfterEdit() }
+    } catch (err) {
+      // A bake that failed half way has written part of an edit into the
+      // engine's copy (a patch without its words, words without their patch),
+      // and the next save would keep it. The page goes back to what it showed
+      // before this bake; the runs stay unapplied and the status says why.
+      await enqueueOp(() => pdfEngine.setPageContent(pageIndex, cur.bytes, { xobjects: cur.xobjects, fonts: cur.fonts })).catch(() => {})
+      throw err
+    }
     const after = await enqueueOp(() => pdfEngine.getPageContent(pageIndex))
     st.hash = fnv1a(after.bytes)
     appliedMeta = captureOcrMeta()
@@ -698,7 +693,9 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
       const k = canvas ? canvas.width / page.pageWidth : 0
       for (const img of plan.images) {
         const [x0, y0, x1, y1] = img.srcRect
-        crops.push(canvas ? await cropToPng(canvas, { x: x0 * k, y: y0 * k, width: (x1 - x0) * k, height: (y1 - y0) * k }) : null)
+        // A pixel short of the first letter's ink, so its own fringe stays.
+        const clearLeft = img.inkX0 !== undefined ? (img.inkX0 - x0) * k - 1 : 0
+        crops.push(canvas ? await cropToPng(canvas, { x: x0 * k, y: y0 * k, width: (x1 - x0) * k, height: (y1 - y0) * k }, { clearLeft, paper: img.paper }) : null)
       }
     }
 
@@ -717,13 +714,22 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
       // Into the content stream, not as an annotation: annotations paint over
       // page content whatever order they were made in, so a patch drawn as one
       // covered the replacement text and it came out with its start missing.
+      //
+      // Every write is CHECKED. The engine answers a failure with `false`,
+      // not an exception, and the bake went on: a shifted tail drawn over a
+      // patch that never landed is the old tail AND the new one —
+      // "YOFC S.A.C.S.A.C." for "YOFC PERU S.A.C." with "PERU" deleted — and
+      // a patch whose tail pixels could not be read erased the tail for good.
+      // A half-drawn edit is worse than none; the caller restores the page.
+      const failed = (what: string) => new Error(`${what}${pdfEngine.error.value ? `: ${pdfEngine.error.value}` : ''}`)
       for (const patch of plan.patches) {
         if (patch.paint === false) continue
-        await pdfEngine.fillRect(pageIndex, patch.rect, patch.color)
+        if (!(await pdfEngine.fillRect(pageIndex, patch.rect, patch.color))) throw failed('the paper patch could not be drawn')
       }
       for (const [i, img] of plan.images.entries()) {
         const png = crops[i]
-        if (png) await pdfEngine.drawImageInContent(pageIndex, img.dstRect, png, false)
+        if (!png) throw new Error('the scan pixels of the words that move could not be read')
+        if (!(await pdfEngine.drawImageInContent(pageIndex, img.dstRect, png, false))) throw failed('the moved words could not be drawn')
       }
       // Ops of one GROUP — a partial redraw's invisible head, visible stretch
       // and invisible tail — go into one text object, or MuPDF lists the
@@ -734,14 +740,17 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
         while (t.group && j < plan.texts.length && plan.texts[j].group === t.group) j++
         const run = plan.texts.slice(i, j)
         // addText takes a bottom-left origin baseline; OCR works top-left.
+        let drawn: boolean
         if (run.length > 1) {
-          await pdfEngine.addTextRun(pageIndex, run.map(o => ({
+          drawn = await pdfEngine.addTextRun(pageIndex, run.map(o => ({
             x: o.x, y: page.pageHeight - o.y, text: o.text, fontSize: o.fontSize, fontName: o.fontName,
             color: o.color, faceId: o.faceId, invisible: o.invisible, fitWidth: o.fitWidth, strokeWidth: o.strokeWidth, faceSkip: o.faceSkip, tracedStrokeWidth: o.tracedStrokeWidth
           })), t.rotation)
         } else {
-          await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible, t.strokeWidth, t.faceSkip, t.tracedStrokeWidth)
+          drawn = await pdfEngine.addText(pageIndex, t.x, page.pageHeight - t.y, t.text, t.fontSize, t.fontName, t.color, t.rotation, t.faceId, t.invisible, t.strokeWidth, t.faceSkip, t.tracedStrokeWidth)
         }
+        // Patched paper with no words on it is a deletion nobody asked for.
+        if (!drawn && run.some(o => !o.invisible)) throw failed(`"${run.filter(o => !o.invisible).map(o => o.text).join(' ').slice(0, 40)}" could not be written`)
         for (const o of run) if (!o.invisible) written++
         i = j
       }
