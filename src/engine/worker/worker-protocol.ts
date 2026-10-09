@@ -88,6 +88,8 @@ export type WorkerRequest =
   | { id: number; type: 'renderPixmap'; data: { pageIndex: number; scale: number } }
   /** The document's digital signatures (/Sig fields), read but not verified. */
   | { id: number; type: 'getSignatures' }
+  /** The Acrobat-style document tools (acroTools.ts), addressed by operation name. */
+  | { id: number; type: 'acro'; data: { op: string; args?: any } }
   | { id: number; type: 'destroy' }
 
 // Messages from worker -> main thread

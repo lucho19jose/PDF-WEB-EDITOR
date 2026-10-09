@@ -3,6 +3,7 @@
 import type { WorkerRequest, WorkerResponse } from './worker-protocol'
 import { glyphNameToUnicode } from './glyphNames'
 import { readPkcs7Signer } from './pkcs7Signer'
+import { createAcroTools } from './acroTools'
 import * as opentype from 'opentype.js'
 // opentype.js is CJS: the browser bundle gives the namespace itself, the
 // SSR loader (tools/pdf-sweep/node-harness.mjs) wraps it under `default`.
@@ -481,6 +482,18 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      // The Acrobat-style tools (organize, crop, header/footer, watermark,
+      // redact, links, protect, export, create) — see acroTools.ts.
+      case 'acro': {
+        const needsDoc = !['createPdf', 'needsPassword', 'unlock'].includes(req.data.op)
+        if (needsDoc && !pdfDoc) throw new Error('No document loaded')
+        if (!mupdf) throw new Error('MuPDF not initialized')
+        const { data, transfer } = acroTools(req.data.op, req.data.args ?? {})
+        if (transfer?.length) self.postMessage({ id: req.id, type: 'success', data }, transfer as any)
+        else respond({ id: req.id, type: 'success', data })
+        break
+      }
+
       case 'destroy': {
         if (pdfDoc) {
           pdfDoc.destroy()
@@ -505,6 +518,28 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 }
 
 // Worker ready
+
+/** The Acrobat-style document tools, given the helpers every other edit uses. */
+const acroTools = createAcroTools({
+  mupdf: () => mupdf,
+  doc: () => pdfDoc,
+  readContentStream,
+  removeMarkedContent,
+  hasMarkedContent,
+  invalidateContentSources,
+  getPageSize,
+  rotatePage,
+  measureRunWidth: (text, fontSize, fontName) => measureRunWidth(text, fontSize, fontName),
+  addTextRunToPage: (pageIndex, parts, rotation, tag) => addTextRunToPage(pageIndex, parts, rotation, tag),
+  buildShowOps: (pageObj, text, fontSize, fontName) => buildShowOps(pageObj, text, fontSize, fontName),
+  pageRotationCtm,
+  matInvert,
+  matConcat,
+  getCtmAtOffset,
+  ownPageResources,
+  isNullObj,
+  fmtNum
+})
 
 // ==========================================
 // TEXT EXTRACTION

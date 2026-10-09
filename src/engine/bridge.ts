@@ -467,6 +467,15 @@ export class MuPDFBridge {
   }
 
   /**
+   * One of the Acrobat-style document tools (organize, crop, header/footer,
+   * watermark, redact, links, protect, export, create) — see acroTools.ts.
+   * Byte buffers in `transfer` move to the worker instead of being copied.
+   */
+  async acro<T = any>(op: string, args?: any, transfer?: Transferable[]): Promise<T> {
+    return this.send('acro', { op, args }, transfer)
+  }
+
+  /**
    * Destroy the loaded document and free WASM memory.
    */
   async destroy(): Promise<void> {

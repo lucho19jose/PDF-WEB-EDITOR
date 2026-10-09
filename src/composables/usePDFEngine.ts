@@ -1,5 +1,6 @@
 import { ref, readonly } from 'vue'
 import { getMuPDFBridge } from '@/engine/bridge'
+import { ACRO_MUTATING_OPS } from '@/engine/worker/acroTools'
 import type { TextRunPart } from '@/engine/worker/worker-protocol'
 import type { PageTextData, TextBlock, Quad, Pt, RectT, AnnotationInfo, SignatureInfo, ContentImageInfo, MarkupType, ShapeType, SearchHit, BlockTransformOp, BlockStyleOp, BlockTransformResult, ImageOrient, ImageAlign } from '@/engine/types'
 
@@ -520,6 +521,18 @@ export function usePDFEngine() {
     return r.success ? (r.pageCount ?? 0) : (error.value = r.error || 'move failed', false)
   }
 
+  /**
+   * The Acrobat-style document tools. A mutation clears the text cache, like
+   * every other page operation: page indices and content may have moved.
+   */
+  async function acro<T = any>(op: string, args?: any, transfer?: Transferable[]): Promise<T> {
+    const r = await bridge.acro<T>(op, args, transfer)
+    if (ACRO_MUTATING_OPS.has(op)) pageTextCache.clear()
+    const failed = r && typeof r === 'object' && (r as any).success === false
+    if (failed) error.value = (r as any).error || `${op} failed`
+    return r
+  }
+
   // ===== SEARCH =====
 
   async function searchPage(pageIndex: number, needle: string, maxHits?: number): Promise<SearchHit[]> {
@@ -615,6 +628,7 @@ export function usePDFEngine() {
     deletePage,
     duplicatePage,
     movePage,
+    acro,
     // search
     searchPage,
     searchDocument
