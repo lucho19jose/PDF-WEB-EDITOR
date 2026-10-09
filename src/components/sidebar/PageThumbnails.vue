@@ -23,9 +23,12 @@
 
     <q-scroll-area ref="scrollRef" class="col" @scroll="scheduleVisible">
       <div class="q-pa-sm">
+        <!-- Keyed by page alone: a key carrying the render version rebuilt every
+             thumbnail (a fresh, blank canvas) on each edit's reload. The
+             pictures stay until their replacements are drawn. -->
         <div
           v-for="page in docStore.totalPages"
-          :key="page + ':' + docStore.renderVersion"
+          :key="page"
           :ref="el => setItemRef(el, page)"
           class="thumb-item q-mb-sm"
           :class="{ active: page === docStore.currentPage, dragover: dragOverPage === page }"
@@ -49,11 +52,11 @@
 
 <script setup lang="ts">
 import { ref, inject, watch, nextTick, onBeforeUnmount } from 'vue'
-import * as pdfjsLib from 'pdfjs-dist'
-import { pdfjsDocumentOptions } from '@/composables/usePDFViewer'
+import type { usePDFViewer } from '@/composables/usePDFViewer'
 import { useDocumentStore } from '@/stores/document'
 
 const docStore = useDocumentStore()
+const pdfViewer = inject<ReturnType<typeof usePDFViewer> | null>('pdfViewer', null)
 const mergePdfFile = inject<(f: File) => void>('mergePdfFile', () => {})
 
 const mergePickRef = ref<HTMLInputElement | null>(null)
@@ -74,7 +77,6 @@ const canvases = new Map<number, HTMLCanvasElement>()
 const items = new Map<number, HTMLElement>()
 const scrollRef = ref<any>(null)
 const dragOverPage = ref<number | null>(null)
-let thumbDoc: pdfjsLib.PDFDocumentProxy | null = null
 let renderToken = 0
 
 function setCanvasRef(el: any, page: number) {
@@ -127,22 +129,33 @@ function revealCurrent() {
  */
 const painted = new Set<number>()
 
-async function ensureDoc(): Promise<any | null> {
-  if (thumbDoc) return thumbDoc
-  if (!docStore.pdfBytes) return null
-  const token = renderToken
-  const task = pdfjsLib.getDocument(pdfjsDocumentOptions(docStore.pdfBytes.slice()))
-  const doc = await task.promise
-  if (token !== renderToken) { await doc.destroy().catch(() => {}); return null }
-  thumbDoc = doc
-  return doc
+/**
+ * Thumbnails are drawn from the VIEWER's document, and never blanked.
+ *
+ * They used to parse a second copy of the file after every edit — the bytes
+ * copied, a second pdf.js document and worker — and to clear each visible
+ * thumbnail before its new picture was ready. On a 30 MB, 260-page fund
+ * request every scanned-page edit reloaded the document, so the panel spent
+ * its time parsing and showed white rectangles for as long as anyone kept
+ * editing; and a render left waiting on a destroyed document never settled,
+ * which held the busy flag for good. Now the viewer's own document is drawn
+ * (it is already parsed), each picture is rendered off screen and copied over
+ * only when complete, and every wait races `abandon`, which a document change
+ * wakes — a pass belongs to one document and lets go when it is replaced.
+ */
+function makeAbandon() {
+  let wake!: () => void
+  const promise = new Promise<null>(resolve => { wake = () => resolve(null) })
+  return { promise, wake }
 }
+let abandon = makeAbandon()
 
 /** Everything on screen is stale — the document changed under us. */
 async function renderThumbnails() {
   renderToken++
   painted.clear()
-  if (thumbDoc) { await thumbDoc.destroy().catch(() => {}); thumbDoc = null }
+  abandon.wake()
+  abandon = makeAbandon()
   await nextTick()
   scheduleVisible()
 }
@@ -162,12 +175,14 @@ function scheduleVisible() {
   settleTimer = setTimeout(() => { settleTimer = null; renderVisible() }, 300)
 }
 
-let visibleBusy = false
+/** The document a running pass belongs to; a pass for a newer one may start beside it. */
+let busyToken = -1
 async function renderVisible() {
-  if (visibleBusy) return
-  visibleBusy = true
+  const token = renderToken
+  if (busyToken === token) return
+  busyToken = token
+  const stop = abandon
   try {
-    const token = renderToken
     const wanted: number[] = []
     for (const [page, el] of items) {
       if (painted.has(page)) continue
@@ -176,27 +191,31 @@ async function renderVisible() {
       if (r.bottom > -window.innerHeight && r.top < window.innerHeight * 2) wanted.push(page)
     }
     if (!wanted.length) return
-    const doc = await ensureDoc()
-    if (!doc || token !== renderToken) return
 
     for (const p of wanted.sort((a, b) => a - b)) {
-      if (token !== renderToken) return
+      const doc = pdfViewer?.pdfDoc.value
+      if (!doc || token !== renderToken) return
       const canvas = canvases.get(p)
-      if (!canvas || painted.has(p)) continue
-      const pdfPage = await doc.getPage(p)
+      if (!canvas || painted.has(p) || p > doc.numPages) continue
+      const pdfPage = await Promise.race([doc.getPage(p), stop.promise])
+      if (!pdfPage || token !== renderToken) return
       const baseVp = pdfPage.getViewport({ scale: 1 })
-      const scale = 150 / baseVp.width
-      const vp = pdfPage.getViewport({ scale })
-      canvas.width = vp.width
-      canvas.height = vp.height
-      const ctx = canvas.getContext('2d')!
-      await pdfPage.render({ canvasContext: ctx, viewport: vp, canvas } as any).promise
+      const vp = pdfPage.getViewport({ scale: 150 / baseVp.width })
+      const off = document.createElement('canvas')
+      off.width = Math.max(1, Math.floor(vp.width))
+      off.height = Math.max(1, Math.floor(vp.height))
+      const task = pdfPage.render({ canvasContext: off.getContext('2d')!, viewport: vp, canvas: off } as any)
+      const done = await Promise.race([task.promise.then(() => true, () => false), stop.promise])
+      if (!done || token !== renderToken) { try { task.cancel() } catch (_) { /* gone */ } return }
+      canvas.width = off.width
+      canvas.height = off.height
+      canvas.getContext('2d')!.drawImage(off, 0, 0)
       painted.add(p)
     }
   } catch (err) {
     console.error('[Thumbnails] render error', err)
   } finally {
-    visibleBusy = false
+    if (busyToken === token) busyToken = -1
   }
 }
 
@@ -219,7 +238,7 @@ watch(() => docStore.renderVersion, renderThumbnails)
 watch(() => docStore.loaded, (l) => { if (l) renderThumbnails() })
 watch(() => docStore.totalPages, () => nextTick(renderThumbnails))
 
-onBeforeUnmount(() => { renderToken++; if (thumbDoc) thumbDoc.destroy().catch(() => {}) })
+onBeforeUnmount(() => { renderToken++; abandon.wake() })
 </script>
 
 <style scoped>

@@ -199,11 +199,15 @@ export function usePDFViewer() {
       if (!outcome || myGen !== docGeneration) { try { task.cancel() } catch (_) {} return }
       if (myToken !== renderToken) return // superseded during render
 
-      // Only now does the visible canvas change at all.
+      // Only now does the visible canvas change at all. It FILLS its page slot
+      // rather than carrying its own pixel size: the slot follows the zoom at
+      // once (points times the scale), and a page not painted again yet shows
+      // its last picture stretched into place instead of a small one in the
+      // corner of a white sheet.
       canvas.width = w
       canvas.height = h
-      canvas.style.width = `${viewport.width}px`
-      canvas.style.height = `${viewport.height}px`
+      canvas.style.width = '100%'
+      canvas.style.height = '100%'
       canvas.getContext('2d')!.drawImage(offscreen, 0, 0)
 
       return { viewport, width: viewport.width, height: viewport.height }
@@ -250,8 +254,42 @@ export function usePDFViewer() {
     return page.getViewport({ scale: docStore.scale })
   }
 
+  /**
+   * Every page's size in POINTS, rotation applied — the box pdf.js will paint.
+   *
+   * Continuous scroll lays every page out before it is painted, and a page whose
+   * slot is a guess changes size when it is finally drawn. On a compilation of
+   * Letter, A4, landscape and CAD sheets every such correction ABOVE the reader
+   * moved the page they were on, and the scroll detector then handed the tools
+   * to another page (an OCR click on page 5 came back to page 4). A `getPage`
+   * reads only the page dictionary, so all of them cost well under a second on a
+   * 260-page file, measured in the background after the first paint. Null when
+   * the document is reloaded under the measurement.
+   */
+  async function measurePages(): Promise<Map<number, { w: number; h: number }> | null> {
+    const doc = pdfDoc.value
+    if (!doc) return null
+    const myGen = docGeneration
+    const out = new Map<number, { w: number; h: number }>()
+    for (let n = 1; n <= doc.numPages; n++) {
+      if (myGen !== docGeneration || pdfDoc.value !== doc) return null
+      const reload = untilReload()
+      try {
+        const page = await Promise.race([doc.getPage(n), reload.promise])
+        if (!page || myGen !== docGeneration) return null
+        const vp = page.getViewport({ scale: 1 })
+        out.set(n, { w: vp.width, h: vp.height })
+      } catch (_) {
+        // A page pdf.js cannot open keeps its guessed size; painting corrects it.
+      } finally {
+        reload.done()
+      }
+    }
+    return out
+  }
+
   return {
     pdfDoc, isLoading, error,
-    loadDocument, reloadDocument, renderPage, renderPageToCanvas, getTextContent, getPageViewport
+    loadDocument, reloadDocument, renderPage, renderPageToCanvas, getTextContent, getPageViewport, measurePages
   }
 }

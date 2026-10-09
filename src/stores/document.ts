@@ -29,6 +29,14 @@ export const useDocumentStore = defineStore('document', () => {
    * already says — the status bar pairs the two.
    */
   const signatures = ref<SignatureInfo[]>([])
+  /**
+   * Bumped by every document OPENED (not by the reloads an edit makes). The
+   * viewer keys what it knows about pages — their sizes, which canvases hold a
+   * painting — on it: opening a second file while the first was loaded left
+   * `loaded` true, so nothing was cleared and every page the new file did not
+   * repaint at once kept the old file's size and pixels.
+   */
+  const openCount = ref(0)
 
   const fileSizeFormatted = computed(() => {
     if (!pdfBytes.value) return '0 KB'
@@ -49,6 +57,7 @@ export const useDocumentStore = defineStore('document', () => {
     // A new document invalidates every overlay's cached geometry even when
     // currentPage/tool don't change (e.g. opening a 2nd PDF while on page 1)
     renderVersion.value++
+    openCount.value++
   }
 
   function setSignatures(list: SignatureInfo[]) {
@@ -97,7 +106,7 @@ export const useDocumentStore = defineStore('document', () => {
   return {
     continuousScroll,
     loaded, fileName, totalPages, currentPage, scale,
-    isModified, pdfBytes, fileSizeFormatted, renderVersion, signatures,
+    isModified, pdfBytes, fileSizeFormatted, renderVersion, signatures, openCount,
     setDocument, reloadBytes, setPage, setScale, markModified, markSaved, reset, setSignatures
   }
 })

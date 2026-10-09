@@ -2,7 +2,7 @@
   <div
     ref="containerRef"
     class="pdf-viewer-container"
-    :style="{ overflow: 'auto', width: '100%', height: '100%' }"
+    :style="{ overflow: 'auto', width: '100%', height: '100%', overflowAnchor: 'none' }"
   >
     <div
       v-for="page in pageList"
@@ -195,30 +195,77 @@ function onObjectPicked() {
 }
 
 /**
- * Page sizes in CSS pixels, so a page that has not been painted yet still
- * occupies the right amount of the scroll bar.
+ * Each page's size in PDF POINTS — rotation applied, as pdf.js's viewport
+ * applies it — and the slot every page occupies is that size times the zoom.
  *
- * Measuring every page up front would mean one `getPage` per page before
- * anything appears, which on a long document is a visible stall for a number
- * that is the same on nearly every page. Page 1 is measured and stands in for
- * the rest; each page corrects its own entry as it is painted, so a document of
- * mixed sizes — a merged A4 into Letter — settles as the reader reaches it.
- */
-const sizes = ref(new Map<number, { w: number; h: number }>())
-const fallbackSize = ref({ w: 612, h: 792 })
-
-/**
- * Each page's size in PDF POINTS — scale divided out, and rotation already
- * applied by PDF.js's viewport.
- *
- * Kept separately from `sizes` (which is CSS pixels at whatever scale the page
- * was painted at) so that arriving on a page can hand the overlays a paper size
- * that does not depend on the zoom being unchanged since that page was drawn.
+ * The slots used to be kept in CSS PIXELS at whatever zoom each page happened
+ * to be painted at, with page 1's size standing in for every page not painted
+ * yet. Both moved the page being read. A page painted before a zoom kept its
+ * old size until it was painted again, and an unpainted A4 or landscape page
+ * in a Letter document changed size the moment it was drawn — each time ABOVE
+ * the reader, so the view slid and the scroll detector handed the tools to the
+ * page before (the YOFC compilation: Letter, A4, landscape and a 3931pt CAD
+ * sheet, where an OCR click on page 5 came back to page 4). Now every page is
+ * measured in the background once the document is open (`measurePages`, a
+ * `getPage` each, well under a second for 260 pages), slots follow the zoom
+ * all together, and what the reader is looking at is held in place whenever
+ * sizes change (`holdView`).
  */
 const pdfSizes = ref(new Map<number, { w: number; h: number }>())
+const fallbackPt = ref({ w: 612, h: 792 })
+
+function pointsOf(page: number): { w: number; h: number } {
+  return pdfSizes.value.get(page) ?? fallbackPt.value
+}
 
 function sizeOf(page: number): { w: number; h: number } {
-  return sizes.value.get(page) ?? fallbackSize.value
+  const pt = pointsOf(page)
+  return { w: pt.w * docStore.scale, h: pt.h * docStore.scale }
+}
+
+/**
+ * Change page sizes without moving what is on screen.
+ *
+ * The current page is the anchor: the share of it scrolled past the top of
+ * the viewer is the same before and after, so a size correction above it
+ * leaves the view where it was and a zoom keeps the same line at the top. The
+ * browser's own scroll anchoring is switched off on the container so the two
+ * do not both correct the same change.
+ */
+async function holdView(change: () => void | Promise<void>) {
+  const el = containerRef.value
+  const page = docStore.currentPage
+  const wrapper = wrappers.get(page)
+  let share: number | null = null
+  if (el && wrapper && continuous.value) {
+    const v = el.getBoundingClientRect(), r = wrapper.getBoundingClientRect()
+    share = (v.top - r.top) / Math.max(1, r.height)
+  }
+  await change()
+  await nextTick()
+  const after = wrappers.get(page)
+  if (share === null || !el || !after || docStore.currentPage !== page) return
+  const v = el.getBoundingClientRect(), r = after.getBoundingClientRect()
+  const delta = r.top + share * r.height - v.top
+  if (Math.abs(delta) > 0.5) {
+    // The scroll this causes must not re-decide the page: it is the same view.
+    scrollingToPage = page
+    el.scrollTop += delta
+    setTimeout(() => { if (scrollingToPage === page) scrollingToPage = 0 }, 250)
+  }
+}
+
+/** Measure every page of the document as it is now, and lay them out at their real sizes. */
+let measureGen = 0
+async function measureAll() {
+  const gen = ++measureGen
+  const measured = await pdfViewer.measurePages()
+  if (!measured || gen !== measureGen) return
+  const first = measured.get(1)
+  await holdView(() => {
+    pdfSizes.value = new Map([...pdfSizes.value, ...measured])
+    if (first) fallbackPt.value = first
+  })
 }
 
 function wrapperStyle(page: number) {
@@ -272,19 +319,19 @@ async function pump() {
       attempts.delete(page)
       painted.add(page)
       // Replacing the Map is what makes Vue notice, and that re-runs every
-      // page's style. Nearly every page in a document is the same size as the
-      // last, so only a page that is actually a different size pays for it.
-      const known = sizes.value.get(page)
-      if (!known || Math.abs(known.w - result.width) > 0.5 || Math.abs(known.h - result.height) > 0.5) {
-        const next = new Map(sizes.value)
-        next.set(page, { w: result.width, h: result.height })
-        sizes.value = next
+      // page's style. A measured page is already the size it paints at, so
+      // only a page that was still a guess (or that a rotation changed) pays
+      // for it — and the view is held while it does.
+      const pt = { w: result.viewport.width / docStore.scale, h: result.viewport.height / docStore.scale }
+      const known = pdfSizes.value.get(page)
+      if (!known || Math.abs(known.w - pt.w) > 0.25 || Math.abs(known.h - pt.h) > 0.25) {
+        await holdView(() => {
+          const next = new Map(pdfSizes.value)
+          next.set(page, pt)
+          pdfSizes.value = next
+          if (page === 1) fallbackPt.value = pt
+        })
       }
-      if (page === 1) fallbackSize.value = { w: result.width, h: result.height }
-      pdfSizes.value.set(page, {
-        w: result.viewport.width / docStore.scale,
-        h: result.viewport.height / docStore.scale
-      })
       if (page === docStore.currentPage) adoptCurrentGeometry(result)
     }
   } finally {
@@ -369,7 +416,16 @@ async function repaintAround(page: number) {
 //
 // The current page follows the scroll, which is what makes the editing tools
 // appear on the page the reader is actually on without them having to click it.
-let syncingFromScroll = false
+/**
+ * The page the scroll (or a click on it) just made current, so the watcher
+ * does not scroll to a page that is already in view. It names the page rather
+ * than being a flag set and cleared around `setPage`: the watcher runs a flush
+ * later, by when such a flag is always false again — every page reached by
+ * scrolling was then "scrolled to", its top snapped to the top of the view
+ * half a screen early, and pressing the mouse on a page not current yet pulled
+ * that page up under the pointer before the button came back up.
+ */
+let arrivedInView = 0
 /** Set while scrolling TO a page, so arriving does not re-decide where we are. */
 let scrollingToPage = 0
 
@@ -430,9 +486,8 @@ function onScroll() {
       if (page !== docStore.currentPage) {
       // An open editor belongs to the page it was opened on; committing it
       // against another page is how an edit lands in the wrong place.
-        syncingFromScroll = true
+        arrivedInView = page
         docStore.setPage(page)
-        syncingFromScroll = false
       }
     }
     requestVisible()
@@ -479,17 +534,18 @@ function onPageMouseDown(page: number) {
   // Clicking a page makes it the one being edited. Without this, a tool used on
   // a page the scroll detector has not caught up with would act on another one.
   if (page !== docStore.currentPage) {
-    syncingFromScroll = true
+    arrivedInView = page
     docStore.setPage(page)
-    syncingFromScroll = false
   }
 }
 
 watch(() => docStore.currentPage, async (page) => {
+  const inView = arrivedInView === page
+  arrivedInView = 0
   await nextTick()
   // A page reached by scrolling is already where it should be; one chosen from
   // the thumbnails or the keyboard has to be brought into view.
-  if (continuous.value && !syncingFromScroll) scrollToPage(page)
+  if (continuous.value && !inView) scrollToPage(page)
   // BOTH geometries, or the overlays scale the new page's blocks by the old
   // page's paper. adoptCurrentGeometry only runs when a page is RENDERED, and
   // a page already painted is not re-rendered on arrival — so every overlay
@@ -499,37 +555,51 @@ watch(() => docStore.currentPage, async (page) => {
   // box on page 2 landed somewhere else (x scaled by 1263/595, y by 892/842).
   // Clicking a line opened the editor on a DIFFERENT line, which reads as
   // "I still can't edit this page" however well the engine matches.
-  const size = sizes.value.get(page)
-  if (size) { pageWidth.value = size.w; pageHeight.value = size.h }
   const pdfSize = pdfSizes.value.get(page)
-  if (pdfSize) { pdfPageWidth.value = pdfSize.w; pdfPageHeight.value = pdfSize.h }
+  if (pdfSize) {
+    pdfPageWidth.value = pdfSize.w; pdfPageHeight.value = pdfSize.h
+    pageWidth.value = pdfSize.w * docStore.scale; pageHeight.value = pdfSize.h * docStore.scale
+  }
   requestVisible()
 })
 
-watch(() => docStore.scale, repaintAll)
+// Every slot follows the zoom at once (they are points times the scale), so
+// the line at the top of the view is held there while the pages resize.
+watch(() => docStore.scale, () => holdView(() => {
+  const pt = pdfSizes.value.get(docStore.currentPage)
+  if (pt) { pageWidth.value = pt.w * docStore.scale; pageHeight.value = pt.h * docStore.scale }
+}).then(repaintAll))
 // A version bump is nearly always one page being rewritten. Page inserts,
 // deletions and reorders change the COUNT, and that watcher repaints the lot.
 watch(() => docStore.renderVersion, () => repaintAround(docStore.currentPage))
-watch(() => docStore.totalPages, repaintAll)
+watch(() => docStore.totalPages, () => { void repaintAll(); void measureAll() })
 watch(continuous, repaintAll)
 
-watch(() => docStore.loaded, async (loaded) => {
-  if (loaded) {
-    painted.clear()
-    attempts.clear()
-    renderQueue = []
-    sizes.value = new Map()
-    pdfSizes.value = new Map()
-    await nextTick()
-    requestVisible()
-  }
+// A document OPENED — the first, or another over it. Nothing known about the
+// previous one's pages (sizes, what each canvas holds) describes this one.
+watch(() => docStore.openCount, async () => {
+  if (!docStore.loaded) return
+  painted.clear()
+  attempts.clear()
+  renderQueue = []
+  pdfSizes.value = new Map()
+  fallbackPt.value = { w: 612, h: 792 }
+  measureGen++
+  await nextTick()
+  // Not chained behind the paint: a page pdf.js draws slowly (a heavy scan,
+  // or any page while the window is covered and animation frames stall)
+  // would hold every slot at the guessed size for as long as it takes.
+  void requestVisible()
+  void measureAll()
 })
 
 onMounted(() => {
   // Capture, so a scroll on any inner container is seen as well as the window's.
   window.addEventListener('scroll', onScroll, true)
   window.addEventListener('resize', onScroll)
-  if (docStore.loaded) requestVisible()
+  // The viewer is created BY the first document's opening, after the
+  // `openCount` bump its watcher would have answered — so it measures here.
+  if (docStore.loaded) { void requestVisible(); void measureAll() }
 })
 
 onBeforeUnmount(() => {
@@ -542,10 +612,17 @@ defineExpose({ textBlockOverlayRef, annotationLayerRef })
 </script>
 
 <style scoped>
+/*
+  Pages are centred by their own auto margins, not by `align-items: center`.
+  A centred flex item WIDER than the column overflows on both sides, and the
+  left overflow can never be scrolled to: the YOFC compilation's 3931pt CAD
+  sheet showed its middle and right only. Auto margins centre what fits and
+  fall to zero for what does not, so a wide page starts at the left edge.
+*/
 .pdf-viewer-container {
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: flex-start;
   background: #2a2a2a;
   padding: 20px 0;
 }
