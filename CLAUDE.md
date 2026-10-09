@@ -5792,13 +5792,45 @@ Printed pages read well; what is refused there is handwriting ("the reading
 does not fit the ink": students' maths notes on squared paper, a dozen pages)
 and pages that are not one scan image (read them with `RENDER=1`).
 
-**Known, and the next large gap: handwriting on a RED grid.** On those notes
-the squared paper's grid is red, 3–4 px thick at 280 DPI and dark enough in
-places (luminance down to ~110) to fail the "faint" test that takes a
-notebook's grid as paper, so it is read as ink: a whole line welds into one
-piece with the grid, no word gap is found, and lifting the whole-line sanity
-check only produced one giant approximate word. Every edit of handwriting
-falls back to Helvetica today.
+**A DARK grid of squares is paper too** (`latticeLines`, in `preparePage`).
+On a phone photo of squared paper (CamScanner, ~280 DPI) the rules are
+grey-blue, four pixels wide and as dark as luminance 80–130 at their centres —
+darker than the faint-line test's bar (no pixel under 120 within 2 px), so
+the whole grid read as ink: a handwritten line welded into one piece with its
+squares, no word gap was found, and every edit fell back to Helvetica over the
+grid. A second pass finds thin straight runs clearly LIGHTER than the pen
+(above the ink's 10th percentile by 30, never within a pixel of anything that
+dark; a run may cross 3 px of grain; 12 pt at least) and takes them as paper —
+their own colour, however dark (`gridPix`) — only when the page is a lattice:
+the row and the column profiles each repeat at a pitch of 8–30 pt
+(autocorrelation 0.3 or more, five lines or more spread over a fifth of the
+page or more) and the two pitches agree within 12%. A form's table has rows at
+one pitch and columns at none, and its rules are as dark as its text.
+
+Three versions were wrong first, each on real pages:
+- **Pitch from 2.5 pt** took a halftone screen — itself a lattice of dots a
+  point or two apart, bridged dot to dot — for squares: the results table's
+  stippled header and its halftone title went to paper.
+- **Runs of 20 pt** and **lines spread over half the page** lost the
+  notebooks: noise breaks a rule every few pixels, and a curled page shows its
+  verticals over a quarter of its width.
+- **An Otsu split of the ink into pen and grid** (written for a synthetic page
+  with more squares than writing) fell above the grid on real notes, between
+  pen-and-grid and their fringes, and took a book cover's texture for squares.
+  The synthetic test page now carries a page of writing, as real notes do.
+
+Measured on every recorded page (61 documents' first pages): the nine
+handwritten notebooks are lattices, none of the 52 printed documents is; the
+18 lab suites are pixel-identical. Two unit tests (a dark grid with pen
+writing; a form ruled as dark as its text at one row pitch).
+
+**Known, and the next large gap: handwriting itself.** With the grid as paper
+the notebooks' lines fail for handwriting's own reasons — "set on a curve"
+(the baseline wanders), "more than one printed line" (ascenders and descenders
+against a type-sized em), "the reading does not fit the ink" (handwriting is
+wider than type's advances) — and with those checks lifted, the word split
+(a gap threshold tuned to type) joined words ("De la", "misma forma"). Every
+edit of handwriting still falls back to Helvetica.
 
 **A whole-run vector redraw erases on the scan's pixels where the line was
 read** (`inkAwareFallback`): when the scan edit declines a line for want of

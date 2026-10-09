@@ -191,6 +191,86 @@ function sideMax(L: Uint8Array, w: number, h: number, r: number, alongRows: bool
 }
 
 /**
+ * A squared-paper GRID darker than the faint-line test allows: thin straight
+ * runs lighter than the pen (above its cores by 30 levels, never within a pixel
+ * of one), found by `scan`, and accepted only when the runs of BOTH directions
+ * repeat at one pitch — the autocorrelation of the row and of the column
+ * profiles peaking at the same lag, within 12%. A form's table has rows at one
+ * pitch and columns at none, and its rules are as dark as its text. Null when
+ * the page is no such grid.
+ */
+let latticeDebug = ''
+/** What the last page's grid test found (lab only). */
+export function lastLatticeTest(): string { return latticeDebug }
+function latticeLines(L: Uint8Array, inkish: Uint8Array, w: number, h: number, pxPerPt: number,
+  scan: (m: Uint8Array, rows: boolean, on: (p: number) => boolean, thin: number, into: { p: number; a: number; b: number; t: number }[]) => void): { mask: Uint8Array; bridges: { p: number; a: number; b: number; t: number }[] } | null {
+  const N = w * h
+  // The pen: the darker tail of what reads as ink. (An Otsu split of the ink
+  // into pen and grid was tried: on real notes it fell between the pen-and-
+  // grid and their fringes, above the grid, and took a book cover's texture
+  // for squares.)
+  const v: number[] = []
+  for (let p = 0; p < N; p += 5) if (inkish[p]) v.push(L[p])
+  if (v.length < 200) return null
+  v.sort((a, b) => a - b)
+  const pen = v[Math.floor(v.length * 0.1)]
+  const lo = Math.max(55, pen + 30)
+  const nearPen = new Uint8Array(N)
+  for (let p = 0; p < N; p++) if (L[p] < lo) nearPen[p] = 1
+  maxFilter1D(nearPen, w, h, 1, true)
+  maxFilter1D(nearPen, w, h, 1, false)
+  const on = (p: number) => !!inkish[p] && !nearPen[p]
+  const thin = Math.max(2, Math.round(0.8 * pxPerPt))
+  const H = new Uint8Array(N), V = new Uint8Array(N)
+  const bh: { p: number; a: number; b: number; t: number }[] = [], bv: { p: number; a: number; b: number; t: number }[] = []
+  scan(H, true, on, thin, bh)
+  scan(V, false, on, thin, bv)
+  // The pitch of each direction: the autocorrelation of its profile.
+  const pitch = (m: Uint8Array, rows: boolean): { lag: number; r: number } | null => {
+    const n = rows ? h : w
+    const prof = new Float64Array(n)
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (m[y * w + x]) prof[rows ? y : x]++
+    // Smoothed a little: a photographed grid wanders by a pixel or two.
+    const sm = new Float64Array(n)
+    for (let i = 0; i < n; i++) { let t = 0; for (let k = -2; k <= 2; k++) t += prof[Math.min(n - 1, Math.max(0, i + k))]; sm[i] = t }
+    let e = 0
+    for (let i = 0; i < n; i++) e += sm[i] * sm[i]
+    if (!e) return null
+    // A notebook's squares are 4 to 10 mm. A halftone screen is a lattice too
+    // — of dots a point or two apart — and its runs, bridged from dot to dot,
+    // made the stippled header of a results table and the halftone letters of
+    // its title read as a grid.
+    const lo = Math.round(8 * pxPerPt), hi = Math.min(Math.round(n / 4), Math.round(30 * pxPerPt))
+    if (hi <= lo + 2) return null
+    const ac = (lag: number) => { let t = 0; for (let i = 0; i + lag < n; i++) t += sm[i] * sm[i + lag]; return t / e }
+    let best: { lag: number; r: number } | null = null
+    let prev = ac(lo - 1), cur = ac(lo)
+    for (let lag = lo; lag < hi; lag++) {
+      const next = ac(lag + 1)
+      if (cur >= prev && cur >= next && (!best || cur > best.r)) best = { lag, r: cur }
+      prev = cur; cur = next
+    }
+    // And as many lines as a page of squares has: the profile's peaks at that pitch.
+    if (!best) return null
+    // And the lines of a page of squares: five at least, spread over a fifth
+    // of it or more (a curled notebook page shows its rules over part of it).
+    let lines = 0, first = -1, last = -1
+    const top = Math.max(...sm)
+    for (let i = 1; i < n - 1; i++) if (sm[i] >= top * 0.25 && sm[i] >= sm[i - 1] && sm[i] > sm[i + 1]) { lines++; if (first < 0) first = i; last = i }
+    latticeDebug += ` ${rows ? 'rows' : 'cols'}: lag ${best.lag} r ${best.r.toFixed(2)} lines ${lines} spread ${((last - first) / n).toFixed(2)}`
+    return lines >= 5 && last - first >= n * 0.2 ? best : null
+  }
+  latticeDebug = `pen ${pen} lo ${lo}`
+  const ph = pitch(H, true), pv = pitch(V, false)
+  if (!ph || !pv || ph.r < 0.3 || pv.r < 0.3) return null
+  if (Math.abs(ph.lag - pv.lag) > Math.max(ph.lag, pv.lag) * 0.12) return null
+  latticeDebug += ' GRID'
+  const mask = new Uint8Array(N)
+  for (let p = 0; p < N; p++) if (H[p] || V[p]) mask[p] = 1
+  return { mask, bridges: [...bh, ...bv] }
+}
+
+/**
  * The paper and the darkness for a whole page. The paper is estimated in two
  * steps: a max filter wider than any stroke finds how bright the paper is
  * around each pixel, which marks what is ink; then every inked pixel (with a
@@ -256,6 +336,7 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
     }
   }
   const line = new Uint8Array(N)
+  const gridPix = new Uint8Array(N)
   const bridges: { p: number; a: number; b: number; t: number }[] = []
   // A notebook's GRID is paper: faint, thin, straight lines running on long
   // past any letter. Read as ink, it was filled in under the letters and the
@@ -278,22 +359,27 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
     for (let p = 0; p < N; p++) if (L[p] < 120) nearDark[p] = 1
     maxFilter1D(nearDark, s.w, s.h, 2, true)
     maxFilter1D(nearDark, s.w, s.h, 2, false)
-    const faint = (p: number) => inkish[p] && !nearDark[p]
+    const faint = (p: number) => !!inkish[p] && !nearDark[p]
     const minRun = Math.max(12, Math.round(8 * pxPerPt))
-    const scan = (rows: boolean, m: Uint8Array) => {
+    const scan = (rows: boolean, m: Uint8Array, on: (p: number) => boolean, thin: number, gapTol: number, into: typeof bridges, minLen = minRun) => {
       const outer = rows ? s.h : s.w, inner = rows ? s.w : s.h
       const at = (o: number, i: number) => rows ? o * s.w + i : i * s.w + o
-      for (let o = 2; o < outer - 2; o++) {
-        let start = -1
+      for (let o = thin; o < outer - thin; o++) {
+        let start = -1, lastOn = -1
         for (let i = 0; i <= inner; i++) {
-          const on = i < inner && faint(at(o, i))
-          if (on && start < 0) start = i
-          if (!on && start >= 0) {
-            if (i - start >= minRun) {
-              // Thin: two pixels either side across it are mostly not faint ink.
+          const here = i < inner && on(at(o, i))
+          if (here && start < 0) start = i
+          if (here) lastOn = i
+          // A break of a few pixels — grain darker or lighter than the line —
+          // does not end it.
+          if (!here && start >= 0 && i < inner && i - lastOn <= gapTol) continue
+          if (!here && start >= 0) {
+            const end = lastOn + 1
+            if (end - start >= minLen) {
+              // Thin: the pixels `thin` either side across it are mostly not the line too.
               let thick = 0
-              for (let k = start; k < i; k++) if (faint(at(o - 2, k)) && faint(at(o + 2, k))) thick++
-              if (thick < (i - start) * 0.3) for (let k = start; k < i; k++) m[at(o, k)] = 1
+              for (let k = start; k < end; k++) if (on(at(o - thin, k)) && on(at(o + thin, k))) thick++
+              if (thick < (end - start) * 0.3) for (let k = start; k < end; k++) m[at(o, k)] = 1
             }
             start = -1
           }
@@ -306,7 +392,7 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
           if (!m[at(o, i)]) continue
           if (last >= 0 && i - last > 1 && i - last - 1 <= maxGap) {
             const a = at(o, last), b = at(o, i)
-            for (let k = last + 1; k < i; k++) { m[at(o, k)] = 1; bridges.push({ p: at(o, k), a, b, t: (k - last) / (i - last) }) }
+            for (let k = last + 1; k < i; k++) { m[at(o, k)] = 1; into.push({ p: at(o, k), a, b, t: (k - last) / (i - last) }) }
           }
           last = i
         }
@@ -314,9 +400,22 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
     }
     const maxGap = Math.round(40 * pxPerPt)
     const lineH = new Uint8Array(N), lineV = new Uint8Array(N)
-    scan(true, lineH)
-    scan(false, lineV)
+    scan(true, lineH, faint, 2, 0, bridges)
+    scan(false, lineV, faint, 2, 0, bridges)
     for (let p = 0; p < N; p++) if (lineH[p] || lineV[p]) line[p] = 1
+    // A DARK grid: a phone photo of squared paper prints its rules at
+    // luminance 80–130, four pixels wide at 280 DPI — darker than the faint
+    // bar above, and read as ink a handwritten line welded into one piece with
+    // its squares: no word gap, no letter, and every edit of a student's notes
+    // fell back to Helvetica over the grid. Such a grid is told by what no
+    // form's table has: thin straight lines CLEARLY LIGHTER than the pen, at
+    // ONE pitch across the page in both directions. Its lines are taken as
+    // paper only when both directions keep the same pitch.
+    const g = latticeLines(L, inkish, s.w, s.h, pxPerPt, (m, rows, on, thin, into) => scan(rows, m, on, thin, 3, into, Math.round(12 * pxPerPt)))
+    if (g) {
+      for (let p = 0; p < N; p++) if (g.mask[p]) { line[p] = 1; gridPix[p] = 1 }
+      for (const b of g.bridges) bridges.push(b)
+    }
     const bridged = new Uint8Array(N)
     for (const b of bridges) bridged[b.p] = 1
     for (let p = 0; p < N; p++) if (line[p] && !bridged[p]) inkish[p] = 0
@@ -348,7 +447,7 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
   // Most pages are plain paper and hold no ground: skip the region pass.
   if (grounds) fillGrounds(ch, known, d, L, C, ground, s.w, s.h)
   if (anyLine) for (let p = 0, i = 0; p < N; p++, i += 4) {
-    if (band[p] && (!inkish[p] || (line[p] && B[p] - L[p] < 110))) { ch[0][p] = d[i]; ch[1][p] = d[i + 1]; ch[2][p] = d[i + 2] }
+    if (band[p] && (!inkish[p] || (line[p] && (B[p] - L[p] < 110 || gridPix[p])))) { ch[0][p] = d[i]; ch[1][p] = d[i + 1]; ch[2][p] = d[i + 2] }
   }
   // A bridge across ink is the line it continues, its colour from one end to the other.
   for (const b of bridges) for (let c = 0; c < 3; c++) ch[c][b.p] = d[b.a * 4 + c] * (1 - b.t) + d[b.b * 4 + c] * b.t

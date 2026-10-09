@@ -1647,3 +1647,57 @@ test('a lone figure in a ruled cell is sized by its ink, not by the cell its box
   }
   assert.equal(outside, 0, `${outside} pixels changed outside the cell`)
 })
+
+/** A phone photo of squared paper at ~280 DPI: grey rules (luminance `ruleL`, `thick` px) every `pitch` px both ways, and pen text. */
+function squaredPage({ pitch = 75, ruleL = 100, thick = 4, colPitch = null } = {}) {
+  const W = 1600, H = 1200
+  const font = new mupdf.Font('Carlito', fs.readFileSync(ROOT + '/public/fonts/match/Carlito-Italic.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const t = new mupdf.Text()
+  // A page of notes: a line of writing on every other row of squares.
+  const notes = ['De la misma forma calculamos', 'Remplazamos los valores en', 'la ecuacion y despejamos x', 'Sumamos componente a', 'componente y obtenemos', 'el vector original v']
+  notes.forEach((line, k) => t.showString(font, [70, 0, 0, -70, 120, 160 + k * 170], line))
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = pix.getPixels(), stride = pix.getStride()
+  const cols = colPitch ?? [...Array(Math.ceil(W / pitch)).keys()].map(k => 10 + k * pitch)
+  const isRule = (x, y) => ((y - 10) % pitch + pitch) % pitch < thick || cols.some(c => x >= c && x < c + thick)
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  let seed = 7
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff }
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const a = 1 - g[y * stride + x] / 255
+    const ground = isRule(x, y) ? ruleL + (rnd() - 0.5) * 30 : 248
+    const v = Math.round(ground * (1 - a) + 30 * a)
+    const i = (y * W + x) * 4
+    rgba[i] = rgba[i + 1] = rgba[i + 2] = Math.max(0, Math.min(255, v))
+    rgba[i + 3] = 255
+  }
+  return { raster: R.scanRasterOf(W, H, rgba, [W * 0.258, 0, 0, H * 0.258, 0, 0], W * 0.258, H * 0.258, 'Notebook'), isRule, g, stride, W, H }
+}
+
+test('a dark grid of squares is paper, and the pen across it stays ink', () => {
+  const { raster, isRule, g, stride, W, H } = squaredPage()
+  const pi = LI.preparePage(raster)
+  if (process.env.LATDBG) console.log('lattice', LI.lastLatticeTest?.())
+  let rules = 0, asPaper = 0, pen = 0, penInk = 0
+  for (let y = 20; y < H - 20; y += 2) for (let x = 20; x < W - 20; x += 2) {
+    const p = y * W + x, inked = g[y * stride + x] < 128
+    if (inked) { pen++; if (pi.dark[p] >= LI.CORE) penInk++; continue }
+    if (!isRule(x, y)) continue
+    rules++
+    if (pi.lines?.[p] && pi.dark[p] < LI.FRINGE) asPaper++
+  }
+  assert.ok(asPaper >= rules * 0.8, `${asPaper} of ${rules} grid pixels taken as paper`)
+  assert.ok(penInk >= pen * 0.9, `${penInk} of ${pen} pen pixels still ink`)
+})
+
+test('a form ruled as dark as its text, rows at one pitch and columns at none, is no grid', () => {
+  const { raster, W, H } = squaredPage({ ruleL: 40, thick: 3, colPitch: [10, 260, 330, 900, 1180, 1500] })
+  const pi = LI.preparePage(raster)
+  let lines = 0
+  for (let p = 0; p < W * H; p += 3) if (pi.lines?.[p]) lines++
+  assert.ok(lines < W * H / 3 * 0.01, `${lines} pixels taken as a grid`)
+})
