@@ -1358,3 +1358,17 @@ test('a watermark over the text is found by its grey plateau, and its second rea
   ]
   assert.deepEqual(WM.linesMissed(base, extra).map(l => l.text), ['15.VIRTUALIZACION'])
 })
+
+test('ink the recogniser box barely touches is left out of the reading, unless the reading then breaks a word of its own', () => {
+  // A seal's edge beside "UNAJMA", no space between: one-word reading, two ink words, the first outside the box.
+  const chars = [...'UNAJMA']
+  const words = [{ x0: 0, x1: 64, outside: true }, { x0: 85, x1: 460 }]
+  const m = WS.alignCharsToWords(words, chars, new Set())
+  assert.deepEqual(m.map(x => [x.word, x.from, x.to]), [[1, 0, 6]])
+  // Without the flag the edge took the "U".
+  const plain = WS.alignCharsToWords(words.map(w => ({ x0: w.x0, x1: w.x1 })), chars, new Set())
+  assert.equal(plain[0].word, 0)
+  // A clipped dash the reading names as a word of its own (" -") keeps its label.
+  const dash = WS.alignCharsToWords([{ x0: 0, x1: 70 }, { x0: 80, x1: 82, outside: true }], [...'DBSANF00-'], new Set([8]))
+  assert.deepEqual(dash.map(x => [x.word, x.from, x.to]), [[0, 0, 8], [1, 8, 9]])
+})

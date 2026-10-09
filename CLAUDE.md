@@ -5024,6 +5024,35 @@ the unforced alignment only if that leaves nothing to fit. Left out, the
 bullet is the line's loose ink: it stays where it is before the first change
 and travels with the tail after the last.
 
+**Ink the recogniser's box barely touches may be left out for nothing.** The
+line's region is the box padded by more than half an em each side, and it
+takes in whatever stands there: a university seal's right edge beside its
+stencil "UNAJMA" became an ink word, took the reading's "U", and every label
+after it moved one letter on — deleting the J erased the A ("UNJMA"). On a
+results table the same thing happened to the NEXT cell's first figure, which
+took the last digit's label in a dozen cells ("6205804 | 0" for "62058040").
+An END ink word whose span is 70% outside the box, every piece of it at
+least half outside, is marked `outside` (`analyzeLine`), and
+`alignCharsToWords` may leave it out at no trim cost — the width fit decides.
+Three things were wrong first, each measured:
+- **Loosening exactness was the wrong fix.** The deletion was refused ("too
+  many letters the page does not hold") because the stencil N and M break into
+  several pieces, so the word was not exact; admitting a cut whose cells hold
+  every run whole made the edit go through and erase the wrong letter. The
+  refusal was right; the labels were shifted.
+- **Every piece, not just the span.** A cell's vertical border outside the box
+  makes one ink word with the first letter just inside it; by span alone it was
+  "outside", and "INGRESÓ" read its N as the I.
+- **Not forced, and not free when the reading names it as a word.** A table
+  cell's box stopped short of the " -" the reading ends with; the dash's ink is
+  clipped to a pixel or two by the region's edge and fits its label badly, so a
+  free trim folded the "-" into the "00" before it. A trim is free only when
+  the remaining end word holds no reading space.
+Measured: the lab A/B over 18 suites gains two edits (the UNAJMA delete, which
+now keeps every letter's pixels, and "CURSO DE ACTUALIZACIÓN") with nothing
+lost; in the app all three UNAJMA documents' deletes go on the scan with no
+damage (they were vector redraws).
+
 **A dash the recogniser boxed short is read whole.** A book cover's
 "—LAS 4 VIRTUDES ESTOICAS—" came with a box that stopped inside the closing
 dash, past even the 0.6 em the line's region adds: the part of the dash

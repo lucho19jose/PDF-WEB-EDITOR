@@ -242,6 +242,8 @@ export interface InkWord {
   x0: number; x1: number; top: number; bottom: number
   /** A list bullet the reading does not name (`markBullets`): it may be left out at an end wherever it stands. */
   bullet?: boolean
+  /** An end ink word lying mostly OUTSIDE the recogniser's box (`markOutside`): it is left out like a bullet. */
+  outside?: boolean
 }
 
 export interface WordSplit { words: InkWord[]; threshold: number; letterGapPx: number; wordGapPx: number }
@@ -323,7 +325,7 @@ export interface WordMatch { word: number; from: number; to: number; /** |ink �
  * price — a stray mark the recogniser rightly ignored. Null when even the best
  * sharing leaves the widths far from the letters.
  */
-export function alignCharsToWords(words: { x0: number; x1: number; bullet?: boolean }[], chars: string[], spaceAfter: Set<number>): WordMatch[] | null {
+export function alignCharsToWords(words: { x0: number; x1: number; bullet?: boolean; outside?: boolean }[], chars: string[], spaceAfter: Set<number>): WordMatch[] | null {
   // Ink at either END of the line that the reading never named — the
   // handwriting in a form's blank the recogniser boxed with the printed line
   // and did not read — takes part in the width scale the fit is judged by,
@@ -344,8 +346,19 @@ export function alignCharsToWords(words: { x0: number; x1: number; bullet?: bool
   // appended to it was toned green. It may be left out however close it is.
   // And it MUST be: its width is a letter's, so it fits a label about as well
   // as the trim costs, and the "4" went on it anyway.
-  const startOk = (a: number) => apart(a) || words.slice(0, a).every(w => w.bullet)
-  const endOk = (b: number) => apart(words.length - b) || words.slice(words.length - b).every(w => w.bullet)
+  // Ink the recogniser's box barely touches may not be what it read either: a
+  // university seal's edge beside its stencil "UNAJMA" took the "U", every
+  // label after it moved one letter on, and deleting the J erased the A. It
+  // may be left out for nothing, and the width fit decides — not forced out,
+  // and not for nothing when the reading then has to put a word of its own
+  // inside the ink beside it: a table cell's box stopped short of the "-" the
+  // reading ends with (" -", its own word), and with the dash's ink left out
+  // the "-" went into the "00" before it.
+  const strayEnd = (w: { bullet?: boolean; outside?: boolean }) => !!(w.bullet || w.outside)
+  const startOk = (a: number) => apart(a) || words.slice(0, a).every(strayEnd)
+  const endOk = (b: number) => apart(words.length - b) || words.slice(words.length - b).every(strayEnd)
+  const spaced = (m: WordMatch | undefined) => !!m && [...spaceAfter].some(j => j > m.from && j < m.to)
+  const trimCost = (ws: { outside?: boolean }[], end: WordMatch | undefined) => ws.reduce((t, w) => t + (w.outside && !spaced(end) ? 0 : TRIM_COST), 0)
   const search = (minA: number, minB: number) => {
     let best: { cost: number; out: WordMatch[] } | null = null
     for (let a = minA; a <= 2; a++) for (let b = minB; b <= 2; b++) {
@@ -353,7 +366,7 @@ export function alignCharsToWords(words: { x0: number; x1: number; bullet?: bool
       if ((a > 0 && !startOk(a)) || (b > 0 && !endOk(b))) continue
       const res = alignOn(words.slice(a, words.length - b), chars, spaceAfter)
       if (!res) continue
-      const cost = res.cost + (a + b) * TRIM_COST
+      const cost = res.cost + trimCost(words.slice(0, a), res.out[0]) + trimCost(words.slice(words.length - b), res.out[res.out.length - 1])
       if (!best || cost < best.cost - 1e-9) best = { cost, out: res.out.map(m => ({ ...m, word: m.word + a })) }
     }
     return best

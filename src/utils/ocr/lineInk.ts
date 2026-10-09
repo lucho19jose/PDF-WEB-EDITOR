@@ -1452,6 +1452,23 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   const split = splitWords(blobs, fit)
   if (!split.words.length) return fail('no words')
   markBullets(split.words, ownPieces, em, text, s.w)
+  // An END word lying mostly outside the recogniser's box — the region is the
+  // box padded by more than half an em each side, and it takes in the edge of
+  // a seal or the next cell's figures — is not part of what was read. Every
+  // piece of it must be at least half outside, not just most of its span: a
+  // cell's border outside the box makes one word with the first letter just
+  // inside it, and leaving that word out dropped the letter ("INGRESÓ" read
+  // its N as the I).
+  if (split.words.length > 1) {
+    const outsideL = (x0: number, x1: number) => Math.max(0, Math.min(x1, box.x0) - x0)
+    const outsideR = (x0: number, x1: number) => Math.max(0, x1 - Math.max(x0, box.x1))
+    const out = (w: { x0: number; x1: number }, side: (x0: number, x1: number) => number) =>
+      side(w.x0, w.x1) >= (w.x1 - w.x0) * 0.7 &&
+      ownPieces.filter(c => c.cx >= w.x0 && c.cx < w.x1).every(c => side(c.x0, c.x1) >= (c.x1 - c.x0) * 0.5)
+    const first = split.words[0], last = split.words[split.words.length - 1]
+    if (out(first, outsideL)) first.outside = true
+    if (out(last, outsideR)) last.outside = true
+  }
   const spaceAfter = spaceBoundaries(text)
   const matches = alignCharsToWords(split.words, chars, spaceAfter)
   if (!matches) return fail('the reading does not fit the words')
