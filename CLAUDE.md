@@ -5185,6 +5185,203 @@ a click past the fold) put the caret at the end of the first VISUAL line:
 typing appended mid-run — "Compra-Venta XYde Repuestos" in the headless
 scan smoke. `wrap="off"` on the textarea; the run is one line.
 
+## The YOFC fund request (2026-10-09): one 260-page, 30 MB compilation
+A fund request that binds a WPS/Excel invoice summary, Word reports
+(Calibri), Century Gothic forms, CAD sheets, photo panels and ~50 scanned
+pages (a delivery note, a 42-page bilingual contract), every page stamped by
+Intellisign two to four times. The user's report was a scanned page whose
+edit "did not work"; the document turned out to be a corpus of its own.
+`tools/pdf-sweep/sweep-doc.mjs <pdf> out.json [first] [last] [perPage]` runs
+the realistic sweep's operations (same, delete, append, resize, recolour,
+move — a fresh document before each) on EVERY page of one file (`SKIP=` a
+regex of block texts to leave out, e.g. the stamp shuffle). On this file the
+engine at 0e93e58 passes 3235 of 3330 operations and the fixes below 3262: 27
+gained, none lost, and of the rows whose outcome did not change, 13 now keep
+the document's own font instead of Helvetica and 18 no longer leave a phantom
+space inside the new words. 48 of the misses are honest paper-edge refusals.
+The 16 corpus sweeps (realistic and marker, main and r2–r8) lose nothing and
+gain 6.
+
+### A stamp over a full-page scan is not text enough to stop a click recognising it
+The delivery note's only text is the stamp strip, so `loadBlocks` never asked
+the scan verdict (it asked only when a page had NO visible text or a hidden
+layer), a click on the photographed title selected the whole scan as an image
+("drag to move it") and recognition never started. The verdict is now also
+asked when the visible text covers under `STAMP_TEXT_COVERAGE` (2%, the same
+union-grid measure — `utils/textCoverage.ts` — the coverage judge uses) AND one
+content image covers 85% of the paper: a document page whose photo leaves
+margins (this file's photo panels sit at 2.1% text, 68% image) keeps its photo
+as an object. Recognition also read the stamp strip itself — real Helvetica,
+two IDs drawn over each other — as an editable run "Ihtteli ggm1D:1962…";
+`dropRunsOnVisibleText` (snapToLayer.ts) drops runs whose ink lies 60% inside
+visible text blocks: real text is edited as text.
+
+### Page slots are points times the zoom, measured up front, and the view is held
+`sizes` kept each slot in CSS pixels at whatever zoom the page was last painted
+at, with page 1's size standing in for unpainted pages. On a file of Letter,
+A4, landscape and a 3931pt CAD sheet, every page painted ABOVE the reader
+changed size, the view slid, and the scroll detector handed the tools to the
+page before: an OCR click on page 5 finished recognising with page 4 current,
+`onScanClicked` saw the page change and opened nothing. Now `pdfSizes` (points,
+rotation applied) is filled for EVERY page by `pdfViewer.measurePages` (one
+`getPage` each, in the background alongside the first paint — 0.2–0.7 s for
+260 pages), slots are points × `docStore.scale`, and `holdView` keeps the share of
+the current page above the viewport's top fixed across a size correction or a
+zoom (`overflow-anchor: none` so the browser does not correct twice). The
+canvas fills its slot (`width: 100%`), so a page not repainted yet after a
+zoom shows its last picture stretched into place. Two more things fell out:
+- **A page wider than the column could not be scrolled to its left edge**:
+  `align-items: center` overflows on both sides and negative overflow is
+  unreachable. Pages are centred by their own auto margins, which fall to zero
+  for a page that does not fit.
+- **Opening a second document cleared nothing**: `loaded` stayed true, so
+  every page the new file did not repaint at once kept the old file's size
+  and pixels. `docStore.openCount` is bumped per open and the viewer resets on
+  it (and measures on mount, since the first open creates the viewer).
+- **The measure is not chained behind the paint.** It was
+  `requestVisible().then(measureAll)`, and pdf.js advances a display render
+  one chunk per animation frame: a heavy page, or ANY page while the window is
+  covered (Windows reports it occluded and frames stall), held every slot at
+  Letter size — 30–38 s on this file's first open in the test browser, 1.3 s
+  after. Timing a render from a session whose window is behind a terminal
+  measures the occlusion, not the page: check `document.visibilityState` and
+  the frame rate before believing a slow render.
+- **A page reached by scrolling was scrolled TO — every page.** `onScroll` set
+  `syncingFromScroll = true`, called `setPage`, and cleared it on the next line;
+  the `currentPage` watcher runs a flush later, so it always read false and
+  called `scrollToPage`. Each time the middle of the view crossed into a new
+  page, that page's top snapped to the top of the view (half a screen's jump),
+  and pressing the mouse on a page not current yet pulled it up under the
+  pointer before the button came back up. `arrivedInView` NAMES the page the
+  scroll or the click made current, and the watcher compares it with the page
+  it was told about (since continuous scrolling, 66602d8). Measured: forty
+  120px steps across four page boundaries move 4800px exactly (each crossing
+  used to add about half a view, +364px); a press on the next page leaves
+  `scrollTop` unchanged.
+
+### Thumbnails draw from the viewer's document, off screen, and are never blanked
+The panel parsed a second 30 MB copy after every edit and keyed its items by
+`renderVersion`, so each reload rebuilt every thumbnail as a blank canvas —
+the user's screenshots showed a column of white rectangles. Items are keyed by
+page; pictures are rendered off screen from `pdfViewer.pdfDoc` and copied over
+when complete; every wait races an `abandon` promise that a document change
+wakes (a `getPage` on a destroyed document never settles, and the old busy
+flag then stayed set for good).
+
+### Word's symbolic TrueType subsets are Windows-coded: write through them
+Word (GDI) embeds Calibri, Arial, Cambria as SYMBOLIC TrueType subsets with
+no /Encoding and no ToUnicode — Flags 4, a (3,0) cmap at 0xF000+code and a
+(1,0) cmap. `getSimpleFontInfo` calls such a font 'Unknown' (the right call
+for Ghostscript's glyph-index subsets), and `planTextEncoding` never writes in
+an 'Unknown' font without a ToUnicode — so EVERY edit of a Word paragraph
+re-set its line in Helvetica: one letter added to "nueva" redrew 480pt of
+justified Calibri in a wider face. `symbolicTrueTypeGlyphs` reads the
+program's own cmap and `loca` (MuPDF's `encodeCharacter` answers 0 for a
+symbolic font): a code is drawable when it maps to a glyph whose outline is
+not empty (Word keeps the WHOLE /Widths array however few glyphs it embeds,
+so a width proves nothing). Trusted only when the /Widths have the shape of
+letters at the letters' codes (`widthsLookLatin`: m > n > i, w > v, M > I —
+a glyph-index subset passes by chance only) and some lowercase codes map. The
+decode reads these bytes as Latin-1 (`mapPlainBytes`), so the write is the
+same byte; C1 codes are refused. Measured on the corpora: edits on Word
+documents in r4–r8 now keep their own font (`substituted_font` Helvetica →
+none) with zero lost.
+
+### A justified line keeps its width
+Word justifies by kerning every space — `(a )-273.98(i)…`, a third of an em —
+and the partial path rewrote the window as one plain string: the edited line
+ended 37pt short of its neighbours, and a longer rewrite ran into the half of
+the line Word places with its own Td. `justifiedArray` detects it (the
+window's arrays kern at least two spaces, consistently, by more than 3% of an
+em) and writes the new text as an array whose inner spaces carry the kern that
+fills the run's old extent (measured pen to pen, Td included) — never
+compressed below natural spacing, never stretched past 2.5× the old kern.
+
+### Word's unmapped ligatures are written back as their own codes
+Calibri's "ti" and "fi" ligatures (CIDs 0x19F, 0x12E in Word's Identity-H
+subsets) have no ToUnicode entry; extraction and the editor show U+FFFD
+("ac�vos", "con�guración"), and ANY edit whose window held one failed —
+"Cannot encode characters: �", appending a word to a line ending in one
+included. `planTextEncoding` takes `unreadableCodes` (the window's glyphs
+without Unicode, in drawing order) and `encodeTextForFont` writes the k-th
+U+FFFD of the new text as the k-th such code — only when the counts agree, so
+a deleted chip never shifts the others onto the wrong ligature.
+
+The SAME glyph is U+FFFD to extraction (and so to the target and the new
+text) and '?' to this engine's decode. A bulleted Word line carrying one
+("• 900 metros lineales de �bra óp�ca…": the bullet a BT of its own, the
+sentence another) matched NOTHING: the cross-block join read "…de?bra…" and
+the target "…de�bra…". Three comparisons now take the two as one glyph:
+`foldForMatch`, `consumePrefixFree` (so the narrowing and the member-dropping
+walk past an untouched ligature) and `shareOfTarget` (which locates a
+member's share by the target's characters).
+
+### The narrowed window keeps the space its first op draws; a trailing space op joins it
+`narrowToChangedOps` stripped the remaining text's leading space even when the
+window's first op DRAWS it: Word starts a style run with its space glyph
+("[( )-4.07(Su)…]TJ" after the bold "Conectividad Interna:"), and the edited
+line read "Interna:Suministros". And Word ends a paragraph's last line with a
+space in another font placed by its own Td: the matched window (the target is
+trimmed) stopped before it, the new text carried a space of its own, and the
+longer word then passed the stale one ("marchas . "). A space-only op on the
+window's line right after it now joins the window (blanked, Td kept).
+
+### Recolouring one line of a list item stays on that line
+Word draws a bullet as its own BT and the item's text as another that runs on
+to its second line. The line group is [bullet, text]; neither containment test
+fired for the text block (it holds more than its share, not the whole target),
+so the whole BT turned red. `groupMemberShare` finds a member's own share of
+the line (longest common stretch, '?' standing for U+FFFD) and, when the
+share's run is found in it, the member is bracketed around that run.
+
+### The Tm in force at the first glyph, and a `'` starts its own line
+- A Java invoice writer opens every BT with the SAME Tm twice; with no
+  governing Tm the move rewrote the first, the second put it straight back,
+  and the ":" of "Monto de redondeo :" stayed behind. The fallback is the last
+  Tm before the block's first show op.
+- A drawing exported each table column as one BT of `'` lines ("ACTIVO /
+  RESERVA / ACTIVO …"). `findTargetRun` called a run starting with `'`
+  mid-line and `textStateAtOp` refused any `'` since the last reset, so no
+  cell after the first could be moved or resized. A `'` is a T* (`"` still
+  refuses — it also rewrites Tw/Tc).
+
+### A cell drawn value-first is read in VISUAL order
+Excel's accounting format (here a WPS export of the invoice summary) draws a
+cell's number, kerns the pen BACK ~40pt, draws "US$" in front of it, and kerns
+on to the next cell. Extraction reads "US$  229,529.99"; no stretch of the
+array in stream order holds that, so every amount was "could not find
+matching text". The array branch of the partial path now reads candidate
+arrays in visual order (pen positions, kerns included), finds the target
+there, splits the match into stretches drawn contiguously AND forwards, and
+requires the edit to fall in one of them (an insertion at a seam joins the
+stretch its characters belong with — digits join the number). Only that
+stretch is replaced; a stretch followed by a kern BACK was set flush right and
+keeps its right edge (`replaceInsideTjArray`'s `alignEnd`: the width
+difference is kerned in before the literal). Measured: "229,529.99" →
+".98", → "1,229,529.99" (grows left), "29,529.99", and "US$" → "S/" each
+render in the cell with the row's other cells unmoved.
+
+### The OCR bake checks every write, and a failed bake puts the page back
+`fillRect`, `drawImageInContent` and `addText` answer failure with `false`,
+and the bake went on: a shifted tail drawn over a patch that never landed is
+the old tail AND the new one — the user's "YOFC S.A.C.S.A.C." for "YOFC PERU
+S.A.C." with "PERU" deleted (not reproduced on this build; the deployed dist
+predates the live bake). Every write is checked; a missing tail crop is an
+error, not a silently erased tail; `applyOcrLiveNow` restores the page content
+it found before a bake that throws, and the status line says why. Two
+fidelity fixes on the same line:
+- **The patch stays inside the gap the scan has.** The head pad came from the
+  NEW text's spacing — deleting the U of "PERU S.A.C." put a word gap after
+  "PER", a 1pt pad, while R and U sat 0.8pt apart: the patch began inside the
+  U and its left stem stayed as a grey bar. Both pads are held to half the
+  scan's own gap to the replaced letters.
+- **A transplanted tail's left margin is the tail's.** The crop's columns
+  left of the tail's first ink are painted paper (`cropToPng`'s `clearLeft`).
+
+### Undo keeps a byte budget
+Twenty whole-document snapshots of a 30 MB file are 600 MB, and redo as much
+again. `history.ts` keeps at most 512 MB per stack (never fewer than three).
+
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
 - **Single BT block replacement**: Each edit targets one BT/ET block. Multi-block edits need separate operations

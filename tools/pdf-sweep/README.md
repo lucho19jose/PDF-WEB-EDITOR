@@ -68,6 +68,22 @@ Visual similarity is not measured on this path (no viewer); everything else
 the driver judges is. Unlink the junctions with `cmd /c rmdir` before removing
 the worktree.
 
+### One long document, every page
+
+A compilation (a fund request binding Excel, Word, CAD and scanned pages)
+changes producer every few pages, and the corpus sweeps only touch pages 1–2.
+`sweep-doc.mjs` runs the realistic operations (same, delete, append, resize,
+recolour, move) on every page of ONE file, a fresh document before each:
+
+```bash
+SKIP='Intellisign' node tools/pdf-sweep/sweep-doc.mjs file.pdf out.json [first] [last] [perPage]
+```
+
+`SKIP` is a regex of block texts to leave out (a signing service's stamp that
+extracts as a shuffle); `KINDS=same,append` restricts the operations. Split a
+long file into page ranges across processes: each process reloads the whole
+document per experiment and its WASM heap grows with the file's size.
+
 ## Output
 
 - `reports/NNN.json` — one report per PDF: features, every experiment, per-strategy
