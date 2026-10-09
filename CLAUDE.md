@@ -5752,6 +5752,54 @@ path with a colon in it (a line id) silently fails on Windows. `glyph <lineId>
 <char> <out.png>` (with `VALUES=1`) prints a letter's harvested copies, and
 `PALE=1` now also prints each ground test's verdict.
 
+**A short reading is sized by its ink, not by its box** (`shortInkEm`). The
+recogniser pads a lone "1" in a table cell out to the cell — 39×33 px round a
+13 px figure — and the em its width implied was three times the figure's: the
+region spanned three rows and reached into the stippled header above, and
+every row number of the results table was refused as "set over a picture".
+For readings of three characters or fewer, the tallest core piece inside the
+box (pieces spanning most of the box and sparse in their own bounds are rules
+or rule corners, and do not count) is taken as a capital or figure height
+(0.72 em; 0.52 for x-height letters alone), and replaces the guess when it is
+under three quarters of it. The row numbers now read with their figure as the
+one cell, the row rules as rules and the neighbouring rows protected, and
+"1"→"7", "3"→"31", "2"→"4" draw from the page's own figures, centred in the
+cell. Leaving thin straight runs out of the picture test instead was tried
+first: with the inflated em the cell analysed with the whole grid as its one
+letter.
+
+**A one-character reading gives the atlas no letter.** It is the recogniser's
+least reliable output — a speck, a corner of artwork, a stamp — with no
+neighbour to vet it. Sized better, a stray reversed "L" on the 96-DPI receipt
+started to pass analysis, moved the shapes that page's few copies are judged
+by, and a word reversal there ("UNIVERSIDAD" → "DADISREVINU", over a cut that
+slides mid-word) went from refused to drawn with remnants of its old letters;
+without the harvest it is refused again. The cost is the occasional useful
+lone letter (an "X" mark) no longer offered as a copy.
+
+Measured: the 18 suites change only in which page copy a few edits take
+(inspected, equivalent: MSP's "30 de septiembre", the purchase order's
+amounts, "213.3 X"), and on the results table one edit draws a smaller "X" from
+another copy. A unit test (a ruled cell padded to the cell, its em and its
+edit) fails at HEAD with an em of 43 px for a 24 px figure.
+
+**Fixtures without the browser.** `ppu-paddle-ocr` runs in node on
+`onnxruntime-node` with the app's own models (`public/paddle/*`): 132 lines of
+a page in under 4 s. A scratch script rendering pages at 220 DPI with MuPDF
+and writing the lab's fixture format (raw detector boxes — the app's
+`buildItems` refinement is NOT applied) surveyed 29 never-recorded documents.
+Printed pages read well; what is refused there is handwriting ("the reading
+does not fit the ink": students' maths notes on squared paper, a dozen pages)
+and pages that are not one scan image (read them with `RENDER=1`).
+
+**Known, and the next large gap: handwriting on a RED grid.** On those notes
+the squared paper's grid is red, 3–4 px thick at 280 DPI and dark enough in
+places (luminance down to ~110) to fail the "faint" test that takes a
+notebook's grid as paper, so it is read as ink: a whole line welds into one
+piece with the grid, no word gap is found, and lifting the whole-line sanity
+check only produced one giant approximate word. Every edit of handwriting
+falls back to Helvetica today.
+
 **A whole-run vector redraw erases on the scan's pixels where the line was
 read** (`inkAwareFallback`): when the scan edit declines a line for want of
 letters (or too many to synthesise) its line analysis still holds which pixels

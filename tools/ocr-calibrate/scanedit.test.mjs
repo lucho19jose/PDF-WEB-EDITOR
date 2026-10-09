@@ -1593,3 +1593,57 @@ test('a whole header line rewritten on a stipple keeps the stipple between its l
   for (let y = band[0]; y < band[1]; y++) for (let x = 0; x < W; x++) darkest = Math.min(darkest, work[(y * W + x) * 4])
   assert.ok(darkest >= 35, `a pixel at ${darkest}: darker than any of the stipple`)
 })
+
+test('a lone figure in a ruled cell is sized by its ink, not by the cell its box was padded to', () => {
+  // A results table's first column: one figure per row, rows 30 px apart,
+  // ruled; the recogniser's box for each figure is the whole cell.
+  const W = 400, H = 360, rowH = 30, top = 40, cx0 = 100, cx1 = 150, size = 24
+  const font = new mupdf.Font('Carlito', fs.readFileSync(ROOT + '/public/fonts/match/Carlito-Regular.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const t = new mupdf.Text()
+  const digits = '1234567890'
+  for (let r = 0; r < digits.length; r++) {
+    const adv = font.advanceGlyph(font.encodeCharacter(digits.codePointAt(r))) * size
+    t.showString(font, [size, 0, 0, -size, (cx0 + cx1) / 2 - adv / 2, top + r * rowH + 23], digits[r])
+  }
+  // The next column's ID numbers: where the page's figures come from (a
+  // one-figure reading gives none).
+  t.showString(font, [size, 0, 0, -size, cx1 + 20, top + 23], '7346829105')
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = pix.getPixels(), stride = pix.getStride()
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const rule = (x >= cx0 - 1 && x <= cx1 + 1 && y >= top && y < top + digits.length * rowH && ((y - top) % rowH < 2)) || ((x === cx0 || x === cx0 - 1 || x === cx1 || x === cx1 + 1) && y >= top && y < top + digits.length * rowH)
+    const v = rule ? 30 : Math.round(250 * g[y * stride + x] / 255 + 30 * (1 - g[y * stride + x] / 255))
+    const i = (y * W + x) * 4
+    rgba[i] = rgba[i + 1] = rgba[i + 2] = v
+    rgba[i + 3] = 255
+  }
+  const raster = R.scanRasterOf(W, H, rgba, [W, 0, 0, H, 0, 0], W, H, 'Table')
+  const pi = LI.preparePage(raster)
+  const cell = (r) => ({ x: cx0 + 2, y: top + r * rowH + 2, width: cx1 - cx0 - 4, height: rowH - 3 })
+  const lis = [...digits].map((d, r) => LI.analyzeLine(pi, { id: `r${r}`, text: d, inkRect: cell(r), confidence: 99 }))
+  const li = lis[0]
+  assert.ok(li, LI.lastLineFailure())
+  // A figure 24 px of em, not the 70 the cell's width implied.
+  assert.ok(Math.abs(li.fit.emPx - size) <= size * 0.3, `em ${li.fit.emPx.toFixed(1)} for a ${size} px figure`)
+  assert.equal(li.cells.length, 1, 'the cell holds one figure')
+  assert.ok(li.cells[0].x1 - li.cells[0].x0 < size * 0.6, 'the figure is its own ink, not the cell')
+  const idWidth = [...'7346829105'].reduce((t, c) => t + font.advanceGlyph(font.encodeCharacter(c.codePointAt(0))) * size, 0)
+  const ids = LI.analyzeLine(pi, { id: 'ids', text: '7346829105', inkRect: { x: cx1 + 18, y: top + 4, width: idWidth + 4, height: rowH - 6 }, confidence: 99 })
+  assert.ok(ids, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [...lis.filter(Boolean), ids], 0)])
+  const work = raster.data.slice()
+  const res = SE.applyLineEdit(pi, li, atlas, '7', work, {})
+  assert.ok(res.ok, res.reason)
+  // Nothing outside the edited cell changed: the rules and the other rows stand.
+  let outside = 0
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const inCell = x > cx0 + 1 && x < cx1 - 1 && y >= top + 2 && y < top + rowH
+    if (!inCell && work[(y * W + x) * 4] !== raster.data[(y * W + x) * 4]) outside++
+  }
+  assert.equal(outside, 0, `${outside} pixels changed outside the cell`)
+})

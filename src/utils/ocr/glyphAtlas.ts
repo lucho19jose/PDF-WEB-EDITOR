@@ -467,7 +467,12 @@ export function harvestPage(pi: PageInk, lines: LineInk[], page: number): PageHa
   const forms = new Map<string, number>()
   for (const li of lines) {
     for (const t of li.text.split(/\s+/)) { const f = formKey(t); if (f) forms.set(f, (forms.get(f) ?? 0) + 1) }
-    harvestLine(pageOfLine(pi, li), li, page, exemplars)
+    // A one-character reading gives no letter: it is the recogniser's least
+    // reliable output — a speck, a corner of artwork, a stamp — and has no
+    // neighbour to vet it. On a page with a few copies of each letter one such
+    // "L" moved the shapes the others are judged by, and a word reversal on a
+    // 96-DPI receipt went from refused to drawn with remnants of its letters.
+    if ([...li.text].filter(c => c.trim()).length >= 2) harvestLine(pageOfLine(pi, li), li, page, exemplars)
     const em = li.fit.emPx
     // Only gaps the reading puts a space in: the ink's split also cuts one
     // word at a wide letter gap, and a page of capitals cells measured its

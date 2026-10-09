@@ -1209,6 +1209,32 @@ function screenGround(pi: PageInk, roi: { x0: number; y0: number; x1: number; y1
 }
 
 /**
+ * The em a short reading's own ink implies: its tallest core piece inside the
+ * box, as a capital or figure (0.72 em) or, for x-height letters alone, as an
+ * x-height (0.52 em). A piece spanning most of the box along either side and
+ * sparse in its own bounds is a rule, or rules meeting at a corner, and does
+ * not count. Null when nothing letter-like is there.
+ */
+function shortInkEm(pi: PageInk, box: { x0: number; y0: number; x1: number; y1: number }, chars: string[]): number | null {
+  const s = pi.s
+  const x0 = Math.max(0, box.x0), y0 = Math.max(0, box.y0), x1 = Math.min(s.w, box.x1), y1 = Math.min(s.h, box.y1)
+  const W = x1 - x0, H = y1 - y0
+  if (W < 3 || H < 6) return null
+  const mask = new Uint8Array(W * H)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (pi.dark[(y0 + y) * s.w + x0 + x] >= CORE) mask[y * W + x] = 1
+  let tallest = 0
+  for (const c of components(mask, W, H, 0, 0, W)) {
+    const w = c.x1 - c.x0, h = c.y1 - c.y0
+    if (c.area < 6) continue
+    if ((h >= H * 0.85 || w >= W * 0.85) && c.area < w * h * 0.2) continue
+    tallest = Math.max(tallest, h)
+  }
+  if (tallest < Math.max(4, H * 0.2)) return null
+  const xHeightOnly = chars.every(c => /[acemnorsuvwxz]/.test(c))
+  return tallest / (xHeightOnly ? 0.52 : 0.72)
+}
+
+/**
  * Analyse one recognised line on the prepared page. `inkRect` is in page
  * points (top-left), as OCR reports it. Null when the line's ink cannot be
  * told apart (no letters, a baseline that cannot be fitted, a reading that
@@ -1229,6 +1255,16 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   const boxH = box.y1 - box.y0
   if (chars.length <= 2) emGuess = Math.max(emGuess, boxH / 1.2)
   emGuess = Math.min(emGuess, boxH * 1.6)
+  // A short reading's box says little about its size: the recogniser pads a
+  // lone "1" in a table cell out to the cell (39×33 px round a 13 px figure),
+  // and the em its width implied, three times the figure's, made a region
+  // spanning three rows and reaching into the header above — every row number
+  // of a results table came back "set over a picture". The ink inside the box
+  // says better: its tallest piece that is not a rule crossing the box.
+  if (chars.length <= 3) {
+    const inkEm = shortInkEm(pi, box, chars)
+    if (inkEm !== null && inkEm < emGuess * 0.75) emGuess = Math.max(inkEm, boxH * 0.3)
+  }
   const padY = Math.round(emGuess * 0.9), padX = Math.round(emGuess * 0.6)
   const [growL, growR] = opts.growX ?? [0, 0]
   const roi = { x0: Math.max(0, box.x0 - padX - growL), y0: Math.max(0, box.y0 - padY), x1: Math.min(s.w, box.x1 + padX + growR), y1: Math.min(s.h, box.y1 + padY) }
