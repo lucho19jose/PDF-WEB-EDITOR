@@ -83,6 +83,8 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       case 'getPageText': {
         if (!pdfDoc) throw new Error('No document loaded')
         const pageData = extractPageText(req.data.pageIndex)
+        // A watermark this editor wrote is an artifact, not editable text.
+        pageData.blocks = acroTools.filterWatermark(req.data.pageIndex, pageData.blocks)
         respond({ id: req.id, type: 'success', data: pageData })
         break
       }

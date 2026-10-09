@@ -1,0 +1,141 @@
+/*
+ * Acrobat DC, dark theme — the colours sampled from the application itself
+ * (menu bar #3e3e3e, tab bar #424242, tool bars and panels #4d4d4d, rules
+ * #3a3a3a / #2a2a2a, the blue "Compartir" #2680eb, the tool accents).
+ * Typeface: Adobe Clean where installed, Segoe UI otherwise — the face
+ * Acrobat itself falls back to on Windows.
+ */
+:root {
+  --acro-menubar: #3e3e3e;
+  --acro-tabbar: #424242;
+  --acro-bar: #4d4d4d;
+  --acro-panel: #4d4d4d;
+  --acro-rail: #4d4d4d;
+  --acro-pane: #424242;
+  --acro-canvas: #3a3a3a;
+  --acro-rule: #3a3a3a;
+  --acro-rule-dark: #2a2a2a;
+  --acro-text: #e6e6e6;
+  --acro-text-strong: #ffffff;
+  --acro-text-dim: #b3b3b3;
+  --acro-text-faint: #8a8a8a;
+  --acro-hover: #5a5a5a;
+  --acro-pressed: #646464;
+  --acro-blue: #2680eb;
+  --acro-blue-hover: #1473e6;
+  --acro-blue-text: #4b9cf5;
+  --acro-select: #dceefa;
+  --acro-select-border: #2175c8;
+  --acro-input: #3a3a3a;
+  --acro-input-border: #6e6e6e;
+  --acro-font: 'Adobe Clean', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+}
+
+html, body, #app {
+  font-family: var(--acro-font);
+  font-size: 13px;
+  background: var(--acro-canvas);
+  color: var(--acro-text);
+}
+body.body--dark { background: var(--acro-canvas); }
+
+/* Thin dark scrollbars, as Acrobat's. */
+.acro-app ::-webkit-scrollbar { width: 14px; height: 14px; }
+.acro-app ::-webkit-scrollbar-track { background: #2b2b2b; }
+.acro-app ::-webkit-scrollbar-thumb { background: #6b6b6b; border: 3px solid #2b2b2b; border-radius: 7px; }
+.acro-app ::-webkit-scrollbar-thumb:hover { background: #8a8a8a; }
+.acro-app ::-webkit-scrollbar-corner { background: #2b2b2b; }
+
+/* ── icon buttons ── */
+.acro-ibtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 32px; min-width: 32px; padding: 0 5px; gap: 6px;
+  border: 0; border-radius: 4px; background: transparent;
+  color: var(--acro-text); font: inherit; font-size: 13px; cursor: pointer;
+  white-space: nowrap; user-select: none; flex: none;
+}
+.acro-ibtn:hover:not(:disabled) { background: var(--acro-hover); }
+.acro-ibtn:active:not(:disabled), .acro-ibtn.pressed { background: var(--acro-pressed); }
+.acro-ibtn.active { color: var(--acro-blue-text); }
+.acro-ibtn.active .q-icon, .acro-ibtn.active .acro-icon { color: var(--acro-blue-text); }
+.acro-ibtn:disabled { opacity: 0.38; cursor: default; }
+.acro-ibtn .q-icon { font-size: 22px; color: #d0d0d0; }
+.acro-ibtn.small .q-icon { font-size: 20px; }
+.acro-ibtn .caret { font-size: 16px !important; margin-left: -4px; }
+
+/* ── pill buttons ── */
+.acro-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 16px; border-radius: 16px;
+  font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; flex: none;
+  border: 2px solid transparent; white-space: nowrap;
+}
+.acro-pill.primary { background: var(--acro-blue); color: #fff; }
+.acro-pill.primary:hover { background: var(--acro-blue-hover); }
+.acro-pill.primary .acro-icon { color: #fff; }
+.acro-pill.outline { background: transparent; color: #e8e8e8; border-color: #d0d0d0; }
+.acro-pill.outline:hover { background: rgba(255, 255, 255, 0.08); border-color: #fff; color: #fff; }
+.acro-pill:disabled { opacity: 0.4; cursor: default; }
+
+/* Small rectangular "Abrir ▾" / "Agregar ▾" split buttons of the Tools page. */
+.acro-split {
+  display: inline-flex; border: 1px solid #c8c8c8; border-radius: 2px; height: 24px; overflow: hidden;
+}
+.acro-split button {
+  background: #474747; color: #f0f0f0; border: 0; font: inherit; font-size: 13px; padding: 0 8px; cursor: pointer;
+}
+.acro-split button + button { border-left: 1px solid #c8c8c8; padding: 0 4px; }
+.acro-split button:hover { background: #5c5c5c; }
+
+/* ── separators ── */
+.acro-vsep { width: 1px; align-self: stretch; margin: 8px 6px; background: var(--acro-rule); flex: none; }
+.acro-hsep { height: 1px; background: #5a5a5a; margin: 6px 0; }
+
+/* ── form controls ── */
+.acro-input {
+  height: 24px; padding: 0 6px; border: 1px solid var(--acro-input-border); border-radius: 2px;
+  background: var(--acro-input); color: var(--acro-text); font: inherit; font-size: 13px; outline: none;
+}
+.acro-input:focus { border-color: var(--acro-blue); }
+.acro-input.underline { border: 0; border-bottom: 1px solid #8a8a8a; border-radius: 0; background: transparent; }
+.acro-input.underline:focus { border-bottom-color: var(--acro-blue); }
+select.acro-input { padding-right: 18px; cursor: pointer; }
+select.acro-input option { background: #3a3a3a; color: #eee; }
+.acro-check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; color: var(--acro-text); font-size: 13px; }
+.acro-check input { width: 15px; height: 15px; accent-color: var(--acro-blue); cursor: pointer; margin: 0; }
+
+/* ── menus (q-menu with class acro-menu) ── */
+.acro-menu.q-menu {
+  background: #323232; color: #e6e6e6; border: 1px solid #1e1e1e; border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55); font-family: var(--acro-font); font-size: 13px;
+  min-width: 200px;
+}
+.acro-menu .q-list { padding: 4px 0; }
+.acro-menu .q-item { min-height: 28px; padding: 3px 24px 3px 12px; color: #e6e6e6; }
+.acro-menu .q-item.q-item--clickable:hover, .acro-menu .q-item.q-manual-focusable--focused { background: #4b4b4b; }
+.acro-menu .q-item.disabled, .acro-menu .q-item--disabled { opacity: 0.4 !important; }
+.acro-menu .q-item__section--avatar { min-width: 28px; color: #cfcfcf; }
+.acro-menu .q-item__section--avatar .q-icon { font-size: 18px; }
+.acro-menu .shortcut { color: #9a9a9a; font-size: 12px; padding-left: 28px; }
+.acro-menu .q-separator { background: #555; margin: 4px 0; }
+.acro-menu .q-item__label--header { color: #9a9a9a; font-size: 11px; text-transform: uppercase; padding: 8px 12px 2px; }
+
+/* ── dialogs (acro-dialog) ── */
+.acro-dialog .q-card, .q-dialog__inner > .q-card.acro-card, .acro-card {
+  background: #323232 !important; color: var(--acro-text); border-radius: 4px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6); font-family: var(--acro-font);
+}
+.acro-card .acro-card-title { font-size: 18px; font-weight: 700; color: #fff; padding: 18px 24px 4px; }
+.acro-card .acro-card-body { padding: 12px 24px; }
+.acro-card .acro-card-actions { padding: 12px 24px 20px; display: flex; justify-content: flex-end; gap: 10px; }
+.acro-card label.acro-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--acro-text-dim); }
+.acro-card fieldset { border: 1px solid #555; border-radius: 3px; padding: 8px 12px 12px; margin: 0 0 12px; }
+.acro-card legend { padding: 0 6px; color: #cfcfcf; font-size: 12px; }
+.q-dialog .q-card.q-dialog-plugin { background: #323232; color: #e6e6e6; }
+
+/* Tooltips the way Acrobat draws them. */
+.q-tooltip { background: #1e1e1e; color: #f0f0f0; font-size: 12px; font-family: var(--acro-font); border-radius: 3px; padding: 4px 8px; }
+
+/* Bounding boxes ("Mostrar cuadros delimitadores") while editing. */
+.acro-bboxes .text-block { outline: 1px solid rgba(70, 140, 220, 0.55); outline-offset: 0; }
+.acro-bboxes .cimg-hit { outline: 1px solid rgba(70, 140, 220, 0.55); }

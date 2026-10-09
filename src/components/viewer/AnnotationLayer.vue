@@ -102,13 +102,14 @@
     />
 
     <!-- Rubber-band preview for rect/circle/markup -->
-    <div v-if="drag && ['rectangle','circle','highlight','underline','strikeout'].includes(drag.tool)"
-         class="annot-preview" :class="{ circle: drag.tool === 'circle', markup: isMarkupPreview }"
+    <div v-if="drag && ['rectangle','circle','highlight','underline','strikeout','redact','link','crop','stamp','symbol','sign'].includes(drag.tool)"
+         class="annot-preview" :class="{ circle: drag.tool === 'circle', markup: isMarkupPreview, ['area-' + drag.tool]: true }"
          :style="previewBoxStyle" />
+    <div v-if="drag && drag.tool === 'measure' && drag.moved" class="measure-label" :style="measureLabelStyle">{{ measureText }}</div>
 
     <!-- SVG preview for line + ink -->
-    <svg v-if="drag && (drag.tool === 'line' || drag.tool === 'draw')" class="annot-svg">
-      <line v-if="drag.tool === 'line'"
+    <svg v-if="drag && (drag.tool === 'line' || drag.tool === 'draw' || drag.tool === 'measure')" class="annot-svg">
+      <line v-if="drag.tool === 'line' || drag.tool === 'measure'"
             :x1="drag.startSx" :y1="drag.startSy" :x2="drag.curSx" :y2="drag.curSy"
             :stroke="editorStore.strokeColor" :stroke-width="editorStore.strokeWidth" />
       <polyline v-if="drag.tool === 'draw'"
@@ -151,6 +152,8 @@ import { ref, computed, watch, nextTick, inject, onMounted, onBeforeUnmount } fr
 import { useQuasar } from 'quasar'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, MARKUP_TOOLS, type Tool } from '@/stores/editor'
+import { useUiStore } from '@/stores/ui'
+import { objectSelection, setObjectHandler, type ObjectAction } from '@/utils/acro/objectBus'
 import { useHistoryStore } from '@/stores/history'
 import { useOcrStore } from '@/stores/ocr'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
@@ -167,6 +170,8 @@ const editorStore = useEditorStore()
 const ocrStore = useOcrStore()
 const historyStore = useHistoryStore()
 const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
+const ui = useUiStore()
+const pickFiles = inject<(accept: string, multiple: boolean) => Promise<File[]>>('pickFiles', async () => [])
 /** The OCR side's ear for a scan that moved or changed under its recognised runs. */
 const ocrController = inject<{ scanMoved?: (pageIndex: number, dx: number, dy: number) => void; scanChanged?: (pageIndex: number) => void } | null>('ocrController', null)
 
@@ -762,11 +767,39 @@ const previewBoxStyle = computed(() => {
   const w = Math.abs(d.curSx - d.startSx)
   const h = Math.abs(d.curSy - d.startSy)
   const color = isMarkupPreview.value ? editorStore.highlightColor : editorStore.strokeColor
+  const area: Record<string, { border: string; bg: string }> = {
+    redact: { border: '#c00000', bg: 'rgba(0,0,0,0.35)' },
+    link: { border: '#2680eb', bg: 'rgba(38,128,235,0.12)' },
+    crop: { border: '#2680eb', bg: 'rgba(38,128,235,0.08)' },
+    stamp: { border: '#b483f0', bg: 'rgba(180,131,240,0.12)' },
+    symbol: { border: editorStore.strokeColor, bg: 'transparent' },
+    sign: { border: '#b483f0', bg: 'rgba(180,131,240,0.1)' }
+  }
+  const a = area[d.tool]
   return {
     left: `${left}px`, top: `${top}px`, width: `${w}px`, height: `${h}px`,
-    borderColor: color,
-    background: isMarkupPreview.value ? rgb01ToCss(hexToRgb01(color), 0.35) : 'transparent'
+    borderColor: a ? a.border : color,
+    borderStyle: a ? 'dashed' : 'solid',
+    background: a ? a.bg : isMarkupPreview.value ? rgb01ToCss(hexToRgb01(color), 0.35) : 'transparent'
   }
+})
+
+/** Medir: the distance being drawn, in the unit chosen on the bar. */
+function measureOf(dxPt: number, dyPt: number): string {
+  const pt = Math.hypot(dxPt, dyPt)
+  const u = editorStore.measureUnit
+  const v = u === 'mm' ? pt * 25.4 / 72 : u === 'cm' ? pt * 2.54 / 72 : u === 'in' ? pt / 72 : pt
+  return `${v.toFixed(u === 'in' ? 2 : u === 'pt' ? 0 : 1).replace('.', ',')} ${u}`
+}
+const measureText = computed(() => {
+  const d = drag.value
+  if (!d) return ''
+  return measureOf((d.curSx - d.startSx) / scaleX.value, (d.curSy - d.startSy) / scaleY.value)
+})
+const measureLabelStyle = computed(() => {
+  const d = drag.value
+  if (!d) return {}
+  return { left: `${(d.startSx + d.curSx) / 2}px`, top: `${(d.startSy + d.curSy) / 2 - 26}px` }
 })
 
 const inkPreviewPoints = computed(() => {
@@ -827,6 +860,7 @@ function onCaptureDown(e: MouseEvent) {
 
   if (tool === 'image') { imageDropY.value = py; imgInputRef.value?.click(); return }
   if (tool === 'note') { placeNote(px, py); return }
+  if (tool === 'sign') { placeSignature(px, py); return }
 
   drag.value = { tool, startSx: sx, startSy: sy, curSx: sx, curSy: sy, inkPts: [[px, py]], moved: false }
   window.addEventListener('mousemove', onCaptureMove)
@@ -860,9 +894,38 @@ async function onCaptureUp() {
   const y1 = Math.max(d.startSy, d.curSy) / scaleY.value
   const rectPage: RectT = [x0, y0, x1, y1]
 
+  // Click-to-place tools take a click as "the default size, here".
+  if (x1 - x0 < 3 && y1 - y0 < 3) {
+    if (d.tool === 'stamp') { await placeStamp([x0 - 75, y0 - 22, x0 + 75, y0 + 22]); return }
+    if (d.tool === 'symbol') { await placeSymbol([x0 - 7, y0 - 7, x0 + 7, y0 + 7]); return }
+  }
+
   // Ignore tiny accidental drags (except draw/note)
   if (d.tool !== 'draw' && (x1 - x0 < 3 && y1 - y0 < 3)) {
     if (d.tool === 'freetext') { openFreeText([x0, y0, x0 + 180 / scaleX.value, y0 + 40 / scaleY.value]) }
+    return
+  }
+
+  // The Acrobat shell's area tools.
+  if (d.tool === 'redact') {
+    await annotOp('Área marcada para redacción — "Aplicar" elimina el contenido', async () => {
+      const r = await pdfEngine.acro<{ success: boolean }>('addRedaction', { pageIndex, rect: [...rectPage] })
+      return !!r?.success
+    })
+    return
+  }
+  if (d.tool === 'link') { ui.openDialog('link', { pageIndex, rect: [...rectPage] }); return }
+  if (d.tool === 'crop') {
+    if (imageCropTarget.value) { await cropImageTo(rectPage); return }
+    ui.openDialog('crop', { pageIndex, rect: [...rectPage], pdfW: props.pdfWidth, pdfH: props.pdfHeight, pages: [pageIndex] })
+    return
+  }
+  if (d.tool === 'stamp') { await placeStamp(rectPage); return }
+  if (d.tool === 'symbol') { await placeSymbol(rectPage); return }
+  if (d.tool === 'measure') {
+    const a: Pt = [d.startSx / scaleX.value, d.startSy / scaleY.value]
+    const b: Pt = [d.curSx / scaleX.value, d.curSy / scaleY.value]
+    await placeMeasure(a, b)
     return
   }
 
@@ -958,10 +1021,122 @@ function placeNote(px: number, py: number) {
   })
 }
 
+// --- Acrobat shell: stamps, form marks, signatures, measurements ---
+async function placeStamp(rect: RectT) {
+  const pageIndex = docStore.currentPage - 1
+  const label = editorStore.stampName
+  await annotOp(`Sello "${label}" agregado`, async () => {
+    const r = await pdfEngine.acro<{ success: boolean }>('addStamp', { pageIndex, rect: [...rect], icon: editorStore.stampName })
+    return !!r?.success
+  })
+}
+
+/** Rellenar y firmar's marks: a tick, a cross, a dot, a line, a box. */
+async function placeSymbol(rect: RectT) {
+  const pageIndex = docStore.currentPage - 1
+  const [x0, y0, x1, y1] = rect
+  const w = x1 - x0, h = y1 - y0
+  const color = hexToRgb01(editorStore.strokeColor)
+  const width = Math.max(1, Math.min(w, h) / 7)
+  const kind = editorStore.symbolKind
+  const labels = { check: 'Marca de verificación', cross: 'Cruz', dot: 'Punto', line: 'Línea', box: 'Rectángulo' }
+  await annotOp(`${labels[kind]} agregada`, () => {
+    if (kind === 'check') return pdfEngine.addInk(pageIndex, [[[x0, y0 + h * 0.55], [x0 + w * 0.38, y1], [x1, y0]]], color, width, 1)
+    if (kind === 'cross') return pdfEngine.addInk(pageIndex, [[[x0, y0], [x1, y1]], [[x1, y0], [x0, y1]]], color, width, 1)
+    if (kind === 'dot') return pdfEngine.addShape(pageIndex, 'Circle', { rect: [...rect] as RectT, color, interiorColor: color, width: 0.5, opacity: 1 })
+    if (kind === 'line') return pdfEngine.addShape(pageIndex, 'Line', { points: [[x0, (y0 + y1) / 2], [x1, (y0 + y1) / 2]], color, width: Math.max(1, editorStore.strokeWidth), opacity: 1 })
+    return pdfEngine.addShape(pageIndex, 'Square', { rect: [...rect] as RectT, color, interiorColor: null, width: Math.max(1, editorStore.strokeWidth), opacity: 1 })
+  })
+}
+
+/** The saved signature (or initials) as an image, centred on the click. */
+async function placeSignature(px: number, py: number) {
+  const url = editorStore.signKind === 'initials' ? ui.initialsImage : ui.signatureImage
+  if (!url) { ui.openDialog('signature', { kind: editorStore.signKind }); return }
+  const bytes = await (await fetch(url)).arrayBuffer()
+  const aspect = await new Promise<number>(res => { const im = new Image(); im.onload = () => res(im.width / im.height || 3); im.onerror = () => res(3); im.src = url })
+  const w = editorStore.signKind === 'initials' ? 60 : 150
+  const h = w / aspect
+  const rect: RectT = [px - w / 2, py - h / 2, px + w / 2, py + h / 2]
+  const msg = editorStore.signKind === 'initials' ? 'Iniciales agregadas' : 'Firma agregada — arrástrela para moverla'
+  await annotOp(msg, () => pdfEngine.addImageStamp(docStore.currentPage - 1, rect, bytes))
+  // setTool writes its own status line: the note goes back after it.
+  editorStore.setTool('select')
+  editorStore.setStatus(msg)
+}
+
+/** Medir: a line with the distance written beside it, as Acrobat's measuring tool leaves. */
+async function placeMeasure(a: Pt, b: Pt) {
+  const pageIndex = docStore.currentPage - 1
+  const text = measureOf(b[0] - a[0], b[1] - a[1])
+  const color = hexToRgb01(editorStore.strokeColor)
+  const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2
+  await annotOp(`Distancia: ${text}`, async () => {
+    const ok = await pdfEngine.addShape(pageIndex, 'Line', { points: [a, b], color, width: Math.max(0.5, editorStore.strokeWidth), opacity: 1 })
+    if (!ok) return false
+    return pdfEngine.addFreeText(pageIndex, [mx - 40, my - 20, mx + 40, my - 6], text, 9, color)
+  })
+}
+
+// --- the OBJETOS panel acts on the selection through objectBus ---
+watch([selectedImgId, selectedIndex], () => {
+  const pageIndex = docStore.currentPage - 1
+  if (selectedImg.value) objectSelection.value = { kind: 'content-image', isImage: true, pageIndex }
+  else if (selectedAnnot.value) objectSelection.value = { kind: 'annotation', isImage: selectedIsImage.value, pageIndex }
+  else objectSelection.value = null
+})
+
+/** The picture "Recortar imagen" is waiting to crop; the next band drawn decides what is kept. */
+const imageCropTarget = ref<ContentImageInfo | null>(null)
+async function cropImageTo(rect: RectT) {
+  const img = imageCropTarget.value
+  imageCropTarget.value = null
+  editorStore.setTool('edit')
+  if (!img) return
+  const r = img.rect
+  const keep: RectT = [Math.max(rect[0], Math.min(r[0], r[2])), Math.max(rect[1], Math.min(r[1], r[3])), Math.min(rect[2], Math.max(r[0], r[2])), Math.min(rect[3], Math.max(r[1], r[3]))]
+  if (keep[2] - keep[0] < 2 || keep[3] - keep[1] < 2) { editorStore.setStatus('El área dibujada no cubre la imagen'); return }
+  await annotOp('Imagen recortada', () => pdfEngine.cropContentImage(docStore.currentPage - 1, img.sourceKey, img.doOffset, img.name, keep))
+}
+
+async function handleObjectAction(action: ObjectAction) {
+  const pageIndex = docStore.currentPage - 1
+  if (action === 'delete') { await deleteSelected(); return }
+  const img = selectedImg.value
+  if (img) {
+    if (action === 'flip-h' || action === 'flip-v' || action === 'rotate-cw' || action === 'rotate-ccw') {
+      const msg = { 'flip-h': 'Imagen volteada horizontalmente', 'flip-v': 'Imagen volteada verticalmente', 'rotate-cw': 'Imagen girada a la derecha', 'rotate-ccw': 'Imagen girada a la izquierda' }[action]
+      await annotOp(msg, () => pdfEngine.orientContentImage(pageIndex, img.sourceKey, img.doOffset, img.name, action))
+    } else if (action.startsWith('align-')) {
+      const mode = action.slice(6) as any
+      await annotOp('Imagen alineada', () => pdfEngine.alignContentImage(pageIndex, img.sourceKey, img.doOffset, img.name, mode))
+    } else if (action === 'front' || action === 'back') {
+      await annotOp(action === 'front' ? 'Imagen traída al frente' : 'Imagen enviada al fondo', () => pdfEngine.reorderContentImage(pageIndex, img.sourceKey, img.doOffset, img.name, action))
+    } else if (action === 'crop') {
+      imageCropTarget.value = img
+      editorStore.setTool('crop')
+      editorStore.setStatus('Dibuje el área de la imagen que desea conservar')
+    } else if (action === 'replace') {
+      const [f] = await pickFiles('image/png,image/jpeg', false)
+      if (!f) return
+      const bytes = new Uint8Array(await f.arrayBuffer())
+      await annotOp('Imagen reemplazada', () => pdfEngine.replaceContentImage(pageIndex, img.sourceKey, img.doOffset, img.name, bytes))
+    }
+    return
+  }
+  if (selectedAnnot.value && (action === 'rotate-cw' || action === 'rotate-ccw')) {
+    if (selectedIsImage.value) await rotateSelectedImage()
+    else editorStore.setStatus('Solo se pueden girar las imágenes')
+  }
+}
+onMounted(() => setObjectHandler(handleObjectAction))
+
 // --- FreeText ---
 function openFreeText(rect: RectT) {
   ftRect.value = rect
-  freeTextValue.value = ''
+  // The Fill & Sign "date" button opens the box already holding today's date.
+  freeTextValue.value = editorStore.freeTextPreset
+  editorStore.freeTextPreset = ''
   freeTextEditing.value = true
   nextTick(() => ftRef.value?.focus())
 }
@@ -1391,6 +1566,8 @@ watch(showLayer, (v) => { if (v) loadAnnotations() }, { immediate: true })
 
 window.addEventListener('keydown', onKeyDown)
 onBeforeUnmount(() => {
+  setObjectHandler(null)
+  objectSelection.value = null
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('mousemove', onCaptureMove)
   window.removeEventListener('mouseup', onCaptureUp)
@@ -1439,6 +1616,10 @@ defineExpose({ loadAnnotations, deleteSelected, selectInBand, clearMultiSelectio
   position: absolute; border: 2px solid; box-sizing: border-box; z-index: 17; pointer-events: none;
 }
 .annot-preview.circle { border-radius: 50%; }
+.measure-label {
+  position: absolute; z-index: 18; transform: translateX(-50%); pointer-events: none; white-space: nowrap;
+  background: #1e1e1e; color: #fff; font-size: 12px; padding: 2px 8px; border-radius: 3px;
+}
 .annot-preview.markup { border-style: none; }
 .annot-svg { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 17; pointer-events: none; overflow: visible; }
 .annot-layout {

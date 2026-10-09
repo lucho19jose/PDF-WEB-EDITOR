@@ -50,6 +50,8 @@ export interface AcroContext {
 export const HF_TAG = 'AcroHeaderFooter'
 export const WM_TAG = 'AcroWatermark'
 export const BG_TAG = 'AcroBackground'
+/** Page-dictionary key recording a watermark's text, so extraction can leave it out (see `isWatermarkBlock`). */
+const WM_KEY = 'AcroWatermarkText'
 
 export function createAcroTools(ctx: AcroContext) {
   const doc = () => ctx.doc()
@@ -402,6 +404,8 @@ export function createAcroTools(ctx: AcroContext) {
         page.destroy()
       }
       writeTagged(i, WM_TAG, body, o.behind)
+      const pg = doc().loadPage(i)
+      try { pg.getObject().put(WM_KEY, doc().newString(o.text)) } finally { pg.destroy() }
       done++
     }
     return { success: true, pages: done }
@@ -441,8 +445,46 @@ export function createAcroTools(ctx: AcroContext) {
     for (let i = 0; i < count(); i++) {
       const r = ctx.removeMarkedContent(i, tag)
       if (r.removed) { removed += r.removed; ctx.invalidateContentSources(i) }
+      if (kind === 'watermark') {
+        const pg = doc().loadPage(i)
+        try { pg.getObject().delete(WM_KEY) } catch (_) { /* none */ } finally { pg.destroy() }
+      }
     }
     return { success: true, removed }
+  }
+
+  /** The watermark text this editor wrote on a page, or ''. */
+  function watermarkTextOf(pageIndex: number): string {
+    const pg = doc().loadPage(pageIndex)
+    try {
+      const v = pg.getObject().get(WM_KEY)
+      return ctx.isNullObj(v) ? '' : String(v.asString?.() ?? '')
+    } catch (_) {
+      return ''
+    } finally {
+      pg.destroy()
+    }
+  }
+
+  /**
+   * Is this extracted block a piece of the page's watermark? A watermark is
+   * an artifact, the way Acrobat treats one: it is not text to click and edit
+   * (it is updated or removed from its own menu), and a turned watermark
+   * extracts as a scatter of one-letter blocks over the body text that would
+   * otherwise catch every click. A block qualifies when its text is part of
+   * the watermark's AND it is turned — or, upright, when it IS the watermark.
+   */
+  function filterWatermark<B extends { text: string; chars: { quad: number[] }[] }>(pageIndex: number, blocks: B[]): B[] {
+    const wm = watermarkTextOf(pageIndex).replace(/\s+/g, '')
+    if (!wm) return blocks
+    return blocks.filter(b => {
+      const t = b.text.replace(/\s+/g, '')
+      if (!t || !wm.includes(t)) return true
+      if (t === wm) return false
+      const q = b.chars[0]?.quad
+      const turned = !!q && Math.abs(q[3] - q[1]) > Math.abs(q[2] - q[0]) * 0.2
+      return !turned
+    })
   }
 
   function hasTagged(): { headerFooter: boolean; watermark: boolean; background: boolean } {
@@ -503,6 +545,28 @@ export function createAcroTools(ctx: AcroContext) {
       try { n += page.getAnnotations().filter((a: any) => a.getType() === 'Redact').length } finally { page.destroy() }
     }
     return n
+  }
+
+  // ───────────────────────── Stamps ─────────────────────────
+
+  /**
+   * One of Acrobat's standard stamps ("Approved", "Draft", "Confidential"…) as
+   * a Stamp annotation: MuPDF draws the standard appearance for the name, so
+   * the stamp looks the same in every viewer, and it stays movable.
+   */
+  function addStamp(pageIndex: number, rect: [number, number, number, number], icon: string): { success: boolean; error?: string } {
+    const page = doc().loadPage(pageIndex)
+    try {
+      const annot = page.createAnnotation('Stamp')
+      annot.setRect(rect as any)
+      try { annot.setIcon(icon) } catch (_) { /* unknown name: the default stamp */ }
+      annot.update()
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: errorOf(err) }
+    } finally {
+      page.destroy()
+    }
   }
 
   // ───────────────────────── Links ─────────────────────────
@@ -744,7 +808,7 @@ export function createAcroTools(ctx: AcroContext) {
 
   // ───────────────────────── Dispatch ─────────────────────────
 
-  return function dispatch(op: string, a: any): { data: any; transfer?: Transferable[] } {
+  const dispatch = function dispatch(op: string, a: any): { data: any; transfer?: Transferable[] } {
     switch (op) {
       case 'rearrange': return { data: rearrange(a.order) }
       case 'deletePages': return { data: deletePages(a.indices) }
@@ -762,6 +826,7 @@ export function createAcroTools(ctx: AcroContext) {
       case 'addRedaction': return { data: addRedaction(a.pageIndex, a.rect) }
       case 'applyRedactions': return { data: applyRedactions() }
       case 'countRedactions': return { data: countRedactions() }
+      case 'addStamp': return { data: addStamp(a.pageIndex, a.rect, a.icon) }
       case 'addLink': return { data: addLink(a.pageIndex, a.rect, a.target) }
       case 'listLinks': return { data: listLinks(a.pageIndex) }
       case 'deleteLink': return { data: deleteLink(a.pageIndex, a.index) }
@@ -780,11 +845,12 @@ export function createAcroTools(ctx: AcroContext) {
       default: throw new Error(`Unknown Acrobat operation: ${op}`)
     }
   }
+  return Object.assign(dispatch, { filterWatermark })
 }
 
 /** Operations that change the document (the rest only read it or make new ones). */
 export const ACRO_MUTATING_OPS = new Set([
   'rearrange', 'deletePages', 'rotatePages', 'replacePages', 'cropPages',
   'headerFooter', 'watermark', 'background', 'removeTagged',
-  'addRedaction', 'applyRedactions', 'addLink', 'deleteLink', 'setMetadata', 'flatten'
+  'addRedaction', 'applyRedactions', 'addStamp', 'addLink', 'deleteLink', 'setMetadata', 'flatten'
 ])

@@ -1,19 +1,23 @@
 <template>
-  <q-layout view="hHh lpR fFf" class="bg-dark">
-    <!-- Header: Title + Toolbar -->
-    <q-header class="bg-grey-10">
-      <div class="title-bar q-px-md q-py-xs row items-center text-grey-4">
-        <q-icon name="picture_as_pdf" size="sm" color="primary" class="q-mr-sm" />
-        <span class="text-weight-bold">PDF Editor Pro v2</span>
-        <span v-if="docStore.fileName" class="q-ml-md text-grey-6">
-          {{ docStore.fileName }}{{ docStore.isModified ? ' *' : '' }}
-        </span>
-        <q-space />
-        <q-btn flat dense icon="menu" size="sm" @click="sidebarOpen = !sidebarOpen">
-          <q-tooltip>Toggle page panel</q-tooltip>
-        </q-btn>
-      </div>
-      <MainToolbar />
+  <q-layout
+    view="hHh lpR fFf"
+    class="acro-app"
+    :class="{ 'acro-bboxes': ui.showBoundingBoxes && editorStore.currentTool === 'edit', 'acro-read': ui.readMode }"
+  >
+    <!--
+      Acrobat DC's header, top to bottom: the menu bar, the tabs (Inicio,
+      Herramientas, the document), and — on the document — the main tool bar
+      and the open tool's own bar. Read mode (Ctrl+H) takes all of it away.
+    -->
+    <q-header class="acro-header">
+      <template v-if="!ui.readMode">
+        <AcroMenuBar />
+        <AcroTabBar />
+        <template v-if="ui.view === 'document' && docStore.loaded">
+          <AcroToolbar />
+          <AcroToolOptions v-if="ui.activeTool" />
+        </template>
+      </template>
       <!--
         Inside the header, not the page container: the header is the only
         element in the layout that is guaranteed to sit above the page, and
@@ -24,13 +28,8 @@
       <FindBar />
     </q-header>
 
-    <!-- Left Sidebar: Page Thumbnails -->
-    <q-drawer v-model="sidebarOpen" side="left" :width="200" bordered class="bg-grey-10">
-      <PageThumbnails />
-    </q-drawer>
-
     <!-- Right Sidebar: the editing assistant (chat) -->
-    <q-drawer v-model="editorStore.assistantOpen" side="right" :width="380" bordered class="bg-grey-10">
+    <q-drawer v-model="editorStore.assistantOpen" side="right" :width="380" bordered class="acro-assistant">
       <AssistantPanel />
     </q-drawer>
 
@@ -67,11 +66,26 @@
       class="offscreen-file-input"
       @change="onMergePicked"
     />
+    <!-- The shell's general-purpose chooser (insert, replace, combine, create, signature image). -->
+    <input
+      id="app-pick-files"
+      ref="pickInputRef"
+      type="file"
+      class="offscreen-file-input"
+      @change="onPickFiles"
+    />
 
     <!-- Footer: Status Bar -->
-    <q-footer class="bg-grey-10 q-px-md" style="height: 28px">
+    <q-footer v-if="!ui.readMode" class="acro-status">
       <StatusBar />
     </q-footer>
+
+    <!-- Read mode: the only control left on screen is the way out. -->
+    <button v-if="ui.readMode" class="read-exit" @click="ui.readMode = false">
+      <q-icon name="close_fullscreen" size="18px" /> Salir del modo de lectura (Ctrl+H)
+    </button>
+
+    <AcroDialogs />
   </q-layout>
 </template>
 
@@ -104,9 +118,17 @@ import { usePDFViewer } from '@/composables/usePDFViewer'
 import { usePDFEngine } from '@/composables/usePDFEngine'
 import { getMuPDFBridge } from '@/engine/bridge'
 import { enqueueOp, settleTransactions, transactionOpen, beginTransaction } from '@/utils/opQueue'
-import MainToolbar from '@/components/toolbar/MainToolbar.vue'
-import PageThumbnails from '@/components/sidebar/PageThumbnails.vue'
 import StatusBar from '@/components/common/StatusBar.vue'
+import AcroMenuBar from '@/components/acrobat/AcroMenuBar.vue'
+import AcroTabBar from '@/components/acrobat/AcroTabBar.vue'
+import AcroToolbar from '@/components/acrobat/AcroToolbar.vue'
+import AcroToolOptions from '@/components/acrobat/AcroToolOptions.vue'
+import AcroDialogs from '@/components/acrobat/AcroDialogs.vue'
+import { createAcroShell } from '@/components/acrobat/acroShell'
+import { useAcroCommands } from '@/composables/useAcroCommands'
+import { useUiStore } from '@/stores/ui'
+import { rememberRecent } from '@/utils/acro/recentFiles'
+import { buildReportMailto } from '@/utils/reportProblem'
 import FindBar from '@/components/toolbar/FindBar.vue'
 import AssistantPanel from '@/components/assistant/AssistantPanel.vue'
 import { createAssistant } from '@/composables/useAssistant'
@@ -120,7 +142,7 @@ const ocrStore = useOcrStore()
 const ocr = useOCR()
 const pdfViewer = usePDFViewer()
 const pdfEngine = usePDFEngine()
-const sidebarOpen = ref(true)
+const ui = useUiStore()
 
 // Provide composables to the whole tree (header, drawer, page)
 provide('pdfViewer', pdfViewer)
@@ -857,6 +879,7 @@ async function loadBytes(bytes: Uint8Array, name: string) {
       ? ` · ${signatures.length} digital signature${signatures.length === 1 ? '' : 's'} — editing will invalidate them`
       : ''
     editorStore.setStatus(`${name} — ${pageCount} pages (ready)${signed}`)
+    afterOpen(bytes, name, pageCount)
   } catch (err: any) {
     // It renders but cannot be edited — say exactly that instead of a bare
     // error, because the pages ARE on screen and the user can still print/save.
@@ -866,6 +889,121 @@ async function loadBytes(bytes: Uint8Array, name: string) {
 
 const openInputRef = ref<HTMLInputElement | null>(null)
 const mergeInputRef = ref<HTMLInputElement | null>(null)
+const pickInputRef = ref<HTMLInputElement | null>(null)
+
+/**
+ * A freshly opened document starts the shell over: its own tab, no tool
+ * open, nothing selected, no password carried over from the last file, and
+ * no save target — a Save goes through the chooser the first time. It is
+ * also remembered for Inicio's "Recientes", with a small picture of page 1.
+ */
+function afterOpen(bytes: Uint8Array, name: string, pageCount: number) {
+  ui.view = 'document'
+  ui.activeTool = null
+  ui.selectedPages = []
+  ui.protection = null
+  saveHandle = null
+  editorStore.setTool('select')
+  ui.notify(`${name} abierto — ${pageCount} página(s)`)
+  pdfEngine.renderPageBitmap(0, 0.18).catch(() => null).then(canvas => {
+    let thumb: string | undefined
+    try { thumb = canvas?.toDataURL('image/jpeg', 0.7) } catch (_) { thumb = undefined }
+    return rememberRecent(name, bytes, pageCount, thumb)
+  }).catch(() => {})
+}
+
+/**
+ * Pick files through the permanent chooser. Must be called from the click
+ * handler itself: the browser opens a chooser only on a fresh user gesture.
+ * Resolves with nothing when the dialog is dismissed (where the browser says
+ * so), or when another pick supersedes this one.
+ */
+let pickResolve: ((files: File[]) => void) | null = null
+function pickFiles(accept: string, multiple: boolean): Promise<File[]> {
+  const input = pickInputRef.value
+  if (!input) { editorStore.setStatus('Cannot open the file chooser — please reload the page'); return Promise.resolve([]) }
+  pickResolve?.([])
+  input.accept = accept
+  input.multiple = multiple
+  input.value = ''
+  return new Promise(resolve => {
+    pickResolve = resolve
+    input.oncancel = () => { if (pickResolve === resolve) { pickResolve = null; resolve([]) } }
+    input.click()
+  })
+}
+function onPickFiles(e: Event) {
+  const input = e.target as HTMLInputElement
+  const files = [...(input.files ?? [])]
+  input.value = ''
+  const r = pickResolve
+  pickResolve = null
+  r?.(files)
+}
+
+/**
+ * Acrobat's "Cerrar": offer to save unsaved changes first, then go back to
+ * Inicio with nothing open.
+ */
+async function closeDocument() {
+  if (!docStore.loaded) return
+  await flushOpenEditor()
+  if (docStore.isModified) {
+    const choice = await new Promise<'save' | 'discard' | 'cancel'>(resolve => {
+      $q.dialog({
+        title: 'PDF Editor Pro',
+        message: `¿Desea guardar los cambios de "${docStore.fileName}" antes de cerrarlo?`,
+        dark: true, persistent: true,
+        options: { type: 'radio', model: 'save', items: [
+          { label: 'Guardar', value: 'save' }, { label: 'No guardar', value: 'discard' }
+        ] },
+        ok: { label: 'Aceptar', unelevated: true }, cancel: { label: 'Cancelar', flat: true }
+      }).onOk((v: 'save' | 'discard') => resolve(v)).onCancel(() => resolve('cancel')).onDismiss(() => resolve('cancel'))
+    })
+    if (choice === 'cancel') return
+    if (choice === 'save') {
+      await saveFile()
+      if (docStore.isModified) return
+    }
+  }
+  historyStore.clear()
+  searchStore.clear()
+  ocrStore.clear()
+  ocr.reset()
+  livePages.clear()
+  docStore.reset()
+  ui.activeTool = null
+  ui.selectedPages = []
+  ui.protection = null
+  ui.view = 'home'
+  saveHandle = null
+  editorStore.setTool('select')
+  editorStore.setStatus('Archivo cerrado')
+}
+
+/**
+ * A protected file is opened the way Acrobat opens one: ask for the password,
+ * then work on the plain document (the protection is offered again on save).
+ * Returns the bytes to load, or null when the user gave up.
+ */
+async function unlockIfNeeded(bytes: Uint8Array, name: string): Promise<Uint8Array | null> {
+  const locked = await pdfEngine.acro<boolean>('needsPassword', { bytes: bytes.buffer.slice(0) }).catch(() => false)
+  if (!locked) return bytes
+  let message = `"${name}" está protegido. Escriba la contraseña para abrirlo.`
+  for (;;) {
+    const password = await new Promise<string | null>(resolve => {
+      $q.dialog({
+        title: 'Contraseña', message, dark: true, persistent: true,
+        prompt: { model: '', type: 'password' },
+        ok: { label: 'Aceptar', unelevated: true }, cancel: { label: 'Cancelar', flat: true }
+      }).onOk((v: string) => resolve(v)).onCancel(() => resolve(null)).onDismiss(() => resolve(null))
+    })
+    if (password === null) { editorStore.setStatus(`${name} no se abrió: se necesita la contraseña`); return null }
+    const r = await pdfEngine.acro<{ success: boolean; bytes?: ArrayBuffer; error?: string }>('unlock', { bytes: bytes.buffer.slice(0), password })
+    if (r.success && r.bytes) { ui.notify(`${name}: contraseña correcta`); return new Uint8Array(r.bytes) }
+    message = 'La contraseña no es correcta. Inténtelo de nuevo.'
+  }
+}
 
 /**
  * Open the chooser on the permanent input.
@@ -891,7 +1029,8 @@ function openFile() {
 async function openPdfFile(file: File) {
   try {
     editorStore.setStatus(`Opening ${file.name}...`)
-    await loadBytes(new Uint8Array(await file.arrayBuffer()), file.name)
+    const bytes = await unlockIfNeeded(new Uint8Array(await file.arrayBuffer()), file.name)
+    if (bytes) await loadBytes(bytes, file.name)
   } catch (err: any) {
     // A file that cannot be read is not a silent no-op.
     editorStore.setStatus(`Could not open ${file.name}: ${err?.message || err}`)
@@ -951,14 +1090,21 @@ async function pickSaveTarget(suggestedName: string): Promise<FileSystemFileHand
   }
 }
 
-async function saveFile() {
+/**
+ * The file the last Save As wrote to. Save writes to it again without asking,
+ * the way Acrobat's Ctrl+S does; Save As always asks. A handle keeps its
+ * write permission for the session.
+ */
+let saveHandle: FileSystemFileHandle | null = null
+
+async function saveFile(opts: { saveAs?: boolean } = {}) {
   if (!docStore.loaded) return
   await flushOpenEditor()
   // What is on screen for a scanned page is only a preview until this runs.
   await bakeOcrEdits()
 
   const name = (docStore.fileName || 'document.pdf').replace(/ \*$/, '')
-  const target = await pickSaveTarget(name)
+  const target = !opts.saveAs && saveHandle ? saveHandle : await pickSaveTarget(name)
   if (target === 'cancelled') {
     editorStore.setStatus('Save cancelled — the document is still open and unsaved')
     return
@@ -966,7 +1112,12 @@ async function saveFile() {
 
   editorStore.setStatus('Saving PDF...')
   try {
-    const bytes = await enqueueOp(() => pdfEngine.saveDocument())
+    // A password set in Proteger is applied to the written file only: the
+    // engine keeps the plain document, so editing goes on as before.
+    const protection = ui.protection ? JSON.parse(JSON.stringify(ui.protection)) : null
+    const bytes = await enqueueOp(() => protection
+      ? pdfEngine.acro<ArrayBuffer>('saveProtected', protection)
+      : pdfEngine.saveDocument())
     if (!bytes || bytes.byteLength === 0) {
       editorStore.setStatus('Save failed: the engine produced an empty document')
       return
@@ -979,8 +1130,11 @@ async function saveFile() {
       const writable = await target.createWritable()
       await writable.write(blob)
       await writable.close()
+      saveHandle = target
+      if (target.name !== docStore.fileName) docStore.fileName = target.name
       docStore.markSaved()
-      editorStore.setStatus(`Saved ${target.name} — ${(blob.size / 1024).toFixed(0)} KB`)
+      editorStore.setStatus(`Saved ${target.name} — ${(blob.size / 1024).toFixed(0)} KB${protection ? ' (protected with a password)' : ''}`)
+      ui.notify(`${target.name} guardado`)
       return
     }
 
@@ -1455,6 +1609,25 @@ function handleKeyDown(e: KeyboardEvent) {
   const tag = (e.target as HTMLElement)?.tagName
   const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable
 
+  // Acrobat's own keys, before the editor's.
+  if (e.key === 'F4' && !e.ctrlKey) { e.preventDefault(); if (e.shiftKey) ui.rightPaneOpen = !ui.rightPaneOpen; else ui.leftPaneOpen = !ui.leftPaneOpen; return }
+  if (e.key === 'F1') { e.preventDefault(); ui.openDialog('shortcuts'); return }
+  if (e.key === 'Escape' && ui.readMode && !isTyping) { ui.readMode = false; return }
+  if (e.ctrlKey || e.metaKey) {
+    const k = e.key.toLowerCase()
+    if (k === 's' && e.shiftKey) { e.preventDefault(); saveFile({ saveAs: true }); return }
+    if (k === 'w') { e.preventDefault(); closeDocument(); return }
+    if (k === 'd' && docStore.loaded) { e.preventDefault(); ui.openDialog('properties'); return }
+    if (k === 'h' && docStore.loaded) { e.preventDefault(); ui.readMode = !ui.readMode; return }
+    if (k === 'l') { e.preventDefault(); acroShell.fullScreen(); return }
+    if (docStore.loaded && ui.view === 'document' && !isTyping) {
+      if (e.key === '+' || e.key === '=') { e.preventDefault(); acroShell.zoomIn(); return }
+      if (e.key === '-') { e.preventDefault(); acroShell.zoomOut(); return }
+      if (e.key === '0') { e.preventDefault(); acroShell.fitPage(); return }
+      if (e.key === '1') { e.preventDefault(); acroShell.setZoom(1); return }
+      if (e.key === '2') { e.preventDefault(); acroShell.fitWidth(); return }
+    }
+  }
   if (e.ctrlKey || e.metaKey) {
     // While typing, Ctrl+Z must stay the browser's TEXT undo — never roll
     // back the whole document underneath an open editor.
@@ -1471,6 +1644,22 @@ function handleKeyDown(e: KeyboardEvent) {
   // not the find bar — the find input closes itself on Escape.
   if (e.key === 'Escape') { if (!isTyping) closeFind(); return }
   if (isTyping || !docStore.loaded) return
+  // The page keys belong to the document tab; Inicio, Herramientas and the
+  // Organize grid (which has keys of its own) are not reading a page.
+  if (ui.view !== 'document' || ui.activeTool === 'organize') return
+  // Holding the space bar is Acrobat's temporary hand tool.
+  if (e.key === ' ' && !e.repeat && editorStore.currentTool !== 'hand') {
+    e.preventDefault()
+    const before = editorStore.currentTool
+    editorStore.setTool('hand')
+    const release = (ev: KeyboardEvent) => {
+      if (ev.key !== ' ') return
+      document.removeEventListener('keyup', release)
+      if (editorStore.currentTool === 'hand') editorStore.setTool(before)
+    }
+    document.addEventListener('keyup', release)
+    return
+  }
 
   // Paging.
   //
@@ -1517,10 +1706,17 @@ function handleKeyDown(e: KeyboardEvent) {
 // ===== DRAG & DROP =====
 function handleDragOver(e: DragEvent) { e.preventDefault() }
 async function handleDrop(e: DragEvent) {
+  // A view that handles its own drop (Organizar páginas inserts the files,
+  // Inicio opens them) has already said so; replacing the document as well
+  // would throw its work away.
+  if (e.defaultPrevented) return
   e.preventDefault()
-  const file = e.dataTransfer?.files[0]
-  if (file?.type === 'application/pdf') {
-    await loadBytes(new Uint8Array(await file.arrayBuffer()), file.name)
+  const files = [...(e.dataTransfer?.files ?? [])]
+  const file = files[0]
+  if (file && (file.type === 'application/pdf' || /\.pdf$/i.test(file.name))) {
+    await openPdfFile(file)
+  } else if (files.length && files.every(f => acroCommands.isImage(f))) {
+    await acroCommands.createPdf(files)
   }
 }
 
@@ -1673,6 +1869,36 @@ const assistant = createAssistant({
 })
 provide('assistant', assistant)
 ;(window as any).__pdfHooks.assistant = assistant
+// ===== THE ACROBAT SHELL =====
+const acroCommands = useAcroCommands({
+  pdfEngine, syncAfterEdit, pushUndo, forgetOcr, loadBytes, flushOpenEditor, bakeOcrEdits
+})
+const acroShell = createAcroShell({
+  pdfEngine,
+  commands: acroCommands,
+  openFile,
+  saveFile,
+  printFile,
+  undo,
+  redo,
+  openFind,
+  rotatePage,
+  closeDocument,
+  toggleAssistant: () => { editorStore.assistantOpen = !editorStore.assistantOpen },
+  reportProblem: () => {
+    window.open(buildReportMailto({ status: editorStore.statusMessage, fileName: docStore.fileName, page: docStore.currentPage, pages: docStore.totalPages }), '_blank')
+  }
+})
+provide('acroShell', acroShell)
+provide('acroCommands', acroCommands)
+provide('pickFiles', pickFiles)
+;(window as any).__pdfHooks.acro = { shell: acroShell, commands: acroCommands, ui }
+// Every status line also lands in the bell's list.
+watch(() => editorStore.statusMessage, (m, prev) => {
+  if (!m || m === prev || /^Tool: /.test(m)) return
+  if (/(failed|error|could not|no se pudo|not found|refused)/i.test(m) && ui.notifications[0]?.text !== m) ui.notify(m)
+})
+
 provide('openFile', openFile)
 provide('openPdfFile', openPdfFile)
 provide('mergePdfFile', mergePdfFile)
@@ -1703,4 +1929,16 @@ provide('closeFind', closeFind)
   left: -9999px;
   top: 0;
 }
+.acro-header { background: var(--acro-tabbar); color: var(--acro-text); box-shadow: none; }
+.acro-status {
+  height: 24px; background: #323232; color: #bdbdbd; border-top: 1px solid var(--acro-rule-dark);
+  padding: 0 10px;
+}
+.acro-assistant { background: #323232 !important; }
+.read-exit {
+  position: fixed; right: 18px; top: 12px; z-index: 3000; display: flex; align-items: center; gap: 6px;
+  border: 0; border-radius: 16px; background: rgba(30, 30, 30, 0.85); color: #fff; padding: 6px 14px;
+  font: inherit; font-size: 13px; cursor: pointer; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+}
+.read-exit:hover { background: #1e1e1e; }
 </style>

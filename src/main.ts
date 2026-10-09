@@ -5,7 +5,9 @@ import router from './router'
 import App from './App.vue'
 
 import '@quasar/extras/material-icons/material-icons.css'
+import '@quasar/extras/material-symbols-outlined/material-symbols-outlined.css'
 import 'quasar/src/css/index.sass'
+import './css/acrobat.scss'
 
 const app = createApp(App)
 

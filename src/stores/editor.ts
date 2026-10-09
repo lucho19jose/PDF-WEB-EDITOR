@@ -8,12 +8,37 @@ export type Tool =
   | 'highlight' | 'underline' | 'strikeout'
   | 'draw' | 'line' | 'rectangle' | 'circle'
   | 'freetext' | 'note' | 'image'
+  // The Acrobat shell's tools: pan, and the drag/click tools of Redactar,
+  // Vínculo, Recortar páginas, Sello, Medir and Rellenar y firmar.
+  | 'hand' | 'redact' | 'link' | 'crop' | 'stamp' | 'measure' | 'sign' | 'symbol'
 
 /** Tools that create/select MuPDF annotations (handled by AnnotationLayer). */
 export const ANNOTATION_TOOLS: Tool[] = [
   'highlight', 'underline', 'strikeout',
   'draw', 'line', 'rectangle', 'circle',
-  'freetext', 'note', 'image'
+  'freetext', 'note', 'image',
+  'redact', 'link', 'crop', 'stamp', 'measure', 'sign', 'symbol'
+]
+
+/** The Acrobat tools that draw a rectangle on the page and then ask what it is for. */
+export const AREA_TOOLS: Tool[] = ['redact', 'link', 'crop']
+
+/** Acrobat's standard dynamic stamps, by their PDF names. */
+export const STAMP_NAMES: { name: string; label: string }[] = [
+  { name: 'Approved', label: 'Aprobado' },
+  { name: 'NotApproved', label: 'No aprobado' },
+  { name: 'Draft', label: 'Borrador' },
+  { name: 'Final', label: 'Final' },
+  { name: 'Confidential', label: 'Confidencial' },
+  { name: 'ForComment', label: 'Para comentarios' },
+  { name: 'ForPublicRelease', label: 'Para publicación' },
+  { name: 'NotForPublicRelease', label: 'No publicar' },
+  { name: 'AsIs', label: 'Tal cual' },
+  { name: 'Departmental', label: 'Departamental' },
+  { name: 'Experimental', label: 'Experimental' },
+  { name: 'Expired', label: 'Vencido' },
+  { name: 'Sold', label: 'Vendido' },
+  { name: 'TopSecret', label: 'Alto secreto' }
 ]
 
 /** Text-markup tools that operate by dragging over existing text. */
@@ -87,6 +112,17 @@ export const useEditorStore = defineStore('editor', () => {
   const imageWrap = ref<'inline' | 'front' | 'behind'>('inline')
   const imageWidthPct = ref(60)
 
+  /** Rellenar y firmar: which mark the symbol tool places. */
+  const symbolKind = ref<'check' | 'cross' | 'dot' | 'line' | 'box'>('check')
+  /** Sello: the stamp the stamp tool places. */
+  const stampName = ref('Approved')
+  /** Medir: the unit distances are reported in. */
+  const measureUnit = ref<'mm' | 'cm' | 'in' | 'pt'>('mm')
+  /** Rellenar y firmar: 'signature' or 'initials' — which saved image the sign tool places. */
+  const signKind = ref<'signature' | 'initials'>('signature')
+  /** Text a new text box opens with (the Fill & Sign "date" button). Consumed once. */
+  const freeTextPreset = ref('')
+
   // Annotation styling
   const highlightColor = ref('#ffeb3b')
   const strokeColor = ref('#e53935')
@@ -114,7 +150,7 @@ export const useEditorStore = defineStore('editor', () => {
     if (MARKUP_TOOLS.includes(t)) return 'markup'
     if (t === 'image') return 'image'
     if (t === 'rectangle' || t === 'circle' || t === 'line') return 'shape'
-    if (t === 'draw') return 'draw'
+    if (t === 'draw' || t === 'symbol' || t === 'measure') return 'draw'
     return 'none'
   })
 
@@ -132,6 +168,7 @@ export const useEditorStore = defineStore('editor', () => {
     imagePlacement, imageWrap, imageWidthPct, reflowOnEdit, ocrMode, ocrEngine, mistralApiKey,
     openaiApiKey, openaiModel, openaiEndpoint, assistantOpen,
     highlightColor, strokeColor, fillColor, fillEnabled, strokeWidth, opacity,
+    symbolKind, stampName, measureUnit, signKind, freeTextPreset,
     isAnnotationTool, isMarkupTool, propertyContext,
     setTool, setStatus
   }

@@ -2,7 +2,9 @@
   <div
     ref="containerRef"
     class="pdf-viewer-container"
+    :class="{ 'hand-mode': editorStore.currentTool === 'hand', panning: !!pan }"
     :style="{ overflow: 'auto', width: '100%', height: '100%' }"
+    @mousedown.capture="onHandDown"
   >
     <div
       v-for="page in pageList"
@@ -475,6 +477,33 @@ async function onTextChanged() {
   })
 }
 
+/**
+ * Acrobat's hand tool: drag the pages around. Captured on the container so
+ * no editing layer sees the press; the layers also stop taking the pointer
+ * while the tool is on (`.hand-mode`), so nothing under the cursor reacts.
+ */
+const pan = ref<{ x: number; y: number; left: number; top: number } | null>(null)
+function onHandDown(e: MouseEvent) {
+  if (editorStore.currentTool !== 'hand' || e.button !== 0) return
+  const el = containerRef.value
+  if (!el) return
+  e.preventDefault()
+  e.stopPropagation()
+  pan.value = { x: e.clientX, y: e.clientY, left: el.scrollLeft, top: el.scrollTop }
+  const move = (ev: MouseEvent) => {
+    if (!pan.value || !el) return
+    el.scrollLeft = pan.value.left - (ev.clientX - pan.value.x)
+    el.scrollTop = pan.value.top - (ev.clientY - pan.value.y)
+  }
+  const up = () => {
+    pan.value = null
+    window.removeEventListener('mousemove', move)
+    window.removeEventListener('mouseup', up)
+  }
+  window.addEventListener('mousemove', move)
+  window.addEventListener('mouseup', up)
+}
+
 function onPageMouseDown(page: number) {
   // Clicking a page makes it the one being edited. Without this, a tool used on
   // a page the scroll detector has not caught up with would act on another one.
@@ -546,9 +575,12 @@ defineExpose({ textBlockOverlayRef, annotationLayerRef })
   display: flex;
   flex-direction: column;
   align-items: center;
-  background: #2a2a2a;
+  background: #3a3a3a;
   padding: 20px 0;
 }
+.pdf-viewer-container.hand-mode { cursor: grab; }
+.pdf-viewer-container.hand-mode.panning { cursor: grabbing; }
+.pdf-viewer-container.hand-mode .pdf-page-wrapper > :not(canvas) { pointer-events: none; }
 .pdf-canvas {
   display: block;
 }
