@@ -1,6 +1,6 @@
 import type { OcrTextItem } from './ocrTypes'
 import type { TextOp } from './ocrExport'
-import { cellRegion, invertedPage, type PageInk, type LineInk } from './lineInk'
+import { cellRegion, domainPage, domainOfLine, type PageInk, type LineInk } from './lineInk'
 import type { Atlas } from './glyphAtlas'
 import { applyLineEdit, overlayOf, wantKey, type GlyphImage, type GlyphWant } from './scanEdit'
 import { apply, pageRectOfPx, pxRectOf, type ScanRaster } from './scanRaster'
@@ -168,7 +168,7 @@ export function inkAwareFallback(pi: PageInk, lines: Map<string, LineInk | null>
     if (patch.paint === false || !patch.item) return
     const mode = ops.modes[patch.item] ?? ''
     const li = lines.get(patch.item)
-    if ((mode.startsWith('whole') || mode.startsWith('removed')) && li && !li.inverted && analysisTrusted(li) && plainNeutralPaper(pi, li)) {
+    if ((mode.startsWith('whole') || mode.startsWith('removed')) && li && !domainOfLine(li) && analysisTrusted(li) && plainNeutralPaper(pi, li)) {
       patches.add(n)
       if (done.has(patch.item)) return
       done.add(patch.item)
@@ -297,6 +297,10 @@ export function textMargin(lines: Iterable<LineInk | null>): number | null {
  */
 export function justifiedMargin(margin: number | null, lines: Iterable<LineInk | null>, li: LineInk): number | null {
   if (margin === null || !li.words.length) return null
+  // Prose has word spaces to spread: a cover's "$100M" over "OFFERS" both end
+  // at the page's right edge, and a deleted "0" pushed the space it freed
+  // into the one place it could go, the gap at the edit — "$1 0M".
+  if (li.spaceAfter.size < 2) return null
   const em = li.fit.emPx
   if (Math.abs(li.words[li.words.length - 1].x1 - margin) > em * 0.6) return null
   // A line of a paragraph spans most of the text: a form's value field ending
@@ -342,7 +346,7 @@ export function alignedRight(lines: Iterable<LineInk | null>, li: LineInk): bool
   // to "1,050.00" grew out to the right. Amounts are set flush right.
   const amount = (o: LineInk) => /^[0-9.,']*[0-9][.,][0-9]{2}$/.test(o.chars.join(''))
   for (const o of lines) {
-    if (!o || o === li || !o.cells.length || !!o.inverted !== !!li.inverted || !figures(o)) continue
+    if (!o || o === li || !o.cells.length || domainOfLine(o) !== domainOfLine(li) || !figures(o)) continue
     if (Math.abs(o.fit.y - li.fit.y) > em * 6 || Math.abs(o.fit.emPx - em) > em * 0.3) continue
     if (Math.abs(right(o) - r0) <= Math.max(2, em * 0.12) && (Math.abs(left(o) - l0) > em * 0.5 || (amount(li) && amount(o)))) return true
   }
@@ -363,7 +367,7 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
   const limitRight = s.w - Math.round(18 / Math.abs(s.toPage[0] || 1))
   const pageLines = [...lines.values()].filter((o): o is LineInk => !!o)
   const done: { item: OcrTextItem; box: { x0: number; y0: number; x1: number; y1: number }; words: { text: string; x0: number; x1: number; base: number }[]; li: LineInk }[] = []
-  let workInv: Uint8ClampedArray | null = null
+  const workDom = new Map<number, Uint8ClampedArray>()
   for (const item of items) {
     if (!item.edited && !item.removed) continue
     const why = scanEditable(item)
@@ -381,10 +385,17 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
     }
     const li = lines.get(item.id)
     if (!li) { modes[item.id] = `vector (the line could not be read on the scan${unread?.get(item.id) ? `: ${unread.get(item.id)}` : ''})`; continue }
-    // Reversed-out lettering is edited on the inverted scan, in a working copy
-    // of its own, and folded back into this one below.
-    const pl = li.inverted ? invertedPage(pi) : pi
-    const w = li.inverted ? (workInv ??= pl.s.data.slice()) : work
+    // Reversed-out or coloured lettering is edited on the scan with its
+    // lighter channels inverted, in a working copy of its own per domain, and
+    // folded back into this one below.
+    const dom = domainOfLine(li)
+    const pl = domainPage(pi, dom)
+    let w: Uint8ClampedArray = work
+    if (dom) {
+      let wd = workDom.get(dom)
+      if (!wd) { wd = pl.s.data.slice(); workDom.set(dom, wd) }
+      w = wd
+    }
     const res = applyLineEdit(pl, li, atlas, item.text, w, { remove: item.removed, justifyTo: justifyFor(li), limitRight, synth, columnRight: alignedRight(lines.values(), li), pageLines })
     if (!res.ok) {
       modes[item.id] = `vector (${res.reason})`
@@ -408,11 +419,11 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
     else if (!item.removed) done.push({ item, box: { x0: 0, y0: 0, x1: 0, y1: 0 }, words: res.words ?? [], li })
   }
 
-  if (workInv) {
-    const orig = invertedPage(pi).s.data
+  for (const [dom, wd] of workDom) {
+    const orig = domainPage(pi, dom).s.data
     for (let i = 0; i < work.length; i += 4) {
-      if (workInv[i] === orig[i] && workInv[i + 1] === orig[i + 1] && workInv[i + 2] === orig[i + 2]) continue
-      work[i] = 255 - workInv[i]; work[i + 1] = 255 - workInv[i + 1]; work[i + 2] = 255 - workInv[i + 2]
+      if (wd[i] === orig[i] && wd[i + 1] === orig[i + 1] && wd[i + 2] === orig[i + 2]) continue
+      for (let c = 0; c < 3; c++) work[i + c] = (dom >> c) & 1 ? 255 - wd[i + c] : wd[i + c]
     }
   }
   const overlays = overlaysOf(s, work, done.map(d => ({ item: d.item.id, box: d.box })))

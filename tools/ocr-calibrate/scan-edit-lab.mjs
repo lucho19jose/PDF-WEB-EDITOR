@@ -108,14 +108,15 @@ export function scanOf(pageIndex) {
 
 /** applyLineEdit, with a reversed-out line edited on the inverted page and folded back into `work`. */
 function editOn(SE, pi, li, atlas, text, work, opts) {
-  if (!li.inverted) return SE.applyLineEdit(pi, li, atlas, text, work, opts)
-  const pl = LI.invertedPage(pi)
+  const dom = LI.domainOfLine ? LI.domainOfLine(li) : (li.inverted ? 7 : 0)
+  if (!dom) return SE.applyLineEdit(pi, li, atlas, text, work, opts)
+  const pl = LI.domainPage ? LI.domainPage(pi, dom) : LI.invertedPage(pi)
   const w = pl.s.data.slice()
   const res = SE.applyLineEdit(pl, li, atlas, text, w, opts)
   const orig = pl.s.data
   for (let i = 0; i < w.length; i += 4) {
     if (w[i] === orig[i] && w[i + 1] === orig[i + 1] && w[i + 2] === orig[i + 2]) continue
-    work[i] = 255 - w[i]; work[i + 1] = 255 - w[i + 1]; work[i + 2] = 255 - w[i + 2]
+    for (let c = 0; c < 3; c++) work[i + c] = (dom >> c) & 1 ? 255 - w[i + c] : w[i + c]
   }
   return res
 }
@@ -153,7 +154,7 @@ if (cmd === 'lines' || cmd === 'debug') {
   let words = 0, cut = 0
   for (const it of items) {
     const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
-    if (!li) { console.log(`${it.id.padEnd(9)} FAIL ${LI.lastLineFailure()}  "${it.text.slice(0, 50)}"`); continue }
+    if (!li) { console.log(`${it.id.padEnd(9)} FAIL ${LI.lastLineFailure()}  "${it.text.slice(0, 50)}"`); if (process.env.PALE) console.log('     smooth', JSON.stringify(LI.lastSmoothTest?.() ?? null)); continue }
     words += li.words.length; cut += li.words.filter(w => w.cut).length
     const ws = li.words.map(w => `${li.chars.slice(w.from, w.to).join('')}${w.cut ? '' : '~'}${w.weight ? '/' + w.weight.toFixed(3) : ''}`).join(' ')
     if (process.env.PALE) console.log('     smooth', JSON.stringify(LI.lastSmoothTest?.() ?? null))

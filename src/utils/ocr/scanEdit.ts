@@ -1,5 +1,5 @@
-import { cellRegion, looseRegion, analyzeLine, edgeWidthOf, CORE, type PageInk, type LineInk } from './lineInk'
-import { pickGlyph, predictGap, lineMetrics, cellShapeOf, shapeOfCore, shapeAgreement, vocabKey, formKey, faceAt, type Atlas, type Exemplar, type FaceClass, type GlyphRequest } from './glyphAtlas'
+import { cellRegion, looseRegion, analyzeLine, edgeWidthOf, domainOfLine, CORE, FRINGE, type PageInk, type LineInk } from './lineInk'
+import { pickGlyph, pickGlyphRescaled, predictGap, lineMetrics, cellShapeOf, shapeOfCore, shapeAgreement, vocabKey, formKey, faceAt, type Atlas, type Exemplar, type FaceClass, type GlyphRequest } from './glyphAtlas'
 import { expectedAdvance } from './glyphCut'
 import { baselineAtOf } from './wordSeg'
 
@@ -529,7 +529,7 @@ function stripMarks(s: string): string {
 export function refineReading(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, log?: (line: string) => void): { li: LineInk; confirmed: number } | null {
   const squash = (t: string) => t.replace(/\s+/g, '')
   if (squash(newText) === squash(li.text)) return null
-  const lu = analyzeLine(pi, { id: li.id, text: newText, inkRect: li.inkRect, confidence: li.confidence })
+  const lu = analyzeLine(pi, { id: li.id, text: newText, inkRect: li.inkRect, confidence: li.confidence }, { typed: true })
   if (!lu || !lu.words.length) { log?.('the line cannot be read with the typed text'); return null }
   const overlap = (a: { x0: number; x1: number }, b: { x0: number; x1: number }) =>
     Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0) > 0.5 * Math.min(a.x1 - a.x0, b.x1 - b.x0)
@@ -580,7 +580,7 @@ export function refineReading(pi: PageInk, li: LineInk, atlas: Atlas, newText: s
   if (!confirmed) return null
   parts.sort((a, b) => a.x0 - b.x0)
   const text = parts.map((p, i) => (i > 0 && p.spaceBefore ? ' ' : '') + p.text).join('')
-  const ln = analyzeLine(pi, { id: li.id, text, inkRect: li.inkRect, confidence: li.confidence })
+  const ln = analyzeLine(pi, { id: li.id, text, inkRect: li.inkRect, confidence: li.confidence }, { typed: true })
   log?.(`refined: "${text}" ${ln ? 'analysed' : 'NOT analysed'}`)
   return ln ? { li: ln, confirmed } : null
 }
@@ -1468,11 +1468,16 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
       ag.sort((a, b) => a - b)
       return ag[Math.floor(ag.length / 2)]
     }
+    // Shapes are compared at the line's own size or not at all: a cover's
+    // condensed title judged against the medoids of its small subtitle read
+    // a heavy "H" as an "O" (0.82) and an "N" as nothing (0.46), and deleting
+    // two letters from "HÁGASE" redrew the four it kept from a foreign face.
+    const nearSize = (e: number | undefined) => !e || (li.fit.emPx / e <= 1.25 && e / li.fit.emPx <= 1.25)
     const bestOther = (shape: Float32Array, ch: string) => {
       let best = 0, bestCh = ''
       for (const [key, med] of atlas.medoids) {
         const bar = key.lastIndexOf('|')
-        if (key.slice(bar + 1) !== String(bold) || key.slice(0, bar) === ch) continue
+        if (key.slice(bar + 1) !== String(bold) || key.slice(0, bar) === ch || !nearSize(med.emPx)) continue
         const a = shapeAgreement(shape, med.shape)
         if (a > best) { best = a; bestCh = key.slice(0, bar) }
       }
@@ -1487,7 +1492,12 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
         let own = shapeAgreement(shape, m.shape)
         // The medoid may be another face's (a title's): copies of the letter
         // at this line's size, from other words, speak for it too.
-        if (own < 0.75 && m.emPx && (li.fit.emPx / m.emPx > 1.08 || m.emPx / li.fit.emPx > 1.08)) own = Math.max(own, peerAgreement(oldChars[i], bold, shape, li.cells[i].x0, li.cells[i].x1))
+        if (own < 0.75 && m.emPx && (li.fit.emPx / m.emPx > 1.08 || m.emPx / li.fit.emPx > 1.08)) {
+          const peers = peerAgreement(oldChars[i], bold, shape, li.cells[i].x0, li.cells[i].x1)
+          // Nothing at this size to judge it by: only a plainly different
+          // letter at this size can still say it is not what it is labelled.
+          own = peers < 0 && !nearSize(m.emPx) ? 1 : Math.max(own, peers)
+        }
         // Unless what it plainly is is the label's look-alike: the ink of a
         // receipt's "B008" was read "Bo08", and its zero — an old-style one,
         // shaped like an "o" — is the right pixels to keep wherever the edit
@@ -1502,8 +1512,12 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
       // above, and with nothing to check the ")" against, the "c" was kept.
       // Not when the other letter is the label's look-alike: a small "B" IS
       // shaped like an "8".
+      // A LETTER with no established shape is judged on stronger evidence
+      // than a mark: a title's heavy "L" agreed 0.83 with the big "C" of its
+      // own line on the coarse grid, and deleting a letter of
+      // "ACTUALIZACIÓN" redrew the word from letters the page did not hold.
       const { best, bestCh } = bestOther(shape, oldChars[i])
-      if (bestCh && best >= 0.8 && !lookAlike(oldChars[i], bestCh)) { redraw[k] = 1; return }
+      if (bestCh && best >= (/[\p{L}\p{N}]/u.test(oldChars[i]) ? 0.86 : 0.8) && !lookAlike(oldChars[i], bestCh)) { redraw[k] = 1; return }
     }
   })
 
@@ -1598,6 +1612,11 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     const req: GlyphRequest = { char: c.ch, emPx: em, xh, capH, figH, bold, style: { line: li.id, refs: styleOf(c.styleWord), face } }
     const found = fromPage(req)
     if (found) { c.glyph = found.glyph; c.drawnAs = found.drawnAs; continue }
+    // The page's own letter at another size, from a line in this word's face
+    // (`pickGlyphRescaled`): truer than any bundled face where the page is
+    // set in something none of them resembles, and nothing is made for it.
+    const rescaled = pickGlyphRescaled(atlas, req)
+    if (rescaled) { c.glyph = toned(scaleImage(imageOf(rescaled.ex), rescaled.scale), rescaled.ex.inkT, inkOverPaper); c.drawnAs = 'w'; continue }
     // Neither weight on any harvested page, in this kind of face: a glyph
     // synthesised from the matched face, if the caller has made one.
     if (lineEdge === undefined) lineEdge = edgeWidthOf(pi, li)
@@ -1777,7 +1796,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     const own = samples(li)
     const page = { dd: [] as number[], ds: [] as number[], sd: [] as number[] }
     for (const o of opts.pageLines ?? []) {
-      if (o === li || !!o.inverted !== !!li.inverted || Math.abs(o.fit.emPx - em) > em * 0.08) continue
+      if (o === li || domainOfLine(o) !== domainOfLine(li) || Math.abs(o.fit.emPx - em) > em * 0.08) continue
       const v = samples(o)
       page.dd.push(...v.dd); page.ds.push(...v.ds); page.sd.push(...v.sd)
     }
@@ -2180,6 +2199,14 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     const paper = pi.paper[p * 3 + ch]
     return paper > 0 ? Math.min(1, src[p * 4 + ch] / paper) : 1
   }
+  // What the pixel shows ABOVE its paper, in a channel where it is lighter:
+  // black lettering on a red cover carries twice the red's green in its JPEG
+  // tint, and multiplied (clamped at the paper) every moved letter lost that
+  // channel and printed a shade darker than the letters left in place.
+  // Added rather than multiplied: the red's green is 15, and a ratio over it
+  // turned the tint of an "L" into a green glow wherever the paper it landed
+  // on differed by a few levels. On white paper there is nothing above 255.
+  const excess = (p: number, ch: number) => layers ? 0 : Math.max(0, src[p * 4 + ch] - pi.paper[p * 3 + ch])
   /** What an erased pixel shows: the paper, under the other ink where it ran. */
   const erasedTo = (p: number, ch: number) => layers ? pi.paper[p * 3 + ch] * Math.exp(-layers.split(p)[1] * layers.Ds[ch]) : pi.paper[p * 3 + ch]
   const printShifted = (set: Iterable<number>, dx: number, dy: number) => {
@@ -2191,7 +2218,7 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
       const x = p % W + dx, y = Math.floor(p / W) + dy
       if (x < 0 || y < 0 || x >= W || y >= s.h) continue
       const q = p + shift
-      for (let ch = 0; ch < 3; ch++) work[q * 4 + ch] = work[q * 4 + ch] * T(p, ch)
+      for (let ch = 0; ch < 3; ch++) work[q * 4 + ch] = work[q * 4 + ch] * T(p, ch) + excess(p, ch)
       touch(q)
     }
   }
@@ -2344,10 +2371,73 @@ function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W
       }
     }
   }
+  const grain = groundGrain(erase, pi, W, H, x0, y0, bw, bh)
   for (const j of idx) {
     const x = j % bw, y = (j - x) / bw, p = (y0 + y) * W + x0 + x
-    for (let c = 0; c < 3; c++) work[p * 4 + c] = v[c][j] + tx(p, c)
+    for (let c = 0; c < 3; c++) work[p * 4 + c] = v[c][j] + tx(p, c) + (grain ? grain[j * 3 + c] : 0)
   }
+}
+
+/**
+ * The GRAIN of the ground beside a hole, to lay over its harmonic fill: a
+ * fill is smooth, and on a JPEG cover's red, noisy to a few levels in every
+ * 8×8 block, a vacated word showed as a clean patch with the outline of the
+ * letters that had been there. The residual of the scan against its own local
+ * mean is copied from the nearest patch of clean ground beside the hole —
+ * shifted by a multiple of 8 pixels, so the compression's blocks stay where
+ * they were. Null where there is no such patch, or no grain worth copying
+ * (plain white paper, whose residual is a level or less: those scans stay
+ * exactly as they were).
+ */
+function groundGrain(erase: Set<number>, pi: PageInk, W: number, H: number, x0: number, y0: number, bw: number, bh: number): Float32Array | null {
+  const src = pi.s.data
+  const clean = (q: number) => pi.dark[q] < FRINGE / 2 && !erase.has(q) && !pi.lines?.[q]
+  const r8 = (v: number) => Math.ceil(v / 8) * 8
+  const offsets: [number, number][] = [[r8(bw + 2), 0], [-r8(bw + 2), 0], [0, r8(bh + 2)], [0, -r8(bh + 2)], [r8(bw + 2), r8(bh + 2)], [-r8(bw + 2), -r8(bh + 2)]]
+  let best: [number, number] | null = null, bestN = 0
+  for (const [ox, oy] of offsets) {
+    let n = 0, all = 0
+    for (const p of erase) {
+      const x = p % W + ox, y = Math.floor(p / W) + oy
+      all++
+      if (x >= 0 && y >= 0 && x < W && y < H && clean(y * W + x)) n++
+    }
+    if (n > bestN && n >= all * 0.7) { bestN = n; best = [ox, oy] }
+  }
+  if (!best) return null
+  const [ox, oy] = best
+  // The residual against a 9×9 mean of the clean pixels around it.
+  const res = (q: number, c: number): number | null => {
+    const qx = q % W, qy = (q - qx) / W
+    let sum = 0, n = 0
+    for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+      const x = qx + dx, y = qy + dy
+      if (x < 0 || y < 0 || x >= W || y >= H) continue
+      const u = y * W + x
+      if (!clean(u)) continue
+      sum += src[u * 4 + c]; n++
+    }
+    return n >= 20 ? src[q * 4 + c] - sum / n : null
+  }
+  const out = new Float32Array(bw * bh * 3)
+  const mags: number[] = []
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    const p = (y0 + y) * W + x0 + x
+    if (!erase.has(p)) continue
+    const qx = x0 + x + ox, qy = y0 + y + oy
+    if (qx < 0 || qy < 0 || qx >= W || qy >= H) continue
+    const q = qy * W + qx
+    if (!clean(q)) continue
+    for (let c = 0; c < 3; c++) {
+      const v = res(q, c)
+      if (v === null) continue
+      out[(y * bw + x) * 3 + c] = v
+      mags.push(Math.abs(v))
+    }
+  }
+  if (mags.length < 30) return null
+  mags.sort((a, b) => a - b)
+  return mags[mags.length >> 1] >= 1.5 ? out : null
 }
 
 /** Multiply a glyph's transmittance onto the working copy with its top-left at (X, Y). */

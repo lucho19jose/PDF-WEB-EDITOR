@@ -32,6 +32,9 @@ export interface PageInk {
   lines?: Uint8Array
   /** A paper's regular fine texture (a security hatch), RGB residual over its smoothed level, 3 a pixel — only where the page has one (`paperTexture`). */
   texture?: Int8Array
+  /** The channels inverted to make this page (`domainPage`: bit 0 red, 1 green, 2 blue), with the page it was made from. */
+  domain?: number
+  base?: PageInk
 }
 
 /** Ideographs (and full-width forms): composed of radicals, so stacked pieces are their nature, not a sign of a broken letter. */
@@ -42,6 +45,8 @@ export const CORE = 110
 export const FRINGE = 26
 /** Darkness of a pale piece of a letter that is not core — a faint dot or accent (see the owner map). */
 const FAINT = 60
+/** The darkness a flat ground's off-colour pixels are given (`flattenGround`): a letter's haze, under FAINT and CORE. */
+const HAZE = 40
 
 /**
  * Max-filter `src` (w × h) in place along rows or columns with a window of
@@ -365,28 +370,53 @@ export function preparePage(s: ScanRaster, opts: { strokes?: boolean } = {}): Pa
   return out
 }
 
-const invertedPages = new WeakMap<PageInk, PageInk>()
+const domainPages = new WeakMap<PageInk, Map<number, PageInk>>()
 
 /**
- * The page with every pixel's colour inverted, prepared like the page itself:
- * reversed-out lettering (white on a band of colour) is dark ink on light
- * paper there. Made on first need and kept with the page.
+ * The page with the channels in `mask` inverted (bit 0 red, 1 green, 2 blue),
+ * prepared like the page itself. Letters are printed as ink MULTIPLIED onto
+ * the paper, which can only darken it; lettering lighter than its ground in a
+ * channel is darker than it there once that channel is inverted. White on a
+ * band of colour is lighter in all three (mask 7, the inverted page); peach
+ * lettering on a purple cover only in red and green (mask 3) — read wholly
+ * inverted its blue was still lighter than the ground's, and the edit came
+ * back pinkish with the old letters left as ghosts. Made on first need and
+ * kept with the page.
  */
-export function invertedPage(pi: PageInk): PageInk {
-  let inv = invertedPages.get(pi)
-  if (!inv) {
-    const d = pi.s.data
+export function domainPage(pi: PageInk, mask: number): PageInk {
+  const base = pi.base ?? pi
+  if (!mask) return base
+  let m = domainPages.get(base)
+  if (!m) { m = new Map(); domainPages.set(base, m) }
+  let pg = m.get(mask)
+  if (!pg) {
+    const d = base.s.data
     const data = new Uint8ClampedArray(d.length)
-    for (let i = 0; i < d.length; i += 4) { data[i] = 255 - d[i]; data[i + 1] = 255 - d[i + 1]; data[i + 2] = 255 - d[i + 2]; data[i + 3] = d[i + 3] }
-    inv = preparePage({ ...pi.s, data }, { strokes: false })
-    invertedPages.set(pi, inv)
+    for (let i = 0; i < d.length; i += 4) {
+      for (let c = 0; c < 3; c++) data[i + c] = (mask >> c) & 1 ? 255 - d[i + c] : d[i + c]
+      data[i + 3] = d[i + 3]
+    }
+    pg = preparePage({ ...base.s, data }, { strokes: false })
+    pg.domain = mask
+    pg.base = base
+    m.set(mask, pg)
   }
-  return inv
+  return pg
 }
 
-/** The prepared page a line was read on: the page, or its inverse for reversed-out lettering. */
+/** The page with every pixel's colour inverted: reversed-out lettering is dark ink on light paper there. */
+export function invertedPage(pi: PageInk): PageInk {
+  return domainPage(pi, 7)
+}
+
+/** The channels inverted for a line's analysis (`LineInk.domain`). */
+export function domainOfLine(li: LineInk): number {
+  return li.domain ?? (li.inverted ? 7 : 0)
+}
+
+/** The prepared page a line was read on: the page, or the one with its lighter channels inverted. */
 export function pageOfLine(pi: PageInk, li: LineInk): PageInk {
-  return li.inverted ? invertedPage(pi) : pi
+  return domainPage(pi, domainOfLine(li))
 }
 
 /** A horizontal rule under (or through) the line — an underline, a cell border. */
@@ -492,6 +522,8 @@ export interface LineInk {
    * edit of the line is made there and inverted back.
    */
   inverted?: boolean
+  /** Which channels its analysis inverted (`domainPage`): 7 for light on dark, fewer for coloured lettering. */
+  domain?: number
   /**
    * Which ink each pixel of the ROI belongs to: the cell index of the nearest
    * core pixel within `ownR` (a Voronoi partition of the line's surroundings),
@@ -890,13 +922,163 @@ function paperRoughness(pi: PageInk, roi: { x0: number; y0: number; x1: number; 
 }
 
 /**
+ * The line's GROUND re-estimated where it is one flat colour — a book
+ * cover's band of red, blue or purple behind its title. The page's paper is
+ * found with a max filter 3.6pt wide, and a cover title's strokes are wider
+ * than that: their middles never saw the ground inside the filter and were
+ * read as paper, black (on the inverted page) inside cyan, and every such
+ * line failed the plain-paper test it should have passed best ("PIENSE",
+ * "RICO", "$100M" measured 47–99 of roughness against a bar of 8). Letters of
+ * ANOTHER line in the region did the same from the other side: lighter than
+ * the ground, the filter took them for paper ("NAPOLEON HILL" above the white
+ * "PIENSE").
+ *
+ * The ground's colour is the commonest colour of the region's padding — the
+ * ring between the recogniser's box and the region's edge — refined by a
+ * mean shift. It must DOMINATE that ring (60% of it within 32 levels of it)
+ * and be tight (a median distance of 8 levels, a 90th percentile of 20 —
+ * JPEG chroma noise on a 72 DPI cover reaches 18), cover at least 30% of the
+ * region, and be lighter than the ink: the line is read in the domain where
+ * its letters are the dark side. A photograph fails the first test outright —
+ * an ocean behind a title put 10–14% of its ring near its commonest colour,
+ * the picture behind a sign 30%, a flat cover 70–82%. The paper is then filled
+ * from the ground's own pixels alone (push-pull), so a stroke of any width is
+ * a hole in it, and the darkness recomputed against it — a lighter letter of
+ * another line now reads as no ink at all, which is what it is to this line.
+ * Writes the region's paper and darkness into the page; false, with nothing
+ * written, when the ground is not flat.
+ *
+ * Anything else off the ground's colour belongs to SOME ink, whichever way
+ * its luminance points — a title's drop shadow is darker than the ground in
+ * the scan and, read with two channels inverted, lighter than it here, so as
+ * darkness it was paper: erasing a letter of "OFFERS" left its shadow on the
+ * purple as a dark "S". Such a pixel gets the darkness of a letter's haze:
+ * enough to be erased and moved with the letter whose region it is in, never
+ * enough to be a core.
+ */
+/** The median luminance of a region's padding ring (outside the recogniser's box): near white on paper. */
+function ringLum(pi: PageInk, roi: { x0: number; y0: number; x1: number; y1: number }, box: { x0: number; y0: number; x1: number; y1: number }): number {
+  const v: number[] = []
+  for (let y = roi.y0; y < roi.y1; y += 2) for (let x = roi.x0; x < roi.x1; x += 2) {
+    if (x >= box.x0 && x < box.x1 && y >= box.y0 && y < box.y1) continue
+    v.push(lumAt(pi.s.data, y * pi.s.w + x))
+  }
+  if (!v.length) return 255
+  v.sort((a, b) => a - b)
+  return v[v.length >> 1]
+}
+
+function flattenGround(pi: PageInk, roi: { x0: number; y0: number; x1: number; y1: number }, box: { x0: number; y0: number; x1: number; y1: number }, em: number): boolean {
+  const s = pi.s, d = s.data, W = roi.x1 - roi.x0, H = roi.y1 - roi.y0, N = W * H
+  if (W < 8 || H < 8) return false
+  const pAt = (j: number) => (roi.y0 + Math.floor(j / W)) * s.w + roi.x0 + (j % W)
+  const hist = new Uint32Array(4096)
+  let ring = 0
+  for (let j = 0; j < N; j++) {
+    const x = roi.x0 + (j % W), y = roi.y0 + Math.floor(j / W)
+    if (x >= box.x0 && x < box.x1 && y >= box.y0 && y < box.y1) continue
+    const i = pAt(j) * 4
+    hist[((d[i] >> 4) << 8) | ((d[i + 1] >> 4) << 4) | (d[i + 2] >> 4)]++
+    ring++
+  }
+  if (ring < 100) return false
+  let top = 0
+  for (let k = 1; k < 4096; k++) if (hist[k] > hist[top]) top = k
+  let g = [((top >> 8) << 4) + 8, (((top >> 4) & 15) << 4) + 8, ((top & 15) << 4) + 8]
+  const dist = (i: number) => Math.hypot(d[i] - g[0], d[i + 1] - g[1], d[i + 2] - g[2])
+  for (let it = 0; it < 4; it++) {
+    let sr = 0, sg = 0, sb = 0, n = 0
+    for (let j = 0; j < N; j++) {
+      const i = pAt(j) * 4
+      if (dist(i) > 24) continue
+      sr += d[i]; sg += d[i + 1]; sb += d[i + 2]; n++
+    }
+    if (!n) return false
+    g = [sr / n, sg / n, sb / n]
+  }
+  let ringNear = 0
+  for (let j = 0; j < N; j++) {
+    const x = roi.x0 + (j % W), y = roi.y0 + Math.floor(j / W)
+    if (x >= box.x0 && x < box.x1 && y >= box.y0 && y < box.y1) continue
+    if (dist(pAt(j) * 4) <= 32) ringNear++
+  }
+  if (ringNear < ring * 0.6) return false
+  const near: number[] = []
+  for (let j = 0; j < N; j += 2) { const v = dist(pAt(j) * 4); if (v <= 32) near.push(v) }
+  if (near.length < 20) return false
+  near.sort((a, b) => a - b)
+  const noise = near[Math.floor(near.length * 0.9)]
+  if (near[Math.floor(near.length * 0.5)] > 8 || noise > 20) return false
+  const T = Math.max(8, Math.min(24, noise * 1.3))
+  const lg = (g[0] * 299 + g[1] * 587 + g[2] * 114) / 1000
+  const known = new Float32Array(N)
+  let ground = 0, darkInk = 0
+  for (let j = 0; j < N; j++) {
+    const i = pAt(j) * 4
+    const v = dist(i)
+    if (v <= T) { known[j] = 1; ground++ } else if (v > 60 && lumAt(d, pAt(j)) < lg - 40) darkInk++
+  }
+  if (ground < N * 0.3 || darkInk < Math.max(30, N * 0.005)) return false
+  // The ground is sampled beyond the haze around the letters, as the page's
+  // own paper is (`preparePage`): blur and JPEG ringing hug every stroke.
+  const grow = Math.max(2, Math.round(1.8 / Math.abs(s.toPage[0] || 1)))
+  const off = new Uint8Array(N)
+  for (let j = 0; j < N; j++) off[j] = known[j] ? 0 : 1
+  maxFilter1D(off, W, H, grow, true)
+  maxFilter1D(off, W, H, grow, false)
+  const k2 = new Float32Array(N)
+  for (let j = 0; j < N; j++) k2[j] = off[j] ? 0 : 1
+  const ch = [new Float32Array(N), new Float32Array(N), new Float32Array(N)]
+  for (let j = 0; j < N; j++) { const i = pAt(j) * 4; ch[0][j] = d[i]; ch[1][j] = d[i + 1]; ch[2][j] = d[i + 2] }
+  if (!pushPull(ch, k2, W, H)) return false
+  // Only where the page's estimate was WRONG — off by more than the ground's
+  // own noise: elsewhere it stands, so a line analysed after this one on the
+  // same pixels reads what it always read ("LA RIQUEZA…" lies inside the
+  // inflated box of the "RICO" above it). A fixed ten levels left the
+  // estimate a few levels off beside every letter, and on a noiseless blue
+  // cover an erased "M" showed as a ghost of that.
+  const bar = Math.max(3, noise * 1.5)
+  for (let j = 0; j < N; j++) {
+    const p = pAt(j)
+    const r = ch[0][j], gg = ch[1][j], b = ch[2][j]
+    const lp = (r * 299 + gg * 587 + b * 114) / 1000
+    const lo = (pi.paper[p * 3] * 299 + pi.paper[p * 3 + 1] * 587 + pi.paper[p * 3 + 2] * 114) / 1000
+    if (Math.abs(lp - lo) <= bar) continue
+    pi.paper[p * 3] = r; pi.paper[p * 3 + 1] = gg; pi.paper[p * 3 + 2] = b
+    const t = lp > 1 ? lumAt(d, p) / lp : 1
+    pi.dark[p] = t >= 1 ? 0 : Math.round((1 - t) * 255)
+  }
+  // The haze: off-colour pixels beside a letter's core — its ringing, its
+  // shadow — whichever way their luminance points. Measured against the
+  // ground's own noise: on a noiseless digital cover the ringing round a
+  // letter is five to twelve levels off, and left as ground it was what the
+  // fill of an erased letter was made from, a faint ghost of the letter on
+  // the blue. Only beside letters: haze strewn over a noisy ground counts
+  // as faint ink to every measure of the line's strokes.
+  const beside = new Uint8Array(N)
+  for (let j = 0; j < N; j++) if (pi.dark[pAt(j)] >= CORE) beside[j] = 1
+  const reach = Math.max(3, Math.round(em * 0.1))
+  maxFilter1D(beside, W, H, reach, true)
+  maxFilter1D(beside, W, H, reach, false)
+  const hazeAt = Math.max(6, T * 0.8)
+  for (let j = 0; j < N; j++) {
+    if (!beside[j]) continue
+    const p = pAt(j)
+    if (pi.dark[p] < HAZE && dist(p * 4) > hazeAt) {
+      pi.dark[p] = HAZE
+    }
+  }
+  return true
+}
+
+/**
  * Analyse one recognised line on the prepared page. `inkRect` is in page
  * points (top-left), as OCR reports it. Null when the line's ink cannot be
  * told apart (no letters, a baseline that cannot be fitted, a reading that
  * cannot be shared among the words) — the caller then leaves the line to the
  * vector redraw.
  */
-export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRect: { x: number; y: number; width: number; height: number }; confidence?: number }, opts: { inverted?: boolean; growX?: [number, number] } = {}): LineInk | null {
+export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRect: { x: number; y: number; width: number; height: number }; confidence?: number }, opts: { inverted?: boolean; growX?: [number, number]; typed?: boolean; domain?: number; recolored?: boolean } = {}): LineInk | null {
   failedBecause = ''
   const s = pi.s
   const text = item.text
@@ -936,7 +1118,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
       lums.sort((a, b) => a - b)
       const lo = lums[Math.floor(lums.length * 0.03)], hi = lums[Math.floor(lums.length * 0.97)], med = lums[Math.floor(lums.length / 2)]
       if (hi - lo > 60 && med - lo < (hi - med) * 0.8) {
-        const li = analyzeLine(invertedPage(pi), item, { inverted: true })
+        const li = analyzeLine(domainPage(pi, 7), item, { inverted: true, domain: 7, typed: opts.typed })
         return li ?? fail(`the text is lighter than its ground, and reversed: ${failedBecause}`)
       }
     }
@@ -945,24 +1127,46 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   // over a photograph or a gradient (a brochure's title on its picture) has no
   // paper to fill from, and an erase there punched pale holes in the picture.
   let smoothGround = false
+  let flatGround = false
   {
-    const lums: number[] = []
-    for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 3) {
-      const p = at(x, y)
-      if (pi.dark[p] >= FRINGE || pi.lines?.[p]) continue
-      lums.push((pi.paper[p * 3] * 299 + pi.paper[p * 3 + 1] * 587 + pi.paper[p * 3 + 2] * 114) / 1000)
+    const paperRange = (): number | null => {
+      const lums: number[] = []
+      for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 3) {
+        const p = at(x, y)
+        if (pi.dark[p] >= FRINGE || pi.lines?.[p]) continue
+        lums.push((pi.paper[p * 3] * 299 + pi.paper[p * 3 + 1] * 587 + pi.paper[p * 3 + 2] * 114) / 1000)
+      }
+      if (lums.length <= 40) return null
+      lums.sort((a, b) => a - b)
+      return lums[Math.floor(lums.length * 0.95)] - lums[Math.floor(lums.length * 0.05)]
     }
-    if (lums.length > 40) {
-      const sorted = [...lums].sort((a, b) => a - b)
-      const range = sorted[Math.floor(sorted.length * 0.95)] - sorted[Math.floor(sorted.length * 0.05)]
-      if (range > 40) {
-        // A wide range is not a picture when it is SMOOTH: a cover's gradient
-        // spans a hundred levels across a line and a pixel's paper differs
-        // from the paper around it by a level or two. What the erase needs is
-        // that the paper can be filled from its surroundings, and a gradient
-        // can — a photograph's texture cannot.
-        const rough = paperRoughness(pi, roi, emGuess)
-        smoothDebug = { range, rough }
+    let range = paperRange()
+    // Reversed or coloured lettering is given its flat ground BEFORE it is
+    // judged: the page's estimate under a thick stroke can be a smooth mix of
+    // the ground and the stroke's own middle, against which the middle reads
+    // as ink and the test below passes — and an erase then wrote that mix (a
+    // white "E" on red came out pinkish white). Where the estimate was right
+    // already, nothing is rewritten.
+    if (opts.inverted || ringLum(pi, roi, box) < 215) {
+      if (flattenGround(pi, roi, box, emGuess)) { flatGround = true; range = paperRange() }
+    }
+    if (range !== null && range > 40) {
+      // A wide range is not a picture when it is SMOOTH: a cover's gradient
+      // spans a hundred levels across a line and a pixel's paper differs
+      // from the paper around it by a level or two. What the erase needs is
+      // that the paper can be filled from its surroundings, and a gradient
+      // can — a photograph's texture cannot.
+      let rough = paperRoughness(pi, roi, emGuess)
+      // Nor when the GROUND is flat and only the page's estimate of it is
+      // rough (`flattenGround`): a cover title's strokes are wider than the
+      // filter that finds ink, and their middles were read as paper.
+      if (rough > 8 && !flatGround && flattenGround(pi, roi, box, emGuess)) {
+        flatGround = true
+        range = paperRange()
+        rough = range !== null && range > 40 ? paperRoughness(pi, roi, emGuess) : 0
+      }
+      smoothDebug = { range, rough, flat: flatGround }
+      if (range !== null && range > 40) {
         if (rough > 8) return fail('the background is not plain paper')
         smoothGround = true
       }
@@ -1529,11 +1733,41 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
       const c = cut!.cells[i]
       return Math.min(r.x1, c.x1) - Math.max(r.x0, c.x0) >= (r.x1 - r.x0) * 0.5
     })
+    // Where the two DISAGREE, the runs are still the truth when every run
+    // that takes a letter or a figure is letter-sized: the cutter places its
+    // cells by advances guessed for an ordinary face, and on a cover's
+    // condensed "NAPOLEON" they drifted a letter's width by the end — the
+    // word stayed "exact", its labels sat on the wrong letters, and deleting
+    // the O erased the E. The specks that made "G." four runs for "ING." are
+    // not letter-sized. And the runs' widths must be CONSISTENT with their
+    // letters — a condensed face narrows every letter alike (0.47–0.70 of
+    // its advance across "NAPOLEON"), where a border's fragment labelled "N"
+    // beside a real "G" does not (0.24 against 0.67): that is the typed text
+    // "ING." laid over the ink of "G." in a table cell, which took it for
+    // confirmed and printed "INING. CIVIL". Letters whose ink is far narrower
+    // than their advance (an I, an l, a t) say nothing either way. Never for a
+    // reading the user typed: there a coincidence confirms a misreading.
+    const runsLetterSized = !opts.typed && !!exactRuns && !runsAgree && (() => {
+      const spans = inkSpans(pieces)
+      const ratios: number[] = []
+      for (let i = 0; i < spans.length; i++) {
+        const ch = wordChars[i] ?? ''
+        if (!/[p{L}p{N}]/u.test(ch)) continue
+        let y0 = Infinity, y1 = -Infinity
+        for (const c of spans[i].pieces) { y0 = Math.min(y0, c.y0); y1 = Math.max(y1, c.y1) }
+        if (y1 - y0 < em * 0.35) return false
+        if (!/[IlijJ1!|tfr]/.test(ch)) ratios.push((spans[i].x1 - spans[i].x0) / em / expectedAdvance(ch))
+      }
+      if (ratios.length < 2) return false
+      const med = [...ratios].sort((a, b) => a - b)[ratios.length >> 1]
+      return ratios.every(r => r >= med * 0.6 && r <= med * 1.67)
+    })()
+    const runsDisown = !opts.typed && !!exactRuns && !runsAgree && !runsLetterSized
     const ok = cutOk || !!byRuns
     let wordCells: { char: string; x0: number; x1: number; suspect: boolean }[]
     if (byRuns) {
       wordCells = byRuns
-    } else if (exactRuns && runsAgree) {
+    } else if (exactRuns && (runsAgree || runsLetterSized)) {
       wordCells = exactRuns.map((c, i) => ({ ...c, suspect: !!cut!.cells[i].suspect }))
     } else if (ok) {
       wordCells = cut!.cells.map(c => ({ char: c.char, x0: c.x0, x1: c.x1, suspect: !!c.suspect }))
@@ -1609,7 +1843,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
         isolated: leftClean && rightClean
       }
     })
-    words.push({ x0: iw.x0, x1: iw.x1, top: iw.top, bottom: iw.bottom, from, to, cut: ok, exact: cutExact || !!byRuns, weight: wordWeight(pi, pieces, iw, base, em), err })
+    words.push({ x0: iw.x0, x1: iw.x1, top: iw.top, bottom: iw.bottom, from, to, cut: ok, exact: (cutExact && !runsDisown) || !!byRuns, weight: wordWeight(pi, pieces, iw, base, em), err })
   }
   for (const m of matches) {
     const iw = split.words[m.word]
@@ -1669,9 +1903,18 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
       // brighter than its ground in any channel cannot be printed that way:
       // yellow lettering on a purple cover (read inverted: blue on green)
       // came back pinkish white, its old letters left as ghosts.
+      // Such a line is read again with those channels inverted as well
+      // (`domainPage`), where the lettering is darker in every channel.
+      let flip = 0
       for (let c = 0; c < 3; c++) {
         const ground = median(ps.map(p => pi.paper[p * 3 + c]))
-        if (inkRgb[c] > ground + 24) return fail('the lettering is a colour its ground cannot be printed with')
+        if (inkRgb[c] > ground + 24) flip |= 1 << c
+      }
+      if (flip) {
+        if (opts.recolored) return fail('the lettering is a colour its ground cannot be printed with')
+        const next = (pi.domain ?? 0) ^ flip
+        const li = analyzeLine(domainPage(pi, next), item, { ...opts, inverted: next !== 0, domain: next, recolored: true })
+        return li ?? fail(`the lettering is coloured: ${failedBecause}`)
       }
     }
   }
@@ -1718,20 +1961,52 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     // In STROKES, an em long at least: colour noise round other letters and a
     // form's rules comes in specks.
     const v: [number, number, number][] = []
-    let n = 0
+    let n = 0, away = 0
+    // And strokes that run AWAY from the letters: a signature crosses into
+    // the gaps and the space around the line, where a cover title's drop
+    // shadow, or its colour fringe, hugs the letters it belongs to. Taken for
+    // a second ink, the shadow under "OFFERS" was split off its letters, and
+    // erasing one left a lilac ghost of it on the purple.
+    // Grown from the LETTERS' pixels, not the core: a signature's stroke is
+    // core too, and grown from itself it was never away from anything.
+    const near = new Uint8Array(W * H)
+    for (const c of cells) for (const p of c.pix) {
+      const x = p % s.w - roi.x0, y = Math.floor(p / s.w) - roi.y0
+      if (x >= 0 && y >= 0 && x < W && y < H) near[y * W + x] = 1
+    }
+    const reach = Math.max(3, Math.round(em * 0.12))
+    maxFilter1D(near, W, H, reach, true)
+    maxFilter1D(near, W, H, reach, false)
+    // And strokes that CROSS the line's letters, in the band they stand in:
+    // another line set in another colour lies in the region's padding — the
+    // white "$100M" above the peach "OFFERS" was taken for a second ink of
+    // "OFFERS", and an erased "S" kept a lilac share of it.
+    let bandTop = Infinity, bandBottom = -Infinity
+    for (const c of cells) if (c.pix.length) { bandTop = Math.min(bandTop, c.top); bandBottom = Math.max(bandBottom, c.bottom) }
+    let inBand = 0
     for (const c of components(fm, W, H, roi.x0, roi.y0, s.w)) {
       if (Math.max(c.x1 - c.x0, c.y1 - c.y0) < em) continue
       n += c.area
-      for (const p of c.pix) if (pi.dark[p] >= 90) v.push([s.data[p * 4], s.data[p * 4 + 1], s.data[p * 4 + 2]])
+      for (const p of c.pix) {
+        if (pi.dark[p] >= 90) v.push([s.data[p * 4], s.data[p * 4 + 1], s.data[p * 4 + 2]])
+        const x = p % s.w - roi.x0, y = Math.floor(p / s.w) - roi.y0
+        if (!near[y * W + x]) away++
+        if (y + roi.y0 >= bandTop && y + roi.y0 <= bandBottom) inBand++
+      }
     }
-    if (n < Math.max(30, em * 2) || v.length < 10) return null
+    if (n < Math.max(30, em * 2) || v.length < 10 || away < n * 0.3 || inBand < Math.max(20, n * 0.1)) return null
     return [median(v.map(c => c[0])), median(v.map(c => c[1])), median(v.map(c => c[2]))]
   })()
 
   // The Voronoi partition of the ROI among the inks in it, out to ~1.4 pt.
   // Out to ~2.2 pt: as far as a letter's JPEG ringing reaches (the edge of
-  // its 8×8 block at 200 DPI).
-  const ownR = Math.max(3, Math.round(2.2 / Math.abs(s.toPage[0] || 1)))
+  // its 8×8 block at 200 DPI). The block does not shrink with the
+  // resolution: on a 72 DPI cover 2.2 pt is two pixels, and the ringing round
+  // its big letters stayed on the page when they were erased — the outline of
+  // a deleted "SE" in the red. A big letter's region reaches up to six pixels.
+  // On a flat ground a letter's region takes its effects as well — a drop
+  // shadow, a glow, an outline — out to a tenth of an em.
+  const ownR = Math.max(3, Math.round(2.2 / Math.abs(s.toPage[0] || 1)), Math.min(6, Math.round(em * 0.08)), flatGround ? Math.round(em * 0.1) : 0)
   const owner = new Int16Array(W * H).fill(-1)
   const dist = new Uint8Array(W * H).fill(255)
   {
@@ -1814,7 +2089,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
       return v.length ? median(v) / 255 : 0.8
     })(),
     coreLevel,
-    ...(opts.inverted ? { inverted: true } : {}),
+    ...(opts.inverted ? { inverted: true, domain: opts.domain ?? 7 } : {}),
     ...(overInk ? { overInk } : {}),
     owner, ownDist: dist, ownR, loose
   }

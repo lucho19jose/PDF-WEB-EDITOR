@@ -1372,3 +1372,116 @@ test('ink the recogniser box barely touches is left out of the reading, unless t
   const dash = WS.alignCharsToWords([{ x0: 0, x1: 70 }, { x0: 80, x1: 82, outside: true }], [...'DBSANF00-'], new Set([8]))
   assert.deepEqual(dash.map(x => [x.word, x.from, x.to]), [[0, 0, 8], [1, 8, 9]])
 })
+
+/** A cover at 72 DPI: `text` in heavy Carlito Bold, `fg` on a flat `bg` with JPEG-like noise. */
+function flatCoverScan(text, fg, bg, size = 200) {
+  const W = 1400, H = 360
+  const font = new mupdf.Font('Carlito', fs.readFileSync(ROOT + '/public/fonts/match/Carlito-Bold.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const t = new mupdf.Text()
+  let pen = 60
+  const boxes = []
+  for (const ch of text) {
+    const adv = font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0))) * size
+    t.showString(font, [size, 0, 0, -size, pen, 260], ch)
+    boxes.push([pen, pen + adv])
+    pen += adv + 18
+  }
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = pix.getPixels(), stride = pix.getStride()
+  let seed = 12345
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff }
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const a = 1 - g[y * stride + x] / 255
+    const i = (y * W + x) * 4
+    for (let c = 0; c < 3; c++) rgba[i + c] = Math.round(bg[c] * (1 - a) + fg[c] * a + (rnd() - 0.5) * 10)
+    rgba[i + 3] = 255
+  }
+  return { raster: R.scanRasterOf(W, H, rgba, [W, 0, 0, H, 0, 0], W, H, 'Cover'), boxes, W, H }
+}
+
+/** How far the region [x0, x1) × the title's rows is from `bg`, at its worst (the 98th percentile). */
+function offGround(work, W, x0, x1, bg) {
+  const d = []
+  for (let y = 90; y < 280; y++) for (let x = Math.round(x0); x < Math.round(x1); x++) {
+    const i = (y * W + x) * 4
+    d.push(Math.hypot(work[i] - bg[0], work[i + 1] - bg[1], work[i + 2] - bg[2]))
+  }
+  d.sort((a, b) => a - b)
+  return d[Math.floor(d.length * 0.98)]
+}
+
+test('a white title on a flat red cover is read on its flat ground, and a deleted letter leaves the red', () => {
+  const bg = [165, 20, 45]
+  const { raster, boxes, W } = flatCoverScan('PIENSE', [250, 250, 250], bg)
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 't', text: 'PIENSE', inkRect: { x: 50, y: 110, width: boxes.at(-1)[1] - 40, height: 160 }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  assert.equal(LI.domainOfLine(li), 7, 'white on red is read with every channel inverted')
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const pl = LI.domainPage(pi, 7)
+  const w = pl.s.data.slice()
+  const res = SE.applyLineEdit(pl, li, atlas, 'PIENS', w, {})
+  assert.ok(res.ok, res.reason)
+  const work = raster.data.slice()
+  for (let i = 0; i < w.length; i += 4) if (w[i] !== pl.s.data[i] || w[i + 1] !== pl.s.data[i + 1] || w[i + 2] !== pl.s.data[i + 2]) for (let c = 0; c < 3; c++) work[i + c] = 255 - w[i + c]
+  const [x0, x1] = boxes.at(-1)
+  assert.ok(offGround(work, W, x0, x1, bg) < 30, `the erased E is ${offGround(work, W, x0, x1, bg).toFixed(0)} off the red`)
+})
+
+test('peach lettering on purple is read with only its lighter channels inverted, and a deleted letter leaves the purple', () => {
+  const bg = [140, 10, 240]
+  const { raster, boxes, W } = flatCoverScan('OFFERS', [255, 215, 105], bg)
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 't', text: 'OFFERS', inkRect: { x: 50, y: 110, width: boxes.at(-1)[1] - 40, height: 160 }, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  assert.equal(LI.domainOfLine(li), 3, 'red and green inverted, blue kept')
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const pl = LI.domainPage(pi, 3)
+  const w = pl.s.data.slice()
+  const res = SE.applyLineEdit(pl, li, atlas, 'OFFER', w, {})
+  assert.ok(res.ok, res.reason)
+  const work = raster.data.slice()
+  for (let i = 0; i < w.length; i += 4) if (w[i] !== pl.s.data[i] || w[i + 1] !== pl.s.data[i + 1] || w[i + 2] !== pl.s.data[i + 2]) {
+    work[i] = 255 - w[i]; work[i + 1] = 255 - w[i + 1]; work[i + 2] = w[i + 2]
+  }
+  const [x0, x1] = boxes.at(-1)
+  assert.ok(offGround(work, W, x0, x1, bg) < 30, `the erased S is ${offGround(work, W, x0, x1, bg).toFixed(0)} off the purple`)
+})
+
+test('the page plan edits coloured lettering in its own domain and folds back only the channels it inverted', () => {
+  const bg = [140, 10, 240]
+  const { raster, boxes, W } = flatCoverScan('OFFERS', [255, 215, 105], bg)
+  const pi = LI.preparePage(raster)
+  const inkRect = { x: 50, y: 110, width: boxes.at(-1)[1] - 40, height: 160 }
+  const li = LI.analyzeLine(pi, { id: 't', text: 'OFFERS', inkRect, confidence: 95 })
+  assert.ok(li, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const items = [{ id: 't', text: 'OFFER', originalText: 'OFFERS', edited: true, removed: false, inkRect, rect: inkRect }]
+  const plan = SEP.planScanEdits(pi, new Map([['t', li]]), atlas, items)
+  assert.equal(plan.overlays.length, 1, JSON.stringify(plan.modes))
+  assert.ok(plan.modes.t.startsWith('scan'), plan.modes.t)
+  // The page as a viewer shows it: the overlay over the scan.
+  const o = plan.overlays[0]
+  const [ox, oy] = R.apply(raster.toPx, o.rect[0], o.rect[1])
+  const work = raster.data.slice()
+  for (let y = 0; y < o.height; y++) for (let x = 0; x < o.width; x++) {
+    const a = o.alpha[y * o.width + x] / 255
+    const p = ((Math.round(oy) + y) * W + Math.round(ox) + x) * 4
+    for (let c = 0; c < 3; c++) work[p + c] = work[p + c] * (1 - a) + o.rgb[(y * o.width + x) * 3 + c] * a
+  }
+  const [x0, x1] = boxes.at(-1)
+  assert.ok(offGround(work, W, x0, x1, bg) < 30, `the erased S is ${offGround(work, W, x0, x1, bg).toFixed(0)} off the purple`)
+  // And the letters it kept are still peach.
+  const [k0, k1] = boxes[0]
+  let peach = 0
+  for (let y = 140; y < 250; y++) for (let x = Math.round(k0); x < Math.round(k1); x++) {
+    const i = (y * W + x) * 4
+    if (work[i] > 230 && work[i + 1] > 190 && work[i + 2] < 140) peach++
+  }
+  assert.ok(peach > 500, `only ${peach} peach pixels left in the O`)
+})

@@ -5525,6 +5525,115 @@ appending letters (the X synthesised) all draw on the scan with no damage —
 including the two title lines that straddle the circle's edge. Lettering over
 a photograph still fails, in either domain, as not plain paper.
 
+**A cover's big title: a flat ground, its own face at another size, its own
+colour, its own shadow.** The covers of the OCR sweep (a red "PIENSE Y HÁGASE
+RICO", a purple "$100M OFFERS", a blue "$100M LEADS") had every big title
+refused and redrawn in Helvetica by the vector path. Seven separate things,
+each found on the crops:
+- **The ground is flat, its estimate was not** (`flattenGround`). The page's
+  paper is found with a 3.6 pt max filter and a title's strokes are wider: on
+  the inverted page their middles were read as paper, and so were the LIGHTER
+  letters of a neighbouring line ("NAPOLEON HILL" above the white "PIENSE").
+  The plain-paper test measured 47–99 of roughness against a bar of 8. Where
+  it fails, the region's ground is taken as the commonest colour of its
+  padding ring (refined by a mean shift) and accepted only if it dominates
+  that ring (60% within 32 levels), is tight (median 8, 90th percentile 20 —
+  JPEG chroma noise on a 72 DPI cover reaches 18) and covers 30% of the
+  region; the paper is then filled from the ground's own pixels. An ocean
+  photograph put 10–14% of its ring near its commonest colour, the picture
+  behind a sign 30%, a flat cover 70–82%. Only pixels the page's estimate got
+  WRONG are rewritten, so a later line on the same pixels reads what it read.
+  Off-colour pixels lighter than paper (a shadow, read with channels
+  inverted) get the darkness of haze (`HAZE`): erased and moved with their
+  letter, never a core. On a flat ground a letter's region reaches 0.1 em.
+  It runs up front for every reversed line and every line whose padding is
+  not near white (median under 215): the page's estimate under a thick
+  stroke can be a smooth MIX of ground and stroke, against which the
+  stroke's middle reads as ink, the plain-paper test passes, and an erase
+  wrote the mix (a white "E" on red came back pinkish white). On the 18 office
+  suites this changes no pixel by more than 8 levels. Two bars are relative
+  to the ground's own measured noise, and both were fixed numbers first: the
+  estimate is rewritten where it is off by more than 1.5× the noise (3 at
+  least; a fixed ten left it a few levels off beside every letter, and on a
+  noiseless blue cover an erased "M" showed as a ghost of that), and a pixel
+  beside a letter's core (within 0.1 em) is haze when it is 0.8× the ground's
+  tolerance off its colour (6 at least) — the JPEG ringing round a letter on
+  a clean cover is five to twelve levels off, and left as ground it was what
+  the fill of the erased letter was made from. Haze is marked only beside
+  letters: strewn over a noisy ground it counts as faint ink to every
+  measure of the line's strokes. Holding an erased hole's border at the
+  paper wherever there was haze was tried and dropped: pinned to clean
+  ground next to a neighbour's shadow, the fill stepped into it.
+- **The page's own letter at another size beats a bundled face**
+  (`pickGlyphRescaled`): an "A" made for "PIENSA" came out a wide regular sans
+  in a condensed bold title while the "Á" of "HÁGASE", a third smaller, was
+  the letter. 0.6–1.7 times, from a line whose letters agree with the word's
+  own (0.8, `SAME_STYLE`), same weight and kind of face, whole letters only,
+  scaled down before up. It also replaced two synthesised figures on office
+  forms (a "6", an "8") with rescaled copies of the page's own — inspected,
+  equivalent.
+- **A capital or x-height letter whose ink rises over its class carries a
+  mark the reading dropped**, and is not harvested: that "Á" filed as "A"
+  printed "PIENSÁ".
+- **Kept letters are judged only against letters at their own size.** The
+  medoids of a cover's small subtitle read a heavy "H" as an "O" (0.82) and
+  an "N" as nothing (0.46), and deleting two letters from "HÁGASE" redrew the
+  four it kept. A kept letter with nothing at its size to judge it by is
+  unverifiable, not wrong; a letter with no established shape at all needs
+  0.86 to be called another letter (a mark still 0.8) — a heavy "L" agreed
+  0.83 with the big "C" of its own line.
+- **Runs over the cutter, when the runs are letters.** The cutter places its
+  cells by an ordinary face's advances; on the condensed "NAPOLEON" they
+  drifted a letter by the end, the word stayed "exact", and deleting the O
+  erased the E. Where the runs and the cutter disagree, the runs win if every
+  run taking a letter is letter-sized (0.35 em) and their widths are
+  CONSISTENT over their advances (within 0.6–1.67 of the word's median,
+  narrow letters aside); otherwise the word is not exact. Never in a reading
+  the user typed (`analyzeLine(…, { typed: true })`): there the typed "ING."
+  laid over the ink of "G." in a table cell was confirmed on a border
+  fragment and a speck and printed "INING. CIVIL" — exactly the case the
+  cutter preference was written for, caught by the A/B.
+- **Coloured lettering is read with its lighter CHANNELS inverted**
+  (`domainPage(pi, mask)`, `LineInk.domain`): multiplying ink onto paper only
+  darkens, and peach on purple is lighter in red and green and darker in
+  blue. Inverting just those makes it darker in every channel; the edit is
+  made there and only those channels flipped back. The "ink lighter than its
+  ground" refusal now re-reads the line once in that domain. White on a band
+  is mask 7 — the inverted page, which `invertedPage` still returns.
+- **A second ink must cross the letters and run away from them.** The
+  two-ink split (a signature over grey text) took the white "$100M" above
+  "OFFERS", and the title's own drop shadow, for a second ink of "OFFERS",
+  and an erased "S" kept a lilac share of it. Its strokes must now lie partly
+  inside the letters' band and at least 30% outside the letters grown by
+  max(3 px, 0.12 em) — grown from the letters' pixels, not the core, or the
+  signature (core too) was never away from anything.
+
+Two print-model fixes came with it: a moved letter keeps the channels where
+it is LIGHTER than its paper (black lettering on red carries twice the red's
+green as JPEG tint; clamped, every moved letter printed darker) — added as
+the excess over the paper, not multiplied, since a ratio over the red's green
+of 15 glowed green — and an erased hole takes the grain of the ground beside
+it (`groundGrain`, a residual copied from clean ground shifted by a multiple
+of 8 px so JPEG blocks stay aligned; only where that grain is measurable, so
+white paper is untouched). A letter's region reaches up to 6 px on big
+letters: 2.2 pt is two pixels at 72 DPI and the ringing round an erased "SE"
+stayed as its outline. And a line with fewer than two word spaces is never
+"justified" (`justifiedMargin`): "$100M" over "OFFERS" both end at the page's
+right edge, and a deleted "0" pushed the space it freed into the only gap
+there was, at the edit.
+
+Measured: on the red cover "NAPOLEON HILL" → "NAPOLEN HILL", "PIENSE" →
+"PIENSA" (its own A, rescaled) and "Y HÁGASE" → "Y HÁGA" all draw on the scan
+from its own letters; both "$100M" titles take deletions and "$001M"; on the
+purple cover "OFFERS" → "OFFER" and "SREFFO" draw in the title's own face
+and colour. The 18 lab suites are unchanged but for those two rescaled
+figures. **Known:** where a letter was erased the ground is filled smooth,
+and on a JPEG cover that shows at high zoom as a patch without the
+compression's texture (or a trace of a neighbour's shadow cut at the patch's
+edge); new letters borrowed from the page carry no shadow; "RICO" (its box
+inflated over the subtitle) cannot be cut; lettering over a photograph is
+still refused.
+
 Tried and dropped: letting a letter's region follow its pale strokes past the
 2.2 pt reach (ink of fringe darkness connected to the letter, bounded to its
 neighbourhood), for what looked at 5x like the ghost of a deleted italic "L".

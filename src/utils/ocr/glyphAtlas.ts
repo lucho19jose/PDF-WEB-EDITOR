@@ -201,6 +201,13 @@ export function harvestLine(pi: PageInk, li: LineInk, page: number, out: Exempla
       // the "." took the first "0", every row gave the page the same
       // "full stop", and an amount typed "1,050.00" printed "1,050000".
       if (/^[.,:;'·]$/.test(c.char) && (c.inkR - c.inkL + 1 > li.fit.emPx * 0.24 || (c.char !== ':' && c.char !== ';' && c.bottom - c.top > li.fit.emPx * 0.4))) continue
+      // A letter labelled without a mark whose ink rises well over its class
+      // carries one the reading dropped: a cover's "HÁGASE" was read "HAGASE",
+      // its "Á" went into the atlas as an "A", and "PIENSE" retyped
+      // "PIENSA" came out "PIENSÁ".
+      const rise = base((c.inkL + c.inkR) / 2) - c.top
+      if (/^[A-Z]$/.test(c.char) && capH && rise > capH * 1.18) continue
+      if (/^[acemnorsuvwxz]$/.test(c.char) && xh && rise > xh * 1.35) continue
       const ex = cutExemplar(pi, li, c, k, base, word.weight, xh, capH, page)
       if (ex) { ex.figH = figH; out.push(ex) }
     }
@@ -852,6 +859,70 @@ function pickFrom(atlas: Atlas, req: GlyphRequest, vouched: boolean): PickedGlyp
   // Within 7% the copy is used at its own size: a resample softens the stem
   // more visibly than a few percent of size shows.
   return { ex: best, scale: Math.abs(r - 1) <= 0.07 ? 1 : r, support: bestSupport }
+}
+
+/** What copies of one face agree across lines (0.85–0.9) clear, and a sans letter against a serif title's (0.76) does not. */
+const SAME_STYLE = 0.8
+
+/**
+ * A copy of the letter at ANOTHER size, from a line set in the request's own
+ * face — for a letter the page holds only in a bigger or a smaller line of
+ * that face. A book cover sets its title in three sizes of one condensed
+ * display face ("PIENSE", "Y HÁGASE", "RICO"); none of the bundled faces is
+ * anything like it, and an "A" made for "PIENSA" came out a wide regular sans
+ * between condensed bold capitals — while the "Á" of "HÁGASE", a third
+ * smaller, was the very letter. `pickGlyph` takes copies within 10% of the
+ * size; this takes them from 0.6 to 1.7 times, but only from a line whose
+ * letters agree with the requesting word's own (`SAME_STYLE`), in the same
+ * weight class and kind of face, and only whole letters. The nearest size
+ * wins, a copy scaled down before one scaled up (a resample softens what it
+ * enlarges), the better style match breaking ties. Null without the style
+ * evidence: two letters of the word at least.
+ */
+export function pickGlyphRescaled(atlas: Atlas, req: GlyphRequest): PickedGlyph | null {
+  const list = atlas.byChar.get(req.char)
+  const refs = req.style?.refs
+  if (!list?.length || !refs || refs.length < 2) return null
+  const face = req.style?.face
+  const scores = new Map<string, number | null>()
+  const lineScore = (line: string): number | null => {
+    if (scores.has(line)) return scores.get(line)!
+    let v: number | null = null
+    if (line === req.style!.line) v = 1
+    else {
+      const own = copiesOnLine(atlas, line)
+      let sum = 0, n = 0
+      for (const r of refs) {
+        const l = own.get(r.char)
+        if (!l) continue
+        let best = 0
+        for (const ex of l) best = Math.max(best, shapeAgreement(ex.shape, r.shape))
+        sum += best
+        n++
+      }
+      v = n >= 2 ? sum / n : null
+    }
+    scores.set(line, v)
+    return v
+  }
+  let best: Exemplar | null = null, bestCost = Infinity
+  for (const ex of list) {
+    if (ex.doubt && !ex.peerVouched && !(ex.faceVouched && ex.faceVouched === face)) continue
+    if (!ex.isolated) continue
+    const b = atlas.boldAt === null ? false : ex.weight === null ? null : ex.weight >= atlas.boldAt
+    if (b === null || b !== req.bold) continue
+    if (face) {
+      const f = faceAt(atlas, ex.lineId, ex.x0 + (ex.inkL + ex.inkR) / 2, ex.emPx)
+      if (f !== null && f !== face) continue
+    }
+    const r = sizeRatioOf(req, ex)
+    if (!(r >= 0.6 && r <= 1.7)) continue
+    const v = lineScore(ex.lineId)
+    if (v === null || v < SAME_STYLE) continue
+    const cost = Math.abs(Math.log(r)) + (r > 1 ? 0.1 : 0) - (v - SAME_STYLE) * 0.5
+    if (cost < bestCost) { bestCost = cost; best = ex }
+  }
+  return best ? { ex: best, scale: sizeRatioOf(req, best), support: 0 } : null
 }
 
 /** Why each copy of a letter would or would not be picked — for the lab. */
