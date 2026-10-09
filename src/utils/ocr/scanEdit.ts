@@ -76,6 +76,36 @@ function toned(g: GlyphImage, fromInk: [number, number, number], toInk: [number,
 }
 
 /**
+ * An ENLARGED copy with its interior made even. A copy carries the scan's
+ * speckle inside its strokes — on a JPEG cover, flecks of the ground in a
+ * white letter — and scaled up half again those flecks became pink dots in
+ * the "S" of "RICOS". Pixels nearly as dark as the letter's core (three
+ * quarters of its median core darkness) take that median; the edges, where
+ * the shape is, are left as they are.
+ */
+function solidified(g: GlyphImage): GlyphImage {
+  const dark = (i: number) => 1 - (g.t[i * 3] * 299 + g.t[i * 3 + 1] * 587 + g.t[i * 3 + 2] * 114) / 1000 / 255
+  const core: number[] = []
+  for (let i = 0; i < g.w * g.h; i++) if (g.m[i] && dark(i) >= CORE / 255) core.push(i)
+  if (core.length < 20) return g
+  const byDark = [...core].sort((a, b) => dark(a) - dark(b))
+  const mid = byDark[byDark.length >> 1]
+  const bar = dark(mid) * 0.75
+  const t = g.t.slice()
+  for (let i = 0; i < g.w * g.h; i++) {
+    if (!g.m[i]) continue
+    const d = dark(i)
+    // The region's outer pixels are the source's paper and its ringing,
+    // enlarged with the letter: a faint frame round it. Within 6% of the
+    // paper they are paper.
+    if (d < 0.06) { t[i * 3] = t[i * 3 + 1] = t[i * 3 + 2] = 255; continue }
+    if (d < bar) continue
+    for (let c = 0; c < 3; c++) t[i * 3 + c] = g.t[mid * 3 + c]
+  }
+  return { ...g, t }
+}
+
+/**
  * A letter borrowed from the other weight, as dark as the line it goes into.
  * Re-weighing widens a regular letter's thinner strokes but not their paler
  * cores: borrowed into a bold date, the "s" and "t" of "septiembre" read grey
@@ -1616,7 +1646,12 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     // (`pickGlyphRescaled`): truer than any bundled face where the page is
     // set in something none of them resembles, and nothing is made for it.
     const rescaled = pickGlyphRescaled(atlas, req)
-    if (rescaled) { c.glyph = toned(scaleImage(imageOf(rescaled.ex), rescaled.scale), rescaled.ex.inkT, inkOverPaper); c.drawnAs = 'w'; continue }
+    if (rescaled) {
+      const g = toned(scaleImage(imageOf(rescaled.ex), rescaled.scale), rescaled.ex.inkT, inkOverPaper)
+      c.glyph = rescaled.scale > 1.2 ? solidified(g) : g
+      c.drawnAs = 'w'
+      continue
+    }
     // Neither weight on any harvested page, in this kind of face: a glyph
     // synthesised from the matched face, if the caller has made one.
     if (lineEdge === undefined) lineEdge = edgeWidthOf(pi, li)

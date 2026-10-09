@@ -1473,6 +1473,33 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     if (inX && c.cy >= b - em * 1.02 && c.cy <= b + em * 0.36) ownPieces.push(c)
     else for (const p of c.pix) protect.add(p)
   }
+  // The band is a fixed share of the em, and a title's em is huge: on a
+  // cover the 166 px band of "RICO" took in the bottom of "Y HÁGASE" above it
+  // and both lines of the subtitle below, and their letters were shared out
+  // among R, I, C and O. Judged against the line's OWN letters instead: a
+  // piece whose bottom stands higher above the baseline than the letters'
+  // tops, too big for an accent, is the line above's; one that starts
+  // clearly below the baseline and is far smaller than the line's letters is
+  // the line below's — a comma or a descender starts at the baseline, and a
+  // handwritten letter's detached tail is half a letter tall. Letters, not
+  // flat strokes: the fragments of a form's blank under the line are its
+  // own, and taken away the date typed into the blank moved off it.
+  {
+    const rise = (c: Comp) => base(c.cx) - c.y0
+    const tall = ownPieces.filter(c => c.y1 - c.y0 >= em * 0.4)
+    if (tall.length >= 3) {
+      const capRise = median(tall.map(rise))
+      const letterH = median(tall.map(c => c.y1 - c.y0))
+      for (let i = ownPieces.length - 1; i >= 0; i--) {
+        const c = ownPieces[i], h = c.y1 - c.y0, b = base(c.cx)
+        const above = b - c.y1 > capRise + em * 0.04 && h >= em * 0.2
+        const below = c.y0 > b + Math.max(2, letterH * 0.08) && h < letterH * 0.35 && h >= 3 && c.x1 - c.x0 <= h * 2.5
+        if (!above && !below) continue
+        for (const p of c.pix) protect.add(p)
+        ownPieces.splice(i, 1)
+      }
+    }
+  }
   // A cell's text stops at the cell's borders. The recogniser's box of
   // "QUISPE…" reached across the border into the column before, and the "51"
   // of "351" was read as its "Q" — reversing the name then set "EPSIUQ" over

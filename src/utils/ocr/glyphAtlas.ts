@@ -865,6 +865,34 @@ function pickFrom(atlas: Atlas, req: GlyphRequest, vouched: boolean): PickedGlyp
 const SAME_STYLE = 0.8
 
 /**
+ * How CONDENSED a line's letters are: the median of each letter's ink width
+ * over the advance an ordinary face gives it (narrow letters left out — an I
+ * is mostly side bearing). A face's fingerprint that needs no letter in
+ * common: a cover's condensed "RICO" shares only its I with the "PIENSE"
+ * above it, and measures 0.59 where that line measures 0.69 (three letters
+ * each: a noisy median, hence a fifth of tolerance) and a regular sans 0.85
+ * to 0.9.
+ */
+const widthIndex = new WeakMap<Atlas, Map<string, number | null>>()
+function lineWidthRatio(atlas: Atlas, line: string): number | null {
+  let m = widthIndex.get(atlas)
+  if (!m) { m = new Map(); widthIndex.set(atlas, m) }
+  if (m.has(line)) return m.get(line)!
+  // Every copy on the line, doubted ones too: a doubt is about the shape a
+  // label names, and a title in a face of its own has its letters doubted
+  // for want of peers at its size — its width is still its width.
+  const r: number[] = []
+  for (const [ch, list] of atlas.byChar) {
+    if (/[IlijJ1!|.,:;'tfr]/.test(ch)) continue
+    for (const ex of list) if (ex.lineId === line) r.push((ex.inkR - ex.inkL) / ex.emPx / expectedAdvance(ch))
+  }
+  r.sort((a, b) => a - b)
+  const v = r.length >= 3 ? r[r.length >> 1] : null
+  m.set(line, v)
+  return v
+}
+
+/**
  * A copy of the letter at ANOTHER size, from a line set in the request's own
  * face — for a letter the page holds only in a bigger or a smaller line of
  * that face. A book cover sets its title in three sizes of one condensed
@@ -917,7 +945,17 @@ export function pickGlyphRescaled(atlas: Atlas, req: GlyphRequest): PickedGlyph 
     }
     const r = sizeRatioOf(req, ex)
     if (!(r >= 0.6 && r <= 1.7)) continue
-    const v = lineScore(ex.lineId)
+    let v = lineScore(ex.lineId)
+    // Too few letters in common to compare shapes: the two lines must at
+    // least be as condensed as each other — for DISPLAY lines only (an em of
+    // 60 px and more): a title's few letters rarely share two with anything,
+    // where body text has letters to compare, and its lines are too alike in
+    // width for this to tell faces apart — a bold italic form label took
+    // upright letters from three other lines this way, a checkbox for its R.
+    if (v === null && req.emPx >= 60) {
+      const a = lineWidthRatio(atlas, req.style!.line), b = lineWidthRatio(atlas, ex.lineId)
+      if (a !== null && b !== null && Math.abs(Math.log(a / b)) <= Math.log(1.2)) v = SAME_STYLE
+    }
     if (v === null || v < SAME_STYLE) continue
     const cost = Math.abs(Math.log(r)) + (r > 1 ? 0.1 : 0) - (v - SAME_STYLE) * 0.5
     if (cost < bestCost) { bestCost = cost; best = ex }

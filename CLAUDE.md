@@ -5608,6 +5608,35 @@ each found on the crops:
   max(3 px, 0.12 em) — grown from the letters' pixels, not the core, or the
   signature (core too) was never away from anything.
 
+- **A title's band takes in its neighbours; its own letters say which are
+  its own.** The band that decides a line's ink is a fixed share of the em,
+  and a title's em is huge: the 166 px band of "RICO" took in the bottom of
+  "Y HÁGASE" above and both lines of the subtitle below, their letters were
+  shared out among R, I, C and O, and reversing the word dragged chunks of
+  the subtitle along. With three letter-sized pieces at least, a piece whose
+  bottom stands higher above the baseline than the letters' tops (too big for
+  an accent) is the line above's, and an upright piece starting below the
+  baseline by 8% of the letters' height and under 35% of it is the line
+  below's — a comma or a descender starts at the baseline, a handwritten
+  tail is half a letter, and a form blank's flat fragments stay the line's
+  (taken away, the date typed into MSP's "Fecha: ____" moved off the blank).
+- **Too few shared letters to compare shapes, the CONDENSATION decides**
+  (`lineWidthRatio`): each letter's ink width over an ordinary face's advance,
+  the median over a line, every copy counted (a title's letters are doubted
+  for want of peers at its size, which says nothing about their width).
+  "RICO" shares only an I with "PIENSE" and measures 0.59 to its 0.69; a
+  regular sans is 0.85–0.9. Within a fifth, the line counts as the same face
+  and its "S" is taken, enlarged half again, for "RICOS". For DISPLAY lines
+  only (an em of 60 px and more): on a form, a bold italic label with no two
+  letters in common with its neighbours took upright letters from three
+  other lines this way, and a checkbox for its "R" — body text has letters to
+  compare, and its lines are too alike in width for this to tell faces apart.
+- **An enlarged copy's interior is evened out** (`solidified`, over 1.2×):
+  the scan's speckle inside its strokes became pink dots in a white "S", and
+  the region's outer pixels a faint frame. Pixels within three quarters of
+  the core's median darkness take that median; those within 6% of paper
+  become paper.
+
 Two print-model fixes came with it: a moved letter keeps the channels where
 it is LIGHTER than its paper (black lettering on red carries twice the red's
 green as JPEG tint; clamped, every moved letter printed darker) — added as
@@ -5630,9 +5659,9 @@ and colour. The 18 lab suites are unchanged but for those two rescaled
 figures. **Known:** where a letter was erased the ground is filled smooth,
 and on a JPEG cover that shows at high zoom as a patch without the
 compression's texture (or a trace of a neighbour's shadow cut at the patch's
-edge); new letters borrowed from the page carry no shadow; "RICO" (its box
-inflated over the subtitle) cannot be cut; lettering over a photograph is
-still refused.
+edge); new letters borrowed from the page carry no shadow; reversing "RICO"
+is refused (the moved letters' regions would land on the subtitle);
+lettering over a photograph is still refused.
 
 Tried and dropped: letting a letter's region follow its pale strokes past the
 2.2 pt reach (ink of fringe darkness connected to the letter, bounded to its
