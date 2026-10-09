@@ -154,10 +154,10 @@ if (cmd === 'lines' || cmd === 'debug') {
   let words = 0, cut = 0
   for (const it of items) {
     const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
-    if (!li) { console.log(`${it.id.padEnd(9)} FAIL ${LI.lastLineFailure()}  "${it.text.slice(0, 50)}"`); if (process.env.PALE) console.log('     smooth', JSON.stringify(LI.lastSmoothTest?.() ?? null)); continue }
+    if (!li) { console.log(`${it.id.padEnd(9)} FAIL ${LI.lastLineFailure()}  "${it.text.slice(0, 50)}"`); if (process.env.PALE) console.log('     smooth', JSON.stringify(LI.lastSmoothTest?.() ?? null), 'flat', JSON.stringify(LI.lastFlatTest?.() ?? null)); continue }
     words += li.words.length; cut += li.words.filter(w => w.cut).length
     const ws = li.words.map(w => `${li.chars.slice(w.from, w.to).join('')}${w.cut ? '' : '~'}${w.weight ? '/' + w.weight.toFixed(3) : ''}`).join(' ')
-    if (process.env.PALE) console.log('     smooth', JSON.stringify(LI.lastSmoothTest?.() ?? null))
+    if (process.env.PALE) console.log('     smooth', JSON.stringify(LI.lastSmoothTest?.() ?? null), 'flat', JSON.stringify(LI.lastFlatTest?.() ?? null))
     if (process.env.INK && LI.lastInkTest) { const m = LI.lastInkTest(); if (m) { const so = [...m].sort((x, y) => x - y); console.log('     ink', m.join(' ')) } }
     if (process.env.FRAG) console.log('   frag', JSON.stringify(LI.lastFragTest?.()))
     console.log(`${it.id.padEnd(9)} em ${li.fit.emPx.toFixed(1)} sl ${li.fit.slope.toFixed(4)} gaps ${li.letterGapPx}/${li.wordGapPx} core ${li.coreLevel} rules ${li.rules.length} cut ${li.words.filter(w => w.cut).length}/${li.words.length} | ${ws.slice(0, 160)}`)
@@ -1014,6 +1014,30 @@ if (cmd === 'rowdiff') {
   }
 }
 
+
+if (cmd === 'glyph') {
+  // `glyph <lineId> <char> <out.png>`: every exemplar of that letter from that line — its transmittance (left) and mask (right), 6x.
+  const GA = await load('/src/utils/ocr/glyphAtlas.ts')
+  const { atlas } = await pagesAndAtlas(GA)
+  const list = (atlas.byChar.get(args[1]) ?? []).filter(e => e.lineId === args[0])
+  console.log(list.length, 'exemplars', list.map(e => `x0=${e.x0} ${e.w}x${e.h} base ${e.baseY.toFixed(1)} ink ${e.inkL}-${e.inkR} inkT ${e.inkT.join(',')} doubt ${e.doubt ?? '-'}`).join(' | '))
+  if (list.length) {
+    const W = list.reduce((t, e) => t + e.w * 2 + 4, 0), H = Math.max(...list.map(e => e.h))
+    const img = new Uint8ClampedArray(W * H * 4).fill(255)
+    let ox = 0
+    for (const e of list) {
+      for (let y = 0; y < e.h; y++) for (let x = 0; x < e.w; x++) {
+        const i = y * e.w + x, o = (y * W + ox + x) * 4, o2 = (y * W + ox + e.w + 2 + x) * 4
+        img[o] = e.t[i * 3]; img[o + 1] = e.t[i * 3 + 1]; img[o + 2] = e.t[i * 3 + 2]
+        const m = e.m[i] ? 0 : 255
+        img[o2] = m; img[o2 + 1] = m; img[o2 + 2] = m
+      }
+      ox += e.w * 2 + 4
+    }
+    savePng(args[2], W, H, img, 6)
+    if (process.env.VALUES) for (const e of list) { console.log(`--- x0=${e.x0}`); for (let y = 0; y < e.h; y++) { let row = ''; for (let x = 0; x < e.w; x++) { const i = y * e.w + x; row += (e.m[i] ? (v => v >= 250 ? "-" : String(Math.floor(v / 25.6)))((e.t[i * 3] * 299 + e.t[i * 3 + 1] * 587 + e.t[i * 3 + 2] * 114) / 1000) : '.') } console.log(row) } }
+  }
+}
 
 if (cmd === 'explain') {
   // `explain <page> <lineId> <char> <bold|regular>`: the target line's metrics and every candidate.

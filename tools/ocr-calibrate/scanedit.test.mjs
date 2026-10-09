@@ -1485,3 +1485,111 @@ test('the page plan edits coloured lettering in its own domain and folds back on
   }
   assert.ok(peach > 500, `only ${peach} peach pixels left in the O`)
 })
+
+/** A table header's cell at 1 pt per pixel: white Carlito Bold over coarse grey stipple (a copier's screen), the cell a little wider than its text, on white paper. */
+function stippleHeaderScan(text, size = 40) {
+  // The band ends a third of an em under the baseline, as a header row does.
+  const W = 900, H = 300, base = 160, Y0 = 60, Y1 = base + 14
+  const font = new mupdf.Font('Carlito', fs.readFileSync(ROOT + '/public/fonts/match/Carlito-Bold.ttf'))
+  const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceGray, [0, 0, W, H], false)
+  pix.clear(255)
+  const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+  const t = new mupdf.Text()
+  let pen = 80
+  const boxes = []
+  for (const ch of text) {
+    const adv = font.advanceGlyph(font.encodeCharacter(ch.codePointAt(0))) * size
+    t.showString(font, [size, 0, 0, -size, pen, base], ch)
+    boxes.push([pen, pen + adv])
+    pen += adv
+  }
+  dev.fillText(t, mupdf.Matrix.identity, mupdf.ColorSpace.DeviceGray, [0], 1)
+  dev.close()
+  const g = pix.getPixels(), stride = pix.getStride()
+  let seed = 4242
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff }
+  // Clumps of two pixels, each clump's level spread ±35 about 122, and a little grain on top.
+  const clump = new Float32Array(Math.ceil(W / 2) * Math.ceil(H / 2))
+  for (let i = 0; i < clump.length; i++) clump[i] = (rnd() - 0.5) * 70
+  const rgba = new Uint8ClampedArray(W * H * 4)
+  const X0 = 50, X1 = Math.round(pen) + 30
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const inBand = y >= Y0 && y < Y1 && x >= X0 && x < X1
+    const ground = inBand ? Math.max(40, Math.min(205, 122 + clump[(y >> 1) * Math.ceil(W / 2) + (x >> 1)] + (rnd() - 0.5) * 24)) : 250
+    const a = 1 - g[y * stride + x] / 255
+    const v = Math.round(ground * (1 - a) + 250 * a)
+    const i = (y * W + x) * 4
+    rgba[i] = rgba[i + 1] = rgba[i + 2] = v
+    rgba[i + 3] = 255
+  }
+  const inkRect = { x: 74, y: base - size * 0.66 - 5, width: pen - 68, height: size * 0.66 + 11 }
+  return { raster: R.scanRasterOf(W, H, rgba, [W, 0, 0, H, 0, 0], W, H, 'Header'), boxes, W, H, inkRect, base, band: [Y0, Y1], cell: [X0, X1] }
+}
+
+test('white letters on a stippled header band are read on the stipple, and a deleted letter leaves stipple', () => {
+  const { raster, boxes, W, inkRect, base, band } = stippleHeaderScan('CONDICION')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 'h', text: 'CONDICION', inkRect, confidence: 97 })
+  assert.ok(li, LI.lastLineFailure())
+  assert.equal(LI.domainOfLine(li), 7, 'white on grey is read inverted')
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const pl = LI.domainPage(pi, 7)
+  const w = pl.s.data.slice()
+  const res = SE.applyLineEdit(pl, li, atlas, 'CONDICON', w, {})
+  assert.ok(res.ok, res.reason)
+  const work = raster.data.slice()
+  for (let i = 0; i < w.length; i += 4) if (w[i] !== pl.s.data[i] || w[i + 1] !== pl.s.data[i + 1] || w[i + 2] !== pl.s.data[i + 2]) for (let c = 0; c < 3; c++) work[i + c] = 255 - w[i + c]
+  const lum = (d, x, y) => d[(y * W + x) * 4]
+  const sd = (d, x0, x1, y0, y1) => {
+    let s = 0, s2 = 0, n = 0
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { const v = lum(d, x, y); s += v; s2 += v * v; n++ }
+    return Math.sqrt(Math.max(0, s2 / n - (s / n) ** 2))
+  }
+  // Where the last letter's right half stood, the stipple is back — as
+  // rough as the band beside the line, not a smooth patch.
+  const end = Math.round(boxes.at(-1)[1])
+  const vac = sd(work, end - 10, end - 2, base - 22, base - 4)
+  const ref = sd(raster.data, 52, 72, base - 22, base - 4)
+  assert.ok(vac >= ref * 0.55, `vacated stipple spread ${vac.toFixed(1)} against ${ref.toFixed(1)} beside the line`)
+  // Nothing darker than the stipple ever was, and nothing changed outside the band.
+  let darkest = 255, outside = 0
+  for (let y = 0; y < raster.h; y++) for (let x = 0; x < W; x++) {
+    const v = lum(work, x, y)
+    if (y >= band[0] && y < band[1]) darkest = Math.min(darkest, v)
+    else if (v !== lum(raster.data, x, y)) outside++
+  }
+  assert.ok(darkest >= 35, `a pixel at ${darkest}: darker than any of the stipple`)
+  assert.equal(outside, 0, 'pixels changed off the band')
+})
+
+test('a whole header line rewritten on a stipple keeps the stipple between its letters, with no grain from beyond the band', () => {
+  const { raster, W, inkRect, base, band } = stippleHeaderScan('DNI NOMBRES')
+  const pi = LI.preparePage(raster)
+  const li = LI.analyzeLine(pi, { id: 'h', text: 'DNI NOMBRES', inkRect, confidence: 97 })
+  assert.ok(li, LI.lastLineFailure())
+  const atlas = GA.atlasFrom([GA.harvestPage(pi, [li], 0)])
+  const pl = LI.domainPage(pi, LI.domainOfLine(li))
+  const w = pl.s.data.slice()
+  const res = SE.applyLineEdit(pl, li, atlas, 'NOMBRES DNI', w, {})
+  assert.ok(res.ok, res.reason)
+  const work = raster.data.slice()
+  for (let i = 0; i < w.length; i += 4) if (w[i] !== pl.s.data[i] || w[i + 1] !== pl.s.data[i + 1] || w[i + 2] !== pl.s.data[i + 2]) for (let c = 0; c < 3; c++) work[i + c] = 255 - w[i + c]
+  // The ground among the letters (what is not a letter's white): as rough
+  // as the band beside the line. A whole-line hole has nowhere to copy
+  // grain from but outside the band, and taken from there it was flat.
+  const spreadOf = (d, x0, x1) => {
+    let s = 0, s2 = 0, n = 0
+    for (let y = base - 22; y < base - 2; y++) for (let x = x0; x < x1; x++) {
+      const v = d[(y * W + x) * 4]
+      if (v > 215) continue
+      s += v; s2 += v * v; n++
+    }
+    return Math.sqrt(Math.max(0, s2 / n - (s / n) ** 2))
+  }
+  const among = spreadOf(work, Math.round(inkRect.x) + 8, Math.round(inkRect.x + inkRect.width) - 8)
+  const beside = spreadOf(raster.data, 52, 72)
+  assert.ok(among >= beside * 0.6, `ground among the new letters spreads ${among.toFixed(1)} against ${beside.toFixed(1)} beside them`)
+  let darkest = 255
+  for (let y = band[0]; y < band[1]; y++) for (let x = 0; x < W; x++) darkest = Math.min(darkest, work[(y * W + x) * 4])
+  assert.ok(darkest >= 35, `a pixel at ${darkest}: darker than any of the stipple`)
+})

@@ -5673,6 +5673,85 @@ and on a certificate with a patterned ground it walked the pattern: two edits
 went from 0 and 6 to 40 and 181 px of damage. Stretch a crop (`lo` ≈ 215)
 before calling something a remnant.
 
+**A stippled header band is its own paper** (`screenGround`, lineInk). A
+results table's header row — white bold capitals on a grey band a copier laid
+down as a coarse stipple, 40 to 190 within a few pixels — was refused cell by
+cell: "the text is lighter than its ground, and reversed: no letters in the
+box". On the inverted scan the page's paper estimate under the band was BLACK
+(every stipple dot read as ink and was filled from the white page around the
+band), so the letters had no darkness at all, and `flattenGround` found no
+flat colour (ring 0.44 near its mode, median deviation 10.8). Where it fails,
+for reversed lettering:
+- **The band is told by its LOCAL MEAN**: a box mean of radius 0.15 em, away
+  from the letters, varies 5–9 levels at the median and 13–23 at the 90th
+  percentile on that header; a photograph's or a gradient's does not (bars
+  10 and 24).
+- **The stipple's level and spread are measured on the stipple alone** — what
+  is plainly ink (under 0.35 of the region's light decile) and its fringe set
+  aside. Over the whole region a three-line cell between two white rules is a
+  third ink, and the spread came out a third too wide: no room was left below
+  it for the letters.
+- **Ink is what the stipple never reaches**: three spreads under its level and
+  core-dark against it; pieces under 4 px are grain.
+- **Off the letters each pixel is its own paper** (darkness 0): a moved letter
+  carries none of the stipple, a harvested glyph is transparent there, and the
+  stipple's dark grain is never ink — measured against the mean, a third of it
+  read as cores and welded the letters into one blob. Only the letters and a
+  fringe of 0.08 em take the mean (push-pulled under them) as paper, and even
+  there grain lighter than the mean stays its own paper: with the mean for
+  paper it travelled with a moved letter as tint above the paper (the excess
+  rule) and printed a ring of dark specks round it.
+- **Reversed lettering on a band is read inside the band**: the region is
+  clipped to the rows where a quarter of the box's width is as light as the
+  band, or the white page above and below (black, inverted) defeats every
+  ground test.
+- **Only for REVERSED lettering.** Dark letters on a light textured ground keep
+  the gradient rule, which asks for a clean cut: a certificate's condensed
+  capitals on a mottled blue ("ALTIMETRÍA", level 213±10) passed the screen
+  test with their touching tops read as a rule and the first cell holding
+  "AL" — deleting the "A" deleted the "L" with it. HEAD refused that line and
+  still does.
+
+**Grain is copied only from ground at the fill's LEVEL** (`groundGrain`,
+scanEdit): a clean pixel's 9×9 clean mean must lie within max(6, min(20,
+0.6 × the frame's grain spread)) of the relaxed fill's luminance at the hole
+pixel it feeds. Swapping the words of a header cell makes a hole as wide as the
+cell: the sideways shifts land outside it, and the downward one (a hole's
+height) on the band's edge, where the residual against a mean straddling
+stipple and page is sixty levels — the vacated letters came back as their own
+lower halves in solid black. Where no single shift qualifies, each 8×8 block
+takes the nearest same-level block within six blocks, and what is left pixel by
+pixel; a smooth leftover showed as a flat grey square in the stipple. On white
+paper the grain is still null.
+
+Measured: ten header cells of the results table now read on the scan (DNI,
+APELLIDOS Y NOMBRES, PROGRAMA, PUNTAJE ×2, PRIMER, SEGUNDO, EXAMEN, FINAL,
+CONDICIÓN; all refused at HEAD), and "NOMBRES Y APELLIDOS", "CONDICION",
+"FINALES", "PUNTAJES", "PRIMERO", "SEGUND" draw on the stipple without an
+artefact. Line survey over 38 recorded pages: those ten and two junk runs the
+recogniser made of the stipple change, nothing else. A/B over the 18 suites: only that page changes, plus paper grain under
+moved letters elsewhere (level-matched now, inspected, equivalent); its title
+edit "RESULTADOS" → "SODATLUSER", which HEAD drew as "SOLATLFSER" (the title
+was classed bold and took a bold "D" cut from a mis-boxed neighbour), draws
+right, because the header's bold letters move the bold threshold. Two unit
+tests (a stippled cell: one letter deleted; a whole line swapped).
+
+**Known:** "DNI" → "DIN" draws its "D" thin — DNI's letters touch, so none of
+its own can be reused, and the page's one clean bold "D" (CONDICIÓN's) has
+one-pixel bars. A table's row numbers ("1", "2", …) are still refused as set
+over a picture: a one-digit cell's padded box gives an em guess three times the
+letter's, and the region it implies spans several rows and reaches into the
+stippled header. Counting only the box's rows and leaving thin straight runs
+out of the picture test was tried: the cell then analysed with the whole grid
+as its one letter. Refused is right until the em guess is.
+
+Two lab traps found on the way: a rotated or layered (MRC) scan must be read
+with `RENDER=1`, as the app does, or every line reads "box too small" / "no
+letters in the box" (three whole pages of the survey did); and a lab output
+path with a colon in it (a line id) silently fails on Windows. `glyph <lineId>
+<char> <out.png>` (with `VALUES=1`) prints a letter's harvested copies, and
+`PALE=1` now also prints each ground test's verdict.
+
 **A whole-run vector redraw erases on the scan's pixels where the line was
 read** (`inkAwareFallback`): when the scan edit declines a line for want of
 letters (or too many to synthesise) its line analysis still holds which pixels

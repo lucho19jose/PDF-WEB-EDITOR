@@ -2406,7 +2406,7 @@ function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W
       }
     }
   }
-  const grain = groundGrain(erase, pi, W, H, x0, y0, bw, bh)
+  const grain = groundGrain(erase, pi, W, H, x0, y0, bw, bh, j => (v[0][j] * 299 + v[1][j] * 587 + v[2][j] * 114) / 1000)
   for (const j of idx) {
     const x = j % bw, y = (j - x) / bw, p = (y0 + y) * W + x0 + x
     for (let c = 0; c < 3; c++) work[p * 4 + c] = v[c][j] + tx(p, c) + (grain ? grain[j * 3 + c] : 0)
@@ -2418,56 +2418,113 @@ function relaxErased(work: Uint8ClampedArray, erase: Set<number>, pi: PageInk, W
  * fill is smooth, and on a JPEG cover's red, noisy to a few levels in every
  * 8×8 block, a vacated word showed as a clean patch with the outline of the
  * letters that had been there. The residual of the scan against its own local
- * mean is copied from the nearest patch of clean ground beside the hole —
- * shifted by a multiple of 8 pixels, so the compression's blocks stay where
- * they were. Null where there is no such patch, or no grain worth copying
- * (plain white paper, whose residual is a level or less: those scans stay
- * exactly as they were).
+ * mean is copied from clean ground beside the hole — shifted by a multiple of
+ * 8 pixels, so the compression's blocks stay where they were. Null where there
+ * is no such ground, or no grain worth copying (plain white paper, whose
+ * residual is a level or less: those scans stay exactly as they were).
+ *
+ * The ground copied from must be at the LEVEL of the fill (`level`, the
+ * relaxed fill's luminance at each hole pixel). A table header's stipple ends
+ * a few pixels under its letters, and a whole-hole shift of one hole height
+ * landed on the band's edge, where the residual against a mean straddling the
+ * stipple and the page is sixty levels: the vacated letters came back as their
+ * own lower halves in solid black. Where no single shift finds such ground —
+ * a wide hole in a narrow band has nowhere to go but out of it — each 8×8
+ * block takes the nearest block of same-level ground on its own.
  */
-function groundGrain(erase: Set<number>, pi: PageInk, W: number, H: number, x0: number, y0: number, bw: number, bh: number): Float32Array | null {
+function groundGrain(erase: Set<number>, pi: PageInk, W: number, H: number, x0: number, y0: number, bw: number, bh: number, level: (j: number) => number): Float32Array | null {
   const src = pi.s.data
   const clean = (q: number) => pi.dark[q] < FRINGE / 2 && !erase.has(q) && !pi.lines?.[q]
   const r8 = (v: number) => Math.ceil(v / 8) * 8
-  const offsets: [number, number][] = [[r8(bw + 2), 0], [-r8(bw + 2), 0], [0, r8(bh + 2)], [0, -r8(bh + 2)], [r8(bw + 2), r8(bh + 2)], [-r8(bw + 2), -r8(bh + 2)]]
-  let best: [number, number] | null = null, bestN = 0
-  for (const [ox, oy] of offsets) {
-    let n = 0, all = 0
-    for (const p of erase) {
-      const x = p % W + ox, y = Math.floor(p / W) + oy
-      all++
-      if (x >= 0 && y >= 0 && x < W && y < H && clean(y * W + x)) n++
-    }
-    if (n > bestN && n >= all * 0.7) { bestN = n; best = [ox, oy] }
-  }
-  if (!best) return null
-  const [ox, oy] = best
-  // The residual against a 9×9 mean of the clean pixels around it.
-  const res = (q: number, c: number): number | null => {
+  const meanMemo = new Map<number, Float32Array | null>()
+  /** The mean of the clean pixels in the 9×9 around q, per channel. */
+  const mean9 = (q: number): Float32Array | null => {
+    let m = meanMemo.get(q)
+    if (m !== undefined) return m
     const qx = q % W, qy = (q - qx) / W
-    let sum = 0, n = 0
+    const sum = new Float32Array(3)
+    let n = 0
     for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
       const x = qx + dx, y = qy + dy
       if (x < 0 || y < 0 || x >= W || y >= H) continue
       const u = y * W + x
       if (!clean(u)) continue
-      sum += src[u * 4 + c]; n++
+      sum[0] += src[u * 4]; sum[1] += src[u * 4 + 1]; sum[2] += src[u * 4 + 2]; n++
     }
-    return n >= 20 ? src[q * 4 + c] - sum / n : null
+    m = n >= 20 ? sum.map(v => v / n) : null
+    meanMemo.set(q, m)
+    return m
+  }
+  const lumOf = (m: Float32Array) => (m[0] * 299 + m[1] * 587 + m[2] * 114) / 1000
+  // The grain's own size, from the clean frame around the hole: what a level
+  // difference between two patches of the same ground can be.
+  const ring: number[] = []
+  for (let y = Math.max(0, y0 - 4); y < Math.min(H, y0 + bh + 4); y += 2) for (let x = Math.max(0, x0 - 4); x < Math.min(W, x0 + bw + 4); x += 2) {
+    const q = y * W + x
+    if (!clean(q)) continue
+    const m = mean9(q)
+    if (m) ring.push(Math.abs((src[q * 4] * 299 + src[q * 4 + 1] * 587 + src[q * 4 + 2] * 114) / 1000 - lumOf(m)))
+  }
+  ring.sort((a, b) => a - b)
+  const spread = ring.length >= 20 ? ring[ring.length >> 1] * 1.4826 : 0
+  const tol = Math.max(6, Math.min(20, spread * 0.6))
+  const holeAt = (x: number, y: number) => erase.has((y0 + y) * W + x0 + x)
+  /** Whether hole pixel (x, y) of the box can take its grain from `q`. */
+  const sourceOk = (x: number, y: number, qx: number, qy: number) => {
+    if (qx < 0 || qy < 0 || qx >= W || qy >= H) return false
+    const q = qy * W + qx
+    if (!clean(q)) return false
+    const m = mean9(q)
+    return !!m && Math.abs(lumOf(m) - level(y * bw + x)) <= tol
   }
   const out = new Float32Array(bw * bh * 3)
+  const got = new Uint8Array(bw * bh)
   const mags: number[] = []
-  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
-    const p = (y0 + y) * W + x0 + x
-    if (!erase.has(p)) continue
-    const qx = x0 + x + ox, qy = y0 + y + oy
-    if (qx < 0 || qy < 0 || qx >= W || qy >= H) continue
-    const q = qy * W + qx
-    if (!clean(q)) continue
+  const take = (x: number, y: number, qx: number, qy: number) => {
+    const q = qy * W + qx, m = mean9(q)!
+    got[y * bw + x] = 1
     for (let c = 0; c < 3; c++) {
-      const v = res(q, c)
-      if (v === null) continue
+      const v = src[q * 4 + c] - m[c]
       out[(y * bw + x) * 3 + c] = v
       mags.push(Math.abs(v))
+    }
+  }
+  // One shift for the whole hole, where one will do.
+  const offsets: [number, number][] = [[r8(bw + 2), 0], [-r8(bw + 2), 0], [0, r8(bh + 2)], [0, -r8(bh + 2)], [r8(bw + 2), r8(bh + 2)], [-r8(bw + 2), -r8(bh + 2)]]
+  let best: [number, number] | null = null, bestN = 0, all = 0
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) if (holeAt(x, y)) all++
+  for (const [ox, oy] of offsets) {
+    let n = 0
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) if (holeAt(x, y) && sourceOk(x, y, x0 + x + ox, y0 + y + oy)) n++
+    if (n > bestN && n >= all * 0.7) { bestN = n; best = [ox, oy] }
+  }
+  if (best) {
+    const [ox, oy] = best
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) if (holeAt(x, y) && sourceOk(x, y, x0 + x + ox, y0 + y + oy)) take(x, y, x0 + x + ox, y0 + y + oy)
+  } else {
+    // Block by block: the nearest same-level block, in steps of 8, within a
+    // few blocks of it; a block that finds none keeps the smooth fill.
+    const bx0 = Math.floor((x0) / 8) * 8, by0 = Math.floor((y0) / 8) * 8
+    const steps: [number, number][] = []
+    for (let r = 1; r <= 6; r++) for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) if (Math.max(Math.abs(dx), Math.abs(dy)) === r) steps.push([dx * 8, dy * 8])
+    for (let by = by0; by < y0 + bh; by += 8) for (let bx = bx0; bx < x0 + bw; bx += 8) {
+      const cells: [number, number][] = []
+      for (let y = Math.max(by, y0); y < Math.min(by + 8, y0 + bh); y++) for (let x = Math.max(bx, x0); x < Math.min(bx + 8, x0 + bw); x++) if (holeAt(x - x0, y - y0)) cells.push([x - x0, y - y0])
+      if (!cells.length) continue
+      for (const [ox, oy] of steps) {
+        let ok = 0
+        for (const [x, y] of cells) if (sourceOk(x, y, x0 + x + ox, y0 + y + oy)) ok++
+        if (ok < cells.length * 0.9) continue
+        for (const [x, y] of cells) if (sourceOk(x, y, x0 + x + ox, y0 + y + oy)) take(x, y, x0 + x + ox, y0 + y + oy)
+        break
+      }
+    }
+    // What no block could fill, pixel by pixel from the nearest same-level
+    // ground: left smooth, a block between two new letters showed as a flat
+    // grey square in the stipple.
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      if (!holeAt(x, y) || got[y * bw + x]) continue
+      for (const [ox, oy] of steps) if (sourceOk(x, y, x0 + x + ox, y0 + y + oy)) { take(x, y, x0 + x + ox, y0 + y + oy); break }
     }
   }
   if (mags.length < 30) return null

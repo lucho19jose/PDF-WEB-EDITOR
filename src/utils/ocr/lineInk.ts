@@ -856,6 +856,9 @@ const median = (v: number[]) => { const s = [...v].sort((a, b) => a - b); return
 
 let smoothDebug: unknown = null
 export function lastSmoothTest(): unknown { const v = smoothDebug; smoothDebug = null; return v }
+let flatDebug: string[] = []
+/** Why each ground test of the last line analysed gave up, or what it found (lab only). */
+export function lastFlatTest(): string[] { const v = flatDebug; flatDebug = []; return v }
 
 /**
  * How far the paper estimate departs from its own local average, over the
@@ -1002,13 +1005,13 @@ function flattenGround(pi: PageInk, roi: { x0: number; y0: number; x1: number; y
     if (x >= box.x0 && x < box.x1 && y >= box.y0 && y < box.y1) continue
     if (dist(pAt(j) * 4) <= 32) ringNear++
   }
-  if (ringNear < ring * 0.6) return false
+  if (ringNear < ring * 0.6) { flatDebug.push(`flat: ringNear ${(ringNear / ring).toFixed(2)}`); return false }
   const near: number[] = []
   for (let j = 0; j < N; j += 2) { const v = dist(pAt(j) * 4); if (v <= 32) near.push(v) }
   if (near.length < 20) return false
   near.sort((a, b) => a - b)
   const noise = near[Math.floor(near.length * 0.9)]
-  if (near[Math.floor(near.length * 0.5)] > 8 || noise > 20) return false
+  if (near[Math.floor(near.length * 0.5)] > 8 || noise > 20) { flatDebug.push(`flat: median ${near[Math.floor(near.length * 0.5)].toFixed(1)} noise ${noise.toFixed(1)}`); return false }
   const T = Math.max(8, Math.min(24, noise * 1.3))
   const lg = (g[0] * 299 + g[1] * 587 + g[2] * 114) / 1000
   const known = new Float32Array(N)
@@ -1071,6 +1074,140 @@ function flattenGround(pi: PageInk, roi: { x0: number; y0: number; x1: number; y
   return true
 }
 
+/** A box blur of radius r (edges replicated), for one channel. */
+function boxBlur(src: Float32Array, W: number, H: number, r: number): Float32Array {
+  const tmp = new Float32Array(W * H), out = new Float32Array(W * H), k = 2 * r + 1
+  for (let y = 0; y < H; y++) {
+    const row = y * W
+    let sum = 0
+    for (let x = -r; x <= r; x++) sum += src[row + Math.min(W - 1, Math.max(0, x))]
+    for (let x = 0; x < W; x++) {
+      tmp[row + x] = sum / k
+      sum += src[row + Math.min(W - 1, x + r + 1)] - src[row + Math.max(0, x - r)]
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    let sum = 0
+    for (let y = -r; y <= r; y++) sum += tmp[Math.min(H - 1, Math.max(0, y)) * W + x]
+    for (let y = 0; y < H; y++) {
+      out[y * W + x] = sum / k
+      sum += tmp[Math.min(H - 1, y + r + 1) * W + x] - tmp[Math.max(0, y - r) * W + x]
+    }
+  }
+  return out
+}
+
+/**
+ * A STIPPLED ground — a table header's grey that a copier laid down as a
+ * coarse screen, 40 to 190 within a few pixels — is one flat grey to the eye
+ * and nothing like one to `flattenGround`. On the inverted page the page's
+ * own estimate under a white-on-grey header row was black, so its letters had
+ * no darkness at all: every header cell of a results table came back "no
+ * letters in the box".
+ *
+ * Such a ground shows as a flat LOCAL MEAN: averaged over a sixth of an em,
+ * away from the letters, it hardly varies (a photograph's or a gradient's
+ * does). The stipple is then left as it is — each of its pixels is its own
+ * paper — and only the letters, the ink darker than anything the stipple
+ * reaches, and a fringe around them get a paper filled from that mean and a
+ * darkness against it. A moved letter carries none of the stipple with it, an
+ * erased one is refilled with stipple copied from beside it (`groundGrain`),
+ * and the stipple's own dark grain is never ink: measured against the mean, a
+ * third of it read as letter cores and welded the letters into one blob.
+ * Writes the region's paper and darkness into the page; false, with nothing
+ * written, when the ground is not such a screen.
+ */
+function screenGround(pi: PageInk, roi: { x0: number; y0: number; x1: number; y1: number }, em: number): boolean {
+  const s = pi.s, d = s.data, W = roi.x1 - roi.x0, H = roi.y1 - roi.y0, N = W * H
+  if (W < 12 || H < 12) return false
+  const pAt = (j: number) => (roi.y0 + Math.floor(j / W)) * s.w + roi.x0 + (j % W)
+  const L = new Float32Array(N)
+  for (let j = 0; j < N; j++) L[j] = lumAt(d, pAt(j))
+  const sorted = Float32Array.from(L).sort()
+  const q90 = sorted[Math.floor(N * 0.9)]
+  const fr = Math.max(1, Math.round(em * 0.08))
+  // The stipple's level and spread, measured on the stipple alone: a header
+  // cell of three lines of letters between two white rules is a third ink,
+  // and over the whole region the spread came out a third too wide — wide
+  // enough to leave no room below it for the letters. What is plainly ink
+  // (under a third of the ground's light side) and its edge are set aside.
+  const plain = new Uint8Array(N)
+  for (let j = 0; j < N; j++) if (L[j] <= q90 * 0.35) plain[j] = 1
+  maxFilter1D(plain, W, H, fr + 1, true)
+  maxFilter1D(plain, W, H, fr + 1, false)
+  const gl: number[] = []
+  for (let j = 0; j < N; j++) if (!plain[j]) gl.push(L[j])
+  if (gl.length < N * 0.2) { flatDebug.push(`screen: stipple ${(gl.length / N).toFixed(2)}`); return false }
+  gl.sort((a, b) => a - b)
+  const med = gl[gl.length >> 1]
+  const sigma = (gl[Math.floor(gl.length * 0.75)] - gl[Math.floor(gl.length * 0.25)]) / 1.349
+  if (sigma < 8) { flatDebug.push(`screen: spread ${sigma.toFixed(1)}`); return false }
+  // Ink is what the stipple never reaches: three spreads below its level, and
+  // dark enough against that level to be a core.
+  const tInk = Math.min(med - 3 * sigma, med * (1 - CORE / 255))
+  if (tInk < 8) { flatDebug.push(`screen: no room for ink under ${med.toFixed(0)}±${sigma.toFixed(0)}`); return false }
+  const seed = new Uint8Array(N)
+  for (let j = 0; j < N; j++) if (L[j] <= tInk) seed[j] = 1
+  // A speck of the stipple's darkest grain is no letter.
+  for (const c of components(seed, W, H, 0, 0, W)) if (c.area < 4) for (const j of c.pix) seed[j] = 0
+  let inkN = 0
+  for (let j = 0; j < N; j++) inkN += seed[j]
+  if (inkN < Math.max(20, N * 0.004)) { flatDebug.push(`screen: ink ${inkN}`); return false }
+  const r = Math.max(2, Math.round(em * 0.15))
+  // The letters and their anti-aliased edge, whose paper is unknown.
+  const zone = seed.slice()
+  maxFilter1D(zone, W, H, fr, true)
+  maxFilter1D(zone, W, H, fr, false)
+  // Where the local mean is pulled by the letters.
+  const near = zone.slice()
+  maxFilter1D(near, W, H, r, true)
+  maxFilter1D(near, W, H, r, false)
+  const raw = [new Float32Array(N), new Float32Array(N), new Float32Array(N)]
+  for (let j = 0; j < N; j++) { const i = pAt(j) * 4; raw[0][j] = d[i]; raw[1][j] = d[i + 1]; raw[2][j] = d[i + 2] }
+  const mean = raw.map(c => boxBlur(c, W, H, r))
+  let free = 0
+  let g = [0, 0, 0]
+  for (let j = 0; j < N; j++) if (!near[j]) { free++; for (let c = 0; c < 3; c++) g[c] += mean[c][j] }
+  if (free < N * 0.2) { flatDebug.push(`screen: ground ${(free / N).toFixed(2)}`); return false }
+  g = g.map(v => v / free)
+  const dev = (j: number) => Math.hypot(mean[0][j] - g[0], mean[1][j] - g[1], mean[2][j] - g[2])
+  // Towards the commonest level: a neighbouring band at the region's edge is not this ground.
+  for (let it = 0; it < 3; it++) {
+    const a = [0, 0, 0]
+    let n = 0
+    for (let j = 0; j < N; j++) if (!near[j] && dev(j) <= 24) { n++; for (let c = 0; c < 3; c++) a[c] += mean[c][j] }
+    if (!n) return false
+    g = a.map(v => v / n)
+  }
+  const devs: number[] = []
+  for (let j = 0; j < N; j += 2) if (!near[j]) devs.push(dev(j))
+  devs.sort((a, b) => a - b)
+  const dMed = devs[devs.length >> 1], d90 = devs[Math.floor(devs.length * 0.9)]
+  if (dMed > 10 || d90 > 24) { flatDebug.push(`screen: local mean ${dMed.toFixed(1)}/${d90.toFixed(1)}`); return false }
+  const known = new Float32Array(N)
+  for (let j = 0; j < N; j++) known[j] = near[j] ? 0 : 1
+  const fill = mean.map(c => c.slice())
+  if (!pushPull(fill, known, W, H)) return false
+  for (let j = 0; j < N; j++) {
+    const p = pAt(j)
+    const r0 = fill[0][j], g0 = fill[1][j], b0 = fill[2][j]
+    const lp = (r0 * 299 + g0 * 587 + b0 * 114) / 1000
+    // Beside a letter, grain lighter than the mean is no part of the letter:
+    // with the mean for its paper it travelled with a moved letter as tint
+    // above the paper and printed a ring of dark specks round it.
+    if (!zone[j] || L[j] >= lp) {
+      pi.paper[p * 3] = raw[0][j]; pi.paper[p * 3 + 1] = raw[1][j]; pi.paper[p * 3 + 2] = raw[2][j]
+      pi.dark[p] = 0
+      continue
+    }
+    pi.paper[p * 3] = r0; pi.paper[p * 3 + 1] = g0; pi.paper[p * 3 + 2] = b0
+    const t = lp > 1 ? L[j] / lp : 1
+    pi.dark[p] = t >= 1 ? 0 : Math.round((1 - t) * 255)
+  }
+  flatDebug.push(`screen: ok level ${med.toFixed(0)}±${sigma.toFixed(0)} ink<${tInk.toFixed(0)} mean ${dMed.toFixed(1)}/${d90.toFixed(1)}`)
+  return true
+}
+
 /**
  * Analyse one recognised line on the prepared page. `inkRect` is in page
  * points (top-left), as OCR reports it. Null when the line's ink cannot be
@@ -1095,6 +1232,35 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   const padY = Math.round(emGuess * 0.9), padX = Math.round(emGuess * 0.6)
   const [growL, growR] = opts.growX ?? [0, 0]
   const roi = { x0: Math.max(0, box.x0 - padX - growL), y0: Math.max(0, box.y0 - padY), x1: Math.min(s.w, box.x1 + padX + growR), y1: Math.min(s.h, box.y1 + padY) }
+  // Reversed-out lettering on a BAND barely taller than itself — a table's
+  // header row, white on grey — is read within the band. The region reached
+  // past it into the white page above and below, which on the inverted scan
+  // is as dark as the letters, and no ground test can pass over it. The
+  // band's rows are those where a quarter of the box's width is at least as
+  // light as the band's light side.
+  if (opts.inverted) {
+    const lumsIn: number[] = []
+    for (let y = Math.max(0, box.y0); y < Math.min(s.h, box.y1); y++) for (let x = Math.max(0, box.x0); x < Math.min(s.w, box.x1); x += 2) lumsIn.push(lumAt(s.data, y * s.w + x))
+    if (lumsIn.length > 20) {
+      lumsIn.sort((a, b) => a - b)
+      const bandL = lumsIn[Math.floor(lumsIn.length * 0.8)]
+      const lightRow = (y: number) => {
+        let n = 0, light = 0
+        for (let x = Math.max(0, box.x0); x < Math.min(s.w, box.x1); x++) { n++; if (lumAt(s.data, y * s.w + x) >= bandL - 40) light++ }
+        return n ? light / n : 0
+      }
+      const mid = Math.round((box.y0 + box.y1) / 2)
+      if (bandL >= 90 && lightRow(mid) >= 0.25) {
+        let by0 = mid, by1 = mid
+        while (by0 - 1 >= roi.y0 && lightRow(by0 - 1) >= 0.25) by0--
+        while (by1 + 1 < roi.y1 && lightRow(by1 + 1) >= 0.25) by1++
+        if (by1 - by0 + 1 >= (box.y1 - box.y0) * 0.8) {
+          roi.y0 = Math.max(roi.y0, by0 - 1)
+          roi.y1 = Math.min(roi.y1, by1 + 2)
+        }
+      }
+    }
+  }
   const W = roi.x1 - roi.x0, H = roi.y1 - roi.y0
   const at = (x: number, y: number) => (roi.y0 + y) * s.w + roi.x0 + x
   // Light text on a dark ground — a title reversed out of a band of colour,
@@ -1128,6 +1294,8 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   // paper to fill from, and an erase there punched pale holes in the picture.
   let smoothGround = false
   let flatGround = false
+  // The ground is a stipple (`screenGround`): its paper is its own pixels, as rough as it is.
+  let screened = false
   {
     const paperRange = (): number | null => {
       const lums: number[] = []
@@ -1149,8 +1317,14 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
     // already, nothing is rewritten.
     if (opts.inverted || ringLum(pi, roi, box) < 215) {
       if (flattenGround(pi, roi, box, emGuess)) { flatGround = true; range = paperRange() }
+      // Only for REVERSED lettering. Dark letters on a light textured ground
+      // keep the gradient rule below, which asks for a clean cut: a
+      // certificate's condensed capitals on a mottled blue passed the screen
+      // test (level 213±10) with their touching tops read as a rule and the
+      // first cell holding "AL" — deleting the "A" deleted the "L" with it.
+      else if (opts.inverted && screenGround(pi, roi, emGuess)) { flatGround = true; screened = true }
     }
-    if (range !== null && range > 40) {
+    if (range !== null && range > 40 && !screened) {
       // A wide range is not a picture when it is SMOOTH: a cover's gradient
       // spans a hundred levels across a line and a pixel's paper differs
       // from the paper around it by a level or two. What the erase needs is
