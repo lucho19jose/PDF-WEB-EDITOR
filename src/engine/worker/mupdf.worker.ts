@@ -1993,14 +1993,25 @@ function encodeTextForFont(
    * run being edited already uses for a character is not a guess: it provably
    * drew that character on this very page.
    */
-  preferCodes?: Map<number, number>
+  preferCodes?: Map<number, number>,
+  /**
+   * The codes, in order, of the glyphs the replaced run draws that have NO
+   * Unicode — Word's Calibri "ti" and "fi" ligatures, which its ToUnicode
+   * leaves out, so extraction (and the editor) shows them as U+FFFD. The k-th
+   * U+FFFD of the new text is the k-th such glyph left untouched, written back
+   * as its own code. Only given when the counts agree (see `unreadableCodes`).
+   */
+  unreadable?: number[]
 ): { hex: string } | { error: string; missingChars: string[] } {
   let hex = ''
   const missingChars: string[] = []
   const pad = (encoding.codeBytes === 1 ? 1 : 2) * 2
+  let nextUnreadable = 0
   for (let i = 0; i < text.length; i++) {
     const codePoint = text.codePointAt(i)!
-    const glyphId = preferCodes?.get(codePoint) ?? encoding.unicodeToGlyph.get(codePoint)
+    const glyphId = codePoint === 0xFFFD && unreadable && nextUnreadable < unreadable.length
+      ? unreadable[nextUnreadable++]
+      : preferCodes?.get(codePoint) ?? encoding.unicodeToGlyph.get(codePoint)
     if (glyphId === undefined) {
       missingChars.push(String.fromCodePoint(codePoint))
     } else {
@@ -2116,6 +2127,14 @@ interface SimpleFontInfo {
    * fonts, and for programs whose glyph names FreeType cannot map.
    */
   program: any | null
+  /**
+   * For a symbolic TrueType subset with no /Encoding (Word's, GDI's): whether
+   * the program draws a glyph at this byte code — see `symbolicTrueTypeGlyphs`.
+   * Set only when the font's codes provably are Windows codes; such a font is
+   * still 'Unknown' to every other path, and only `planTextEncoding` writes
+   * through it.
+   */
+  byteGlyphs?: ((code: number) => boolean) | null
 }
 
 /**
@@ -2160,6 +2179,132 @@ function loadFontProgram(fdr: any, baseFont: string, differences: Map<number, st
 
 function programHasGlyph(program: any, cp: number): boolean {
   try { return program.encodeCharacter(cp) !== 0 } catch (_) { return true }
+}
+
+/**
+ * Which byte codes a SYMBOLIC TrueType program can draw, read from its own
+ * tables — the question MuPDF's `Font.encodeCharacter` cannot answer for it.
+ *
+ * Word (and anything printing through GDI) embeds Calibri, Arial or Cambria
+ * as a symbolic TrueType subset with no /Encoding and no ToUnicode: the byte
+ * codes are Windows codes, and the viewer finds each glyph through the
+ * program's (3,0) cmap at 0xF000 + code (or its (1,0) cmap at the code). Such
+ * a font was read as an opaque glyph-index subset (Ghostscript's kind), so no
+ * edit could be written back in it: inserting one letter into a Word
+ * paragraph re-set the whole line in Helvetica, wider, toward the paper's
+ * edge. The decode reads these bytes as Latin-1, so the inverse is the same
+ * byte — when the subset really holds that glyph. Word keeps the WHOLE /Widths
+ * array however few glyphs it embeds, so a width proves nothing; a glyph is
+ * present when the cmap maps the code to a glyph whose `glyf` outline is not
+ * empty (a space draws nothing and needs only the mapping). Null for anything
+ * else (CFF programs, no usable cmap), which leaves the font as before.
+ */
+function symbolicTrueTypeGlyphs(fdr: any): ((code: number) => boolean) | null {
+  const ref = fdr.get('FontFile2')
+  if (!ref || String(ref) === 'null') return null
+  let b: Uint8Array
+  // COPIED out of MuPDF's buffer: the closure returned below is cached with
+  // the font info and asked again on later edits, and a view into WASM memory
+  // is detached the moment that memory grows ("Cannot perform
+  // DataView.prototype.getUint16 on a detached ArrayBuffer" — five edits lost
+  // in the full-document sweep).
+  try {
+    const buf = ref.readStream()
+    b = buf.asUint8Array().slice()
+    try { buf.destroy?.() } catch (_) { /* already gone */ }
+  } catch (_) { return null }
+  if (b.length < 12) return null
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength)
+  const u16 = (o: number) => dv.getUint16(o), u32 = (o: number) => dv.getUint32(o)
+  try {
+    const tables = new Map<string, { off: number; len: number }>()
+    const n = u16(4)
+    for (let i = 0; i < n; i++) {
+      const o = 12 + i * 16
+      tables.set(String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]), { off: u32(o + 8), len: u32(o + 12) })
+    }
+    const cmap = tables.get('cmap'), head = tables.get('head'), loca = tables.get('loca'), maxp = tables.get('maxp')
+    if (!cmap) return null
+    const numGlyphs = maxp ? u16(maxp.off + 4) : 0
+    // Glyph outline lengths from `loca`; without it (no glyf) a mapping is all there is.
+    let glyphLen: ((gid: number) => number) | null = null
+    if (head && loca && tables.has('glyf') && numGlyphs > 0) {
+      const longOffsets = u16(head.off + 50) === 1
+      glyphLen = (gid: number) => {
+        if (gid < 0 || gid >= numGlyphs) return 0
+        return longOffsets
+          ? u32(loca.off + (gid + 1) * 4) - u32(loca.off + gid * 4)
+          : (u16(loca.off + (gid + 1) * 2) - u16(loca.off + gid * 2)) * 2
+      }
+    }
+    // The subtables a viewer consults for a symbolic font, in its order.
+    let sym4: ((c: number) => number) | null = null
+    let mac: ((c: number) => number) | null = null
+    const count = u16(cmap.off + 2)
+    for (let i = 0; i < count; i++) {
+      const platform = u16(cmap.off + 4 + i * 8), enc = u16(cmap.off + 6 + i * 8)
+      const sub = cmap.off + u32(cmap.off + 8 + i * 8)
+      const format = u16(sub)
+      if (platform === 3 && enc === 0 && format === 4) {
+        const segX2 = u16(sub + 6)
+        const ends = sub + 14, starts = ends + segX2 + 2, deltas = starts + segX2, ranges = deltas + segX2
+        sym4 = (c: number) => {
+          for (let s = 0; s < segX2; s += 2) {
+            const end = u16(ends + s)
+            if (c > end) continue
+            const start = u16(starts + s)
+            if (c < start) return 0
+            const delta = u16(deltas + s), range = u16(ranges + s)
+            if (range === 0) return (c + delta) & 0xFFFF
+            const g = u16(ranges + s + range + (c - start) * 2)
+            return g === 0 ? 0 : (g + delta) & 0xFFFF
+          }
+          return 0
+        }
+      } else if (platform === 1 && enc === 0 && format === 0) {
+        mac = (c: number) => (c >= 0 && c < 256 ? b[sub + 6 + c] : 0)
+      } else if (platform === 1 && enc === 0 && format === 6) {
+        const first = u16(sub + 6), cnt = u16(sub + 8)
+        mac = (c: number) => (c >= first && c < first + cnt ? u16(sub + 10 + (c - first) * 2) : 0)
+      }
+    }
+    if (!sym4 && !mac) return null
+    const gidFor = (code: number) => (sym4 ? (sym4(0xF000 + code) || sym4(code)) : 0) || (mac ? mac(code) : 0)
+    const has = (code: number) => {
+      const gid = gidFor(code)
+      if (!gid) return false
+      return code === 0x20 || !glyphLen || glyphLen(gid) > 0
+    }
+    // Sanity: a Windows-coded subset holds SOME lowercase letters at their own
+    // codes. A glyph-index subset (codes 1..N) answers few or none of them, and
+    // stays an opaque font.
+    let letters = 0
+    for (let c = 0x61; c <= 0x7A; c++) if (has(c)) letters++
+    return letters >= 3 ? has : null
+  } catch (_) {
+    return null
+  }
+}
+
+/**
+ * Whether a font's /Widths have the SHAPE of a Latin alphabet at the Latin
+ * codes: an m wider than an n wider than an i, a w wider than a v, an M wider
+ * than an I. True of every text face; a glyph-index subset whose codes 1..N
+ * happen to reach the letters' codes draws arbitrary glyphs there and passes
+ * this by chance only. Pairs whose widths are missing are not counted, and
+ * at least three must be measurable.
+ */
+function widthsLookLatin(widths: number[] | null, firstChar: number): boolean {
+  if (!widths) return false
+  const w = (ch: string) => widths[ch.charCodeAt(0) - firstChar] || 0
+  const pairs: [string, string][] = [['m', 'n'], ['n', 'i'], ['w', 'v'], ['M', 'I'], ['W', 'V'], ['o', 'l']]
+  let measured = 0
+  for (const [wide, narrow] of pairs) {
+    if (!w(wide) || !w(narrow)) continue
+    measured++
+    if (w(wide) <= w(narrow)) return false
+  }
+  return measured >= 3
 }
 
 const simpleFontInfoCache = new Map<string, SimpleFontInfo | null>()
@@ -2304,10 +2449,12 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
       let isEmbedded = false
       let missingWidth = 0
       let program: any | null = null
+      let fdrObj: any = null
       try {
         const fd = r.get('FontDescriptor')
         if (fd && String(fd) !== 'null') {
           const fdr = fd.resolve()
+          fdrObj = fdr
           flags = parseInt(String(fdr.get('Flags') || '0')) || 0
           isEmbedded = ['FontFile', 'FontFile2', 'FontFile3']
             .some(k => String(fdr.get(k) || 'null') !== 'null')
@@ -2320,8 +2467,16 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
       // codes are font-internal glyph indices, not any standard encoding
       // A named encoding survives the symbolic flag: LaTeX marks its fonts
       // symbolic and still names every glyph it draws.
+      let byteGlyphs: ((code: number) => boolean) | null = null
       if (encodingName === 'Standard' && (flags & 4) !== 0 && !differences) {
         encodingName = 'Unknown'
+        // …unless the program is a Windows-coded TrueType (Word's Calibri):
+        // its own cmap says which codes it draws, and its widths have the
+        // shape of letters at the letters' codes. It stays 'Unknown' for the
+        // readers; `planTextEncoding` may write through it.
+        if (subtype === '/TrueType' && fdrObj && widthsLookLatin(widths, firstChar)) {
+          try { byteGlyphs = symbolicTrueTypeGlyphs(fdrObj) } catch (_) { byteGlyphs = null }
+        }
       }
 
       info = {
@@ -2337,6 +2492,7 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
         missingWidth,
         isType0: subtype === '/Type0',
         program,
+        byteGlyphs,
         ...(subtype === '/Type0' ? readCidWidths(r) : {})
       }
     }
@@ -2689,18 +2845,29 @@ function planTextEncoding(
     mode: 'hex' | 'plain'; fontRef: string; encoding: ReturnType<typeof getFontEncoding>
     /** Glyph codes the run being edited already uses — see encodeTextForFont. */
     preferCodes?: Map<number, number>
+    /** The run's own glyphs without Unicode, in order — see encodeTextForFont. */
+    unreadableCodes?: number[]
   },
   lines: string[],
   targetBlock?: TextBlock
 ): EncodingPlan {
   // Empty replacement (deletion) never needs substitution
   const isEmpty = lines.every(l => l.length === 0)
+  // The untouched unreadable glyphs are handed out across the lines in order,
+  // and only when the new text keeps exactly as many as the run drew.
+  const fffd = lines.reduce((n, l) => n + [...l].filter(c => c === '\uFFFD').length, 0)
+  const unreadable = block.unreadableCodes && fffd > 0 && fffd === block.unreadableCodes.length ? [...block.unreadableCodes] : undefined
+  const takeUnreadable = (line: string): number[] | undefined => {
+    if (!unreadable) return undefined
+    const n = [...line].filter(c => c === '\uFFFD').length
+    return unreadable.splice(0, n)
+  }
 
   if (block.mode === 'hex' && block.encoding) {
     const hexLines: string[] = []
     let ok = true
     for (const line of lines) {
-      const res = encodeTextForFont(line, block.encoding, block.preferCodes)
+      const res = encodeTextForFont(line, block.encoding, block.preferCodes, takeUnreadable(line))
       if ('error' in res) { ok = false; break }
       hexLines.push(res.hex)
     }
@@ -2735,7 +2902,7 @@ function planTextEncoding(
       const hexLines: string[] = []
       let ok = true
       for (const line of lines) {
-        const res = encodeTextForFont(line, block.encoding, block.preferCodes)
+        const res = encodeTextForFont(line, block.encoding, block.preferCodes, takeUnreadable(line))
         if ('error' in res) { ok = false; break }
         hexLines.push(res.hex)
       }
@@ -2749,6 +2916,25 @@ function planTextEncoding(
         const res = encodeForSimpleFont(line, info)
         if ('missing' in res) { ok = false; break }
         byteLines.push(res.bytes)
+      }
+      if (ok) return { kind: 'keep-plain', byteLines }
+    } else if (info && !info.isType0 && info.byteGlyphs && !block.encoding) {
+      // A Windows-coded symbolic TrueType (Word's Calibri subsets): the decode
+      // reads each byte as its Latin-1 character (`mapPlainBytes`), so a
+      // character is written as that same byte — when it IS a Latin-1 code
+      // point outside the C1 range, and the subset draws a glyph there. Without
+      // this every edit of a Word paragraph fell through to Helvetica.
+      const byteLines: string[] = []
+      let ok = true
+      for (const line of lines) {
+        let bytes = ''
+        for (const ch of line) {
+          const cp = ch.codePointAt(0)!
+          if (cp < 0x20 || cp > 0xFF || (cp >= 0x7F && cp < 0xA0) || !info.byteGlyphs(cp)) { ok = false; break }
+          bytes += String.fromCharCode(cp)
+        }
+        if (!ok) break
+        byteLines.push(bytes)
       }
       if (ok) return { kind: 'keep-plain', byteLines }
     } else if (info === null) {
@@ -3978,7 +4164,18 @@ function transformInSource(
       // lines, each with its own Tm.
       const tmRegex = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+Tm/
       const governingRaw = findGoverningTm(block, targetBlock.text, pageIndex)
-      const fallback = maskStreamLiterals(block.content).match(tmRegex)
+      // Without a governing Tm, the one in force at the block's FIRST glyph —
+      // the last Tm before its first show op, not the first Tm in it. A
+      // Java invoice writer opens every BT with the same Tm twice; the move
+      // rewrote the first, the second put it straight back, and the ":" of
+      // "Monto de redondeo :" stayed behind while its label moved.
+      const fallback = (() => {
+        const masked = maskStreamLiterals(block.content)
+        const firstShow = scanShowOps(block.content, block.encoding, getSimpleFontInfo(pageIndex, block.fontRef))[0]?.start ?? masked.length
+        const all = [...masked.matchAll(new RegExp(tmRegex.source, 'g'))]
+        const before = all.filter(m => m.index! < firstShow)
+        return before.length ? before[before.length - 1] : (all[0] ?? null)
+      })()
 
 
       // When the block draws MORE than the target, the Tm is shared with other
@@ -4601,6 +4798,47 @@ function provablyHoldsMore(block: BtInfo, targetBlock: TextBlock): boolean {
     dFree.includes(tFree) && dFree.replace(tFree, '').length > 0
 }
 
+/**
+ * A member of a MULTI-block line that also draws text outside the line: its
+ * own share of the target, as the block's decoded text spells it — or null
+ * when the block lies wholly inside the target (or shares too little of it).
+ *
+ * Word draws a bullet as a BT of its own and the item's text as another BT
+ * that runs on to the item's second line. The line group is [bullet, text],
+ * and neither containment test fires for the text block: it holds MORE than
+ * its share, but not the whole target (the bullet is elsewhere). Recolouring
+ * the first line of "• Canalización: … entretecho (medición …)" turned the
+ * second line red with it. The share is the longest stretch the block and the
+ * target have in common, space-free (a glyph the decode reads as '?' is the
+ * one extraction reports as U+FFFD — Word's unmapped ligatures); at least four
+ * glyphs, and the block must draw at least one more. The caller only acts on
+ * it when the share's run is found in the block.
+ */
+function groupMemberShare(block: BtInfo, targetText: string, groupSize: number): string | null {
+  if (groupSize < 2) return null
+  const dec = block.decodedText
+  const dIdx: number[] = []
+  let dFree = ''
+  for (let i = 0; i < dec.length; i++) if (!/\s/.test(dec[i])) { dFree += dec[i]; dIdx.push(i) }
+  const tFree = targetText.replace(/\s+/g, '').replace(/\uFFFD/g, '?')
+  if (dFree.length < 5 || tFree.length < 4) return null
+  // Longest common substring, space-free.
+  let best = 0, bestEnd = 0
+  let prev = new Uint16Array(tFree.length + 1)
+  for (let i = 1; i <= dFree.length; i++) {
+    const cur = new Uint16Array(tFree.length + 1)
+    for (let j = 1; j <= tFree.length; j++) {
+      if (dFree[i - 1] === tFree[j - 1]) {
+        cur[j] = prev[j - 1] + 1
+        if (cur[j] > best) { best = cur[j]; bestEnd = i }
+      }
+    }
+    prev = cur
+  }
+  if (best < 4 || dFree.length - best < 1) return null
+  return dec.slice(dIdx[bestEnd - best], dIdx[bestEnd - 1] + 1)
+}
+
 /** Fill-colour operators, with the colour space a `sc`/`scn` reads against. */
 const FILL_COLOR_OP_RE = /(-?[\d.]+(?:\s+-?[\d.]+){0,3})\s+(rg|g|k|sc|scn)(?![A-Za-z0-9])|\/[ ]*\s+scn(?![A-Za-z0-9])|\/[ ]*\s+cs(?![A-Za-z0-9])/g
 
@@ -4817,6 +5055,16 @@ function restyleInSource(
       ? Math.max(0, op.fontSize - targetBlock.fontSize)
       : 0
 
+    /** A multi-block line member's own share, found as a run in it — see `groupMemberShare`. Null keeps the whole-block path. */
+    const memberRuns = new Map<BtInfo, ReturnType<typeof findTargetRun>>()
+    const memberRunOf = (block: BtInfo): ReturnType<typeof findTargetRun> => {
+      if (memberRuns.has(block)) return memberRuns.get(block)!
+      const share = groupMemberShare(block, targetBlock.text, matchedBlocks.length)
+      const run = share ? findTargetRun(block, share, pageIndex, blockLocalPoint(stream, block, targetBlock, pageHeight)) : null
+      memberRuns.set(block, run)
+      return run
+    }
+
     for (const block of matchedBlocks) {
       let inner: string
       /** Emitted between the `q` and the `BT` when the block sets no colour of its own. */
@@ -4885,7 +5133,8 @@ function restyleInSource(
         inner = rebuildBtContent(block.content, [enc.bytes], newFontRef, false, sizeOverride, colorOp, block.inheritedTf)
         usedStrategy ??= 'rebuild_font'
       } else if (matchLength(block.decodedText) > matchLength(targetBlock.text) * 1.4 + 4 ||
-                 provablyHoldsMore(block, targetBlock)) {
+                 provablyHoldsMore(block, targetBlock) ||
+                 memberRunOf(block) !== null) {
         // ONE LINE of a block that draws several. The size and colour ops in
         // such a block are per line, or set once for the whole of it, and
         // rewriting them all restyles every line: a LaTeX title shares its BT
@@ -4895,8 +5144,10 @@ function restyleInSource(
         // the new state goes in front of its first show op, and what was in
         // force at its end (in the ORIGINAL content, or before the BT) is put
         // back after its last. Nothing outside the run changes.
+        // A member of a multi-block line is bracketed around ITS share of
+        // the line (see `groupMemberShare`).
         const local = blockLocalPoint(stream, block, targetBlock, pageHeight)
-        const run = findTargetRun(block, targetBlock.text, pageIndex, local)
+        const run = memberRunOf(block) ?? findTargetRun(block, targetBlock.text, pageIndex, local)
         if ((globalThis as any).__debugCandidates) {
           console.log(`[restyle] block@${block.start} run=${run ? `${run.start}..${run.end} line=${run.startsLine}` : null} local=${local ? `${local.x.toFixed(1)} y${local.yLo.toFixed(1)}..${local.yHi.toFixed(1)}` : null}`)
         }
@@ -5267,7 +5518,13 @@ function findTargetRun(
   const runStart = ops[best.i].start
   const prevShowEnd = best.i > 0 ? ops[best.i - 1].end : 0
   const between = maskStreamLiterals(block.content.slice(prevShowEnd, runStart))
-  const startsLine = best.i === 0 || /(?:Td|TD|Tm|T\*)/.test(between)
+  // A `'` or `"` op moves to the next line itself (T*, then show), so a run
+  // that begins with one leads its line, and a Td in front of it shifts that
+  // line. A drawing exported with each table column as one BT of `'` lines
+  // ("ACTIVO / RESERVA / ACTIVO …") could not move or resize any cell after
+  // the first: the run was found and called mid-line.
+  const startsLine = best.i === 0 || /(?:Td|TD|Tm|T\*)/.test(between) ||
+    ops[best.i].kind === 'quote' || ops[best.i].kind === 'dquote'
 
   return { start: runStart, end: ops[best.j].end, startsLine }
 }
@@ -6795,7 +7052,10 @@ function consumePrefixFree(text: string, prefixFree: string): number | null {
   let p = 0
   for (let k = 0; k < prefixFree.length; k++) {
     while (p < text.length && /\s/.test(text[p])) p++
-    if (p >= text.length || text[p] !== prefixFree[k]) return null
+    // The op decodes a glyph without Unicode as '?' where the editor's text
+    // has U+FFFD for the same glyph (Word's unmapped ligatures): one glyph.
+    const same = p < text.length && (text[p] === prefixFree[k] || (prefixFree[k] === '?' && text[p] === '\uFFFD'))
+    if (!same) return null
     p++
   }
   return p
@@ -7734,7 +7994,9 @@ function shareOfTarget(targetBlock: TextBlock, needle: string, fromFree = 0): Te
   if (!needleFree || chars.length === 0) return targetBlock
   const idx: number[] = []
   let free = ''
-  chars.forEach((ch, i) => { if (ch.c.trim()) { idx.push(i); free += ch.c } })
+  // A glyph without Unicode is U+FFFD to extraction and '?' to the decode a
+  // member's text comes from: one glyph either way, and one code unit each.
+  chars.forEach((ch, i) => { if (ch.c.trim()) { idx.push(i); free += ch.c === '\uFFFD' ? '?' : ch.c } })
   const k = free.indexOf(needleFree, fromFree)
   if (k < 0) return targetBlock
   const from = idx[k], to = idx[k + needleFree.length - 1]
@@ -8100,7 +8362,12 @@ function applyLineReplacement(
  * candidate to the click still wins.
  */
 function foldForMatch(s: string): string {
-  return s.replace(/[\uFB00-\uFB06]/g, ch => LIGATURE_FOLD[ch] ?? ch).replace(/\s+/g, ' ').trim().toLowerCase()
+  // U+FFFD is extraction's name for a glyph with no Unicode (Word's Calibri
+  // "ti"/"fi" ligatures) and '?' is the stream decode's name for the SAME
+  // glyph. Unfolded, a bulleted Word line carrying one ("900 metros lineales
+  // de [fi]bra op[ti]ca") joined with '?' where its target had U+FFFD, and no
+  // candidate ever matched.
+  return s.replace(/[\uFB00-\uFB06]/g, ch => LIGATURE_FOLD[ch] ?? ch).replace(/\uFFFD/g, '?').replace(/\s+/g, ' ').trim().toLowerCase()
 }
 
 /**
@@ -8950,7 +9217,15 @@ function replaceInsideTjArray(
    * other cell keeps its font and its position. `newWidthKu` is the new run's
    * width in thousandths of the drawn size, measured on the substitute face.
    */
-  subst?: { fontRef: string; origFontRef: string | null; sizeStr: string; newWidthKu: number; tz?: number | null; spacing?: { tc: number; tw: number } }
+  subst?: { fontRef: string; origFontRef: string | null; sizeStr: string; newWidthKu: number; tz?: number | null; spacing?: { tc: number; tw: number } },
+  /**
+   * Keep the run's RIGHT edge instead of its left (same-font path only): the
+   * width difference is kerned in BEFORE the new literal, so the pen still
+   * ends where the old run ended. An accounting cell's number is set flush
+   * right, and "229,529.99" → "1,229,529.99" grew rightwards over the
+   * column's border while the "US$" in front of it stayed put.
+   */
+  alignEnd = false
 ): string | null {
   if (op.kind !== 'TJ') return null
   const items = parseTjItems(op.raw, encoding, simpleInfo)
@@ -9196,6 +9471,9 @@ function replaceInsideTjArray(
       if (cw === undefined) { known = false } else newW += cw
     }
     if (known) comp = ` ${fmtNum(newW - oldW)} `
+  }
+  if (alignEnd && comp) {
+    return op.raw.slice(0, spliceStart) + comp + newLiteral.literal + ' ' + op.raw.slice(spliceEnd)
   }
   return op.raw.slice(0, spliceStart) + newLiteral.literal + comp + ' ' + op.raw.slice(spliceEnd)
 }
@@ -9446,10 +9724,13 @@ function textStateAtOp(
   for (let i = 0; i < index; i++) {
     const op = ops[i]
     if (op.start < reset) continue
-    // ' and " carry an implicit T* and " rewrites Tw/Tc. Refusing is cheaper
-    // than modelling them, and they do not appear in the generators this path
-    // exists for.
-    if (op.kind === 'quote' || op.kind === 'dquote') return null
+    // " carries an implicit T* AND rewrites Tw/Tc; refusing is cheaper than
+    // modelling it. A ' is only the T*: the pen is back at a line origin
+    // before it draws, exactly as after an explicit reset. A drawing that sets
+    // a table column as one BT of ' lines ("ACTIVO / RESERVA / ACTIVO …")
+    // refused every cell after the first here, so none could be resized.
+    if (op.kind === 'dquote') return null
+    if (op.kind === 'quote') adv = 0
     const fr = op.fontRef && op.fontRef !== block.fontRef
       ? { encoding: getFontEncoding(pageIndex, op.fontRef), simpleInfo: getSimpleFontInfo(pageIndex, op.fontRef) }
       : { encoding: block.encoding, simpleInfo: getSimpleFontInfo(pageIndex, block.fontRef) }
@@ -9457,6 +9738,9 @@ function textStateAtOp(
     if (w === null) return null
     adv += w * tzAt(op.start)
   }
+  // The op's own ' (or ") starts a new line before it draws.
+  if (ops[index].kind === 'dquote') return null
+  if (ops[index].kind === 'quote') adv = 0
 
   return { penX: ops[index].x + adv, tfSize, ts, tc, tw }
 }
@@ -10108,7 +10392,16 @@ function narrowToChangedOps(
     }
     lo++
   }
-  return lo !== i ? { i: lo, j, text: text.replace(/^\s+/, '') } : null
+  if (lo === i) return null
+  // The space between the kept ops and the window is the window's own when
+  // its first op DRAWS it. Word starts a style run with its space glyph —
+  // "[( )-4.07(Su)…]TJ" after the bold "Conectividad Interna:" — and
+  // stripping it wrote the run without one: the S moved onto the colon and
+  // the line read "Interna:Suministros". A gap made by positioning (a Td) has
+  // no glyph, and there the space stays stripped.
+  const lead = /^\s+/.exec(ops[lo]?.decoded ?? '')?.[0] ?? ''
+  const rest = text.replace(/^\s+/, '')
+  return { i: lo, j, text: lead && /^\s/.test(text) ? lead + rest : rest }
 }
 
 /**
@@ -10454,6 +10747,81 @@ function applyCrossBlockLine(
   }
 }
 
+/**
+ * The replacement for a JUSTIFIED run, as a TJ array that keeps its width.
+ *
+ * Word justifies a paragraph line by kerning its spaces — `(a )-273.98(i)…`,
+ * a third of an em after every word on that line — and writes each line as
+ * one or two arrays (the second placed by a Td from the line's start). The
+ * window was rewritten as one plain string, so the kerns went: inserting one
+ * letter in "nueva" drew the line 37pt SHORT of its neighbours, and a longer
+ * rewrite ran into the half of the line its Td still holds in place.
+ *
+ * A run is justified when the window's arrays kern at least two of their
+ * spaces, consistently, by more than 3% of an em. The new text then gets the
+ * kern per inner space that makes it as wide as the old run — never
+ * compressed below its natural spacing (a longer text simply runs longer, as
+ * before), and never stretched past two and a half times the old per-space
+ * kern (a line emptied to two words keeps the paragraph's look and ends
+ * short, as a last line does). `width` is what the array advances, for the
+ * pen compensation after it.
+ */
+function justifiedArray(
+  windowOps: ShowOpInfo[],
+  literal: { plain?: string; hex?: string; codeBytes?: number },
+  newText: string,
+  fr: { encoding: ReturnType<typeof getFontEncoding>; simpleInfo: SimpleFontInfo | null },
+  st: { tfSize: number; tc: number; tw: number },
+  oldAdvance: number
+): { body: string; width: number } | null {
+  if (!(st.tfSize > 0) || !(oldAdvance > 0)) return null
+  const spaceKerns: number[] = []
+  for (const op of windowOps) {
+    if (op.kind !== 'TJ') continue
+    const items = parseTjItems(op.raw, fr.encoding, fr.simpleInfo)
+    for (let k = 0; k + 1 < items.length; k++) {
+      const a = items[k], b = items[k + 1]
+      if (a.isLiteral && !b.isLiteral && /\s$/.test(a.decoded) && typeof b.value === 'number') spaceKerns.push(b.value)
+    }
+  }
+  if (spaceKerns.length < 2) return null
+  const mean = spaceKerns.reduce((s, v) => s + v, 0) / spaceKerns.length
+  if (!(mean <= -30)) return null
+  if (spaceKerns.some(v => Math.abs(v - mean) > Math.abs(mean) * 0.4)) return null
+
+  // The new text's characters, each with its code, split after every space
+  // that has more text after it (a trailing space is never kerned).
+  const chars = [...newText]
+  let pieces: string[] = []
+  if (literal.plain !== undefined) {
+    if (literal.plain.length !== chars.length) return null
+    let cur = ''
+    for (let i = 0; i < chars.length; i++) {
+      cur += literal.plain[i]
+      if (chars[i] === ' ' && i < chars.length - 1 && chars[i + 1] !== ' ') { pieces.push(`(${escapePdfString(cur)})`); cur = '' }
+    }
+    if (cur) pieces.push(`(${escapePdfString(cur)})`)
+  } else if (literal.hex !== undefined) {
+    const w = (literal.codeBytes === 1 ? 1 : 2) * 2
+    if (literal.hex.length !== chars.length * w) return null
+    let cur = ''
+    for (let i = 0; i < chars.length; i++) {
+      cur += literal.hex.slice(i * w, (i + 1) * w)
+      if (chars[i] === ' ' && i < chars.length - 1 && chars[i + 1] !== ' ') { pieces.push(`<${cur}>`); cur = '' }
+    }
+    if (cur) pieces.push(`<${cur}>`)
+  } else return null
+  const gaps = pieces.length - 1
+  if (gaps < 1) return null
+  const natural = showOpAdvance({ kind: 'TJ', raw: `[${pieces.join('')}]` } as ShowOpInfo, fr.encoding, fr.simpleInfo, st.tfSize, st.tc, st.tw)
+  if (natural === null) return null
+  const extraPerGap = Math.min((oldAdvance - natural) / gaps, -mean / 1000 * st.tfSize * 2.5)
+  if (!(extraPerGap > 0.01)) return null
+  const kern = fmtNum(-extraPerGap * 1000 / st.tfSize)
+  const body = `[${pieces.join(kern)}]`
+  return { body, width: natural + extraPerGap * gaps }
+}
+
 function applyPartialBlockReplacement(
   stream: string,
   block: BtInfo,
@@ -10765,22 +11133,212 @@ function applyPartialBlockReplacement(
         }
       }
     }
+    // A cell drawn VALUE-FIRST inside the array. Excel's accounting format
+    // (here a WPS export of a fund request) draws each cell's number, kerns
+    // the pen BACK forty points, draws "US$" in front of it, and kerns on to
+    // the next cell. Extraction reads the page left to right — "US$
+    // 229,529.99" — and no stretch of the array in stream order holds that,
+    // so every amount on the page was "could not find matching text". The
+    // array is read in VISUAL order (pen positions, kerns included) to find
+    // the target; the edit must then fall inside ONE stretch that the stream
+    // draws contiguously (the number, or the "US$"), and only that stretch is
+    // replaced — the compensating kern `replaceInsideTjArray` writes after it
+    // keeps the pieces drawn later where they were.
+    const reordered = (() => {
+      const tFree = targetNorm.replace(/\s+/g, '')
+      const nFree = newText.replace(/\s+/g, '')
+      if (!tFree || !targetLocal) return null
+      for (const op of ops) {
+        if (op.kind !== 'TJ' || arrayTooFar(op)) continue
+        const fr = encodingFor(op)
+        const si = fr.simpleInfo
+        const advanceOf: ((code: number) => number | undefined) | null =
+          si?.isType0 && si.cidWidths ? (code: number) => si.cidWidths!.get(code) ?? si.cidDefaultWidth ?? 1000
+            : si?.widths ? (code: number) => si.widths![code - si.firstChar] : null
+        if (!advanceOf) continue
+        const items = parseTjItems(op.raw, fr.encoding, si)
+        type Ch = { ch: string; pen: number; item: number; idx: number; seq: number }
+        const chars: Ch[] = []
+        let pen = 0, seq = 0, ok = true
+        items.forEach((it, k) => {
+          if (!ok) return
+          if (!it.isLiteral) { pen -= it.value || 0; return }
+          if (it.decoded.length !== it.codes.length) { ok = false; return }
+          it.codes.forEach((code, c) => {
+            const w = advanceOf(code)
+            if (w === undefined || !Number.isFinite(w)) { ok = false; return }
+            chars.push({ ch: it.decoded[c], pen, item: k, idx: c, seq: seq++ })
+            pen += w
+          })
+        })
+        if (!ok || chars.length < tFree.length) continue
+        const visual = [...chars].sort((a, b) => a.pen - b.pen || a.seq - b.seq).filter(c => !/\s/.test(c.ch))
+        const vText = visual.map(c => c.ch).join('')
+        // Already readable in stream order: the paths above own it.
+        if (op.decoded.replace(/\s+/g, '').includes(tFree)) continue
+        const size = sizeAtOp(op)
+        const opAlong = targetLocal.along(op.x, op.y)
+        let at = -1, bestD = Infinity
+        for (let p = vText.indexOf(tFree); p !== -1; p = vText.indexOf(tFree, p + 1)) {
+          const d = Math.abs(opAlong + visual[p].pen / 1000 * size - targetLocal.aLo)
+          if (d < bestD) { bestD = d; at = p }
+        }
+        if ((globalThis as any).__debugCandidates) console.log(`[reorder] op@${op.start} at=${at} d=${bestD.toFixed(1)} visual="${vText.slice(0, 60)}"`)
+        if (at < 0 || bestD > Math.max(24, (targetBlock.height || 0) * 3)) continue
+        const match = visual.slice(at, at + tFree.length)
+        // What the edit changes, on the space-free texts.
+        let cp = 0
+        while (cp < tFree.length && cp < nFree.length && tFree[cp] === nFree[cp]) cp++
+        let cs = 0
+        while (cs < tFree.length - cp && cs < nFree.length - cp && tFree[tFree.length - 1 - cs] === nFree[nFree.length - 1 - cs]) cs++
+        if (cp === tFree.length && cp === nFree.length) return null // nothing changed
+        // The match's stretches the stream draws contiguously AND forwards — a
+        // kern that sends the pen back (to draw "US$" in front of its number)
+        // ends a stretch as surely as a glyph outside the match does.
+        const runs: Ch[][] = []
+        for (const c of [...match].sort((a, b) => a.seq - b.seq)) {
+          const last = runs[runs.length - 1]
+          const prev = last?.[last.length - 1]
+          if (last && prev && c.seq === prev.seq + 1 && c.pen > prev.pen) last.push(c)
+          else runs.push([c])
+        }
+        const changedLo = cp, changedHi = tFree.length - cs // [lo, hi) in visual order
+        const runOf = (c: Ch) => runs.findIndex(r => r.includes(c))
+        const touched = new Set<number>()
+        for (let v = changedLo; v < changedHi; v++) touched.add(runOf(match[v]))
+        if (changedLo === changedHi) {
+          // A pure insertion at the seam between two stretches joins the one
+          // its characters belong with: "1," typed before "229,529.99" is part
+          // of the number, not of the "US$" in front of it.
+          const ins = nFree.slice(changedLo, nFree.length - cs)
+          const before = match[changedLo - 1], after = match[changedLo]
+          const cls = (c: string | undefined) => !c ? '' : /\d/.test(c) ? 'd' : /\p{L}/u.test(c) ? 'l' : 'p'
+          const joinAfter = !before || (!!after && runOf(after) !== runOf(before) &&
+            cls(ins[ins.length - 1]) === cls(after.ch) && cls(ins[0]) !== cls(before.ch))
+          touched.add(runOf(joinAfter ? after : before))
+        }
+        if ((globalThis as any).__debugCandidates) console.log(`[reorder]   runs=${runs.map(r => r.map(c => c.ch).join('')).join('|')} changed=${changedLo}..${changedHi} touched=${[...touched]}`)
+        if (touched.size !== 1) return null
+        const run = runs[[...touched][0]]
+        // The stretch must be drawn left to right, like any text, and its
+        // characters must be the visual match's own in that order.
+        const runVisual = match.filter(c => run.includes(c))
+        if (runVisual.some((c, k) => c !== run[k])) return null
+        const vLo = match.indexOf(run[0]), vHi = vLo + run.length // run spans [vLo, vHi) of the match
+        if (changedLo < vLo || changedHi > vHi) return null
+        const oldRun = run.map(c => c.ch).join('')
+        const newRun = oldRun.slice(0, changedLo - vLo) + nFree.slice(changedLo, nFree.length - cs) + oldRun.slice(changedHi - vLo)
+        // A stretch the stream follows with a kern BACK was placed flush to
+        // its right (the number of an accounting cell, drawn before the
+        // currency that stands in front of it): it keeps its right edge.
+        const lastSeq = run[run.length - 1].seq
+        const follower = chars.find(c => c.seq === lastSeq + 1)
+        const alignEnd = !!follower && follower.pen < run[run.length - 1].pen
+        const plan = planTextEncoding(pageIndex,
+          { mode: op.isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding,
+            preferCodes: preferredGlyphCodes(ops, op, block, fr.encoding) },
+          [newRun], targetBlock)
+        if (plan.kind === 'error') return { error: plan.error }
+        // The occurrence at THIS stretch's pen position, whatever repeats elsewhere in the row.
+        const runLocalX = op.x + run[0].pen * size / 1000
+        let newRaw: string | null
+        let substFont: string | undefined
+        if (plan.kind === 'subst') {
+          const i = ops.indexOf(op)
+          const st = i >= 0 ? textStateAtOp(block, ops, i, pageIndex) : null
+          newRaw = replaceInsideTjArray(op, oldRun, { literal: substLiteral(plan), codes: [] }, fr.encoding, si, runLocalX, size, {
+            fontRef: plan.fontRef, origFontRef: op.fontRef ?? block.fontRef, sizeStr: fmtNum(size),
+            newWidthKu: Math.round(measureEm(newRun, plan.fontName) * 1000),
+            tz: plan.hex ? null : substituteTz(targetBlock, newText, plan.fontName),
+            spacing: { tc: st?.tc ?? 0, tw: st?.tw ?? 0 }
+          })
+          if (newRaw) substFont = plan.fontName
+        } else {
+          const newLit = plan.kind === 'keep-hex'
+            ? { literal: `<${plan.hexLines[0]}>`, codes: hexToCodes(plan.hexLines[0], fr.encoding ? (fr.encoding.codeBytes === 1 ? 1 : 2) : 1) }
+            : { literal: `(${escapePdfString(plan.byteLines[0])})`, codes: [...plan.byteLines[0]].map(c => c.charCodeAt(0)) }
+          newRaw = replaceInsideTjArray(op, oldRun, newLit, fr.encoding, si, runLocalX, size, undefined, alignEnd)
+        }
+        if ((globalThis as any).__debugCandidates) console.log(`[reorder]   "${oldRun}" -> "${newRun}" plan=${plan.kind} alignEnd=${alignEnd} raw=${newRaw ? 'ok' : 'null'}`)
+        if (!newRaw) return null
+        const content = block.content.slice(0, op.start) + newRaw + block.content.slice(op.end)
+        const spanText = ops.map(o => o === op ? looseReplace(o.decoded, oldRun, newRun) : o.decoded).join('')
+        const tag = retagSpanActualText(stream, block.start, spanText.trim(), block.end)
+        return {
+          stream: stream.slice(0, block.start) + 'BT' + content + 'ET' + stream.slice(block.end),
+          substitutedFont: substFont,
+          retags: tag ? [tag] : []
+        }
+      }
+      return null
+    })()
+    if (reordered) return reordered
+
     // Refuse rather than fall through to the op-level replacement: this array
     // holds cells the edit never named, and losing the edit is recoverable
     // where silently deleting the rest of the row is not.
     return null
   }
 
-  const planLinesFor = (at: number, lines: string[]) => {
+  // The glyphs a window of ops draws in `fontRef` that have NO Unicode, in
+  // drawing order — Word's Calibri ligatures ("ti", "fi"), which extraction
+  // and the editor show as U+FFFD. An edit elsewhere on such a line kept the
+  // U+FFFD, no font could encode it, and the edit failed with "Cannot encode
+  // characters: U+FFFD"; written back as their own codes they need no encoding.
+  const unreadableIn = (from: number, to: number, fontRef: string, enc: ReturnType<typeof getFontEncoding>): number[] | undefined => {
+    if (!enc) return undefined
+    const out: number[] = []
+    const stride = enc.codeBytes === 1 ? 1 : 2
+    const litRe = new RegExp(`(${STR_LIT_SRC})|(${HEX_LIT_SRC})`, 'g')
+    for (let k = from; k <= to && k < ops.length; k++) {
+      if ((ops[k].fontRef ?? block.fontRef) !== fontRef) continue
+      litRe.lastIndex = 0
+      let m: RegExpExecArray | null
+      while ((m = litRe.exec(ops[k].raw)) !== null) {
+        let codes: number[] = []
+        if (m[2] !== undefined) codes = hexToCodes(m[2].slice(1, -1).replace(/\s+/g, ''), stride)
+        else {
+          const s = unescapePdfString(m[1].slice(1, -1))
+          for (let i = 0; i + stride - 1 < s.length; i += stride) {
+            let c = 0
+            for (let q = 0; q < stride; q++) c = (c << 8) | s.charCodeAt(i + q)
+            codes.push(c)
+          }
+        }
+        for (const c of codes) if (enc.glyphToUnicode.get(c) === undefined && !enc.glyphToText?.has(c)) out.push(c)
+      }
+    }
+    return out.length ? out : undefined
+  }
+  /** `range`: the window [first, last] the lines replace, whose unreadable glyphs they may keep. */
+  const planLinesFor = (at: number, lines: string[], range: [number, number] = [at, at]) => {
     const fr = encodingFor(ops[at])
     return planTextEncoding(pageIndex,
       { mode: ops[at].isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding,
-        preferCodes: preferredGlyphCodes(ops, ops[at], block, fr.encoding) },
+        preferCodes: preferredGlyphCodes(ops, ops[at], block, fr.encoding),
+        unreadableCodes: unreadableIn(range[0], range[1], fr.fontRef, fr.encoding) },
       lines, targetBlock)
   }
-  const planFor = (at: number, text: string) => planLinesFor(at, [text])
+  const planFor = (at: number, text: string, range?: [number, number]) => planLinesFor(at, [text], range)
 
   let winI = best.i, winJ = best.j, winText = newText
+  // Whitespace at the end of the new text belongs to the window. Word ends a
+  // paragraph's line with a space in ANOTHER font, placed by its own Td —
+  // `/R4094 12 Tf 247.7 0 Td ( )Tj` — and the block's text carries it, while
+  // the matched window (the target is trimmed) stops before it. The line was
+  // written with a space of its own beside the one still drawn at the old
+  // end, and read back "puesta en marchas . ": the longer word now passes
+  // that stale space. A space-only op on the window's line right after it is
+  // taken into the window (blanked, its Td kept, the new text drawing the
+  // space where the pen ends).
+  while (/\s$/.test(winText) && winJ + 1 < ops.length && ops[winJ + 1].kind !== 'quote' && ops[winJ + 1].kind !== 'dquote' &&
+         /^\s+$/.test(ops[winJ + 1].decoded) && Math.abs(ops[winJ + 1].y - ops[winJ].y) < 0.5) winJ++
+  // Whitespace the window still does not draw is drawn by an op outside it.
+  {
+    const drawn = ops.slice(winI, winJ + 1).map(o => o.decoded).join('')
+    if (/\s$/.test(winText) && !/\s$/.test(drawn)) winText = winText.replace(/\s+$/, '')
+    if (/^\s/.test(winText) && !/^\s/.test(drawn)) winText = winText.replace(/^\s+/, '')
+  }
   // The op the new text is written INTO is the leftmost of the window, not
   // the first in the stream: a pdf24 form draws a row's value before its
   // label, and writing the line at the value's op put the label's words in
@@ -10792,7 +11350,7 @@ function applyPartialBlockReplacement(
     return k
   }
   const reorderedWindow = leftmostOf(winI, winJ) !== winI
-  let plan = planFor(reorderedWindow ? leftmostOf(winI, winJ) : winI, winText)
+  let plan = planFor(reorderedWindow ? leftmostOf(winI, winJ) : winI, winText, [winI, winJ])
   if (!reorderedWindow && (plan.kind === 'error' || plan.kind === 'subst')) {
     // The run as a whole is not encodable in any one face — or only in a
     // SUBSTITUTE one. Before accepting either, stop trying to re-encode the
@@ -10805,7 +11363,7 @@ function applyPartialBlockReplacement(
     // nothing is trimmed and the rewrite stays exactly as wide as it was.
     const narrowed = narrowToChangedOps(ops, winI, winJ, winText, targetBlock.text)
     if (narrowed) {
-      const retry = planFor(narrowed.i, narrowed.text)
+      const retry = planFor(narrowed.i, narrowed.text, [narrowed.i, narrowed.j])
       if (retry.kind !== 'error') {
         winI = narrowed.i; winJ = narrowed.j; winText = narrowed.text; plan = retry
       }
@@ -10864,7 +11422,7 @@ function applyPartialBlockReplacement(
       const windowPageX = targetBlock.x + prefixPage
       const wrapped = m ? wrapWindowText(winText, targetBlock, pageWidth, windowPageX, drawnFace) : null
       if (wrapped && wrapped.length > 1) {
-        const retry = planLinesFor(winI, wrapped)
+        const retry = planLinesFor(winI, wrapped, [winI, winJ])
         if (retry.kind !== 'error') {
           plan = retry
           wrapLines = wrapped
@@ -10886,6 +11444,29 @@ function applyPartialBlockReplacement(
       wrapExtra += ` ${fmtNum(n === 1 ? wrapDx : 0)} ${fmtNum(-wrapLead)} Td ${lineLiteral(n)} Tj`
     }
     wrapExtra += ` ${fmtNum(-wrapDx)} ${fmtNum(wrapLead * (wrapLines.length - 1))} Td`
+  }
+
+  // A justified run (Word kerns every space of a justified line) keeps its
+  // width: the replacement is written as an array whose spaces carry the
+  // kern that fills the run's old extent — see `justifiedArray`. One line
+  // only, same font throughout, measured from where the window's first op
+  // starts to where its last one ends (a Td between Word's two halves of a
+  // line is part of that extent).
+  let just: { body: string; width: number } | null = null
+  if (!wrapLines && !reorderedWindow && (plan.kind === 'keep-plain' || plan.kind === 'keep-hex') &&
+      (ops[writeIdx].kind === 'TJ' || ops[writeIdx].kind === 'Tj') &&
+      ops.slice(winI, winJ + 1).every(o => Math.abs(o.y - ops[winI].y) < 0.5 &&
+        (/^\s*$/.test(o.decoded) || (o.fontRef ?? block.fontRef) === (ops[writeIdx].fontRef ?? block.fontRef)))) {
+    const fr = encodingFor(ops[writeIdx])
+    const stA = textStateAtOp(block, ops, winI, pageIndex)
+    const stB = winJ === winI ? stA : textStateAtOp(block, ops, winJ, pageIndex)
+    const lastAdv = stB ? showOpAdvance(ops[winJ], fr.encoding, fr.simpleInfo ?? null, stB.tfSize, stB.tc, stB.tw) : null
+    if (stA && stB && lastAdv !== null && stA.tfSize > 0 && Math.abs(stA.tfSize - stB.tfSize) < 1e-6) {
+      const extent = stB.penX - stA.penX + lastAdv
+      just = justifiedArray(ops.slice(winI, winJ + 1),
+        plan.kind === 'keep-plain' ? { plain: plan.byteLines[0] } : { hex: plan.hexLines[0], codeBytes: fr.encoding?.codeBytes },
+        winText, { encoding: fr.encoding, simpleInfo: fr.simpleInfo ?? null }, { tfSize: stA.tfSize, tc: stA.tc, tw: stA.tw }, extent)
+    }
   }
 
   // What follows the window inside the same BT is placed by the PEN unless
@@ -10910,7 +11491,9 @@ function applyPartialBlockReplacement(
     const stIn = textStateAtOp(block, ops, winI, pageIndex)
     if (!stIn || !(stIn.tfSize > 0)) return ''
     let newAdv = 0
-    if (plan.kind === 'keep-plain') {
+    if (just) {
+      newAdv = just.width
+    } else if (plan.kind === 'keep-plain') {
       const si = encodingFor(ops[winI]).simpleInfo
       if (!si?.widths) return ''
       for (const b of plan.byteLines[0]) {
@@ -10945,7 +11528,9 @@ function applyPartialBlockReplacement(
     const op = ops[k]
     let repl: string
     if (k === writeIdx) {
-      if (plan.kind === 'keep-hex') {
+      if (just) {
+        repl = `${just.body} TJ`
+      } else if (plan.kind === 'keep-hex') {
         repl = buildShowOp(op.kind, `<${plan.hexLines[0]}>`, op.raw) + wrapExtra
       } else if (plan.kind === 'keep-plain') {
         repl = buildShowOp(op.kind, `(${escapePdfString(plan.byteLines[0])})`, op.raw) + wrapExtra
