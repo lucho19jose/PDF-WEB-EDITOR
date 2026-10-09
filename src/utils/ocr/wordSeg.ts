@@ -255,7 +255,7 @@ export interface WordSplit { words: InkWord[]; threshold: number; letterGapPx: n
  * line stretches its word gaps and a tracked heading its letter gaps, so the
  * split is the line's, not a constant.
  */
-export function splitWords(blobs: Blob[], fit: LineFit): WordSplit {
+export function splitWords(blobs: Blob[], fit: LineFit, box?: { x0: number; x1: number }): WordSplit {
   const own = blobs.filter(b => ownedBy(b, fit)).sort((a, b) => a.x0 - b.x0)
   const runs: { x0: number; x1: number; top: number; bottom: number }[] = []
   for (const b of own) {
@@ -269,13 +269,25 @@ export function splitWords(blobs: Blob[], fit: LineFit): WordSplit {
   for (let i = 1; i < runs.length; i++) gaps.push(runs[i].x0 - runs[i - 1].x1)
   const lo = fit.emPx * 0.12, hi = fit.emPx * 0.4
   let threshold = fit.emPx * 0.22
-  if (gaps.length >= 3) {
+  // Ink wholly outside the recogniser's box at either end — the tip of an
+  // illustration's beam beside a heading — is no part of the line's spacing:
+  // its gap voted the threshold up past the heading's one word space,
+  // "Conocimiento Técnico" stayed one ink word, the beam took the "C", every
+  // label after it moved one letter on, and deleting the "o" deleted the "C".
+  let votes = gaps
+  if (box) {
+    let a = 0, b = gaps.length
+    if (runs.length > 1 && runs[0].x1 <= box.x0) a = 1
+    if (runs.length > 1 && runs[runs.length - 1].x0 >= box.x1) b = gaps.length - 1
+    if (b - a >= 3) votes = gaps.slice(a, b)
+  }
+  if (votes.length >= 3) {
     // Gaps wider than any word space count as no wider than that. A form's
     // line runs on into its blank — a 58px stretch before the handwriting in
     // it — and that one gap outvoted the line's spacing: the threshold went
     // over every word gap (9 to 11 px), clamped to 0.4 em, and "el mismo que
     // acredita con copia de mi recibo" came out as one word.
-    const t = otsu(gaps.map(g => Math.min(g, fit.emPx * 0.6)))
+    const t = otsu(votes.map(g => Math.min(g, fit.emPx * 0.6)))
     if (t !== null) threshold = Math.min(hi, Math.max(lo, t))
   }
   const words: InkWord[] = []

@@ -1989,7 +1989,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   // Words: the line's own ink split at its word gaps, then the reading
   // shared among them by width.
   const blobs: Blob[] = ownPieces.map(c => ({ x0: c.x0, x1: c.x1, y0: c.y0, y1: c.y1, area: c.area, cx: c.cx, cy: c.cy }))
-  const split = splitWords(blobs, fit)
+  const split = splitWords(blobs, fit, box)
   if (!split.words.length) return fail('no words')
   markBullets(split.words, ownPieces, em, text, s.w)
   // An END word lying mostly outside the recogniser's box — the region is the
