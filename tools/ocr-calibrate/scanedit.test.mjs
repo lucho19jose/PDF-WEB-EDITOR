@@ -1325,3 +1325,36 @@ test('a security hatch continues through an erased word', () => {
   assert.ok(dots >= 20, `only ${dots} dot positions measured`)
   assert.ok(restSum / rest - dotSum / dots >= 6, `dots ${(dotSum / dots).toFixed(1)} against paper ${(restSum / rest).toFixed(1)}`)
 })
+
+test('a watermark over the text is found by its grey plateau, and its second reading only adds lines', async () => {
+  const WM = await loadOcr('ocrWatermark.ts')
+  // White paper, black text, a diagonal band of light grey (188) over a tenth of the sheet.
+  const W = 400, H = 300, rgba = new Uint8ClampedArray(W * H * 4)
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let v = 252
+    if (Math.abs(x - y - 50) < 15) v = 188
+    if (y % 40 > 30 && x % 9 < 5) v = 10
+    const p = (y * W + x) * 4
+    rgba[p] = rgba[p + 1] = rgba[p + 2] = v
+    rgba[p + 3] = 255
+  }
+  const level = WM.watermarkLevel(rgba)
+  assert.ok(level !== null && Math.abs(level - 188) <= 3, `level ${level}`)
+  // The same page without the band has a smooth tail and no plateau.
+  const plain = rgba.slice()
+  for (let i = 0; i < plain.length; i += 4) if (plain[i] === 188) plain[i] = plain[i + 1] = plain[i + 2] = 252
+  assert.equal(WM.watermarkLevel(plain), null)
+  // A darker band (a colour behind reversed lettering) is never a watermark.
+  const dark = rgba.slice()
+  for (let i = 0; i < dark.length; i += 4) if (dark[i] === 188) dark[i] = dark[i + 1] = dark[i + 2] = 120
+  assert.equal(WM.watermarkLevel(dark), null)
+  const line = (x0, y0, x1, y1, text, confidence = 99) => ({ box: { x0, y0, x1, y1 }, text, confidence })
+  const base = [line(10, 10, 300, 30, 'PRIMERA LINEA'), line(10, 50, 300, 70, 'SEGUNDA LINEA')]
+  const extra = [
+    line(12, 12, 298, 31, 'PRIMERA LlNEA'),        // the same line read again: never replaces it
+    line(10, 90, 300, 110, '15.VIRTUALIZACION'),   // missed by the first reading: added
+    line(10, 130, 40, 150, 'C'),                    // a stray letter: not a line
+    line(10, 170, 300, 190, 'SERVIDORES', 70),      // unsure: not added
+  ]
+  assert.deepEqual(WM.linesMissed(base, extra).map(l => l.text), ['15.VIRTUALIZACION'])
+})

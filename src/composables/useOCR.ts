@@ -18,6 +18,7 @@ import { harvestPage, atlasFrom, type PageHarvest, type Atlas } from '@/utils/oc
 import { planScanEdits, inkAwareFallback, type ScanEditPlan, type FallbackOps, type PixelOverlay } from '@/utils/ocr/scanEditPage'
 import { wantKey, repairReading, repairIsDisplayable, isProseLine, type GlyphImage } from '@/utils/ocr/scanEdit'
 import { fitScanLook, synthGlyph, type Rasterize, type ScanLook, type LookNear } from '@/utils/ocr/glyphSynth'
+import { watermarkLevel, whitenFrom, linesMissed } from '@/utils/ocr/ocrWatermark'
 import { useOcrStore } from '@/stores/ocr'
 
 /** A line cut word by word — see `wordSpanFor`. Rects are each word's cut box, raster pixels. */
@@ -1696,6 +1697,30 @@ function createOCR() {
         engine = engineFor('tesseract')
         stage.value = 'Recognising text...'
         data = await engine.recognize(target, { lang, onProgress })
+      }
+
+      // A light grey watermark printed over the text hides whole lines from
+      // the recogniser: the page is read a second time with the watermark's
+      // grey whitened, and only the lines that reading finds where the first
+      // found nothing are added (`ocrWatermark.ts`). Never for a cloud
+      // engine: a second call costs money.
+      if (engine.id !== 'mistral') {
+        const level = watermarkLevel(tctx.getImageData(0, 0, target.width, target.height).data)
+        if (level !== null) {
+          const clean = document.createElement('canvas')
+          clean.width = target.width
+          clean.height = target.height
+          const cctx = clean.getContext('2d', { willReadFrequently: true })
+          if (cctx) {
+            const img = tctx.getImageData(0, 0, target.width, target.height)
+            whitenFrom(img.data, level - 20)
+            cctx.putImageData(img, 0, 0)
+            stage.value = 'Reading under the watermark...'
+            const again = await engine.recognize(clean, { lang, onProgress }).catch(() => null)
+            const missed = again ? linesMissed(data.lines, again.lines) : []
+            if (missed.length) data = { ...data, lines: [...data.lines, ...missed] }
+          }
+        }
       }
 
       // Canvas pixels -> page points.

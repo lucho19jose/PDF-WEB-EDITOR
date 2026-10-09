@@ -2343,6 +2343,35 @@ box instead. Runs the model hardly believes — the stamp read as "ci Y", "ee",
 "N" at 0–40% — are dropped by `isJunkRun`; two-character Chinese cells and
 numbers are kept whatever their confidence above 30.
 
+### A watermark over the text is read UNDER, in a second reading that only adds
+A registry certificate prints a light grey diagonal watermark ("verify at…",
+each letter a hand tall) over its text, and PaddleOCR returned seven of the
+page's lines as nothing at all — four list items, a heading, the notary line —
+though every one is black and legible. Those lines could not be clicked, edited
+or searched. `watermarkLevel` (`ocrWatermark.ts`) finds such a page by its
+luminance histogram: paper the mode (230 or lighter), and a PLATEAU between
+170 and 20 below it — the tallest local maximum of the smoothed histogram,
+holding 0.4% of the page and twice what the histogram holds 25 levels darker
+(the soft edges of black text make a smooth tail there, never a bump). Darker
+plateaus are left alone: a band of colour behind reversed white lettering
+lies there.
+
+`recognizePage` then reads the page again with every pixel from 20 below the
+plateau whitened, and `linesMissed` ADDS the lines that reading found where
+the first found nothing — confident (90+), three letters or figures at least,
+overlapping no first-reading box by a quarter of the smaller — and changes
+nothing else. Whitening is no cure on its own, which is why it never
+replaces a line: on an ordinary grey scan it eats the soft edges of letters
+("GERENTE" read back "CERENTE", "Thumbnails" "Thurmbnails", measured on
+twelve plateau pages of the corpus), and whitening only the plateau's own
+grey band did the same. Measured on those twelve: the registry page gains
+its seven lines, every other page gains nothing (what its second reading
+found it had already). The cost is one more recognition on such pages — the
+status line says "Reading under the watermark…" — and none for the cloud
+engine, where a second call costs money. Editing the recovered lines works
+like any other: five edits across them draw on the scan with no damage, the
+watermark intact behind the new words.
+
 ### Three OCR engines behind one contract; PaddleOCR reads first
 `src/utils/ocr/ocrEngine.ts` is what every recogniser answers to — lines with
 a box, text and confidence, and OPTIONAL words, glyph boxes, baseline and
