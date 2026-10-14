@@ -139,11 +139,11 @@ const menus: { label: string; items: Item[] }[] = [
 <style scoped>
 .acro-menubar {
   height: 21px; display: flex; align-items: center; background: var(--acro-menubar);
-  border-bottom: 1px solid var(--acro-rule-dark); padding: 0 4px; font-size: 12px; color: #e8e8e8;
+  border-bottom: 1px solid var(--acro-rule-dark); padding: 0 4px; font-size: 12px; color: var(--acro-text);
   user-select: none;
 }
 .menu-title { padding: 1px 7px; cursor: default; border-radius: 2px; line-height: 17px; }
-.menu-title:hover, .menu-title.open { background: #5a5a5a; }
+.menu-title:hover, .menu-title.open { background: var(--acro-hover); }
 .menu-title u { text-decoration: underline; text-underline-offset: 2px; }
-.app-name { color: #9a9a9a; font-size: 12px; padding-right: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50%; }
+.app-name { color: var(--acro-text-dim); font-size: 12px; padding-right: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50%; }
 </style>

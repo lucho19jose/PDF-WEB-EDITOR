@@ -4,6 +4,7 @@ import type { SignatureInfo } from '@/engine/types'
 
 export const useDocumentStore = defineStore('document', () => {
   const loaded = ref(false)
+  const documentId = ref(0)
   const fileName = ref<string | null>(null)
   const totalPages = ref(0)
   const currentPage = ref(1)
@@ -22,6 +23,8 @@ export const useDocumentStore = defineStore('document', () => {
   const isModified = ref(false)
   const pdfBytes = ref<Uint8Array | null>(null)
   const renderVersion = ref(0)
+  /** New index -> previous index for a pure reorder; null for content edits. */
+  const pageOrder = ref<number[] | null>(null)
   /**
    * The digital signatures the document carried WHEN IT WAS OPENED (read by
    * the engine, never verified). Kept as of the open, not re-read after each
@@ -37,6 +40,7 @@ export const useDocumentStore = defineStore('document', () => {
   })
 
   function setDocument(name: string, pages: number, bytes: Uint8Array) {
+    documentId.value++
     loaded.value = true
     fileName.value = name
     totalPages.value = pages
@@ -46,6 +50,7 @@ export const useDocumentStore = defineStore('document', () => {
     // The previous document's signatures must not describe this one for the
     // moment before the engine has read its own.
     signatures.value = []
+    pageOrder.value = null
     // A new document invalidates every overlay's cached geometry even when
     // currentPage/tool don't change (e.g. opening a 2nd PDF while on page 1)
     renderVersion.value++
@@ -56,8 +61,9 @@ export const useDocumentStore = defineStore('document', () => {
   }
 
   /** Reload bytes without resetting page/state — used after in-place editing */
-  function reloadBytes(bytes: Uint8Array, pages?: number) {
+  function reloadBytes(bytes: Uint8Array, pages?: number, order?: number[]) {
     pdfBytes.value = bytes
+    pageOrder.value = order ?? null
     if (pages !== undefined) {
       totalPages.value = pages
       // Clamp BEFORE bumping renderVersion so the re-render never requests an
@@ -84,6 +90,7 @@ export const useDocumentStore = defineStore('document', () => {
   }
 
   function reset() {
+    documentId.value++
     loaded.value = false
     fileName.value = null
     totalPages.value = 0
@@ -92,12 +99,13 @@ export const useDocumentStore = defineStore('document', () => {
     isModified.value = false
     pdfBytes.value = null
     signatures.value = []
+    pageOrder.value = null
   }
 
   return {
     continuousScroll,
-    loaded, fileName, totalPages, currentPage, scale,
-    isModified, pdfBytes, fileSizeFormatted, renderVersion, signatures,
+    loaded, documentId, fileName, totalPages, currentPage, scale,
+    isModified, pdfBytes, fileSizeFormatted, renderVersion, pageOrder, signatures,
     setDocument, reloadBytes, setPage, setScale, markModified, markSaved, reset, setSignatures
   }
 })

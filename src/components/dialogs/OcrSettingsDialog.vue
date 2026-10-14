@@ -1,6 +1,6 @@
 <template>
   <q-dialog :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)">
-    <q-card dark class="bg-grey-9" style="min-width: 420px">
+    <q-card class="acro-card" style="min-width: 420px">
       <q-card-section>
         <div class="text-subtitle1">OCR settings</div>
         <div class="text-caption text-grey-5">
@@ -11,7 +11,7 @@
       <q-card-section class="q-pt-none">
         <q-input
           v-model="key"
-          dark dense outlined
+          dense outlined
           label="Mistral API key"
           :type="reveal ? 'text' : 'password'"
           autocomplete="off"

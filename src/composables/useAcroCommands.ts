@@ -2,7 +2,7 @@ import { useQuasar } from 'quasar'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 import { useUiStore } from '@/stores/ui'
-import { enqueueOp, beginTransaction } from '@/utils/opQueue'
+import { enqueueOp, beginTransaction, settleTransactions } from '@/utils/opQueue'
 import { makeZip } from '@/utils/acro/zip'
 import { buildDocx, type StPage } from '@/utils/acro/docx'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
@@ -19,7 +19,7 @@ import type { RectT } from '@/engine/types'
  */
 export interface AcroCommandDeps {
   pdfEngine: ReturnType<typeof usePDFEngine>
-  syncAfterEdit: () => Promise<void>
+  syncAfterEdit: (opts?: { pageOrder?: number[] }) => Promise<void>
   pushUndo: () => void
   forgetOcr: () => void
   loadBytes: (bytes: Uint8Array, name: string) => Promise<void>
@@ -45,22 +45,33 @@ export function useAcroCommands(deps: AcroCommandDeps) {
    * One document change: engine call, undo point on success, re-sync.
    * `structure` = the page list changed (count, order, rotation).
    */
-  async function change(label: string, fn: () => Promise<Result>, structure = false): Promise<Result> {
+  async function change(label: string, fn: () => Promise<Result>, structure = false, pageOrder?: number[]): Promise<Result> {
+    if (structure && ui.pageOperationBusy) return { success: false, error: 'Espere a que termine la operación de páginas' }
+    if (structure) ui.pageOperationBusy = true
+    const documentId = docStore.documentId
     let result: Result = { success: false }
-    await enqueueOp(async () => {
-      try {
+    try {
+      await enqueueOp(async () => {
+        if (docStore.documentId !== documentId) {
+          result = { success: false, error: 'El documento cambió; seleccione las páginas de nuevo' }
+          say(`${label}: ${result.error}`)
+          return
+        }
         result = await fn()
-      } catch (err: any) {
-        result = { success: false, error: err?.message || String(err) }
-      }
-      if (!result?.success) {
-        say(`${label}: ${result?.error || pdfEngine.error.value || 'no se pudo completar'}`)
-        return
-      }
-      deps.pushUndo()
-      if (structure) deps.forgetOcr()
-      await deps.syncAfterEdit()
-    })
+        if (!result?.success) {
+          say(`${label}: ${result?.error || pdfEngine.error.value || 'no se pudo completar'}`)
+          return
+        }
+        deps.pushUndo()
+        if (structure) deps.forgetOcr()
+        await deps.syncAfterEdit(pageOrder ? { pageOrder } : undefined)
+      })
+    } catch (err: any) {
+      result = { success: false, error: err?.message || String(err) }
+      say(`${label}: ${result.error}`)
+    } finally {
+      if (structure) ui.pageOperationBusy = false
+    }
     return result
   }
 
@@ -129,13 +140,15 @@ export function useAcroCommands(deps: AcroCommandDeps) {
   /** Move the pages in `indices` (in their order) so they land before page `before` (0..n). */
   async function movePages(indices: number[], before: number) {
     const n = docStore.totalPages
-    const moving = [...new Set(indices)].sort((a, b) => a - b)
+    const moving = [...new Set(indices)].filter(i => Number.isInteger(i) && i >= 0 && i < n).sort((a, b) => a - b)
+    if (!moving.length || !Number.isInteger(before) || before < 0 || before > n) return
+    const movingSet = new Set(moving)
     const rest: number[] = []
-    for (let i = 0; i < n; i++) if (!moving.includes(i)) rest.push(i)
+    for (let i = 0; i < n; i++) if (!movingSet.has(i)) rest.push(i)
     const at = rest.filter(i => i < before).length
     const order = [...rest.slice(0, at), ...moving, ...rest.slice(at)]
     if (order.every((v, i) => v === i)) return
-    const r = await change('Mover', () => pdfEngine.acro('rearrange', { order }), true)
+    const r = await change('Mover', () => pdfEngine.acro('rearrange', { order }), true, order)
     if (r.success) {
       ui.selectedPages = moving.map((_, k) => at + k)
       docStore.setPage(at + 1)
@@ -145,7 +158,7 @@ export function useAcroCommands(deps: AcroCommandDeps) {
 
   async function reverseOrder() {
     const order = Array.from({ length: docStore.totalPages }, (_, i) => docStore.totalPages - 1 - i)
-    const r = await change('Invertir', () => pdfEngine.acro('rearrange', { order }), true)
+    const r = await change('Invertir', () => pdfEngine.acro('rearrange', { order }), true, order)
     if (r.success) say('Orden de las páginas invertido')
   }
 
@@ -375,23 +388,36 @@ export function useAcroCommands(deps: AcroCommandDeps) {
   }
 
   /** "Combinar archivos": a new document, the files' pages in the order given. */
-  async function combine(files: File[]) {
-    if (files.length < 1) return
-    const first = await pdfBytesOf(files[0])
-    if (!first) return
-    await deps.loadBytes(new Uint8Array(first), 'Combinados.pdf')
-    for (const f of files.slice(1)) {
-      const bytes = await pdfBytesOf(f)
-      if (!bytes) continue
-      await enqueueOp(async () => {
-        const m = await pdfEngine.mergePages(bytes, docStore.totalPages)
-        if (m === false) { say(`${f.name}: ${pdfEngine.error.value}`); return }
-        await deps.syncAfterEdit()
+  let combineInFlight = false
+  async function combine(files: File[], includeOpen = false): Promise<Result> {
+    if (combineInFlight) return { success: false, error: 'Ya hay una combinacion en curso' }
+    if (!files.length && !includeOpen) return { success: false, error: 'Agregue archivos para combinar' }
+    combineInFlight = true
+    try {
+      if (includeOpen) { await deps.flushOpenEditor(); await deps.bakeOcrEdits() }
+      await settleTransactions()
+      return await enqueueOp(async () => {
+        const inputs: ArrayBuffer[] = [], names: string[] = []
+        if (includeOpen && docStore.loaded) {
+          inputs.push(await pdfEngine.saveDocument()); names.push(docStore.fileName || 'documento.pdf')
+        }
+        for (const file of files) {
+          say(`Preparando ${file.name}...`)
+          const bytes = await pdfBytesOf(file)
+          if (!bytes) return { success: false, error: `No se pudo leer ${file.name}` }
+          inputs.push(bytes); names.push(file.name)
+        }
+        say(`Combinando ${inputs.length} archivos...`)
+        const r = await pdfEngine.acro<Result>('combinePdf', { files: inputs }, inputs)
+        if (!r.success) return { ...r, error: `${names[r.fileIndex] || 'Archivo'}: ${r.error}` }
+        // One load and one save for the whole batch, regardless of file count.
+        await deps.loadBytes(new Uint8Array(r.bytes), 'Combinados.pdf')
+        docStore.markModified(); ui.view = 'document'
+        say(`${names.length} archivos combinados - ${r.pages} paginas. Guarde con Ctrl+S`)
+        return r
       })
-    }
-    docStore.markModified()
-    ui.view = 'document'
-    say(`${files.length} archivos combinados — ${docStore.totalPages} páginas. Guárdelo con Ctrl+S`)
+    } catch (err: any) { return { success: false, error: err?.message || String(err) } }
+    finally { combineInFlight = false }
   }
 
   // ───────────────────────── helpers ─────────────────────────

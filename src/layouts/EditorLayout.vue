@@ -17,6 +17,8 @@
           <AcroToolbar />
           <AcroToolOptions v-if="ui.activeTool" />
         </template>
+        <!-- A tool opened before any document: its bar, greyed out (Cerrar still works). -->
+        <AcroToolOptions v-else-if="ui.view === 'document' && ui.activeTool" />
       </template>
       <!--
         Inside the header, not the page container: the header is the only
@@ -97,6 +99,7 @@ import { useEditorStore } from '@/stores/editor'
 import { useHistoryStore } from '@/stores/history'
 import { useSearchStore } from '@/stores/search'
 import { useOcrStore } from '@/stores/ocr'
+import { useThumbnails } from '@/composables/useThumbnails'
 import { useOCR, OCR_DEFAULT_LANG } from '@/composables/useOCR'
 
 import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
@@ -110,6 +113,7 @@ import { planOcrExport, base14 } from '@/utils/ocr/ocrExport'
 import { stretchOf, sizeOf, weightPlan } from '@/utils/ocr/partialRedraw'
 import { cropToPng } from '@/utils/ocr/pixelCrop'
 import { measureHalo } from '@/utils/ocr/ocrSampling'
+import { whitenAbove } from '@/utils/ocr/faintLayer'
 import { detectFace } from '@/utils/ocr/ocrFontDetect'
 import type { OcrTextItem } from '@/utils/ocr/ocrTypes'
 import { snapItemsToTextLayer } from '@/utils/ocr/snapToLayer'
@@ -204,7 +208,7 @@ async function runOcrOnPage(lang = OCR_DEFAULT_LANG) {
     $q.dialog({
       title: 'This page already has text',
       message: `${verdict.reason}. Running OCR would add a second, guessed copy on top of it. Recognise it anyway?`,
-      cancel: true, persistent: true, dark: true
+      cancel: true, persistent: true
     }).onOk(() => runOcrNow(pageIndex, lang))
     return
   }
@@ -330,15 +334,60 @@ function ocrScanChanged(pageIndex: number) {
   if (hadEdits) editorStore.setStatus('The scan changed — unsaved OCR edits on this page were discarded; recognise it again')
 }
 
+/**
+ * Acrobat's Editar PDF converts a scanned page as soon as it is shown, with a
+ * progress toast, when "Reconocer texto" is checked — there is nothing to
+ * click first. Each page is tried once per document: a page that recognises
+ * to nothing must not be re-read on every reload of its text blocks.
+ */
+const autoTried = new Set<number>()
+watch(() => docStore.fileName, () => autoTried.clear())
+
+async function autoRecognise(pageIndex: number) {
+  if (!ui.autoRecognize || !docStore.loaded || ocr.busy.value) return
+  if (autoTried.has(pageIndex) || ocrStore.itemsFor(pageIndex).length > 0) return
+  autoTried.add(pageIndex)
+  if (!(await isScanLikePage(pageIndex))) return
+  if (ocr.busy.value) { autoTried.delete(pageIndex); return }
+  ocrStore.layerVisible = true
+  await runOcrNow(pageIndex, OCR_DEFAULT_LANG)
+}
+
 provide('ocrController', {
   isScanLike: isScanLikePage,
   recognise: (pageIndex: number) => runOcrNow(pageIndex, OCR_DEFAULT_LANG),
+  autoRecognise,
   busy: ocr.busy,
   scanMoved: ocrScanMoved,
   scanChanged: ocrScanChanged
 })
 
+/**
+ * Every recognition shows Acrobat's toast — "Página N: Conversión de la página
+ * digitalizada en texto e imágenes editables" with a progress bar — whoever
+ * started it. The recogniser reports progress per stage (detection, reading,
+ * the sideways pass), each from 0, so the bar only ever moves forward and
+ * holds short of full until the page is actually done.
+ */
 async function runOcrNow(pageIndex: number, lang: string) {
+  ui.scanConversion = { page: pageIndex + 1, pct: 2, hidden: false }
+  const stop = watch(ocr.progress, p => {
+    const job = ui.scanConversion
+    if (job && ocr.busy.value) job.pct = Math.min(95, Math.max(job.pct, p))
+  })
+  try {
+    await runOcrNowInner(pageIndex, lang)
+  } finally {
+    stop()
+    const job = ui.scanConversion
+    if (job && job.page === pageIndex + 1) {
+      job.pct = 100
+      setTimeout(() => { if (ui.scanConversion === job) ui.scanConversion = null }, 600)
+    }
+  }
+}
+
+async function runOcrNowInner(pageIndex: number, lang: string) {
   const size = await pdfEngine.getPageSize(pageIndex).catch(() => ({ width: 612, height: 792 }))
   editorStore.setStatus('Recognising text on this page...')
 
@@ -377,7 +426,7 @@ async function runOcrNow(pageIndex: number, lang: string) {
         $q.dialog({
           title: 'Send this page to Mistral?',
           message: 'The page image will be uploaded to Mistral\'s OCR service to be read. Nothing is sent for any other engine.',
-          ok: 'Send', cancel: true, persistent: true, dark: true
+          ok: 'Send', cancel: true, persistent: true
         }).onOk(() => resolve(true)).onCancel(() => resolve(false)).onDismiss(() => resolve(false))
       })
       if (!ok) { stopProgress(); editorStore.setStatus('Cloud recognition cancelled'); return }
@@ -628,6 +677,10 @@ async function bakeOcrEdits(opts: { live?: boolean; pages?: number[] } = {}): Pr
     const touched = page.items.filter(i => (i.edited || i.removed) && !i.baked)
     const rasterCanvas = touched.length ? await renderForOcr(pageIndex, 220 / 72) : null
     const hctx = rasterCanvas?.getContext('2d', { willReadFrequently: true }) ?? null
+    // A watermark is a faint tint everywhere, and the halo walk takes every
+    // faint row it meets: painted out first, as it was for recognition.
+    const faintCutoff = ocr.faintCutoffFor(pageIndex)
+    if (hctx && faintCutoff !== undefined) whitenAbove(hctx, faintCutoff)
     const k = rasterCanvas ? rasterCanvas.width / page.pageWidth : 0
     const plans = new Map(candidates.map(item => {
       const face = ocr.faceOf(pageIndex, styleKeyOf(item))
@@ -870,13 +923,14 @@ async function loadBytes(bytes: Uint8Array, name: string) {
     // objects until the tool was toggled. Bump again now the engine is ready.
     docStore.reloadBytes(bytes)
     // The document's digital signatures, as of the open. Read once here, not
-    // after each edit: every edit breaks all of them, and the status bar pairs
-    // this list with `isModified` to say so. An Intellisign contract carries
+    // after each edit: the edits are appended after the signed bytes (the
+    // worker saves a signed file incrementally), and the status bar pairs
+    // this list with `isModified` to say the file changed after signing. An Intellisign contract carries
     // one /Sig widget per signer per page, so the count can run to dozens.
     const signatures = await pdfEngine.getSignatures()
     docStore.setSignatures(signatures)
     const signed = signatures.length
-      ? ` · ${signatures.length} digital signature${signatures.length === 1 ? '' : 's'} — editing will invalidate them`
+      ? ` · ${signatures.length} digital signature${signatures.length === 1 ? '' : 's'} — edits are saved after them`
       : ''
     editorStore.setStatus(`${name} — ${pageCount} pages (ready)${signed}`)
     afterOpen(bytes, name, pageCount)
@@ -904,6 +958,7 @@ function afterOpen(bytes: Uint8Array, name: string, pageCount: number) {
   ui.protection = null
   saveHandle = null
   editorStore.setTool('select')
+  acroShell.documentOpened()
   ui.notify(`${name} abierto — ${pageCount} página(s)`)
   pdfEngine.renderPageBitmap(0, 0.18).catch(() => null).then(canvas => {
     let thumb: string | undefined
@@ -953,7 +1008,7 @@ async function closeDocument() {
       $q.dialog({
         title: 'PDF Editor Pro',
         message: `¿Desea guardar los cambios de "${docStore.fileName}" antes de cerrarlo?`,
-        dark: true, persistent: true,
+        persistent: true,
         options: { type: 'radio', model: 'save', items: [
           { label: 'Guardar', value: 'save' }, { label: 'No guardar', value: 'discard' }
         ] },
@@ -993,7 +1048,7 @@ async function unlockIfNeeded(bytes: Uint8Array, name: string): Promise<Uint8Arr
   for (;;) {
     const password = await new Promise<string | null>(resolve => {
       $q.dialog({
-        title: 'Contraseña', message, dark: true, persistent: true,
+        title: 'Contraseña', message, persistent: true,
         prompt: { model: '', type: 'password' },
         ok: { label: 'Aceptar', unelevated: true }, cancel: { label: 'Cancelar', flat: true }
       }).onOk((v: string) => resolve(v)).onCancel(() => resolve(null)).onDismiss(() => resolve(null))
@@ -1029,8 +1084,12 @@ function openFile() {
 async function openPdfFile(file: File) {
   try {
     editorStore.setStatus(`Opening ${file.name}...`)
-    const bytes = await unlockIfNeeded(new Uint8Array(await file.arrayBuffer()), file.name)
-    if (bytes) await loadBytes(bytes, file.name)
+    const inputBytes = new Uint8Array(await file.arrayBuffer())
+    await settleTransactions()
+    await enqueueOp(async () => {
+      const bytes = await unlockIfNeeded(inputBytes, file.name)
+      if (bytes) await loadBytes(bytes, file.name)
+    })
   } catch (err: any) {
     // A file that cannot be read is not a silent no-op.
     editorStore.setStatus(`Could not open ${file.name}: ${err?.message || err}`)
@@ -1348,11 +1407,11 @@ async function printFile() {
 }
 
 // ===== shared re-render after a document-level edit =====
-async function syncAfterEdit() {
+async function syncAfterEdit(opts?: { pageOrder?: number[] }) {
   const saved = await pdfEngine.saveDocument()
   const bytes = new Uint8Array(saved)
-  await pdfViewer.reloadDocument(bytes)
   await pdfEngine.loadDocument(saved)
+  await pdfViewer.reloadDocument(bytes, opts?.pageOrder)
   if (docStore.currentPage > docStore.totalPages) docStore.setPage(docStore.totalPages)
   docStore.markModified()
 }
@@ -1711,7 +1770,9 @@ async function handleDrop(e: DragEvent) {
   // would throw its work away.
   if (e.defaultPrevented) return
   e.preventDefault()
+  if (ui.dialog) return
   const files = [...(e.dataTransfer?.files ?? [])]
+  if (files.length > 1) { ui.openDialog('combine', { files }); return }
   const file = files[0]
   if (file && (file.type === 'application/pdf' || /\.pdf$/i.test(file.name))) {
     await openPdfFile(file)
@@ -1863,7 +1924,7 @@ const assistant = createAssistant({
     $q.dialog({
       title: 'Send the page text to OpenAI?',
       message: 'The assistant sends the text of the page you are on and your messages to OpenAI, using your API key. Nothing else leaves the machine.',
-      ok: 'Send', cancel: true, persistent: true, dark: true
+      ok: 'Send', cancel: true, persistent: true
     }).onOk(() => resolve(true)).onCancel(() => resolve(false)).onDismiss(() => resolve(false))
   })
 })
@@ -1905,6 +1966,7 @@ provide('acroShell', acroShell)
 provide('acroCommands', acroCommands)
 provide('pickFiles', pickFiles)
 ;(window as any).__pdfHooks.acro = { shell: acroShell, commands: acroCommands, ui }
+;(window as any).__pdfHooks.thumbnails = useThumbnails()
 // Every status line also lands in the bell's list.
 watch(() => editorStore.statusMessage, (m, prev) => {
   if (!m || m === prev || /^Tool: /.test(m)) return
@@ -1943,14 +2005,14 @@ provide('closeFind', closeFind)
 }
 .acro-header { background: var(--acro-tabbar); color: var(--acro-text); box-shadow: none; }
 .acro-status {
-  height: 24px; background: #323232; color: #bdbdbd; border-top: 1px solid var(--acro-rule-dark);
+  height: 24px; background: var(--acro-surface-2); color: var(--acro-text-dim); border-top: 1px solid var(--acro-rule-dark);
   padding: 0 10px;
 }
-.acro-assistant { background: #323232 !important; }
+.acro-assistant { background: var(--acro-surface-2) !important; }
 .read-exit {
   position: fixed; right: 18px; top: 12px; z-index: 3000; display: flex; align-items: center; gap: 6px;
-  border: 0; border-radius: 16px; background: rgba(30, 30, 30, 0.85); color: #fff; padding: 6px 14px;
-  font: inherit; font-size: 13px; cursor: pointer; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+  border: 0; border-radius: 16px; background: rgba(255, 255, 255, 0.95); color: var(--acro-text-strong); padding: 6px 14px;
+  font: inherit; font-size: 13px; cursor: pointer; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
 }
-.read-exit:hover { background: #1e1e1e; }
+.read-exit:hover { background: var(--acro-hover); }
 </style>

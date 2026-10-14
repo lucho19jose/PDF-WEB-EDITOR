@@ -46,7 +46,8 @@ function compute(): number[] {
   if (parity.value === 'even') list = list.filter(i => i % 2 === 1)
   return list
 }
-watch([mode, text, parity], () => emit('update:modelValue', compute()))
+watch(() => props.initial, initial => { mode.value = initial === 'selected' && !ui.selectedPages.length ? 'current' : initial })
+watch([mode, text, parity, () => docStore.currentPage, () => docStore.totalPages, () => ui.selectedPages], () => emit('update:modelValue', compute()))
 onMounted(() => emit('update:modelValue', compute()))
 </script>
 

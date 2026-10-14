@@ -3,7 +3,7 @@
     <div class="accent" />
     <div class="tool-name">{{ tool?.label }}</div>
 
-    <div class="opts">
+    <div class="opts" :class="{ off: !docStore.loaded || ui.pageOperationBusy }">
       <!-- ═══════════ Editar PDF ═══════════ -->
       <template v-if="ui.activeTool === 'edit'">
         <button class="acro-ibtn" :class="{ active: et === 'edit' }" @click="setTool('edit')">
@@ -69,15 +69,25 @@
 
       <!-- ═══════════ Organizar páginas ═══════════ -->
       <template v-else-if="ui.activeTool === 'organize'">
-        <select class="acro-input range-select" :value="rangeChoice" @change="pickRange(($event.target as HTMLSelectElement).value)">
-          <option value="" disabled>Introduzca el intervalo de páginas</option>
-          <option value="all">Todas las páginas</option>
-          <option value="even">Páginas pares</option>
-          <option value="odd">Páginas impares</option>
-          <option value="landscape">Páginas horizontales</option>
-          <option value="portrait">Páginas verticales</option>
-          <option value="none">Ninguna</option>
-        </select>
+        <!-- Acrobat's page-range box: it SHOWS the selection ("2-12") and takes a
+             typed range ("1, 3-5, 9") on Enter; the caret holds the presets. -->
+        <div class="range-box">
+          <input
+            v-model="rangeText" class="range-input" spellcheck="false"
+            placeholder="Introduzca el intervalo de páginas" :disabled="!docStore.loaded"
+            @focus="rangeEditing = true" @blur="commitRange" @keydown.enter.prevent="($event.target as HTMLInputElement).blur()"
+            @keydown.esc.prevent="rangeEditing = false; ($event.target as HTMLInputElement).blur()"
+          />
+          <button class="range-caret" :disabled="!docStore.loaded" title="Seleccionar páginas">
+            <q-icon name="arrow_drop_down" size="18px" />
+            <q-menu class="acro-menu" anchor="bottom right" self="top right" auto-close>
+              <q-list dense style="min-width: 220px">
+                <q-item v-for="o in RANGE_PRESETS" :key="o.v" clickable @click="pickRange(o.v)"><q-item-section>{{ o.l }}</q-item-section></q-item>
+              </q-list>
+            </q-menu>
+          </button>
+        </div>
+        <span v-if="rangeError" class="range-error">{{ rangeError }}</span>
         <button class="acro-ibtn" :disabled="!sel.length" @click="shell.commands.rotatePages(sel, -90)">
           <q-icon name="sym_o_rotate_left" /><q-tooltip>Girar 90 grados a la izquierda</q-tooltip>
         </button>
@@ -195,7 +205,7 @@
           </q-menu>
         </button>
         <button class="acro-ibtn" :class="{ active: et === 'redact' }" @click="toggleTool('redact')">
-          <AcroIcon name="redact" :size="20" color="#d0d0d0" /> Redactar texto e imágenes
+          <AcroIcon name="redact" :size="20" color="#4b4b4b" /> Redactar texto e imágenes
         </button>
         <button class="acro-ibtn" @click="shell.commands.applyRedactions()">
           <q-icon name="sym_o_check_circle" /> Aplicar
@@ -274,7 +284,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, ref, type Ref } from 'vue'
+import { computed, inject, ref, watch, type Ref } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, STAMP_NAMES, type Tool } from '@/stores/editor'
 import { useUiStore } from '@/stores/ui'
@@ -300,13 +310,64 @@ const tool = computed(() => ui.toolMeta)
 const et = computed(() => editorStore.currentTool)
 const sel = computed(() => [...ui.selectedPages].sort((a, b) => a - b))
 
-function setTool(t: Tool) { editorStore.setTool(t) }
+function setTool(t: Tool) {
+  editorStore.setTool(t)
+  if (t === 'crop') editorStore.setStatus('Arrastre un rectangulo para elegir el area que desea conservar')
+  if (t === 'link') editorStore.setStatus('Arrastre un rectangulo para crear un vinculo')
+}
 function toggleTool(t: Tool) { editorStore.setTool(et.value === t ? 'select' : t) }
 
 // ── Organize ──
-const rangeChoice = ref('')
+const RANGE_PRESETS = [
+  { v: 'all', l: 'Todas las páginas' }, { v: 'even', l: 'Páginas pares' }, { v: 'odd', l: 'Páginas impares' },
+  { v: 'landscape', l: 'Páginas horizontales' }, { v: 'portrait', l: 'Páginas verticales' }, { v: 'none', l: 'Ninguna' }
+]
+/** "1,2,3,5,7,8" → "1-3, 5, 7-8" (1-based), as Acrobat writes a selection. */
+function formatRange(pages: number[]): string {
+  const out: string[] = []
+  for (let i = 0; i < pages.length; i++) {
+    const a = pages[i]
+    let b = a
+    while (i + 1 < pages.length && pages[i + 1] === b + 1) b = pages[++i]
+    out.push(a === b ? `${a + 1}` : `${a + 1}-${b + 1}`)
+  }
+  return out.join(', ')
+}
+/** "1, 3-5, 9" → 0-based page indices; null when a part is not a page of this document. */
+function parseRange(text: string, n: number): number[] | null {
+  const set = new Set<number>()
+  for (const raw of text.split(/[,;]/)) {
+    const part = raw.trim()
+    if (!part) continue
+    const m = part.match(/^(\d+)\s*(?:-\s*(\d+))?$/)
+    if (!m) return null
+    let a = Number(m[1]), b = m[2] ? Number(m[2]) : a
+    if (a > b) [a, b] = [b, a]
+    if (a < 1 || b > n) return null
+    for (let k = a; k <= b; k++) set.add(k - 1)
+  }
+  return [...set].sort((x, y) => x - y)
+}
+const rangeEditing = ref(false)
+const rangeDraft = ref('')
+const rangeError = ref('')
+const rangeText = computed({
+  get: () => rangeEditing.value ? rangeDraft.value : formatRange(sel.value),
+  set: v => { rangeDraft.value = v; rangeError.value = '' }
+})
+watch(rangeEditing, on => { if (on) rangeDraft.value = formatRange(sel.value) })
+function commitRange() {
+  if (!rangeEditing.value) return
+  rangeEditing.value = false
+  const text = rangeDraft.value.trim()
+  if (text === formatRange(sel.value)) return
+  const pages = parseRange(text, docStore.totalPages)
+  if (!pages) { rangeError.value = `Intervalo no válido (1-${docStore.totalPages})`; return }
+  rangeError.value = ''
+  ui.selectedPages = pages
+}
 async function pickRange(v: string) {
-  rangeChoice.value = ''
+  rangeError.value = ''
   const n = docStore.totalPages
   const all = Array.from({ length: n }, (_, i) => i)
   if (v === 'all') ui.selectedPages = all
@@ -415,14 +476,28 @@ const engineLabel = computed(() => engineOptions.find(o => o.value === editorSto
   border-bottom: 1px solid var(--acro-rule); padding: 0 10px 0 20px; user-select: none;
 }
 .accent { position: absolute; left: 0; top: 0; bottom: 0; width: 8px; background: var(--accent); }
-.tool-name { font-size: 15px; font-weight: 700; color: #fff; white-space: nowrap; min-width: 160px; }
+.tool-name { font-size: 15px; font-weight: 700; color: var(--acro-text-strong); white-space: nowrap; min-width: 160px; }
 .opts { flex: 1; display: flex; align-items: center; justify-content: center; gap: 4px; overflow: hidden; }
-.opts .acro-ibtn { font-size: 14px; color: #ececec; }
+/* No document yet: the bar is shown for what it offers, and none of it acts. */
+.opts.off { opacity: 0.4; pointer-events: none; }
+.opts .acro-ibtn { font-size: 14px; color: var(--acro-text); }
 .close-pill { margin-left: 12px; }
-.range-select { width: 220px; height: 26px; margin-right: 6px; }
-.ab { font-family: 'Times New Roman', serif; font-size: 17px; font-weight: 700; color: #ddd; }
+.range-box {
+  display: inline-flex; align-items: center; width: 220px; height: 26px; margin-right: 6px; flex: none;
+  border-bottom: 1px solid var(--acro-input-border);
+}
+.range-box:focus-within { border-bottom-color: var(--acro-blue); }
+.range-input {
+  flex: 1; min-width: 0; height: 100%; border: 0; outline: 0; background: transparent; padding: 0 6px;
+  font: inherit; font-size: 12px; color: var(--acro-text);
+}
+.range-input::placeholder { color: var(--acro-text-dim); }
+.range-caret { border: 0; background: transparent; color: var(--acro-text-dim); cursor: pointer; padding: 0; display: flex; }
+.range-caret:hover:not(:disabled) { color: var(--acro-text-strong); }
+.range-error { color: var(--acro-danger); font-size: 12px; margin-right: 8px; white-space: nowrap; }
+.ab { font-family: 'Times New Roman', serif; font-size: 17px; font-weight: 700; color: var(--acro-text); }
 .sig-preview { max-width: 200px; max-height: 48px; background: #fff; border-radius: 2px; }
 .sig-preview.small { max-height: 32px; }
-.hint { color: #c8c8c8; font-size: 13px; margin: 0 6px; }
-.prot-note { color: #f5c46b; font-size: 12px; margin-left: 10px; display: inline-flex; align-items: center; gap: 4px; }
+.hint { color: var(--acro-text); font-size: 13px; margin: 0 6px; }
+.prot-note { color: #a35f00; font-size: 12px; margin-left: 10px; display: inline-flex; align-items: center; gap: 4px; }
 </style>

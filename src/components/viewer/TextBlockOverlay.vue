@@ -92,6 +92,10 @@
         ref="addTextEditorRef"
         v-model="addTextValue"
         class="inline-editor add-text-editor"
+        :style="{ fontSize: `${editorStore.fontSize * scaleY}px`, color: editorStore.textColor,
+          fontFamily: editorStore.fontFamily.startsWith('Times') ? 'Times New Roman, serif' : editorStore.fontFamily.startsWith('Courier') ? 'monospace' : 'Arial, sans-serif',
+          fontWeight: /Bold/.test(editorStore.fontFamily) ? 'bold' : 'normal',
+          fontStyle: /Italic|Oblique/.test(editorStore.fontFamily) ? 'italic' : 'normal' }"
         placeholder="Type new text..."
         @keydown.enter.ctrl="commitAddText"
         @keydown.escape="cancelAddText"
@@ -176,6 +180,8 @@ const getPageCanvas = inject<(page: number) => HTMLCanvasElement | undefined>('g
 const ocrController = inject<{
   isScanLike: (pageIndex: number) => Promise<boolean>
   recognise: (pageIndex: number) => Promise<void>
+  /** Converts the page on its own when "Reconocer texto" is on (Acrobat's default). */
+  autoRecognise?: (pageIndex: number) => Promise<void>
   busy: { value: boolean }
 } | null>('ocrController', null)
 const ocrStore = useOcrStore()
@@ -569,6 +575,9 @@ async function loadBlocks(announce = false) {
     if ((data.length === 0 || hiddenLayer.value) && editorStore.currentTool === 'edit' && ocrController) {
       const isScan = await ocrController.isScanLike(pageIndex)
       if (isScan && pageIndex === docStore.currentPage - 1) {
+        // Not awaited: the conversion takes seconds and loadBlocks is awaited
+        // by the reload that follows every edit.
+        if (ocrStore.itemsFor(pageIndex).length === 0) void ocrController.autoRecognise?.(pageIndex)
         editorStore.setStatus(ocrStore.itemsFor(pageIndex).length > 0
           ? 'Scanned page: click a recognised line to edit it'
           : 'This page is a scan — click on the text to recognise it')
@@ -1200,7 +1209,7 @@ function closeEditorIfStill(block: TextBlock) {
   editorPopulated = false
   editingBlock.value = null
   editingGroup.value = []
-  clearSelection()
+  // Formatting controls still act on the text after its inline edit commits.
 }
 
 function cancelEdit() {
@@ -1457,7 +1466,12 @@ watch(selectedBlocks, (sel) => {
   const first = sel[0]
   if (!first) return
   syncingStyle = true
-  editorStore.fontFamily = familyOf(first)
+  const base = familyOf(first)
+  const weight = first.isBold || /bold|black|heavy/i.test(first.fontName || '')
+  const slant = first.isItalic || /italic|oblique/i.test(first.fontName || '')
+  editorStore.fontFamily = weight || slant
+    ? `${base === 'Times-Roman' ? 'Times' : base}-${weight ? 'Bold' : ''}${slant ? (base === 'Times-Roman' ? 'Italic' : 'Oblique') : ''}`
+    : base
   editorStore.fontSize = Math.max(1, Math.round(first.fontSize))
   editorStore.textColor = rgb01ToHex(first.color)
   // Released a tick later, once the watcher below has seen — and ignored — the
@@ -2516,7 +2530,8 @@ async function commitAddText() {
         addTextPdfY.value,
         addTextValue.value,
         editorStore.fontSize,
-        'Helvetica'
+        editorStore.fontFamily,
+        hexToRgb01(editorStore.textColor)
       )
 
       if (success) {

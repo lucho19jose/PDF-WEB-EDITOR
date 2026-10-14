@@ -46,7 +46,7 @@ const isShape = computed(() => ['rectangle', 'circle'].includes(editorStore.curr
 
 <style scoped>
 .style-controls { display: flex; align-items: center; gap: 8px; }
-.lbl { color: #c8c8c8; font-size: 12px; }
+.lbl { color: var(--acro-text); font-size: 12px; }
 .size { width: 54px; }
 .width { width: 64px; }
 .op { width: 64px; }

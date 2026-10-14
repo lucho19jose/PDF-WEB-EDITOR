@@ -62,29 +62,29 @@ const shortName = computed(() => {
   border-bottom: 1px solid var(--acro-rule-dark); user-select: none;
 }
 .tab {
-  position: relative; border: 0; background: transparent; color: #c8c8c8; font: inherit; font-size: 15px;
+  position: relative; border: 0; background: transparent; color: var(--acro-text); font: inherit; font-size: 15px;
   padding: 0 17px; cursor: pointer;
 }
-.tab:hover { color: #fff; }
-.tab.active { color: #fff; }
-.tab.active::after { content: ''; position: absolute; left: 17px; right: 17px; bottom: 1px; height: 2px; background: #fff; }
+.tab:hover { color: var(--acro-text-strong); }
+.tab.active { color: var(--acro-text-strong); }
+.tab.active::after { content: ''; position: absolute; left: 17px; right: 17px; bottom: 1px; height: 2px; background: var(--acro-text-strong); }
 .doc-tab {
   display: flex; align-items: center; gap: 10px; min-width: 150px; max-width: 220px; padding: 0 10px 0 24px;
-  background: transparent; color: #d8d8d8; font-size: 13px; cursor: pointer; border-left: 1px solid #383838; border-right: 1px solid #383838;
+  background: transparent; color: var(--acro-text); font-size: 13px; cursor: pointer; border-left: 1px solid var(--acro-border); border-right: 1px solid var(--acro-border);
 }
-.doc-tab.active { background: var(--acro-bar); color: #fff; }
+.doc-tab.active { background: var(--acro-bar); color: var(--acro-text-strong); }
 .doc-name { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.doc-close { border: 0; background: transparent; color: #cfcfcf; width: 18px; height: 18px; border-radius: 3px; display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; }
-.doc-close:hover { background: #6a6a6a; color: #fff; }
+.doc-close { border: 0; background: transparent; color: var(--acro-text); width: 18px; height: 18px; border-radius: 3px; display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; }
+.doc-close:hover { background: var(--acro-hover); color: var(--acro-text-strong); }
 .round-btn {
   position: relative; align-self: center; width: 32px; height: 32px; border-radius: 50%; border: 0; background: transparent;
-  color: #d0d0d0; cursor: pointer; display: flex; align-items: center; justify-content: center; margin-right: 6px;
+  color: var(--acro-text); cursor: pointer; display: flex; align-items: center; justify-content: center; margin-right: 6px;
 }
-.round-btn:hover { background: #555; color: #fff; }
+.round-btn:hover { background: var(--acro-hover); color: var(--acro-text-strong); }
 .badge {
   position: absolute; top: 3px; right: 2px; min-width: 15px; height: 15px; border-radius: 8px; background: var(--acro-blue);
   color: #fff; font-size: 10px; line-height: 15px; padding: 0 3px;
 }
-.signin { border: 0; background: transparent; color: #f2f2f2; font: inherit; font-size: 15px; font-weight: 700; padding: 0 20px 0 12px; cursor: pointer; }
-.signin:hover { color: #fff; }
+.signin { border: 0; background: transparent; color: var(--acro-text-strong); font: inherit; font-size: 15px; font-weight: 700; padding: 0 20px 0 12px; cursor: pointer; }
+.signin:hover { color: var(--acro-text-strong); }
 </style>

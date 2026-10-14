@@ -1,6 +1,6 @@
 <template>
   <q-dialog :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)">
-    <q-card dark class="bg-grey-9" style="min-width: 440px">
+    <q-card class="acro-card" style="min-width: 440px">
       <q-card-section>
         <div class="text-subtitle1">Assistant settings</div>
         <div class="text-caption text-grey-5">
@@ -11,7 +11,7 @@
       <q-card-section class="q-pt-none">
         <q-input
           v-model="key"
-          dark dense outlined
+          dense outlined
           label="OpenAI API key"
           :type="reveal ? 'text' : 'password'"
           autocomplete="off"
@@ -24,11 +24,11 @@
         <div class="text-caption text-grey-6 q-mt-xs q-mb-md">
           Stored only in this browser (localStorage). Clear the field to forget it.
         </div>
-        <q-input v-model="model" dark dense outlined label="Model" placeholder="gpt-4o-mini" spellcheck="false" />
+        <q-input v-model="model" dense outlined label="Model" placeholder="gpt-4o-mini" spellcheck="false" />
         <div class="text-caption text-grey-6 q-mt-xs q-mb-md">
           Any chat model with tool calling, e.g. gpt-4o-mini (cheap) or gpt-4o.
         </div>
-        <q-input v-model="endpoint" dark dense outlined label="Endpoint (optional)" placeholder="https://api.openai.com/v1/chat/completions" spellcheck="false" />
+        <q-input v-model="endpoint" dense outlined label="Endpoint (optional)" placeholder="https://api.openai.com/v1/chat/completions" spellcheck="false" />
         <div class="text-caption text-grey-6 q-mt-xs">
           Leave empty for the public API. Set a same-origin proxy URL if the API refuses this browser.
         </div>

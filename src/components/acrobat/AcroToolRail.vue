@@ -12,7 +12,7 @@
       <q-tooltip anchor="center left" self="center right">{{ t.label }}</q-tooltip>
     </button>
     <button class="rail-btn" @click="ui.view = 'tools'">
-      <AcroIcon name="moretools" color="#d6d6d6" :size="24" />
+      <AcroIcon name="moretools" color="#4b4b4b" :size="24" />
       <q-tooltip anchor="center left" self="center right">Más herramientas</q-tooltip>
     </button>
   </div>

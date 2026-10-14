@@ -85,6 +85,9 @@ import SearchHighlights from './SearchHighlights.vue'
 import OcrTextLayer from './OcrTextLayer.vue'
 import { enqueueOp } from '@/utils/opQueue'
 
+/** True while another view (Organizar páginas) covers the viewer without unmounting it. */
+const props = defineProps<{ hidden?: boolean }>()
+
 const docStore = useDocumentStore()
 const editorStore = useEditorStore()
 
@@ -259,7 +262,7 @@ async function pump() {
   if (renderBusy) return
   renderBusy = true
   try {
-    while (renderQueue.length) {
+    while (renderQueue.length && !props.hidden) {
       const page = renderQueue.shift()!
       const canvas = canvases.get(page)
       if (!canvas || painted.has(page)) continue
@@ -313,7 +316,7 @@ function neighbourhood(): number[] {
 
 /** Queue the current page first, then whatever is on or near the screen. */
 async function requestVisible(): Promise<void> {
-  if (!docStore.loaded) return
+  if (!docStore.loaded || props.hidden) return
   const wanted = new Set<number>()
   // eslint-disable-next-line prefer-const
   if (pageList.value.includes(docStore.currentPage)) wanted.add(docStore.currentPage)
@@ -425,6 +428,10 @@ function onScroll() {
   if (scrollFrame) return
   scrollFrame = requestAnimationFrame(() => {
     scrollFrame = 0
+    // Hidden (Organizar páginas is open over it): every page measures as a
+    // zero box, and reading "the page in view" from that would move the
+    // current page to wherever the organizer's own scroll happened to be.
+    if (!containerRef.value?.offsetParent) return
     // The page first, then what to paint: the paint window is centred on the
     // current page, so asking in the other order paints where we just left.
     if (continuous.value && !scrollingToPage) {
@@ -460,21 +467,23 @@ async function onTextChanged() {
   // Serialized through the global op queue: another op landing between the
   // save and the reload would be applied to a document that is about to be
   // replaced (silently lost).
-  await enqueueOp(async () => {
+  await enqueueOp(syncDocumentEdit)
+}
+
+provide('syncDocumentEdit', syncDocumentEdit)
+async function syncDocumentEdit() {
     try {
       const savedBytes = await pdfEngine.saveDocument()
       const bytes = new Uint8Array(savedBytes)
-      // Reload PDF.js without resetting page/tool state
-      await pdfViewer.reloadDocument(bytes)
-      // Also reload into MuPDF with the saved bytes
+      // Publish the new revision only after both engines can read it.
       await pdfEngine.loadDocument(savedBytes)
+      await pdfViewer.reloadDocument(bytes)
       docStore.markModified()
       await repaintAround(docStore.currentPage)
     } catch (err: any) {
       console.error('Failed to re-render after edit:', err)
       await repaintAround(docStore.currentPage)
     }
-  })
 }
 
 /**
@@ -535,6 +544,28 @@ watch(() => docStore.currentPage, async (page) => {
   requestVisible()
 })
 
+// Coming back from a view that covered the viewer: show the current page.
+// The page may have been chosen while hidden (a double-click in Organizar
+// páginas), or be the same number as before over a document that the
+// organizer has since reordered — either way the old scroll position is not
+// where the reader is going.
+let hiddenVersion = docStore.renderVersion
+watch(() => props.hidden, async (hidden) => {
+  if (hidden) { hiddenVersion = docStore.renderVersion; return }
+  // Organizing can change every page's order or rotation without changing
+  // the count. None of the previously painted canvases can be trusted.
+  if (hiddenVersion !== docStore.renderVersion) {
+    painted.clear()
+    attempts.clear()
+    renderQueue = []
+    sizes.value = new Map()
+    pdfSizes.value = new Map()
+  }
+  await nextTick()
+  if (continuous.value) scrollToPage(docStore.currentPage)
+  requestVisible()
+})
+
 watch(() => docStore.scale, repaintAll)
 // A version bump is nearly always one page being rewritten. Page inserts,
 // deletions and reorders change the COUNT, and that watcher repaints the lot.
@@ -575,7 +606,7 @@ defineExpose({ textBlockOverlayRef, annotationLayerRef })
   display: flex;
   flex-direction: column;
   align-items: center;
-  background: #3a3a3a;
+  background: var(--acro-canvas);
   padding: 20px 0;
 }
 .pdf-viewer-container.hand-mode { cursor: grab; }

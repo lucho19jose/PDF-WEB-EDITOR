@@ -208,13 +208,13 @@ async function share(email: boolean) {
 }
 .group { display: flex; align-items: center; gap: 4px; }
 .group.right { gap: 10px; }
-.page-box, .zoom-box { display: flex; align-items: center; gap: 6px; margin: 0 4px; color: #d8d8d8; }
+.page-box, .zoom-box { display: flex; align-items: center; gap: 6px; margin: 0 4px; color: var(--acro-text); }
 .page-box.disabled, .zoom-box.disabled { opacity: 0.4; }
 .page-input { width: 40px; text-align: center; height: 24px; }
-.page-total { font-size: 13px; color: #cfcfcf; }
+.page-total { font-size: 13px; color: var(--acro-text); }
 .zoom-box { gap: 0; }
 .zoom-input { width: 54px; text-align: center; height: 24px; }
-.zoom-caret { border: 0; background: transparent; color: #ccc; cursor: pointer; padding: 0; display: flex; }
-.zoom-caret:hover { color: #fff; }
+.zoom-caret { border: 0; background: transparent; color: var(--acro-text); cursor: pointer; padding: 0; display: flex; }
+.zoom-caret:hover { color: var(--acro-text-strong); }
 .blue { color: var(--acro-blue-text) !important; }
 </style>

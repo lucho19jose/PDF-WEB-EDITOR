@@ -1,6 +1,6 @@
 <template>
   <q-dialog :model-value="modelValue" persistent @update:model-value="v => !running && emit('update:modelValue', v)">
-    <q-card dark class="bg-grey-9" style="min-width: 460px">
+    <q-card class="acro-card" style="min-width: 460px">
       <q-card-section>
         <div class="text-subtitle1">Reconocer texto en este archivo</div>
         <div class="text-caption text-grey-5">
@@ -13,7 +13,7 @@
       <q-card-section v-if="!running" class="q-pt-none q-gutter-y-sm">
         <div class="text-caption text-grey-4">Pages</div>
         <q-option-group
-          v-model="pages" dark dense inline color="primary"
+          v-model="pages" dense inline color="primary"
           :options="[
             { label: `All (${totalPages})`, value: 'all' },
             { label: `Current (${currentPage})`, value: 'current' },
@@ -22,17 +22,17 @@
         />
         <q-input
           v-if="pages === 'range'"
-          v-model="range" dark dense outlined
+          v-model="range" dense outlined
           label="Pages, e.g. 3-5, 8"
           :error="!!range && parseRange(range, totalPages).length === 0"
           error-message="No page in that range"
         />
         <q-select
-          v-model="lang" dark dense outlined emit-value map-options
+          v-model="lang" dense outlined emit-value map-options
           label="Language"
           :options="languages"
         />
-        <q-toggle v-model="replaceExisting" dark dense color="primary"
+        <q-toggle v-model="replaceExisting" dense color="primary"
           label="Also pages that already have a text layer (replace it)" />
         <div class="text-caption text-grey-6">
           Engine: {{ engineLabel }}. Pages with real text are skipped. About 10–40 seconds per page.
@@ -41,7 +41,7 @@
 
       <q-card-section v-else class="q-pt-none">
         <div class="text-body2 q-mb-xs">{{ progress.stage || 'Recognising…' }}</div>
-        <q-linear-progress :value="progress.total ? progress.done / progress.total : 0" color="primary" dark rounded size="10px" />
+        <q-linear-progress :value="progress.total ? progress.done / progress.total : 0" color="primary" rounded size="10px" />
         <div class="text-caption text-grey-5 q-mt-xs">
           Page {{ progress.page }} — {{ progress.done }} of {{ progress.total }} done,
           {{ progress.layered }} recognised, {{ progress.skipped }} skipped

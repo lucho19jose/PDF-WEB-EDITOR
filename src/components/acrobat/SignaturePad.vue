@@ -125,20 +125,20 @@ defineExpose({ result })
 
 <style scoped>
 .sig-pad { width: 600px; max-width: 100%; }
-.tabs { display: flex; gap: 4px; border-bottom: 1px solid #5a5a5a; margin-bottom: 12px; }
-.tabs button { border: 0; background: transparent; color: #cfcfcf; font: inherit; font-size: 14px; padding: 8px 14px; cursor: pointer; border-bottom: 2px solid transparent; }
-.tabs button.on { color: #fff; border-bottom-color: #fff; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--acro-border); margin-bottom: 12px; }
+.tabs button { border: 0; background: transparent; color: var(--acro-text); font: inherit; font-size: 14px; padding: 8px 14px; cursor: pointer; border-bottom: 2px solid transparent; }
+.tabs button.on { color: var(--acro-text-strong); border-bottom-color: var(--acro-text-strong); }
 .area { position: relative; background: #fff; border-radius: 3px; min-height: 200px; padding: 12px; color: #111; }
 .type-input { width: 100%; border: 0; outline: 0; font-size: 46px; color: #111; background: transparent; height: 90px; }
 .styles { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.styles button { border: 1px solid #ccc; background: #fafafa; border-radius: 3px; padding: 4px 10px; font-size: 20px; cursor: pointer; color: #222; max-width: 180px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.styles button { border: 1px solid var(--acro-border); background: #fafafa; border-radius: 3px; padding: 4px 10px; font-size: 20px; cursor: pointer; color: #222; max-width: 180px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .styles button.on { border-color: var(--acro-blue); background: #e8f1fc; }
 .draw { width: 100%; height: 180px; cursor: crosshair; touch-action: none; display: block; }
 .clear { position: absolute; top: 8px; right: 10px; border: 0; background: transparent; color: var(--acro-blue); cursor: pointer; font: inherit; }
-.img-drop { height: 176px; display: flex; align-items: center; justify-content: center; cursor: pointer; color: #666; border: 1px dashed #aaa; border-radius: 3px; }
+.img-drop { height: 176px; display: flex; align-items: center; justify-content: center; cursor: pointer; color: #666; border: 1px dashed var(--acro-border); border-radius: 3px; }
 .img-drop img { max-width: 100%; max-height: 170px; }
-.line { position: absolute; left: 24px; right: 24px; bottom: 34px; border-bottom: 1px solid #bbb; pointer-events: none; }
-.colors { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 13px; color: #cfcfcf; }
+.line { position: absolute; left: 24px; right: 24px; bottom: 34px; border-bottom: 1px solid var(--acro-border); pointer-events: none; }
+.colors { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 13px; color: var(--acro-text); }
 .dot { width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; }
-.dot.on { border-color: #fff; }
+.dot.on { border-color: var(--acro-text-strong); }
 </style>

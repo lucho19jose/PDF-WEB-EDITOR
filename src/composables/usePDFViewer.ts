@@ -1,4 +1,4 @@
-import { ref, shallowRef } from 'vue'
+import { ref, shallowRef, onScopeDispose } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 // Vite-bundled module worker — avoids the "Setting up fake worker" fallback
 // (main-thread parsing) that workerSrc URL strings trigger under Vite dev
@@ -6,7 +6,13 @@ import PdfJsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 
-pdfjsLib.GlobalWorkerOptions.workerPort = new PdfJsWorker()
+/** Documents use an explicit worker so destroying one cannot destroy a peer's worker. */
+export function createPdfjsWorker() {
+  const port = new PdfJsWorker()
+  // PDF.js's generated declarations type the supported worker port as null.
+  const worker = new pdfjsLib.PDFWorker({ port } as any)
+  return { worker, destroy() { worker.destroy(); port.terminate() } }
+}
 
 /**
  * Everything pdf.js needs that is not in its bundle, served from `public/pdfjs`
@@ -24,10 +30,11 @@ pdfjsLib.GlobalWorkerOptions.workerPort = new PdfJsWorker()
  * `cMapUrl` and `standardFontDataUrl` are the same class: CJK text in a
  * non-embedded font and the base-14 faces this editor substitutes.
  */
-export function pdfjsDocumentOptions(data: Uint8Array): Parameters<typeof pdfjsLib.getDocument>[0] {
+export function pdfjsDocumentOptions(data: Uint8Array, worker: pdfjsLib.PDFWorker): Parameters<typeof pdfjsLib.getDocument>[0] {
   const base = `${import.meta.env.BASE_URL || '/'}pdfjs/`.replace(/\/\/+/g, '/')
   return {
     data,
+    worker,
     wasmUrl: `${base}wasm/`,
     iccUrl: `${base}iccs/`,
     cMapUrl: `${base}cmaps/`,
@@ -39,6 +46,7 @@ export function pdfjsDocumentOptions(data: Uint8Array): Parameters<typeof pdfjsL
 export function usePDFViewer() {
   const docStore = useDocumentStore()
   const editorStore = useEditorStore()
+  const pdfWorker = createPdfjsWorker()
 
   const pdfDoc = shallowRef<pdfjsLib.PDFDocumentProxy | null>(null)
   const isLoading = ref(false)
@@ -58,7 +66,7 @@ export function usePDFViewer() {
       let doc: pdfjsLib.PDFDocumentProxy
       try {
         if (old) await old.destroy()
-        const loadingTask = pdfjsLib.getDocument(pdfjsDocumentOptions(bytes.slice()))
+        const loadingTask = pdfjsLib.getDocument(pdfjsDocumentOptions(bytes.slice(), pdfWorker.worker))
         doc = await loadingTask.promise
         pdfDoc.value = doc
       } finally {
@@ -78,7 +86,7 @@ export function usePDFViewer() {
   }
 
   /** Reload PDF.js with new bytes without resetting document state (page, tool, etc.) */
-  async function reloadDocument(bytes: Uint8Array) {
+  async function reloadDocument(bytes: Uint8Array, order?: number[]) {
     // The reference is dropped BEFORE the (asynchronous) destroy: a render the
     // queue starts during the destroy would otherwise call `getPage` on a
     // document that is going away, and that call never settles — its wake-up
@@ -88,13 +96,13 @@ export function usePDFViewer() {
     abandonRenders()
     try {
       if (old) await old.destroy()
-      const loadingTask = pdfjsLib.getDocument(pdfjsDocumentOptions(bytes.slice()))
+      const loadingTask = pdfjsLib.getDocument(pdfjsDocumentOptions(bytes.slice(), pdfWorker.worker))
       const doc = await loadingTask.promise
       pdfDoc.value = doc
     } finally {
       documentReady()
     }
-    docStore.reloadBytes(bytes, pdfDoc.value!.numPages)
+    docStore.reloadBytes(bytes, pdfDoc.value!.numPages, order)
   }
 
   let renderToken = 0
@@ -249,6 +257,13 @@ export function usePDFViewer() {
     const page = await pdfDoc.value.getPage(pageNum)
     return page.getViewport({ scale: docStore.scale })
   }
+
+  onScopeDispose(() => {
+    abandonRenders()
+    documentReady()
+    void pdfDoc.value?.destroy().catch(() => {})
+    pdfWorker.destroy()
+  })
 
   return {
     pdfDoc, isLoading, error,

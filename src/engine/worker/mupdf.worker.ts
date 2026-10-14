@@ -26,6 +26,8 @@ let pdfDoc: any = null // mupdf.PDFDocument
  * length, and every signature then reads as partial, which is the truth.
  */
 let loadedByteLength = 0
+/** Whether the loaded document carries a digital signature; worked out on first save. */
+let signedDoc: boolean | null = null
 
 // Font encoding cache: fontName → { unicodeToGlyph, glyphToUnicode, codeBytes } (null = no ToUnicode CMap)
 const fontEncodingCache = new Map<string, {
@@ -68,6 +70,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         invalidateContentSources()
         const bytes = new Uint8Array(req.data.bytes)
         loadedByteLength = bytes.length
+        signedDoc = null
         pdfDoc = new mupdf.PDFDocument(bytes)
         const pageCount = pdfDoc.countPages()
         respond({ id: req.id, type: 'success', data: { pageCount } })
@@ -445,7 +448,8 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         if (!pdfDoc) throw new Error('No document loaded')
         // garbage=compact removes orphaned objects (e.g. content streams replaced
         // wholesale during edits) so the output doesn't bloat across edit cycles.
-        const buf = pdfDoc.saveToBuffer('compress,garbage=compact')
+        // A SIGNED document is appended to instead — see `saveOptions`.
+        const buf = saveDocumentBuffer()
         const savedBytes = buf.asUint8Array().slice()
         buf.destroy()
         // Transfer instead of structured-cloning the whole document
@@ -487,7 +491,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       // The Acrobat-style tools (organize, crop, header/footer, watermark,
       // redact, links, protect, export, create) — see acroTools.ts.
       case 'acro': {
-        const needsDoc = !['createPdf', 'needsPassword', 'unlock'].includes(req.data.op)
+        const needsDoc = !['createPdf', 'combinePdf', 'needsPassword', 'unlock'].includes(req.data.op)
         if (needsDoc && !pdfDoc) throw new Error('No document loaded')
         if (!mupdf) throw new Error('MuPDF not initialized')
         const { data, transfer } = acroTools(req.data.op, req.data.args ?? {})
@@ -531,6 +535,7 @@ const acroTools = createAcroTools({
   invalidateContentSources,
   getPageSize,
   rotatePage,
+  rearrangePages: order => rearrangePagesKeepingForm(order),
   measureRunWidth: (text, fontSize, fontName) => measureRunWidth(text, fontSize, fontName),
   addTextRunToPage: (pageIndex, parts, rotation, tag) => addTextRunToPage(pageIndex, parts, rotation, tag),
   buildShowOps: (pageObj, text, fontSize, fontName) => buildShowOps(pageObj, text, fontSize, fontName),
@@ -539,6 +544,7 @@ const acroTools = createAcroTools({
   matConcat,
   getCtmAtOffset,
   ownPageResources,
+  copyImage: copySelectedImage,
   isNullObj,
   fmtNum
 })
@@ -13118,6 +13124,94 @@ function duplicatePage(pageIndex: number): {
   }
 }
 
+/**
+ * `rearrangePages`, without losing the form.
+ *
+ * MuPDF's rearrange deletes the catalog's /AcroForm outright while leaving
+ * every page's widgets in place. On a signed document that unregistered the
+ * signatures: the pages still drew them, but a reader that lists signatures
+ * through the form (Acrobat's Signatures panel, any validator) found none —
+ * "the signatures are removed when I reorder the pages". The dictionary is
+ * put back as it was, minus the fields whose widgets left with deleted pages.
+ */
+function rearrangePagesKeepingForm(order: number[]): void {
+  const catalog = () => derefObj(safe(() => pdfDoc.getTrailer().get('Root'), null))
+  const form = safe(() => catalog()?.get('AcroForm'), null)
+  pdfDoc.rearrangePages(order)
+  if (!form || String(form) === 'null') return
+  // Read the catalog again: the rearrange REPLACES it, so a handle resolved
+  // before it is a detached copy that writes nowhere.
+  const root = catalog()
+  if (!root || derefObj(safe(() => root.get('AcroForm'), null))) return // none, or this build kept it
+  root.put('AcroForm', form)
+  pruneFieldsWithoutWidgets(derefObj(form))
+}
+
+/**
+ * Drop the /AcroForm fields none of whose widgets is on a page any more. A
+ * field without widgets (a hidden one, or one that never had any) stays.
+ */
+function pruneFieldsWithoutWidgets(form: any): void {
+  const fields = derefObj(safe(() => form?.get('Fields'), null))
+  if (!fields || !safe(() => fields.isArray(), false)) return
+  const onPage = new Set<number>()
+  const pageCount = safe(() => pdfDoc.countPages(), 0)
+  for (let p = 0; p < pageCount; p++) {
+    const annots = derefObj(safe(() => pdfDoc.findPage(p).get('Annots'), null))
+    const n = annots && safe(() => annots.isArray(), false) ? safe(() => annots.length, 0) : 0
+    for (let i = 0; i < n; i++) {
+      const a = safe(() => annots.get(i), null)
+      if (a && safe(() => a.isIndirect(), false)) onPage.add(a.asIndirect())
+    }
+  }
+  // true = keep. A field is its own widget (merged dictionary) or a parent of
+  // kids that are; a parent whose kids all went goes with them.
+  const prune = (arr: any, depth: number): void => {
+    const n = safe(() => arr.length, 0)
+    for (let i = n - 1; i >= 0; i--) {
+      const ref = safe(() => arr.get(i), null)
+      const f = derefObj(ref)
+      if (!f || !safe(() => f.isDictionary(), false)) continue
+      const kids = derefObj(safe(() => f.get('Kids'), null))
+      let keep = true
+      if (kids && safe(() => kids.isArray(), false) && depth < 32) {
+        const before = safe(() => kids.length, 0)
+        prune(kids, depth + 1)
+        keep = before === 0 || safe(() => kids.length, 0) > 0
+      } else if (sigName(f, 'Subtype') === 'Widget') {
+        keep = !safe(() => ref.isIndirect(), false) || onPage.has(ref.asIndirect())
+      }
+      if (!keep) arr.delete(i)
+    }
+  }
+  prune(fields, 0)
+}
+
+/**
+ * The document as bytes. A signed one is saved INCREMENTALLY: the bytes it
+ * was opened from are written back untouched and the edits appended as an
+ * update after them, which is how every signing tool adds its own signature.
+ * Each signature's /ByteRange still covers exactly the bytes it signed, so
+ * it stays valid for its revision, and Acrobat reports the later edits as
+ * changes made after signing instead of a broken signature. A full rewrite
+ * (garbage=compact renumbers and recompresses everything) broke every
+ * digest on the first edit — "the signature is removed when I edit".
+ *
+ * The engine reloads from these bytes after every edit, so the edits pile up
+ * as one update each; that growth is the price of keeping the signatures.
+ * MuPDF refuses an incremental save of a file it had to repair, and that one
+ * is rewritten as before.
+ */
+function saveDocumentBuffer(): any {
+  if (signedDoc === null) signedDoc = getSignatures().length > 0
+  if (signedDoc && safe(() => pdfDoc.canBeSavedIncrementally(), false)) {
+    try { return pdfDoc.saveToBuffer('incremental,compress') } catch (err) {
+      console.warn('[MuPDF Worker] incremental save failed, rewriting the file:', err)
+    }
+  }
+  return pdfDoc.saveToBuffer('compress,garbage=compact')
+}
+
 function movePage(from: number, to: number): {
   success: boolean; pageCount?: number; error?: string } {
   invalidateContentSources() // page indices shift
@@ -13128,7 +13222,7 @@ function movePage(from: number, to: number): {
     for (let i = 0; i < n; i++) order.push(i)
     const [moved] = order.splice(from, 1)
     order.splice(to, 0, moved)
-    pdfDoc.rearrangePages(order)
+    rearrangePagesKeepingForm(order)
     return { success: true, pageCount: pdfDoc.countPages() }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
@@ -13361,4 +13455,47 @@ function searchDocument(needle: string, maxHitsPerPage = 100): any[] {
     all.push(...searchPage(i, needle, maxHitsPerPage))
   }
   return all
+}
+
+/** Copy only the selected picture, never the text or background behind it.
+ * Render once, in the worker, bounded to 16MP. Repeated pastes reuse the PNG.
+ */
+function copySelectedImage(a: any): { bytes: ArrayBuffer; width: number; height: number } {
+  if (!pdfDoc || !mupdf) throw new Error('No document')
+  const page = pdfDoc.loadPage(a.pageIndex)
+  let isolated: any = null, target: any = null, pix: any = null, image: any = null
+  try {
+    let width: number, height: number, scale: number
+    if (a.annotIndex !== undefined) {
+      const annot = page.getAnnotations()[a.annotIndex]
+      if (!annot || annot.getType() !== 'Stamp') throw new Error('Seleccione una imagen')
+      const r = annot.getRect()
+      width = r[2] - r[0]; height = r[3] - r[1]
+      scale = Math.min(3, 4096 / Math.max(width, height), Math.sqrt(16000000 / (width * height)))
+      pix = annot.toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceRGB, true)
+    } else {
+      const site = locateContentImage(a.pageIndex, a.sourceKey, a.doOffset, a.name)
+      if ('error' in site) throw new Error(site.error)
+      const { src, F, x0, x1, y0, y1 } = site
+      const resources = src.resources || pageResourcesOf(page.getObject())
+      const ref = resources.resolve().get('XObject').resolve().get(a.name)
+      image = pdfDoc.loadImage(ref)
+      width = x1 - x0; height = y1 - y0
+      scale = Math.min(Math.max(image.getWidth() / width, image.getHeight() / height),
+        4096 / Math.max(width, height), Math.sqrt(16000000 / (width * height)))
+      isolated = new mupdf.PDFDocument()
+      const copy = isolated.graftObject(ref)
+      const matrix = [...F]; matrix[4] -= x0; matrix[5] -= y0
+      const obj = isolated.addPage([0, 0, width, height], 0, { XObject: { Image: copy } },
+        `q ${matrix.map(fmtNum).join(' ')} cm /Image Do Q`)
+      isolated.insertPage(-1, obj)
+      target = isolated.loadPage(0)
+      pix = target.toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceRGB, true, false)
+    }
+    const png = pix.asPNG()
+    const bytes = new Uint8Array(png).buffer
+    return { bytes, width, height }
+  } finally {
+    pix?.destroy(); target?.destroy(); isolated?.destroy(); image?.destroy(); page.destroy()
+  }
 }

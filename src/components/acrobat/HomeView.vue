@@ -113,9 +113,11 @@ async function open(f: RecentFile) {
 async function forget(id: string) { await forgetRecent(id); await refresh() }
 async function clearAll() { await clearRecent(); await refresh() }
 async function onDrop(e: DragEvent) {
-  const f = e.dataTransfer?.files?.[0]
-  if (f && /pdf$/i.test(f.type || f.name)) await openPdfFile(f)
-  else if (e.dataTransfer?.files?.length) await shell.commands.createPdf([...e.dataTransfer.files].filter(shell.commands.isImage))
+  const files = Array.from(e.dataTransfer?.files ?? [])
+  if (files.length > 1) { ui.openDialog('combine', { files }); return }
+  const file = files[0]
+  if (file && (file.type === 'application/pdf' || /\.pdf$/i.test(file.name))) await openPdfFile(file)
+  else if (file && shell.commands.isImage(file)) await shell.commands.createPdf([file])
 }
 
 function when(t: number) {
@@ -131,45 +133,45 @@ function size(b: number) {
 <style scoped>
 .home { display: flex; height: 100%; background: var(--acro-bar); color: var(--acro-text); }
 .home-nav { width: 230px; flex: none; background: var(--acro-pane); border-right: 1px solid var(--acro-rule); padding: 18px 0; display: flex; flex-direction: column; }
-.nav-item { display: flex; align-items: center; gap: 8px; text-align: left; border: 0; background: transparent; color: #e0e0e0; font: inherit; font-size: 14px; padding: 9px 24px; cursor: pointer; }
+.nav-item { display: flex; align-items: center; gap: 8px; text-align: left; border: 0; background: transparent; color: var(--acro-text); font: inherit; font-size: 14px; padding: 9px 24px; cursor: pointer; }
 .nav-item:hover { background: var(--acro-hover); }
-.nav-item.active { background: #5d5d5d; color: #fff; font-weight: 700; }
-.nav-head { color: #9a9a9a; font-size: 12px; font-weight: 700; text-transform: uppercase; padding: 20px 24px 6px; }
+.nav-item.active { background: var(--acro-pressed); color: var(--acro-text-strong); font-weight: 700; }
+.nav-head { color: var(--acro-text-dim); font-size: 12px; font-weight: 700; text-transform: uppercase; padding: 20px 24px 6px; }
 .home-main { flex: 1; overflow-y: auto; padding: 28px 44px 60px; }
 .welcome {
   display: flex; align-items: center; gap: 30px; padding: 26px 30px; border-radius: 6px;
-  background: linear-gradient(100deg, #3b3f4a 0%, #464646 60%, #4d4d4d 100%); border: 1px solid #5a5a5a;
+  background: linear-gradient(100deg, #e8f1fc 0%, #f4f6fa 60%, #fafafa 100%); border: 1px solid var(--acro-border);
 }
 .welcome-text { flex: 1; }
-.welcome h1 { font-size: 26px; font-weight: 700; margin: 0 0 8px; line-height: 1.2; color: #fff; }
-.welcome p { margin: 0; color: #cfcfcf; font-size: 14px; max-width: 640px; line-height: 1.5; }
+.welcome h1 { font-size: 26px; font-weight: 700; margin: 0 0 8px; line-height: 1.2; color: var(--acro-text-strong); }
+.welcome p { margin: 0; color: var(--acro-text); font-size: 14px; max-width: 640px; line-height: 1.5; }
 .welcome-actions { display: flex; flex-direction: column; gap: 10px; }
-.rec-title { margin: 30px 0 14px; font-size: 16px; font-weight: 700; color: #f0f0f0; }
+.rec-title { margin: 30px 0 14px; font-size: 16px; font-weight: 700; color: var(--acro-text-strong); }
 .rec-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; }
 .rec-card {
   display: flex; flex-direction: column; align-items: flex-start; gap: 8px; text-align: left; padding: 18px 16px 14px;
-  background: #424242; border: 1px solid #5a5a5a; border-radius: 6px; color: inherit; font: inherit; cursor: pointer;
+  background: var(--acro-surface-2); border: 1px solid var(--acro-border); border-radius: 6px; color: inherit; font: inherit; cursor: pointer;
 }
-.rec-card:hover { background: #484848; border-color: #7a7a7a; }
-.rec-name { font-weight: 700; font-size: 14px; color: #fff; }
-.rec-desc { font-size: 12px; color: #bdbdbd; line-height: 1.4; flex: 1; }
+.rec-card:hover { background: var(--acro-hover); border-color: var(--acro-border-strong); }
+.rec-name { font-weight: 700; font-size: 14px; color: var(--acro-text-strong); }
+.rec-desc { font-size: 12px; color: var(--acro-text-dim); line-height: 1.4; flex: 1; }
 .rec-use { color: var(--acro-blue-text); font-size: 13px; font-weight: 700; }
 .list-head { display: flex; align-items: center; margin: 34px 0 8px; }
-.list-head h2 { font-size: 18px; margin: 0; font-weight: 700; color: #fff; line-height: 1.2; }
+.list-head h2 { font-size: 18px; margin: 0; font-weight: 700; color: var(--acro-text-strong); line-height: 1.2; }
 .clear-btn { border: 0; background: transparent; color: var(--acro-blue-text); cursor: pointer; font: inherit; }
 .recent { width: 100%; border-collapse: collapse; font-size: 13px; }
-.recent th { text-align: left; color: #a8a8a8; font-size: 11px; font-weight: 700; padding: 8px 10px; border-bottom: 1px solid #5c5c5c; }
-.recent td { padding: 7px 10px; border-bottom: 1px solid #555; color: #dcdcdc; }
+.recent th { text-align: left; color: var(--acro-text-dim); font-size: 11px; font-weight: 700; padding: 8px 10px; border-bottom: 1px solid var(--acro-border); }
+.recent td { padding: 7px 10px; border-bottom: 1px solid var(--acro-border); color: var(--acro-text); }
 .recent tbody tr:not(.empty-row) { cursor: pointer; }
-.recent tbody tr:not(.empty-row):hover td { background: #555; }
+.recent tbody tr:not(.empty-row):hover td { background: var(--acro-hover); }
 .c-name { width: 50%; }
 .name-cell { display: flex; align-items: center; gap: 12px; }
-.mini { width: 28px; height: 36px; object-fit: cover; object-position: top; background: #fff; border: 1px solid #666; }
+.mini { width: 28px; height: 36px; object-fit: cover; object-position: top; background: #fff; border: 1px solid var(--acro-border); }
 .mini-icon { width: 28px; }
-.fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #f0f0f0; }
+.fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--acro-text-strong); }
 .c-act { width: 40px; text-align: right; }
-.row-btn { border: 0; background: transparent; color: #aaa; cursor: pointer; border-radius: 3px; display: inline-flex; padding: 2px; }
-.row-btn:hover { background: #666; color: #fff; }
-.empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 40px; color: #c8c8c8; }
-.faint { color: #8a8a8a; font-size: 12px; }
+.row-btn { border: 0; background: transparent; color: var(--acro-text-dim); cursor: pointer; border-radius: 3px; display: inline-flex; padding: 2px; }
+.row-btn:hover { background: var(--acro-hover); color: var(--acro-text-strong); }
+.empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 40px; color: var(--acro-text); }
+.faint { color: var(--acro-text-faint); font-size: 12px; }
 </style>

@@ -526,6 +526,7 @@ export function usePDFEngine() {
    * every other page operation: page indices and content may have moved.
    */
   async function acro<T = any>(op: string, args?: any, transfer?: Transferable[]): Promise<T> {
+    if (!await initEngine()) throw new Error(error.value || 'Failed to initialize MuPDF engine')
     const r = await bridge.acro<T>(op, args, transfer)
     if (ACRO_MUTATING_OPS.has(op)) pageTextCache.clear()
     const failed = r && typeof r === 'object' && (r as any).success === false

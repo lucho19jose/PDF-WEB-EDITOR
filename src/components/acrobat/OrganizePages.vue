@@ -1,6 +1,6 @@
 <template>
   <div
-    class="organize" tabindex="0"
+    class="organize" tabindex="0" :aria-busy="ui.pageOperationBusy"
     @keydown="onKey"
     @click.self="ui.selectedPages = []"
     @dragover.prevent="onAreaDragOver"
@@ -11,7 +11,7 @@
         v-for="p in docStore.totalPages" :key="p"
         class="cell"
         :class="{ selected: isSel(p - 1), dropBefore: dropAt === p - 1, dropAfter: dropAt === p && p === docStore.totalPages, dragging: draggingSet.has(p - 1) }"
-        draggable="true"
+        :draggable="!ui.pageOperationBusy"
         @click.stop="onClick($event, p - 1)"
         @dblclick.stop="openPage(p)"
         @dragstart="onDragStart($event, p - 1)"
@@ -65,15 +65,17 @@
     </div>
 
     <div v-if="fileDrop" class="file-drop">Suelte los archivos para insertarlos en la posición {{ (dropAt ?? docStore.totalPages) + 1 }}</div>
+    <div v-if="ui.pageOperationBusy" class="page-progress" role="status">Actualizando páginas…</div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted } from 'vue'
+import { ref, computed, inject, watch, onMounted, nextTick } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useUiStore } from '@/stores/ui'
 import ThumbImage from './ThumbImage.vue'
 import type { AcroShell } from './acroShell'
+import { pageDropPosition } from '@/utils/acro/pageDropPosition'
 
 const docStore = useDocumentStore()
 const ui = useUiStore()
@@ -84,11 +86,16 @@ const gridRef = ref<HTMLElement | null>(null)
 
 const thumbW = computed({ get: () => ui.organizeThumbWidth, set: v => { ui.organizeThumbWidth = v } })
 const sel = computed(() => [...ui.selectedPages].sort((a, b) => a - b))
-const isSel = (i: number) => ui.selectedPages.includes(i)
+const selectedSet = computed(() => new Set(ui.selectedPages))
+const isSel = (i: number) => selectedSet.value.has(i)
 /** A hover button acts on the selection when the page is part of it, else on that page alone. */
 const targets = (i: number) => (isSel(i) && ui.selectedPages.length > 1 ? sel.value : [i])
 
 let anchor = 0
+watch(() => docStore.renderVersion, () => {
+  ui.selectedPages = ui.selectedPages.filter(i => i >= 0 && i < docStore.totalPages)
+  anchor = Math.max(0, Math.min(anchor, docStore.totalPages - 1))
+})
 function onClick(e: MouseEvent, i: number) {
   if (e.shiftKey) {
     const [a, b] = [Math.min(anchor, i), Math.max(anchor, i)]
@@ -129,26 +136,44 @@ async function replaceSel() {
 const dropAt = ref<number | null>(null)
 const draggingSet = ref(new Set<number>())
 const fileDrop = ref(false)
+let dragCells: NodeListOf<HTMLElement> | null = null
+let dragRevision = -1
+function positionAt(e: DragEvent) {
+  dragCells ??= gridRef.value?.querySelectorAll<HTMLElement>('.cell') ?? null
+  return pageDropPosition(dragCells?.length ?? 0, i => dragCells![i].getBoundingClientRect(), e.clientX, e.clientY)
+}
 function onDragStart(e: DragEvent, i: number) {
+  if (ui.pageOperationBusy) { e.preventDefault(); return }
+  dragCells = null
+  dragRevision = docStore.renderVersion
   if (!isSel(i)) { ui.selectedPages = [i]; anchor = i }
   draggingSet.value = new Set(ui.selectedPages)
-  if (e.dataTransfer) { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('application/x-acro-pages', '1') }
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('application/x-acro-pages', JSON.stringify({ pages: [...draggingSet.value], revision: dragRevision }))
+  }
 }
-function onDragEnd() { draggingSet.value = new Set(); dropAt.value = null }
+function onDragEnd() { draggingSet.value = new Set(); dropAt.value = null; fileDrop.value = false; dragCells = null }
 function isFileDrag(e: DragEvent) { return !!e.dataTransfer && [...e.dataTransfer.types].includes('Files') }
 function onCellDragOver(e: DragEvent, i: number) {
+  if (ui.pageOperationBusy) return
   const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
   dropAt.value = e.clientX < r.left + r.width / 2 ? i : i + 1
   fileDrop.value = isFileDrag(e)
 }
 function onAreaDragOver(e: DragEvent) {
+  if (ui.pageOperationBusy) return
   fileDrop.value = isFileDrag(e)
-  if (dropAt.value === null) dropAt.value = docStore.totalPages
+  // White space is a drop target too; never carry the last cell's position
+  // into a gap or the empty area below the grid.
+  dropAt.value = positionAt(e)
 }
 async function onDrop(e: DragEvent) {
-  const at = dropAt.value ?? docStore.totalPages
-  dropAt.value = null
-  fileDrop.value = false
+  const at = positionAt(e)
+  const moving = [...draggingSet.value]
+  const revision = dragRevision
+  onDragEnd()
+  if (ui.pageOperationBusy) return
   if (isFileDrag(e)) {
     let pos = at
     for (const f of [...e.dataTransfer!.files]) {
@@ -158,21 +183,39 @@ async function onDrop(e: DragEvent) {
     }
     return
   }
-  const moving = [...draggingSet.value]
-  draggingSet.value = new Set()
-  if (moving.length) await commands.movePages(moving, at)
+  if (moving.length && revision === docStore.renderVersion) await commands.movePages(moving, at)
 }
 const onAreaDrop = onDrop
 
 // ── keyboard ──
 function onKey(e: KeyboardEvent) {
   if ((e.target as HTMLElement).tagName === 'INPUT') return
+  // The layout listens on the document for the viewer's paging keys (arrows
+  // turn the page, Home/End jump); here the same keys move the selection, and
+  // letting them through as well turned the document's page under the grid.
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'Delete', 'Enter'].includes(e.key)
+      || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a')) e.stopPropagation()
   const n = docStore.totalPages
+  if (!n) return
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); ui.selectedPages = Array.from({ length: n }, (_, k) => k); return }
-  if (e.key === 'Delete' && sel.value.length) { e.preventDefault(); commands.deletePages(sel.value); return }
+  if (e.key === 'Delete' && sel.value.length) { e.preventDefault(); if (!ui.pageOperationBusy) commands.deletePages(sel.value); return }
   if (e.key === 'Enter' && sel.value.length) { e.preventDefault(); openPage(sel.value[0] + 1); return }
+  if (e.key === 'Home' || e.key === 'End') {
+    e.preventDefault()
+    const to = e.key === 'Home' ? 0 : n - 1
+    if (e.shiftKey) {
+      const [a, b] = [Math.min(anchor, to), Math.max(anchor, to)]
+      ui.selectedPages = Array.from({ length: b - a + 1 }, (_, k) => a + k)
+    } else { ui.selectedPages = [to]; anchor = to }
+    return
+  }
   const cur = sel.value.length ? (e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? sel.value[0] : sel.value[sel.value.length - 1]) : -1
-  const perRow = Math.max(1, Math.floor((gridRef.value?.clientWidth ?? 800) / (thumbW.value + 90)))
+  const grid = gridRef.value
+  const style = grid ? getComputedStyle(grid) : null
+  const gap = parseFloat(style?.columnGap || '16')
+  const available = (grid?.clientWidth ?? 800) - parseFloat(style?.paddingLeft || '40') - parseFloat(style?.paddingRight || '40')
+  const cellWidth = grid?.querySelector('.cell')?.getBoundingClientRect().width ?? thumbW.value + 104
+  const perRow = Math.max(1, Math.floor((available + gap) / (cellWidth + gap)))
   const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -perRow, ArrowDown: perRow } as Record<string, number>
   if (e.key in step) {
     e.preventDefault()
@@ -184,9 +227,13 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   if (!ui.selectedPages.length) ui.selectedPages = [docStore.currentPage - 1]
-  ;(gridRef.value?.parentElement as HTMLElement | null)?.focus()
+  ;(gridRef.value?.parentElement as HTMLElement | null)?.focus({ preventScroll: true })
+  // Open on the page being read, not at the top of a long document.
+  await nextTick()
+  const cell = gridRef.value?.querySelectorAll('.cell')[docStore.currentPage - 1] as HTMLElement | undefined
+  cell?.scrollIntoView({ block: 'center' })
 })
 </script>
 
@@ -200,16 +247,16 @@ onMounted(() => {
 }
 .cell.selected .card { background: var(--acro-select); border-color: var(--acro-select-border); }
 .cell.dragging .card { opacity: 0.4; }
-.frame { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6); background: #fff; line-height: 0; }
-.label { margin-top: 14px; font-size: 13px; color: #e6e6e6; }
+.frame { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18); background: #fff; line-height: 0; }
+.label { margin-top: 14px; font-size: 13px; color: var(--acro-text); }
 .cell.selected .label { color: #1e5a96; }
 .hover-bar {
   position: absolute; right: -8px; top: 26px; display: none; flex-direction: column; gap: 8px;
-  background: #323232; border-radius: 3px; padding: 6px 4px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45); z-index: 2;
+  background: var(--acro-surface); border-radius: 3px; padding: 6px 4px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18); z-index: 2;
 }
 .cell:hover .hover-bar { display: flex; }
-.hover-bar button { width: 36px; height: 36px; border: 0; background: transparent; color: #f0f0f0; border-radius: 3px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-.hover-bar button:hover { background: #4f4f4f; }
+.hover-bar button { width: 36px; height: 36px; border: 0; background: transparent; color: var(--acro-text-strong); border-radius: 3px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.hover-bar button:hover { background: var(--acro-hover); }
 .hover-bar .q-icon { font-size: 24px; }
 .cell.dropBefore::before, .cell.dropAfter::after {
   content: ''; position: absolute; top: 20px; bottom: 20px; width: 3px; background: var(--acro-blue); border-radius: 2px;
@@ -218,14 +265,16 @@ onMounted(() => {
 .cell.dropAfter::after { right: -10px; }
 .zoom {
   position: sticky; bottom: 12px; float: right; margin: -60px 18px 0 0; display: flex; align-items: center; gap: 6px;
-  background: #323232; border-radius: 16px; padding: 4px 10px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5); z-index: 3;
+  background: var(--acro-surface); border-radius: 16px; padding: 4px 10px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18); z-index: 3;
 }
-.zoom button { border: 0; background: transparent; color: #ddd; cursor: pointer; display: flex; padding: 2px; border-radius: 50%; }
-.zoom button:hover { background: #555; }
-.zoom input[type=range] { width: 120px; accent-color: #ccc; }
-.zoom .count { color: #cfcfcf; font-size: 12px; margin-right: 8px; }
+.zoom button { border: 0; background: transparent; color: var(--acro-text); cursor: pointer; display: flex; padding: 2px; border-radius: 50%; }
+.zoom button:hover { background: var(--acro-hover); }
+.zoom input[type=range] { width: 120px; accent-color: var(--acro-text-dim); }
+.zoom .count { color: var(--acro-text); font-size: 12px; margin-right: 8px; }
 .file-drop {
   position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%); background: var(--acro-blue); color: #fff;
   padding: 8px 18px; border-radius: 18px; font-weight: 700; pointer-events: none; z-index: 5;
 }
+.page-progress { position: sticky; bottom: 16px; width: fit-content; margin: -38px auto 12px; padding: 8px 16px; border-radius: 18px; background: var(--acro-surface); color: var(--acro-text); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18); pointer-events: none; }
+.organize[aria-busy=true] .hover-bar { pointer-events: none; }
 </style>

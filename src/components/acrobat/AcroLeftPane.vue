@@ -199,36 +199,36 @@ const BookmarkNode: any = defineComponent({
 .acro-leftpane { display: flex; height: 100%; flex: none; background: var(--acro-pane); border-right: 1px solid var(--acro-rule); }
 .strip { width: 18px; display: flex; flex-direction: column; align-items: center; position: relative; }
 .acro-leftpane.open .strip { width: 36px; padding-top: 8px; gap: 4px; border-right: 1px solid var(--acro-rule); }
-.strip-btn { width: 30px; height: 30px; border: 0; border-radius: 3px; background: transparent; color: #cfcfcf; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.strip-btn { width: 30px; height: 30px; border: 0; border-radius: 3px; background: transparent; color: var(--acro-text); cursor: pointer; display: flex; align-items: center; justify-content: center; }
 .strip-btn:hover { background: var(--acro-hover); }
-.strip-btn.active { color: var(--acro-blue-text); background: #3a3a3a; }
+.strip-btn.active { color: var(--acro-blue-text); background: var(--acro-pressed); }
 .toggle {
   position: absolute; top: 50%; transform: translateY(-50%); width: 18px; height: 40px; border: 0; background: transparent;
-  color: #c2c2c2; cursor: pointer; padding: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--acro-text-dim); cursor: pointer; padding: 0; display: flex; align-items: center; justify-content: center;
 }
-.toggle:hover { color: #fff; }
+.toggle:hover { color: var(--acro-text-strong); }
 .acro-leftpane.open .toggle { width: 36px; }
 .toggle.open .q-icon { transform: rotate(180deg); }
 .panel { width: 210px; display: flex; flex-direction: column; min-height: 0; }
-.panel-head { display: flex; align-items: center; height: 38px; padding: 0 6px 0 12px; font-weight: 700; font-size: 13px; color: #f0f0f0; border-bottom: 1px solid var(--acro-rule); }
+.panel-head { display: flex; align-items: center; height: 38px; padding: 0 6px 0 12px; font-weight: 700; font-size: 13px; color: var(--acro-text-strong); border-bottom: 1px solid var(--acro-rule); }
 .tool-row { display: flex; gap: 2px; padding: 4px 8px; border-bottom: 1px solid var(--acro-rule); }
 .thumb-list { flex: 1; overflow-y: auto; padding: 12px 0 24px; }
 .thumb-item { display: flex; flex-direction: column; align-items: center; padding: 6px 0; cursor: pointer; position: relative; }
 .thumb-frame { padding: 4px; border: 2px solid transparent; border-radius: 2px; }
-.thumb-item:hover .thumb-frame { border-color: #777; }
+.thumb-item:hover .thumb-frame { border-color: var(--acro-border-strong); }
 .thumb-item.selected .thumb-frame { border-color: var(--acro-select-border); background: rgba(33, 117, 200, 0.25); }
 .thumb-item.current .thumb-frame { border-color: var(--acro-blue); }
-.thumb-label { font-size: 12px; color: #d0d0d0; margin-top: 4px; }
-.thumb-item.current .thumb-label { color: #fff; font-weight: 700; }
+.thumb-label { font-size: 12px; color: var(--acro-text); margin-top: 4px; }
+.thumb-item.current .thumb-label { color: var(--acro-text-strong); font-weight: 700; }
 .thumb-item.dropBefore::before, .thumb-item.dropAfter::after {
   content: ''; position: absolute; left: 20px; right: 20px; height: 3px; background: var(--acro-blue); border-radius: 2px;
 }
 .thumb-item.dropBefore::before { top: -1px; }
 .thumb-item.dropAfter::after { bottom: -1px; }
 .bm-list { flex: 1; overflow-y: auto; padding: 6px 0; }
-.empty { color: #9a9a9a; font-size: 12px; padding: 14px; }
-:deep(.bm-row) { display: flex; align-items: center; gap: 4px; padding: 4px 8px; cursor: pointer; color: #e6e6e6; font-size: 13px; }
+.empty { color: var(--acro-text-dim); font-size: 12px; padding: 14px; }
+:deep(.bm-row) { display: flex; align-items: center; gap: 4px; padding: 4px 8px; cursor: pointer; color: var(--acro-text); font-size: 13px; }
 :deep(.bm-row:hover) { background: var(--acro-hover); }
-:deep(.bm-tw) { width: 12px; color: #aaa; font-size: 11px; flex: none; }
+:deep(.bm-tw) { width: 12px; color: var(--acro-text-dim); font-size: 11px; flex: none; }
 :deep(.bm-title) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>

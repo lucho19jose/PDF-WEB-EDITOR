@@ -74,11 +74,11 @@ function close() {
  */
 .find-bar {
   position: absolute; top: calc(100% + 8px); right: 24px;
-  background: #2d2d2d; border: 1px solid #444; border-radius: 8px;
-  padding: 6px 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+  background: var(--acro-surface-2); border: 1px solid var(--acro-border); border-radius: 8px;
+  padding: 6px 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
 }
 .find-input {
-  background: transparent; border: none; outline: none; color: #eee;
+  background: transparent; border: none; outline: none; color: var(--acro-text-strong);
   font-size: 13px; width: 200px;
 }
 .slide-down-enter-active, .slide-down-leave-active { transition: all 0.15s ease; }

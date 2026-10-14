@@ -236,34 +236,35 @@
   </q-dialog>
 
   <!-- ═════════════ Combinar archivos ═════════════ -->
-  <q-dialog :model-value="ui.dialog === 'combine'" @update:model-value="(v: boolean) => !v && closeIf('combine')">
-    <div class="acro-card dlg wide">
+  <q-dialog :persistent="combineBusy" :model-value="ui.dialog === 'combine'" @update:model-value="(v: boolean) => !v && !combineBusy && closeIf('combine')">
+    <div class="acro-card dlg wide" @dragover.stop.prevent="cfDragOver" @drop.stop.prevent="dropCombine">
       <div class="acro-card-title">Combinar archivos</div>
       <div class="acro-card-body">
         <div class="inline">
-          <button class="acro-pill primary pill-sm" @click="addCombineFiles"><q-icon name="add" size="16px" /> Agregar archivos</button>
-          <label v-if="docStore.loaded" class="acro-check"><input v-model="combineWithOpen" type="checkbox" /> Incluir el documento abierto ({{ docStore.fileName }})</label>
+          <button class="acro-pill primary pill-sm" :disabled="combineBusy" @click="addCombineFiles"><q-icon name="add" size="16px" /> Agregar archivos</button>
+          <label v-if="docStore.loaded" class="acro-check"><input v-model="combineWithOpen" :disabled="combineBusy" type="checkbox" /> Incluir el documento abierto ({{ docStore.fileName }})</label>
         </div>
-        <div class="combine-list" @dragover.prevent @drop.prevent="dropCombine">
+        <div class="combine-list" :aria-busy="combineBusy">
           <div v-if="!combineFiles.length && !(combineWithOpen && docStore.loaded)" class="empty">Arrastre archivos PDF o imágenes aquí, o use "Agregar archivos".</div>
           <div v-if="combineWithOpen && docStore.loaded" class="cf-row fixed">
             <q-icon name="picture_as_pdf" color="red-5" size="22px" />
             <span class="cf-name">{{ docStore.fileName }}</span>
             <span class="cf-meta">{{ docStore.totalPages }} pág. · abierto</span>
           </div>
-          <div v-for="(f, i) in combineFiles" :key="i + f.name" class="cf-row" draggable="true" @dragstart="cfDrag = i" @dragover.prevent @drop.stop.prevent="cfDrop(i)">
+          <div v-for="(f, i) in combineFiles" :key="cfKey(f)" class="cf-row" :class="{ dragging: cfDrag === f, before: cfBefore === i, after: cfBefore === combineFiles.length && i === combineFiles.length - 1 }" :draggable="!combineBusy" @dragstart="cfStart($event, f)" @dragend="cfReset">
             <q-icon :name="commands.isImage(f) ? 'image' : 'picture_as_pdf'" :color="commands.isImage(f) ? 'teal-4' : 'red-5'" size="22px" />
             <span class="cf-name">{{ f.name }}</span>
             <span class="cf-meta">{{ sizeOf(f.size) }}</span>
-            <button class="row-btn" :disabled="i === 0" title="Subir" @click="cfMove(i, -1)"><q-icon name="arrow_upward" size="16px" /></button>
-            <button class="row-btn" :disabled="i === combineFiles.length - 1" title="Bajar" @click="cfMove(i, 1)"><q-icon name="arrow_downward" size="16px" /></button>
-            <button class="row-btn" title="Quitar" @click="combineFiles.splice(i, 1)"><q-icon name="close" size="16px" /></button>
+            <button class="row-btn" :disabled="combineBusy || i === 0" title="Subir" @click="cfMove(i, -1)"><q-icon name="arrow_upward" size="16px" /></button>
+            <button class="row-btn" :disabled="combineBusy || i === combineFiles.length - 1" title="Bajar" @click="cfMove(i, 1)"><q-icon name="arrow_downward" size="16px" /></button>
+            <button class="row-btn" :disabled="combineBusy" title="Quitar" @click="combineFiles.splice(i, 1)"><q-icon name="close" size="16px" /></button>
           </div>
         </div>
       </div>
+      <p v-if="combineError" class="combine-error" role="alert">{{ combineError }}</p>
       <div class="acro-card-actions">
-        <button class="acro-pill outline" @click="close">Cancelar</button>
-        <button class="acro-pill primary" :disabled="combineCount < 2" @click="applyCombine">Combinar</button>
+        <button class="acro-pill outline" :disabled="combineBusy" @click="close">Cancelar</button>
+        <button class="acro-pill primary" :disabled="combineBusy || combineCount < 2" @click="applyCombine">{{ combineBusy ? 'Combinando...' : 'Combinar' }}</button>
       </div>
     </div>
   </q-dialog>
@@ -349,6 +350,10 @@
         <div class="acro-card-body">
           <fieldset>
             <legend>Acción del vínculo</legend>
+            <label class="acro-check"><input v-model="link.visible" type="checkbox" /> Rectángulo visible</label>
+            <label class="acro-field">Color <input v-model="link.color" type="color" /></label>
+            <label class="acro-field">Grosor <input v-model.number="link.width" type="number" min="0.5" max="10" step="0.5" class="acro-input num" /></label>
+            <label class="acro-check"><input v-model="link.dashed" type="checkbox" /> Línea discontinua</label>
             <label class="acro-check"><input v-model="link.kind" type="radio" value="uri" /> Abrir una página web</label>
             <input v-if="link.kind === 'uri'" v-model="link.uri" class="acro-input full q-mt-xs" placeholder="https://" />
             <label class="acro-check q-mt-sm"><input v-model="link.kind" type="radio" value="page" /> Ir a una vista de página</label>
@@ -460,7 +465,7 @@
     <div class="acro-card dlg">
       <div class="acro-card-title">PDF Editor Pro</div>
       <div class="acro-card-body about">
-        <AcroIcon name="create" color="#ff7b82" :size="56" />
+        <AcroIcon name="create" color="#e34850" :size="56" />
         <p>Editor de PDF que modifica el contenido real del documento — texto, imágenes y páginas — con una interfaz familiar para quienes usan Acrobat.</p>
         <p class="note">No necesita una cuenta: todo se procesa en su equipo y los archivos no se suben a ningún servidor. Solo el OCR de Mistral y el asistente envían datos, y siempre piden permiso antes.</p>
         <p class="note">Motor de edición: MuPDF (AGPL). Renderizado: PDF.js.</p>
@@ -647,34 +652,77 @@ async function applyProperties() {
 // ═════════════ Combine ═════════════
 const combineFiles = ref<File[]>([])
 const combineWithOpen = ref(false)
-const cfDrag = ref<number | null>(null)
+const combineBusy = ref(false)
+const combineError = ref('')
+const cfDrag = ref<File | null>(null)
+const cfBefore = ref<number | null>(null)
+const cfKeys = new WeakMap<File, number>()
+let cfNextKey = 0, combineSession = 0
+function cfKey(file: File) { if (!cfKeys.has(file)) cfKeys.set(file, ++cfNextKey); return cfKeys.get(file)! }
 const combineCount = computed(() => combineFiles.value.length + (combineWithOpen.value && docStore.loaded ? 1 : 0))
+function appendCombineFiles(files: File[]) {
+  const supported = files.filter(f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf' || commands.isImage(f))
+  combineFiles.value.push(...supported)
+  combineError.value = supported.length !== files.length ? 'Solo se admiten archivos PDF e imagenes compatibles' : ''
+}
 async function addCombineFiles() {
+  const session = combineSession
   const files = await pickFiles('application/pdf,.pdf,image/*', true)
-  combineFiles.value.push(...files)
+  if (ui.dialog === 'combine' && session === combineSession && !combineBusy.value) appendCombineFiles(files)
 }
-function dropCombine(e: DragEvent) { combineFiles.value.push(...[...(e.dataTransfer?.files ?? [])]) }
+function cfReset() { cfDrag.value = null; cfBefore.value = null }
+function cfStart(e: DragEvent, f: File) {
+  if (combineBusy.value) { e.preventDefault(); return }
+  cfDrag.value = f
+  e.dataTransfer?.setData('application/x-pdf-editor-combine', String(cfKey(f)))
+  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+}
+function cfPosition(e: DragEvent) {
+  const card = (e.currentTarget as HTMLElement)
+  const rows = Array.from(card.querySelectorAll<HTMLElement>('.cf-row:not(.fixed)'))
+  let lo = 0, hi = rows.length
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1, r = rows[mid].getBoundingClientRect()
+    if (e.clientY < r.top + r.height / 2) hi = mid; else lo = mid + 1
+  }
+  return lo
+}
+function cfDragOver(e: DragEvent) {
+  if (combineBusy.value) return
+  if (e.dataTransfer) e.dataTransfer.dropEffect = cfDrag.value ? 'move' : 'copy'
+  cfBefore.value = cfDrag.value ? cfPosition(e) : null
+}
+function dropCombine(e: DragEvent) {
+  if (combineBusy.value) { cfReset(); return }
+  const files = Array.from(e.dataTransfer?.files ?? [])
+  if (files.length) { cfReset(); appendCombineFiles(files); return }
+  const dragged = cfDrag.value
+  const token = e.dataTransfer?.getData('application/x-pdf-editor-combine')
+  if (dragged && token === String(cfKey(dragged))) {
+    const from = combineFiles.value.indexOf(dragged), before = cfPosition(e)
+    if (from >= 0) {
+      combineFiles.value.splice(from, 1)
+      combineFiles.value.splice(before > from ? before - 1 : before, 0, dragged)
+    }
+  }
+  cfReset()
+}
 function cfMove(i: number, d: number) {
-  const a = combineFiles.value
-  const [f] = a.splice(i, 1)
-  a.splice(i + d, 0, f)
-}
-function cfDrop(i: number) {
-  if (cfDrag.value === null || cfDrag.value === i) return
-  const a = combineFiles.value
-  const [f] = a.splice(cfDrag.value, 1)
-  a.splice(i, 0, f)
-  cfDrag.value = null
+  if (combineBusy.value || i+d < 0 || i+d >= combineFiles.value.length) return
+  const [file] = combineFiles.value.splice(i, 1)
+  combineFiles.value.splice(i+d, 0, file)
+  cfReset()
 }
 async function applyCombine() {
-  const files = [...combineFiles.value]
-  if (combineWithOpen.value && docStore.loaded) {
-    const bytes = await pdfEngine.saveDocument()
-    files.unshift(new File([bytes], docStore.fileName || 'documento.pdf', { type: 'application/pdf' }))
-  }
-  close()
-  await commands.combine(files)
+  if (combineBusy.value || combineCount.value < 2) return
+  combineBusy.value = true; combineError.value = ''; cfReset()
+  try {
+    const result = await commands.combine([...combineFiles.value], combineWithOpen.value)
+    if (result.success) close()
+    else combineError.value = result.error || 'No se pudo combinar'
+  } finally { combineBusy.value = false }
 }
+
 function sizeOf(b: number) { return b < 1048576 ? `${Math.max(1, Math.round(b / 1024))} KB` : `${(b / 1048576).toFixed(1)} MB` }
 
 // ═════════════ Create ═════════════
@@ -712,7 +760,7 @@ async function applyExport() {
 }
 
 // ═════════════ Link ═════════════
-const link = reactive({ kind: 'uri' as 'uri' | 'page', uri: 'https://', page: 1 })
+const link = reactive({ kind: 'uri' as 'uri' | 'page', uri: 'https://', page: 1, visible: true, width: 1, dashed: false, color: '#0000ff' })
 const links = ref<{ rect: number[]; uri: string; external: boolean; page: number | null }[]>([])
 async function loadLinks() { links.value = await commands.listLinks(docStore.currentPage - 1).catch(() => []) }
 async function deleteLink(i: number) { await commands.deleteLink(docStore.currentPage - 1, i); await loadLinks() }
@@ -721,7 +769,7 @@ async function applyLink() {
   if (!a?.rect) { close(); return }
   let uri = link.uri.trim()
   if (link.kind === 'uri' && !/^[a-z]+:/i.test(uri)) uri = 'https://' + uri
-  const target = link.kind === 'uri' ? { uri } : { page: link.page }
+  const target = { ...(link.kind === 'uri' ? { uri } : { page: link.page }), appearance: { visible: link.visible, width: link.width, dashed: link.dashed, color: hexToRgb01(link.color) } }
   close()
   await commands.addLink(a.pageIndex, a.rect, target)
 }
@@ -813,6 +861,12 @@ watch(() => ui.dialog, async d => {
       const f = (v: number) => Math.max(0, Math.round(v / CM * 100) / 100)
       crop.left = f(Math.min(x0, x1)); crop.top = f(Math.min(y0, y1))
       crop.right = f(a.pdfW - Math.max(x0, x1)); crop.bottom = f(a.pdfH - Math.max(y0, y1))
+      // The drawn rectangle is relative to the current CropBox, not MediaBox.
+      const existing = await pdfEngine.acro('cropOf', { pageIndex: a.pageIndex }).catch(() => null)
+      if (existing) {
+        crop.left += existing.left / CM; crop.right += existing.right / CM
+        crop.top += existing.top / CM; crop.bottom += existing.bottom / CM
+      }
     } else {
       const page = a.pages?.[0] ?? docStore.currentPage - 1
       const m = await pdfEngine.acro('cropOf', { pageIndex: page }).catch(() => null)
@@ -835,8 +889,10 @@ watch(() => ui.dialog, async d => {
     Object.assign(meta, m)
     if (a.sanitize) meta.Title = meta.Author = meta.Subject = meta.Keywords = ''
   } else if (d === 'combine') {
+    combineSession++; cfReset(); combineError.value = ''
     combineFiles.value = []
-    combineWithOpen.value = docStore.loaded
+    appendCombineFiles(a.files ?? [])
+    combineWithOpen.value = a.files ? false : docStore.loaded
   } else if (d === 'export') {
     if (a.format) exp.format = a.format
   } else if (d === 'link') {
@@ -860,8 +916,8 @@ watch(() => ui.dialog, async d => {
 .cols { display: flex; gap: 24px; }
 .col-form { flex: 1; min-width: 0; }
 .col-preview { width: 210px; flex: none; }
-.preview-label { font-size: 12px; color: #bdbdbd; margin-bottom: 6px; }
-.mini-page { position: relative; background: #fff; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); overflow: hidden; }
+.preview-label { font-size: 12px; color: var(--acro-text-dim); margin-bottom: 6px; }
+.mini-page { position: relative; background: #fff; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18); overflow: hidden; }
 .mini-bg { position: absolute; inset: 0; opacity: 0.85; }
 .mini-txt { position: absolute; white-space: nowrap; line-height: 1; z-index: 1; }
 .mini-wm { position: absolute; left: 50%; white-space: nowrap; line-height: 1; }
@@ -875,36 +931,40 @@ watch(() => ui.dialog, async d => {
 .acro-pill.pill-sm { height: 26px; font-size: 12px; padding: 0 12px; font-weight: 600; }
 .crop-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
 .perm-grid { display: grid; grid-template-columns: 1fr; gap: 6px; margin-top: 10px; }
-.note { color: #a8a8a8; font-size: 12px; line-height: 1.5; }
-.error { color: #ff8a8a; margin-top: 8px; font-size: 13px; }
-.props-tabs { border-bottom: 1px solid #5a5a5a; margin-bottom: 12px; }
-.props-tabs span { display: inline-block; padding: 6px 12px; border-bottom: 2px solid #fff; color: #fff; font-size: 13px; }
+.note { color: var(--acro-text-dim); font-size: 12px; line-height: 1.5; }
+.error { color: var(--acro-danger); margin-top: 8px; font-size: 13px; }
+.props-tabs { border-bottom: 1px solid var(--acro-border); margin-bottom: 12px; }
+.props-tabs span { display: inline-block; padding: 6px 12px; border-bottom: 2px solid var(--acro-text-strong); color: var(--acro-text-strong); font-size: 13px; }
 .props { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .pr { display: flex; align-items: center; gap: 10px; }
-.pr > span { width: 140px; color: #bdbdbd; flex: none; text-align: right; }
+.pr > span { width: 140px; color: var(--acro-text-dim); flex: none; text-align: right; }
 .pr .acro-input { flex: 1; }
-.combine-list { margin-top: 14px; min-height: 180px; border: 1px dashed #666; border-radius: 4px; padding: 6px; }
-.empty { color: #9a9a9a; padding: 40px 10px; text-align: center; }
-.cf-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 3px; background: #3d3d3d; margin-bottom: 4px; cursor: grab; }
-.cf-row.fixed { cursor: default; background: #384252; }
+.combine-error { color: var(--acro-danger); margin: 12px 24px; }
+.cf-row.dragging { opacity: .45; }
+.cf-row.before { box-shadow: 0 -2px var(--acro-blue); }
+.cf-row.after { box-shadow: 0 2px var(--acro-blue); }
+.combine-list { margin-top: 14px; min-height: 180px; border: 1px dashed var(--acro-border); border-radius: 4px; padding: 6px; }
+.empty { color: var(--acro-text-dim); padding: 40px 10px; text-align: center; }
+.cf-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 3px; background: var(--acro-surface-2); margin-bottom: 4px; cursor: grab; }
+.cf-row.fixed { cursor: default; background: var(--acro-select); }
 .cf-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cf-meta { color: #a0a0a0; font-size: 12px; }
-.row-btn { border: 0; background: transparent; color: #bbb; cursor: pointer; border-radius: 3px; display: inline-flex; padding: 3px; }
-.row-btn:hover:not(:disabled) { background: #555; color: #fff; }
+.cf-meta { color: var(--acro-text-dim); font-size: 12px; }
+.row-btn { border: 0; background: transparent; color: var(--acro-text-dim); cursor: pointer; border-radius: 3px; display: inline-flex; padding: 3px; }
+.row-btn:hover:not(:disabled) { background: var(--acro-hover); color: var(--acro-text-strong); }
 .row-btn:disabled { opacity: 0.3; }
 .choice-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-.choice { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 16px 10px; border: 1px solid #5a5a5a; border-radius: 4px; background: #3b3b3b; color: #e6e6e6; cursor: pointer; font: inherit; text-align: center; }
-.choice span { font-size: 11px; color: #a8a8a8; }
-.choice.on { border-color: var(--acro-blue); background: #33405a; }
+.choice { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 16px 10px; border: 1px solid var(--acro-border); border-radius: 4px; background: var(--acro-surface-2); color: var(--acro-text); cursor: pointer; font: inherit; text-align: center; }
+.choice span { font-size: 11px; color: var(--acro-text-dim); }
+.choice.on { border-color: var(--acro-blue); background: var(--acro-select); }
 .formats { display: flex; flex-direction: column; gap: 6px; }
-.fmt { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border: 1px solid #555; border-radius: 4px; cursor: pointer; }
-.fmt.on { border-color: var(--acro-blue); background: #33405a; }
+.fmt { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border: 1px solid var(--acro-border); border-radius: 4px; cursor: pointer; }
+.fmt.on { border-color: var(--acro-blue); background: var(--acro-select); }
 .fmt span { display: flex; flex-direction: column; }
-.fmt small { color: #a8a8a8; font-size: 11px; }
+.fmt small { color: var(--acro-text-dim); font-size: 11px; }
 .fmt input { accent-color: var(--acro-blue); }
 .keys { width: 100%; border-collapse: collapse; font-size: 13px; }
-.keys td { padding: 5px 6px; border-bottom: 1px solid #484848; }
-kbd { background: #252525; border: 1px solid #555; border-radius: 3px; padding: 1px 6px; font-family: inherit; font-size: 12px; white-space: nowrap; }
+.keys td { padding: 5px 6px; border-bottom: 1px solid var(--acro-border); }
+kbd { background: var(--acro-surface); border: 1px solid var(--acro-border); border-radius: 3px; padding: 1px 6px; font-family: inherit; font-size: 12px; white-space: nowrap; }
 .about { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 6px; }
 .about p { margin: 6px 0; line-height: 1.5; }
 </style>

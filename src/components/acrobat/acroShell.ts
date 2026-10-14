@@ -1,4 +1,5 @@
 import { watch } from 'vue'
+import { pasteImageFromMenu } from '@/utils/acro/imageClipboard'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, type Tool } from '@/stores/editor'
 import { useUiStore, toolInfo, type AcroTool } from '@/stores/ui'
@@ -55,9 +56,13 @@ export function createAcroShell(deps: AcroShellDeps) {
       return
     }
     if (!docStore.loaded) {
+      // Acrobat does not throw a file chooser at you: it opens the tool, greys
+      // out its bar, and says what the tool is for above "Seleccionar un
+      // archivo". The tool finishes opening once a file is loaded.
       pendingTool = id
+      ui.activeTool = id
+      ui.view = 'document'
       editorStore.setStatus(`Abra un archivo PDF para usar "${info?.label ?? id}"`)
-      deps.openFile()
       return
     }
     ui.activeTool = id
@@ -70,14 +75,19 @@ export function createAcroShell(deps: AcroShellDeps) {
   }
 
   function closeTool() {
+    pendingTool = null
     ui.activeTool = null
     editorStore.setTool('select')
+  }
+
+  /** Resume a requested tool AFTER the file-open handler resets the shell. */
+  function documentOpened() {
+    if (pendingTool) { const t = pendingTool; pendingTool = null; openTool(t) }
   }
 
   watch(() => [docStore.loaded, docStore.fileName] as const, ([loaded]) => {
     if (!loaded) return
     ui.view = 'document'
-    if (pendingTool) { const t = pendingTool; pendingTool = null; openTool(t) }
   })
 
   // ── zoom ──
@@ -108,6 +118,7 @@ export function createAcroShell(deps: AcroShellDeps) {
   }
 
   async function paste() {
+    if (await pasteImageFromMenu()) return
     try {
       const text = await navigator.clipboard.readText()
       document.execCommand('insertText', false, text)
@@ -129,7 +140,7 @@ export function createAcroShell(deps: AcroShellDeps) {
     paste,
     zoomIn, zoomOut, setZoom, fitPage, fitWidth,
     rotateCurrent: (deg: number) => deps.rotatePage(deg),
-    openTool, closeTool,
+    openTool, closeTool, documentOpened,
     fullScreen,
     toggleAssistant: deps.toggleAssistant,
     reportProblem: deps.reportProblem,

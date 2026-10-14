@@ -21,7 +21,20 @@
         <AcroLeftPane v-if="!ui.readMode && ui.activeTool !== 'organize'" />
         <div class="center">
           <OrganizePages v-if="ui.activeTool === 'organize'" />
-          <PDFViewer v-else ref="pdfViewerRef" :class="{ 'hand-tool': editorStore.currentTool === 'hand' }" />
+          <!-- Hidden, never unmounted, while Organizar páginas is open: a
+               double-click on a page there sets the page and closes the tool
+               in one go, and a viewer built afresh at that moment missed the
+               page change and opened at page 1. Kept alive it scrolls to the
+               page like any other page change, and its rendered pages and
+               scroll position survive the trip. -->
+          <PDFViewer v-show="ui.activeTool !== 'organize'" ref="pdfViewerRef" :hidden="ui.activeTool === 'organize'" :class="{ 'hand-tool': editorStore.currentTool === 'hand' }" />
+          <!-- Acrobat's conversion toast: bottom right of the document, a bar
+               and one line saying which page is being made editable. -->
+          <div v-if="ui.scanConversion && !ui.scanConversion.hidden" class="scan-toast" role="status">
+            <div class="scan-toast-bar"><div class="scan-toast-fill" :style="{ width: ui.scanConversion.pct + '%' }" /></div>
+            <button class="scan-toast-close" title="Cerrar" @click="ui.scanConversion.hidden = true"><q-icon name="close" size="18px" /></button>
+            <div class="scan-toast-text">Página {{ ui.scanConversion.page }}: Conversión de la página digitalizada en texto e imágenes editables</div>
+          </div>
         </div>
         <template v-if="!ui.readMode">
           <template v-if="ui.activeTool !== 'organize'">
@@ -36,10 +49,16 @@
       </template>
 
       <!-- No document: what the old welcome screen offered, in Acrobat's dress. -->
-      <div v-else class="no-doc">
-        <AcroIcon name="create" color="#ff7b82" :size="72" />
-        <div class="t1">Abra un archivo PDF para empezar</div>
-        <div class="t2">O arrástrelo y suéltelo aquí</div>
+      <div v-else class="no-doc" :class="{ 'tool-wait': !!ui.toolMeta?.headline }">
+        <!-- A tool opened before a document: Acrobat's headline for it, then the button. -->
+        <template v-if="ui.toolMeta?.headline">
+          <div class="headline">{{ ui.toolMeta.headline }}</div>
+        </template>
+        <template v-else>
+          <AcroIcon name="create" color="#e34850" :size="72" />
+          <div class="t1">Abra un archivo PDF para empezar</div>
+          <div class="t2">O arrástrelo y suéltelo aquí</div>
+        </template>
         <!--
           The input is laid OVER the button so the click lands on it and the
           browser opens the chooser natively; styled inline, with a click
@@ -96,17 +115,31 @@ const pdfViewerRef = ref<InstanceType<typeof PDFViewer> | null>(null)
 <style scoped>
 .acro-page { background: var(--acro-canvas); }
 .workspace { display: flex; height: 100%; width: 100%; }
+.scan-toast {
+  position: absolute; right: 20px; bottom: 20px; z-index: 40; width: 540px; max-width: calc(100% - 40px);
+  background: #1e1e1e; color: #fff; border-radius: 2px; padding: 22px 52px 16px 20px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3); font-size: 13px; font-weight: 700;
+}
+.scan-toast-bar { height: 4px; background: #4a4a4a; border-radius: 2px; overflow: hidden; margin-bottom: 18px; }
+.scan-toast-fill { height: 100%; background: var(--acro-blue); transition: width 0.4s ease; }
+.scan-toast-close {
+  position: absolute; top: 12px; right: 12px; border: 0; background: transparent; color: #c8c8c8;
+  cursor: pointer; padding: 2px; display: flex; border-radius: 2px;
+}
+.scan-toast-close:hover { color: #fff; background: #3a3a3a; }
 .center { flex: 1; min-width: 0; height: 100%; position: relative; background: var(--acro-canvas); }
 .center :deep(.pdf-viewer-container) { background: var(--acro-canvas) !important; }
 .center :deep(.hand-tool), .center :deep(.hand-tool *) { cursor: grab !important; }
 .pane-handle {
-  width: 18px; flex: none; border: 0; background: var(--acro-pane); color: #c2c2c2; cursor: pointer; padding: 0;
+  width: 18px; flex: none; border: 0; background: var(--acro-pane); color: var(--acro-text-dim); cursor: pointer; padding: 0;
   display: flex; align-items: center; justify-content: center; border-left: 1px solid var(--acro-rule);
 }
-.pane-handle:hover { color: #fff; background: #4a4a4a; }
+.pane-handle:hover { color: var(--acro-text-strong); background: var(--acro-hover); }
 .pane-handle .flip { transform: rotate(180deg); }
 .right-pane { width: 340px; flex: none; height: 100%; border-left: 1px solid var(--acro-rule); }
-.no-doc { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: #d0d0d0; }
-.no-doc .t1 { font-size: 20px; color: #fff; }
-.no-doc .t2 { font-size: 13px; color: #a0a0a0; margin-bottom: 8px; }
+.no-doc { flex: 1; background: var(--acro-pane); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--acro-text); }
+.no-doc.tool-wait { justify-content: flex-start; padding-top: 110px; gap: 40px; }
+.no-doc .headline { font-size: 27px; font-weight: 400; color: var(--acro-text); text-align: center; padding: 0 20px; }
+.no-doc .t1 { font-size: 20px; color: var(--acro-text-strong); }
+.no-doc .t2 { font-size: 13px; color: var(--acro-text-dim); margin-bottom: 8px; }
 </style>

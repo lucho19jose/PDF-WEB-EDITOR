@@ -2219,6 +2219,31 @@ things widgets need done differently:
 Verified engine-level (rect moved, AP stream byte-identical, ink pixels moved
 by exactly the delta) and in the browser (drag commits, undo restores).
 
+### A signed document is saved incrementally, and a rearrange keeps its form
+Two ways a signed file lost its signatures ("Informe consolidado - Obras",
+six Intellisign /Sig widgets on two pages):
+
+- **Every save rewrote the file** (`compress,garbage=compact`), so on the
+  first edit every /ByteRange pointed at bytes that were no longer what was
+  signed: all six digests broke. `saveDocumentBuffer()` now saves a signed
+  document `incremental,compress`. The opened bytes are an exact prefix of
+  the output, and the signatures stay valid for their revision. Readers
+  report the edits as changes after signing. The engine reloads after every
+  edit, so each edit appends one update (about 5-25 KB here). A file MuPDF had
+  to repair (`canBeSavedIncrementally()` false) is rewritten as before, and so
+  is a password-protected save.
+- **`rearrangePages` deletes the catalog's /AcroForm** and leaves the widgets.
+  The pages still drew the scribbles, but nothing listed them as signatures.
+  `rearrangePagesKeepingForm()` (movePage, Organize's move, delete, reverse)
+  puts it back and prunes the fields whose widgets left with deleted pages. It
+  re-reads the catalog AFTER the rearrange, because the rearrange replaces it
+  and a handle resolved earlier writes nowhere.
+
+To check: hash each /ByteRange and compare with the CMS `messageDigest`
+(OID 1.2.840.113549.1.9.4). Before the fix, a move or an edit broke all six
+digests; after it, all six stay valid through chained moves, edits and the
+signed page's deletion.
+
 ### The overlays learn of a reload from ONE bump — so it must come LAST
 Undo was `pdfViewer.reloadDocument(snapshot)` then `pdfEngine.loadDocument(snapshot)`.
 The viewer reload bumps `renderVersion` (via `reloadBytes`), and that bump is
@@ -5211,6 +5236,49 @@ editor is sized to the run's box, a long title wrapped inside it, and End (or
 a click past the fold) put the caret at the end of the first VISUAL line:
 typing appended mid-run — "Compra-Venta XYde Repuestos" in the headless
 scan smoke. `wrap="off"` on the textarea; the run is one line.
+
+### A watermark across a scan is painted out before the recogniser reads it
+A due-diligence printout stamps the requester's name and DNI over the whole
+sheet in pale lavender (luminance 225-245 on 254 paper). PaddleOCR read it as
+text and boxed it with every cell it crossed: 152 runs at 40 s, the label
+"Fecha y hora de / consulta:", the date beside it and a stretch of watermark
+came back as ONE run ("omento ivacional ge igenua Fechay hora deacion1
+consulta: …"), and editing the date redrew all of it in one small face over
+both cells. `faintLayer.ts` detects the layer and `recognizePage` hands the
+recogniser, the ink measurers and the kept raster a COPY with everything
+lighter than the layer's strokes painted white; the colour samplers read the
+real pixels (`buildItems`' `colorCtx`), so a patch keeps the page's colours.
+The tracing raster and the bake's halo raster are cleaned with the same cutoff
+(`faintCutoffFor`). Same page after: 30 runs at 99% in 5 s, the date its own
+run, and the edit bakes in the scan's face inside its cell.
+
+The test is four bars, each from a false positive on the OCR corpora
+(`tools/ocr-calibrate/faint-hist.mjs`): pixels at darkness 0.06-0.3 that are
+not within 2px of ink (a glyph's own fringe is), covering 3% of the page; 40%
+of them touching paper (strokes, not a tinted area); three quarters under 0.13
+(a faded photocopy's grey text spreads to 0.3); and reaching half the page's
+tiles (a chart grid or a table's tinted header is faint and bunched too, but
+in one corner). The cutoff is the layer's 90th percentile + 0.04, never past
+0.2 — darker than that is type someone may want to read. Over the four OCR
+corpora (75 documents) only the watermarked page triggers, so every other
+page is recognised exactly as before.
+
+**Known:** the patch under an edited run is solid paper, so the watermark has
+a hole where the old text was, as it does in Acrobat.
+
+### A stub of a cell border behind a gap is not part of the run
+On the same page "RUC" and "consulta:" measured 12.1pt beside 6pt neighbours,
+and "RUC" → "ddddd" was drawn twice their size, regular and grey (the face
+detector and the colour sampler read the inflated box too). The detector's box
+ended inside the cell's bottom rule: 12 empty rows under the letters, then one
+row of 46 inked columns, too short to be cleared as a rule span and 15% of the
+box's ink, over the 10% bar for a thin fringe. `trimProfile` now strips a band
+of 1-3 rows behind a clear gap when it is a STROKE: an unbroken run (breaks of
+two pixels allowed) half again the body's height, or 2.5 body heights of ink
+per row (the "consulta:" stub was 55 pixels in broken pieces). Measured on the
+main OCR corpus, 1229 runs over the scanned pages: three change, all
+corrections (a checkbox "x" 10.8 → 9.5pt, a fax line under a logo 9 → 4.7pt
+twice).
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates

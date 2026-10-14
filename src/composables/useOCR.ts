@@ -12,6 +12,7 @@ import { scanFaceFor, scanFacesOf, styleKeyOf, traceRunIntoFace, clearScanFaces,
 import { cutGlyphs, lastCutReason, lastCutDebug, expectedAdvance, type GlyphCutResult } from '@/utils/ocr/glyphCut'
 import { toSpanCut, sizeOf, type SpanCut } from '@/utils/ocr/partialRedraw'
 import { useOcrStore } from '@/stores/ocr'
+import { withoutFaintLayer, whitenAbove } from '@/utils/ocr/faintLayer'
 
 /**
  * Recognising the text in a scanned page.
@@ -264,6 +265,12 @@ function createOCR() {
   let pageRenderer: ((pageIndex: number, scale: number) => Promise<HTMLCanvasElement | null>) | null = null
   function setPageRenderer(fn: typeof pageRenderer) { pageRenderer = fn }
   const traceRasters = new Map<number, { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; toPt: number }>()
+  /**
+   * The luminance a page's faint layer (a watermark) was painted out from when
+   * it was recognised — see faintLayer.ts. The tracing raster is cleaned the
+   * same way, or the glyph cut would measure the watermark crossing a letter.
+   */
+  const faintCutoffs = new Map<number, number>()
   async function traceRasterFor(pageIndex: number, base: { canvas: HTMLCanvasElement; toPt: number }) {
     const have = traceRasters.get(pageIndex)
     if (have) return have
@@ -275,6 +282,8 @@ function createOCR() {
       const canvas = await pageRenderer(pageIndex, scale)
       const ctx = canvas?.getContext('2d', { willReadFrequently: true })
       if (!canvas || !ctx) return null
+      const cutoff = faintCutoffs.get(pageIndex)
+      if (cutoff !== undefined) whitenAbove(ctx, cutoff)
       const entry = { canvas, ctx, toPt: pageWidth / canvas.width }
       traceRasters.clear()
       traceRasters.set(pageIndex, entry)
@@ -282,6 +291,7 @@ function createOCR() {
     } catch (_) { return null }
   }
   function forgetTraceRaster(pageIndex: number) { traceRasters.delete(pageIndex) }
+  function faintCutoffFor(pageIndex: number): number | undefined { return faintCutoffs.get(pageIndex) }
   async function settleTraces(): Promise<void> {
     while (pendingTraces.size) await Promise.allSettled([...pendingTraces])
   }
@@ -586,6 +596,7 @@ function createOCR() {
   function reset() {
     rasters.clear()
     traceRasters.clear()
+    faintCutoffs.clear()
     spanCuts.clear()
     clearScanFaces()
     faceVersion.value++
@@ -1090,7 +1101,12 @@ function createOCR() {
     engine: OcrEngine,
     lang: string,
     /** Re-read cut boxes (upright pass); the sideways pass skips it. */
-    reread = true
+    reread = true,
+    /**
+     * Where the colours are sampled, when `ctx` is a cleaned copy: a patch is
+     * painted in the page's REAL paper colour, watermark and tinted fill and all.
+     */
+    colorCtx: CanvasRenderingContext2D = ctx
   ): Promise<OcrTextItem[]> {
     const items: OcrTextItem[] = []
 
@@ -1141,8 +1157,8 @@ function createOCR() {
         // the em; the Latin rule (tallest box = 0.76 of an em when nothing
         // descends) sized a 10pt Chinese cell at 13pt.
         const emPx = isMostlyCjk(text) ? cjkEm(run, pxRect.height) : emOf(run, pxRect.height, text)
-        const { color } = sampleLineColors(ctx, pxRect)
-        const background = samplePatchColor(ctx, pxRect)
+        const { color } = sampleLineColors(colorCtx, pxRect)
+        const background = samplePatchColor(colorCtx, pxRect)
 
         // The baseline OCR reports is the whole LINE's, and a run taken out
         // of that line sits on the same one. The face detector needs it:
@@ -1266,6 +1282,12 @@ function createOCR() {
       const tctx = target.getContext('2d', { willReadFrequently: true })
       if (!tctx) throw new Error('Could not prepare the page for recognition')
       tctx.drawImage(canvas, 0, 0, target.width, target.height)
+      // A watermark printed across the page is read as text and glued to every
+      // cell it crosses; the recogniser and the ink measurers read a copy with
+      // it painted out. `tctx` keeps the real pixels for the colour samplers.
+      const clean = withoutFaintLayer(target)
+      if (clean.layer) faintCutoffs.set(pageIndex, clean.layer.cutoff)
+      else faintCutoffs.delete(pageIndex)
 
       // The chosen engine, or Tesseract when it cannot run here. Only the
       // in-browser default falls back on its own: a cloud call that fails is
@@ -1275,36 +1297,36 @@ function createOCR() {
       let data: OcrRecognition
       try {
         stage.value = 'Recognising text...'
-        data = await engine.recognize(target, { lang, onProgress })
+        data = await engine.recognize(clean.canvas, { lang, onProgress })
       } catch (err: any) {
         if (engineId !== 'paddle') throw err
         fallbackNote = `${ENGINE_LABELS.paddle} could not run (${err?.message || err}); read with ${ENGINE_LABELS.tesseract} instead`
         engine = engineFor('tesseract')
         stage.value = 'Recognising text...'
-        data = await engine.recognize(target, { lang, onProgress })
+        data = await engine.recognize(clean.canvas, { lang, onProgress })
       }
 
       // Canvas pixels -> page points.
       const toPt = pageWidth / target.width
       const seq = { n: 0 }
-      const items = await buildItems(data, tctx, pageIndex, toPt, seq, false, b => ({
+      const items = await buildItems(data, clean.ctx, pageIndex, toPt, seq, false, b => ({
         x: b.x0 * toPt,
         y: b.y0 * toPt,
         width: (b.x1 - b.x0) * toPt,
         height: (b.y1 - b.y0) * toPt
-      }), engine, lang)
+      }), engine, lang, true, tctx)
 
       let verticalCount = 0
       // A cloud call costs money and a round trip; sideways text is rare.
       if (readVertical && engine.id !== 'mistral') {
-        const sideways = await addVerticalRuns(target, tctx, pageIndex, toPt, seq, items, engine, lang)
+        const sideways = await addVerticalRuns(clean.canvas, tctx, pageIndex, toPt, seq, items, engine, lang)
         verticalCount = sideways.length
       }
 
       let confSum = 0
       for (const it of items) confSum += it.confidence
 
-      keepRaster(pageIndex, { canvas: target, ctx: tctx, toPt })
+      keepRaster(pageIndex, { canvas: clean.canvas, ctx: clean.ctx, toPt })
       // Warm the recogniser the glyph-box fallback will ask for, so the first
       // edit on a fresh browser does not pay its ~20 s worker start. Not
       // awaited, and a failure is the fallback's to report when it is needed.
@@ -1474,5 +1496,5 @@ function createOCR() {
     engines.clear()
   }
 
-  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, spanCutFor, forgetSpanCut, setPageRenderer, forgetTraceRaster, cutFor, debugCuts, faceOf, facesOf, reset, destroy }
+  return { busy, progress, stage, error, faceVersion, judgeScanned, recognizePage, engineFor, traceItem, settleTraces, spanCutFor, forgetSpanCut, setPageRenderer, forgetTraceRaster, faintCutoffFor, cutFor, debugCuts, faceOf, facesOf, reset, destroy }
 }

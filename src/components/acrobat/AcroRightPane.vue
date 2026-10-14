@@ -40,8 +40,8 @@
             <q-tooltip>Tamaño y color del texto seleccionado</q-tooltip>
           </div>
           <div class="row-line">
-            <button class="fmt-btn" :class="{ on: bold }" title="Negrita" @click="bold = !bold"><span class="t b">T</span></button>
-            <button class="fmt-btn" :class="{ on: italic }" title="Cursiva" @click="italic = !italic"><span class="t i">T</span></button>
+            <button class="fmt-btn" @mousedown.prevent :class="{ on: bold }" title="Negrita" @click="bold = !bold"><span class="t b">T</span></button>
+            <button class="fmt-btn" @mousedown.prevent :class="{ on: italic }" title="Cursiva" @click="italic = !italic"><span class="t i">T</span></button>
             <button class="fmt-btn" disabled title="Subrayado"><span class="t u">T</span></button>
             <button class="fmt-btn" disabled title="Superíndice"><span class="t">T<sup>1</sup></span></button>
             <button class="fmt-btn" disabled title="Subíndice"><span class="t">T<sub>1</sub></span></button>
@@ -119,7 +119,7 @@
         <h6>Documentos digitalizados</h6>
         <button class="link-btn plain" @click="ocrSettingsOpen = true"><q-icon name="settings" size="18px" /> Configuración</button>
         <label class="acro-check">
-          <input type="checkbox" :checked="ocrStore.layerVisible" @change="toggleRecognise(($event.target as HTMLInputElement).checked)" />
+          <input type="checkbox" :checked="ui.autoRecognize" @change="toggleRecognise(($event.target as HTMLInputElement).checked)" />
           Reconocer texto
         </label>
       </section>
@@ -169,7 +169,7 @@
       </button>
       <div class="acro-hsep" />
       <button class="tool-row" @click="ui.view = 'tools'">
-        <AcroIcon name="moretools" color="#d0d0d0" :size="22" />
+        <AcroIcon name="moretools" color="#4b4b4b" :size="22" />
         <span>Más herramientas</span>
       </button>
     </div>
@@ -184,7 +184,6 @@ import { useUiStore, ACRO_TOOLS } from '@/stores/ui'
 import { useOcrStore } from '@/stores/ocr'
 import { hexToRgb01, rgb01ToHex } from '@/utils/color'
 import { objectSelection, objectAction, type ObjectAction } from '@/utils/acro/objectBus'
-import { OCR_DEFAULT_LANG } from '@/composables/useOCR'
 import ColorSwatch from '@/components/toolbar/ColorSwatch.vue'
 import OcrSettingsDialog from '@/components/dialogs/OcrSettingsDialog.vue'
 import AcroIcon from './AcroIcon.vue'
@@ -197,7 +196,7 @@ const ui = useUiStore()
 const ocrStore = useOcrStore()
 const shell = inject<AcroShell>('acroShell')!
 const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
-const runOcrOnPage = inject<(lang: string) => Promise<void>>('runOcrOnPage', async () => {})
+const ocrController = inject<{ autoRecognise?: (pageIndex: number) => Promise<void> } | null>('ocrController', null)
 
 // ── Formato ──
 /**
@@ -258,9 +257,15 @@ const alignMenu: { v: ObjectAction; icon: string; label: string }[] = [
 
 // ── Documentos digitalizados ──
 const ocrSettingsOpen = ref(false)
+/**
+ * Acrobat's "Reconocer texto": checked, a scanned page converts to editable
+ * text as soon as Editar PDF shows it; unchecked, the scan stays a picture
+ * (the recognised runs are hidden, not discarded).
+ */
 function toggleRecognise(on: boolean) {
-  if (on && !ocrStore.itemsFor(docStore.currentPage - 1).length) runOcrOnPage(OCR_DEFAULT_LANG)
+  ui.autoRecognize = on
   ocrStore.layerVisible = on
+  if (on) void ocrController?.autoRecognise?.(docStore.currentPage - 1)
 }
 
 // ── Comentarios ──
@@ -307,50 +312,50 @@ const listTools = computed(() => ACRO_TOOLS.filter(t => ['create', 'combine', 'e
 <style scoped>
 .acro-rightpane { width: 100%; height: 100%; background: var(--acro-panel); color: var(--acro-text); display: flex; flex-direction: column; }
 .pane-scroll { flex: 1; overflow-y: auto; padding: 8px 14px 20px; }
-section { border-bottom: 1px solid #5c5c5c; padding: 10px 0 14px; }
+section { border-bottom: 1px solid var(--acro-border); padding: 10px 0 14px; }
 section.last { border-bottom: 0; display: flex; flex-direction: column; gap: 10px; }
-h6 { margin: 8px 0 12px; font-size: 12px; font-weight: 700; letter-spacing: 0.02em; text-transform: uppercase; color: #f0f0f0; line-height: 1; }
+h6 { margin: 8px 0 12px; font-size: 12px; font-weight: 700; letter-spacing: 0.02em; text-transform: uppercase; color: var(--acro-text-strong); line-height: 1; }
 .row-line { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
 .grow { flex: 1; }
 .size { width: 72px; }
 .gap { width: 10px; }
 .fmt-btn {
   display: inline-flex; align-items: center; justify-content: center; min-width: 32px; height: 30px; padding: 0 4px;
-  border: 0; border-radius: 3px; background: transparent; color: #d4d4d4; cursor: pointer; font: inherit;
+  border: 0; border-radius: 3px; background: transparent; color: var(--acro-text); cursor: pointer; font: inherit;
 }
 .fmt-btn:hover:not(:disabled) { background: var(--acro-hover); }
-.fmt-btn.on { background: #6a6a6a; color: #fff; }
+.fmt-btn.on { background: var(--acro-pressed); color: var(--acro-text-strong); }
 .fmt-btn:disabled { opacity: 0.35; cursor: default; }
 .t { font-family: 'Times New Roman', serif; font-size: 20px; line-height: 1; }
 .t.b { font-weight: 700; }
 .t.i { font-style: italic; }
 .t.u { text-decoration: underline; }
 .t sup, .t sub { font-size: 10px; }
-.edit-using { display: flex; align-items: center; gap: 6px; color: #8f8f8f; font-size: 13px; border-bottom: 1px solid #6a6a6a; padding: 4px 0; margin-top: 2px; }
-.link-btn { display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent; color: #4b9cf5; cursor: pointer; font: inherit; font-size: 13px; padding: 2px 0; }
-.link-btn.plain { color: #e6e6e6; margin-bottom: 10px; display: flex; }
-.link-btn.danger { color: #ff8a8a; margin-left: 12px; }
-.small-gap { font-size: 12px; color: #c8c8c8; }
-.lbl { font-size: 12px; color: #c8c8c8; min-width: 48px; }
+.edit-using { display: flex; align-items: center; gap: 6px; color: var(--acro-text-faint); font-size: 13px; border-bottom: 1px solid var(--acro-border); padding: 4px 0; margin-top: 2px; }
+.link-btn { display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent; color: var(--acro-blue-text); cursor: pointer; font: inherit; font-size: 13px; padding: 2px 0; }
+.link-btn.plain { color: var(--acro-text); margin-bottom: 10px; display: flex; }
+.link-btn.danger { color: var(--acro-danger); margin-left: 12px; }
+.small-gap { font-size: 12px; color: var(--acro-text); }
+.lbl { font-size: 12px; color: var(--acro-text); min-width: 48px; }
 
 .comments-head { display: flex; align-items: center; font-weight: 700; font-size: 14px; padding: 6px 0 8px; }
 .search { width: 100%; height: 28px; margin-bottom: 10px; }
-.empty { display: flex; flex-direction: column; align-items: center; gap: 8px; color: #bdbdbd; padding: 30px 10px; text-align: center; }
-.faint { color: #8a8a8a; font-size: 12px; }
-.comment-card { background: #3d3d3d; border: 1px solid #555; border-radius: 4px; padding: 8px 10px; margin-bottom: 8px; cursor: pointer; }
-.comment-card:hover { border-color: #888; }
+.empty { display: flex; flex-direction: column; align-items: center; gap: 8px; color: var(--acro-text-dim); padding: 30px 10px; text-align: center; }
+.faint { color: var(--acro-text-faint); font-size: 12px; }
+.comment-card { background: var(--acro-surface-2); border: 1px solid var(--acro-border); border-radius: 4px; padding: 8px 10px; margin-bottom: 8px; cursor: pointer; }
+.comment-card:hover { border-color: var(--acro-border-strong); }
 .comment-card.current { border-color: var(--acro-blue); }
 .c-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .c-dot { width: 10px; height: 10px; border-radius: 2px; flex: none; }
-.c-type { font-weight: 700; color: #f0f0f0; }
-.c-page { color: #9a9a9a; }
-.c-author { color: #b8b8b8; font-size: 12px; margin-top: 4px; }
-.c-text { margin-top: 6px; font-size: 13px; color: #e8e8e8; white-space: pre-wrap; word-break: break-word; }
+.c-type { font-weight: 700; color: var(--acro-text-strong); }
+.c-page { color: var(--acro-text-dim); }
+.c-author { color: var(--acro-text-dim); font-size: 12px; margin-top: 4px; }
+.c-text { margin-top: 6px; font-size: 13px; color: var(--acro-text); white-space: pre-wrap; word-break: break-word; }
 
 .tool-list { padding: 18px 10px; }
 .tool-row {
   display: flex; align-items: center; gap: 12px; width: 100%; height: 46px; padding: 0 14px; border: 0; border-radius: 4px;
-  background: transparent; color: #ececec; font: inherit; font-size: 15px; cursor: pointer; text-align: left;
+  background: transparent; color: var(--acro-text); font: inherit; font-size: 15px; cursor: pointer; text-align: left;
 }
 .tool-row:hover { background: var(--acro-hover); }
 </style>

@@ -35,6 +35,8 @@ export interface AcroContext {
   invalidateContentSources: (pageIndex?: number) => void
   getPageSize: (pageIndex: number) => { width: number; height: number; rotation: number }
   rotatePage: (pageIndex: number, degrees: number) => { success: boolean; error?: string }
+  /** `doc().rearrangePages`, keeping the /AcroForm MuPDF's own drops (signatures!). */
+  rearrangePages: (order: number[]) => void
   measureRunWidth: (text: string, fontSize: number, fontName: string) => { width: number; exact: boolean }
   addTextRunToPage: (pageIndex: number, parts: AcroTextPart[], rotation: number, tag?: string) => { success: boolean; error?: string }
   buildShowOps: (pageObj: any, text: string, fontSize: number, fontName: string) => { ops: string } | { error: string }
@@ -44,6 +46,7 @@ export interface AcroContext {
   getCtmAtOffset: (stream: string, offset: number) => Mat6
   ownPageResources: (pageObj: any) => any
   isNullObj: (o: any) => boolean
+  copyImage: (args: any) => { bytes: ArrayBuffer; width: number; height: number }
   fmtNum: (n: number) => string
 }
 
@@ -91,7 +94,7 @@ export function createAcroTools(ctx: AcroContext) {
     if (!order.length) return { success: false, error: 'A document needs at least one page' }
     if (order.some(i => !Number.isInteger(i) || i < 0 || i >= n)) return { success: false, error: 'Page index out of range' }
     ctx.invalidateContentSources()
-    doc().rearrangePages(order)
+    ctx.rearrangePages(order)
     return { success: true, pageCount: count() }
   }
 
@@ -193,6 +196,21 @@ export function createAcroTools(ctx: AcroContext) {
    * LEFT edge.
    */
   function cropPages(indices: number[], m: { top: number; right: number; bottom: number; left: number }): { success: boolean; error?: string } {
+    if (![m.top, m.right, m.bottom, m.left].every(v => Number.isFinite(v) && v >= 0))
+      return { success: false, error: 'Los márgenes deben ser números positivos' }
+    // Validate every page before mutating any; failed batches must be atomic.
+    for (const i of indicesOf(indices)) {
+      const p = doc().loadPage(i)
+      try {
+        const media = boxOf(p.getObject(), 'MediaBox')
+        if (!media) return { success: false, error: 'La p?gina no tiene MediaBox' }
+        const rotated = ctx.getPageSize(i).rotation % 180 !== 0
+        const w = media[rotated ? 3 : 2] - media[rotated ? 1 : 0]
+        const h = media[rotated ? 2 : 3] - media[rotated ? 0 : 1]
+        if (w - m.left - m.right < 18 || h - m.top - m.bottom < 18)
+          return { success: false, error: 'Los márgenes dejan una página demasiado pequeña' }
+      } finally { p.destroy() }
+    }
     for (const i of indicesOf(indices)) {
       const page = doc().loadPage(i)
       try {
@@ -205,7 +223,8 @@ export function createAcroTools(ctx: AcroContext) {
         else if (rot === 180) { L = m.right; B = m.top; R = m.left; T = m.bottom }
         else if (rot === 270) { L = m.top; B = m.left; R = m.bottom; T = m.right }
         if (L === 0 && B === 0 && R === 0 && T === 0) {
-          try { pageObj.delete('CropBox') } catch (_) { /* none */ }
+          // Override an inherited CropBox too: deleting a local key exposes it.
+          pageObj.put('CropBox', media)
         } else {
           const box = [media[0] + L, media[1] + B, media[2] - R, media[3] - T]
           if (box[2] - box[0] < 18 || box[3] - box[1] < 18) {
@@ -579,6 +598,15 @@ export function createAcroTools(ctx: AcroContext) {
         ? target.uri
         : doc().formatLinkURI({ type: 'Fit', page: Math.max(0, (target.page ?? 1) - 1) })
       page.createLink(rect as any, uri)
+      // Links are invisible by default. Persist the chosen border in the PDF.
+      const annots = page.getObject().get('Annots')
+      const annot = annots.get(annots.length - 1).resolve()
+      const appearance = (target as any).appearance ?? {}
+      const width = appearance.visible === false ? 0 : (appearance.width ?? 1)
+      annot.put('Border', [0, 0, width])
+      annot.put('C', appearance.color ?? [0, 0, 1])
+      annot.put('BS', { W: width, S: appearance.dashed ? 'D' : 'S', D: [3, 3] })
+      annot.put('H', 'I')
       return { success: true }
     } catch (err) {
       return { success: false, error: errorOf(err) }
@@ -590,10 +618,19 @@ export function createAcroTools(ctx: AcroContext) {
   function listLinks(pageIndex: number): { rect: number[]; uri: string; external: boolean; page: number | null }[] {
     const page = doc().loadPage(pageIndex)
     try {
-      return page.getLinks().map((l: any) => {
+      const styles: any[] = []
+      const annots = page.getObject().get('Annots')
+      for (let i = 0; i < annots.length; i++) {
+        const a = annots.get(i).resolve()
+        if (a.get('Subtype').asName() !== 'Link') continue
+        const border = a.get('Border'), bs = a.get('BS'), color = a.get('C')
+        styles.push({ width: !ctx.isNullObj(bs.get('W')) ? bs.get('W').asNumber() : border.length >= 3 ? border.get(2).asNumber() : 0,
+          color: color.length === 3 ? [0,1,2].map(k => color.get(k).asNumber()) : [0,0,0], dashed: bs.get('S').asName() === 'D' })
+      }
+      return page.getLinks().map((l: any, index: number) => {
         const uri = l.getURI() as string
         const m = /#page=(\d+)/.exec(uri || '')
-        return { rect: Array.from(l.getBounds()) as number[], uri, external: l.isExternal(), page: m ? Number(m[1]) : null }
+        return { rect: Array.from(l.getBounds()) as number[], uri, external: l.isExternal(), page: m ? Number(m[1]) : null, appearance: styles[index] }
       })
     } finally {
       page.destroy()
@@ -808,6 +845,84 @@ export function createAcroTools(ctx: AcroContext) {
 
   // ───────────────────────── Dispatch ─────────────────────────
 
+  /** Build separately: a bad/password-protected file never replaces the open PDF. */
+  function combinePdf(files: ArrayBuffer[]): any {
+    const out = new (ctx.mupdf().PDFDocument)()
+    let fileIndex = 0
+    try {
+      if (!files.length) throw new Error('No hay archivos para combinar')
+      for (const bytes of files) {
+        const source = new (ctx.mupdf().PDFDocument)(new Uint8Array(bytes))
+        try {
+          if (source.needsPassword()) throw new Error('El PDF necesita contraseña; desbloquéelo antes de combinar')
+          const n = source.countPages()
+          if (!n) throw new Error('El archivo no contiene páginas')
+          const map = out.newGraftMap()
+          try {
+            const offset = out.countPages()
+            for (let p = 0; p < n; p++) map.graftPage(-1, source, p)
+            const pageRefs = new Map<number, any>()
+            for (let p = 0; p < n; p++) pageRefs.set(source.findPage(p).asIndirect(), out.findPage(offset + p))
+            const destination = (original: any): any => {
+              if (!original.isArray()) return map.graftObject(original)
+              const arr = out.newArray()
+              for (let i = 0; i < original.length; i++) {
+                const value = original.get(i)
+                arr.push(i === 0 && value.isIndirect() && pageRefs.has(value.asIndirect())
+                  ? pageRefs.get(value.asIndirect()) : map.graftObject(value))
+              }
+              return arr
+            }
+            // graftPage intentionally excludes annotations and page groups.
+            // Copy their appearances without following /P back into the old page tree.
+            const fields = out.newArray()
+            for (let p = 0; p < n; p++) {
+              const from = source.findPage(p), to = out.findPage(offset + p)
+              const group = from.get('Group')
+              if (!group.isNull()) to.put('Group', map.graftObject(group))
+              const annotations = from.get('Annots'), copies = out.newArray()
+              for (let i = 0; i < annotations.length; i++) {
+                const original = annotations.get(i).resolve(), copy = out.newDictionary()
+                original.forEach((value: any, key: string) => {
+                  if (['P', 'Parent', 'Popup', 'IRT', 'Kids'].includes(key)) return
+                  if (key === 'Dest') copy.put(key, destination(value))
+                  else if (key === 'A' && value.get('S').asName() === 'GoTo') {
+                    const action = out.newDictionary()
+                    value.forEach((v: any, k: string) => action.put(k, k === 'D' ? destination(v) : map.graftObject(v)))
+                    copy.put(key, action)
+                  } else copy.put(key, map.graftObject(value))
+                })
+                copy.put('P', to)
+                const isWidget = original.get('Subtype').asName() === 'Widget'
+                if (isWidget) {
+                  for (const key of ['FT', 'T', 'V', 'DV', 'Ff', 'DA', 'Q', 'MaxLen', 'Opt']) {
+                    const value = original.getInheritable(key)
+                    if (!value.isNull()) copy.put(key, map.graftObject(value))
+                  }
+                }
+                const ref = out.addObject(copy)
+                copies.push(ref)
+                if (isWidget) fields.push(ref)
+              }
+              if (copies.length) to.put('Annots', copies)
+            }
+            if (fields.length) {
+              const catalog = out.getTrailer().get('Root')
+              let form = catalog.get('AcroForm')
+              if (form.isNull()) { form = out.newDictionary(); form.put('Fields', out.newArray()); catalog.put('AcroForm', form) }
+              const allFields = form.get('Fields')
+              for (let i = 0; i < fields.length; i++) allFields.push(fields.get(i))
+            }
+          }
+          finally { map.destroy() }
+        } finally { source.destroy() }
+        fileIndex++
+      }
+      return { success: true, bytes: save(out), pages: out.countPages() }
+    } catch (err) { return { success: false, error: errorOf(err), fileIndex } }
+    finally { out.destroy() }
+  }
+
   const dispatch = function dispatch(op: string, a: any): { data: any; transfer?: Transferable[] } {
     switch (op) {
       case 'rearrange': return { data: rearrange(a.order) }
@@ -818,6 +933,7 @@ export function createAcroTools(ctx: AcroContext) {
       case 'replacePages': return { data: replacePages(a.indices, a.bytes) }
       case 'cropPages': return { data: cropPages(a.indices, a.margins) }
       case 'cropOf': return { data: cropOf(a.pageIndex) }
+      case 'copyImage': { const r = ctx.copyImage(a); return { data: r, transfer: [r.bytes] } }
       case 'headerFooter': return { data: headerFooter(a) }
       case 'watermark': return { data: watermark(a) }
       case 'background': return { data: background(a) }
@@ -838,6 +954,7 @@ export function createAcroTools(ctx: AcroContext) {
       case 'exportStructured': return { data: exportStructured() }
       case 'renderImage': { const b = renderImage(a.pageIndex, a.scale, a.format, a.quality); return { data: b, transfer: [b] } }
       case 'createPdf': { const r = createPdf(a.images ?? [], a.blank); return { data: r, transfer: r.bytes ? [r.bytes] : [] } }
+      case 'combinePdf': { const r = combinePdf(a.files); return { data: r, transfer: r.bytes ? [r.bytes] : [] } }
       case 'flatten': return { data: flatten() }
       case 'saveProtected': { const b = saveProtected(a); return { data: b, transfer: [b] } }
       case 'needsPassword': return { data: needsPassword(a.bytes) }

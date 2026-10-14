@@ -18,12 +18,15 @@ const url = ref<string | null>(null)
 const placeholderH = ref(Math.round(props.width * props.aspect))
 let visible = false
 let observer: IntersectionObserver | null = null
+let requestId = 0
+let resizeTimer: ReturnType<typeof setTimeout> | undefined
 
 async function load() {
   if (!visible) return
+  const id = ++requestId
   const want = thumbs.version.value
   const u = await thumbs.request(props.page, props.width)
-  if (want === thumbs.version.value && u) url.value = u
+  if (id === requestId && want === thumbs.version.value && u) url.value = u
 }
 
 function onLoad(e: Event) {
@@ -35,11 +38,20 @@ function onLoad(e: Event) {
   }
 }
 
-watch(() => [thumbs.version.value, props.page, props.width] as const, () => {
+watch(() => [thumbs.version.value, props.page] as const, () => {
+  requestId++
+  clearTimeout(resizeTimer)
   // Keep the old picture until the new one is ready: a blank flash on every edit reads as a glitch.
   const c = thumbs.cached(props.page, props.width)
   if (c) url.value = c
   load()
+})
+
+watch(() => props.width, (width, oldWidth) => {
+  requestId++
+  placeholderH.value = Math.round(placeholderH.value * width / oldWidth)
+  clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(load, 120)
 })
 
 onMounted(() => {
@@ -49,7 +61,11 @@ onMounted(() => {
   }, { rootMargin: '400px' })
   if (el.value) observer.observe(el.value)
 })
-onBeforeUnmount(() => observer?.disconnect())
+onBeforeUnmount(() => {
+  requestId++
+  clearTimeout(resizeTimer)
+  observer?.disconnect()
+})
 </script>
 
 <style scoped>

@@ -16,7 +16,7 @@ app.use(router)
 app.use(Quasar, {
   plugins: { Dark, Dialog, Notify },
   config: {
-    dark: true,
+    dark: false,
     // Acrobat's blue for every Quasar control that asks for the primary colour.
     brand: { primary: '#2680eb', secondary: '#4b9cf5', accent: '#f56bb7', dark: '#323232' }
   }

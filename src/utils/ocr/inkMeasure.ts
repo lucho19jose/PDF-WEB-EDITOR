@@ -570,6 +570,32 @@ function trimProfile(p: Profile, emHint?: number, dipStrip = true): { top: numbe
         // (7, 4, 3, 3 under "PAGADO SOLES") were 3% of the ink — over the
         // 1.5% stray bar — and each box read 8.5pt for 4.7pt of letters.
         if (bandH <= 4 && ink < totalInk * 0.1) return next
+        // A STROKE behind a clear gap is a border's stub, however much ink it
+        // holds: the detector's box for "RUC" on a consultation printout cut
+        // the cell's bottom rule off after 46 columns, too short for a rule
+        // span and 15% of the box's ink, so twelve empty rows below the letters
+        // it stayed in the box. The run measured 12pt beside its 6pt
+        // neighbours and its replacement was drawn twice their size, regular
+        // and grey. One to three rows with an unbroken run wider than half
+        // again the body's height is no glyph: a tilde or an accent is narrower
+        // than its letter, and nothing else sits three empty rows away. A
+        // scan drops pixels off a thin line, so breaks of two pixels do not
+        // end the run.
+        if (bandH <= 3 && bodyH >= 4) {
+          let longest = 0
+          for (let r = Math.min(from, yy); r <= Math.max(from, yy); r++) {
+            let start = -1, last = -1
+            for (let xx = 0; xx <= p.width; xx++) {
+              if (xx < p.width && p.ink[r * p.width + xx]) { if (start < 0) start = xx; last = xx; continue }
+              if (start >= 0 && (xx - last > 2 || xx === p.width)) { longest = Math.max(longest, last - start + 1); start = -1 }
+            }
+          }
+          // Or so much ink in so few rows: a broken grey stub ("consulta:")
+          // came out 55 pixels in one row, its longest piece 15.
+          const perRow = ink / bandH
+          walkDebug.push(`stroke band bandH=${bandH} bodyH=${bodyH} longest=${longest} perRow=${perRow}`)
+          if (longest >= bodyH * 1.5 || perRow >= bodyH * 2.5) return next
+        }
         // A dense band behind a clear gap is the neighbouring line whatever
         // its height, up to most of the body's: a 4.5pt table set at 5.2pt
         // leading (the OT-GA order) put the bottom HALF of "ELABORACION" in

@@ -29,10 +29,12 @@
       <span>{{ docStore.fileSizeFormatted }}</span>
       <!--
         The document's digital signatures. A signed contract says nothing about
-        being signed anywhere else in this UI, and an edit breaks the signature
-        silently — so the chip states both: that the file is signed, and, once
-        `isModified`, that the edits have invalidated it. The list is as of the
-        open (see the store); the modified flag is what changes the chip.
+        being signed anywhere else in this UI — so the chip states both: that
+        the file is signed, and, once `isModified`, that it now carries changes
+        made after signing. The engine saves a signed file incrementally, so
+        the signatures stay valid for the version they signed and readers list
+        the edits as later changes. The list is as of the open (see the store);
+        the modified flag is what changes the chip.
       -->
       <template v-if="signatures.length">
         <q-separator vertical inset class="q-mx-sm" />
@@ -40,7 +42,7 @@
           dense square outline size="sm"
           class="sig-chip q-ma-none"
           :color="docStore.isModified ? 'amber-5' : 'teal-4'"
-          :icon="docStore.isModified ? 'gpp_bad' : 'verified_user'"
+          :icon="docStore.isModified ? 'gpp_maybe' : 'verified_user'"
           :label="sigLabel"
           data-testid="signature-chip"
         >
@@ -61,8 +63,8 @@
             </div>
             <div class="q-mt-xs" :class="docStore.isModified ? 'text-amber-5' : 'text-grey-4'">
               {{ docStore.isModified
-                ? 'The document has been edited: its digital signatures are no longer valid.'
-                : 'Editing the document will invalidate its digital signatures.' }}
+                ? 'Edited after signing. The signatures stay valid for the signed version; PDF readers will list your edits as changes made after signing.'
+                : 'Edits are saved after the signed version, so the signatures stay valid; PDF readers will list them as changes made after signing.' }}
             </div>
           </q-tooltip>
         </q-chip>
@@ -114,7 +116,7 @@ const signers = computed(() => {
  * contract sealed by one certificate keeps its count beside the name.
  */
 const sigLabel = computed(() => {
-  if (docStore.isModified) return 'Signature invalidated by edits'
+  if (docStore.isModified) return 'Edited after signing'
   const n = signatures.value.length
   const count = `${n} signature${n === 1 ? '' : 's'}`
   if (signers.value.length === 1) return n === 1 ? `Signed by ${signers.value[0]}` : `Signed by ${signers.value[0]} · ${count}`

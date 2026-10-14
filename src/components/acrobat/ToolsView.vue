@@ -72,20 +72,20 @@ function pin(id: AcroTool) {
 .tools-view { display: flex; height: 100%; background: var(--acro-bar); }
 .tools-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .search-bar { display: flex; align-items: center; gap: 10px; height: 44px; padding: 0 14px; border-bottom: 1px solid var(--acro-rule); }
-.search { flex: 1; border: 0; outline: 0; background: transparent; color: #eee; font: inherit; font-size: 13px; }
-.search::placeholder { color: #a0a0a0; }
+.search { flex: 1; border: 0; outline: 0; background: transparent; color: var(--acro-text-strong); font: inherit; font-size: 13px; }
+.search::placeholder { color: var(--acro-text-dim); }
 .tools-scroll { flex: 1; overflow-y: auto; padding: 30px 0 60px 196px; }
 section { margin-bottom: 34px; }
-h2 { font-size: 21px; font-weight: 400; color: #f2f2f2; margin: 0 0 30px; line-height: 1.2; }
+h2 { font-size: 21px; font-weight: 400; color: var(--acro-text-strong); margin: 0 0 30px; line-height: 1.2; }
 .grid { display: flex; flex-wrap: wrap; gap: 30px 0; }
 .tool { width: 170px; display: flex; flex-direction: column; align-items: center; gap: 0; }
 .tool-icon { position: relative; border: 0; background: transparent; cursor: pointer; height: 66px; display: flex; align-items: center; justify-content: center; padding: 0; }
 .nueva { position: absolute; top: -8px; left: 50%; transform: translateX(-50%); background: #2d6cc4; color: #fff; font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 2px; letter-spacing: .03em; }
-.tool-label { margin: 6px 0 14px; color: #ececec; font-size: 15px; text-align: center; cursor: pointer; min-height: 20px; }
-.tool-label:hover { color: #fff; }
-.none { color: #bbb; padding: 20px 0; }
+.tool-label { margin: 6px 0 14px; color: var(--acro-text); font-size: 15px; text-align: center; cursor: pointer; min-height: 20px; }
+.tool-label:hover { color: var(--acro-text-strong); }
+.none { color: var(--acro-text-dim); padding: 20px 0; }
 .tools-side { width: 300px; flex: none; border-left: 1px solid var(--acro-rule); background: var(--acro-bar); padding: 16px 12px; overflow-y: auto; }
-.side-row { display: flex; align-items: center; gap: 12px; width: 100%; height: 46px; padding: 0 12px; border: 0; background: transparent; color: #ececec; font: inherit; font-size: 15px; cursor: pointer; text-align: left; border-radius: 4px; }
+.side-row { display: flex; align-items: center; gap: 12px; width: 100%; height: 46px; padding: 0 12px; border: 0; background: transparent; color: var(--acro-text); font: inherit; font-size: 15px; cursor: pointer; text-align: left; border-radius: 4px; }
 .side-row:hover { background: var(--acro-hover); }
 @media (max-width: 1200px) { .tools-scroll { padding-left: 40px; } }
 </style>

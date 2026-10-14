@@ -40,7 +40,7 @@
     <div class="q-pa-sm assistant-input">
       <q-input
         v-model="draft"
-        dark dense outlined autogrow
+        dense outlined autogrow
         type="textarea"
         :placeholder="docStore.loaded ? 'Escribe qué cambiar… (Enter para enviar)' : 'Abre un PDF primero'"
         :disable="!docStore.loaded || assistant.busy.value"
@@ -94,9 +94,9 @@ watch(() => assistant.messages.value.length + (assistant.busy.value ? 1 : 0), as
 </script>
 
 <style scoped>
-.assistant { background: #1d1d1d; }
-.assistant-head { border-bottom: 1px solid #333; }
-.assistant-input { border-top: 1px solid #333; }
+.assistant { background: var(--acro-surface); }
+.assistant-head { border-bottom: 1px solid var(--acro-border); }
+.assistant-input { border-top: 1px solid var(--acro-border); }
 .assistant-list { font-size: 13px; }
 .msg {
   border-radius: 8px;
@@ -106,10 +106,10 @@ watch(() => assistant.messages.value.length + (assistant.busy.value ? 1 : 0), as
   word-break: break-word;
   line-height: 1.35;
 }
-.msg-user { background: #2a3f5f; color: #e8eef7; margin-left: 24px; }
-.msg-assistant { background: #2c2c2c; color: #eee; margin-right: 24px; }
+.msg-user { background: var(--acro-select); color: var(--acro-text); margin-left: 24px; }
+.msg-assistant { background: var(--acro-surface-2); color: var(--acro-text-strong); margin-right: 24px; }
 .msg-tool { color: #9aa; font-size: 12px; padding: 2px 6px; display: flex; align-items: center; }
-.msg-error { background: #4a2020; color: #ffb4b4; }
-.example { cursor: pointer; color: #9cc4ff; }
+.msg-error { background: #fdecec; color: var(--acro-danger); }
+.example { cursor: pointer; color: var(--acro-blue-text); }
 .example:hover { text-decoration: underline; }
 </style>

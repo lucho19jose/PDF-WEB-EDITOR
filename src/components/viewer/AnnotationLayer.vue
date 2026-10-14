@@ -1,5 +1,10 @@
 <template>
   <div class="annot-layer-container" v-if="showLayer">
+    <a v-for="(link, i) in pageLinks" :key="'link' + i" class="pdf-link"
+       :class="{ editing: editorStore.currentTool === 'link' }"
+       :style="linkStyle(link)" :href="safeLink(link)" :title="link.uri"
+       :aria-label="link.uri" target="_blank" rel="noopener noreferrer"
+       @mousedown.stop @click.stop="followLink($event, link)" />
     <!-- Existing annotations and page images: selectable / movable hit-targets.
          Live in the EDIT tool as well as in select — Acrobat's "Editar PDF" is
          one mode in which a click on text edits the text and a click on a
@@ -160,6 +165,7 @@ import type { usePDFEngine } from '@/composables/usePDFEngine'
 import type { AnnotationInfo, ContentImageInfo, Quad, Pt, RectT, MarkupType, ShapeType, TextChar } from '@/engine/types'
 import { hexToRgb01, rgb01ToCss } from '@/utils/color'
 import { enqueueOp, beginTransaction } from '@/utils/opQueue'
+import { rememberImage, copiedImage, IMAGE_CLIPBOARD_MARKER, setImagePasteHandler, type CopiedImage } from '@/utils/acro/imageClipboard'
 
 const props = defineProps<{ pageWidth: number; pageHeight: number; pdfWidth: number; pdfHeight: number }>()
 const emit = defineEmits<{ changed: []; objectPicked: [] }>()
@@ -171,6 +177,7 @@ const ocrStore = useOcrStore()
 const historyStore = useHistoryStore()
 const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
 const ui = useUiStore()
+const syncDocumentEdit = inject<() => Promise<void>>('syncDocumentEdit')
 const pickFiles = inject<(accept: string, multiple: boolean) => Promise<File[]>>('pickFiles', async () => [])
 /** The OCR side's ear for a scan that moved or changed under its recognised runs. */
 const ocrController = inject<{ scanMoved?: (pageIndex: number, dx: number, dy: number) => void; scanChanged?: (pageIndex: number) => void } | null>('ocrController', null)
@@ -181,6 +188,20 @@ function coversPage(rect: RectT): boolean {
   return w * h >= Math.max(1, props.pdfWidth * props.pdfHeight) * 0.5
 }
 
+interface PageLink { rect: number[]; uri: string; external: boolean; page: number | null; appearance?: { width: number; color: number[]; dashed: boolean } }
+const pageLinks = ref<PageLink[]>([])
+function safeLink(link: PageLink) { return link.external && /^(https?:|mailto:|tel:)/i.test(link.uri) ? link.uri : undefined }
+function followLink(e: MouseEvent, link: PageLink) {
+  if (!link.external) { e.preventDefault(); if (link.page) docStore.setPage(link.page) }
+  else if (!safeLink(link)) e.preventDefault()
+}
+function linkStyle(link: PageLink) {
+  const r = link.rect, a = link.appearance
+  return { left: `${r[0] * scaleX.value}px`, top: `${r[1] * scaleY.value}px`,
+    pointerEvents: editorStore.currentTool === 'edit' ? 'none' as const : 'auto' as const,
+    width: `${(r[2] - r[0]) * scaleX.value}px`, height: `${(r[3] - r[1]) * scaleY.value}px`,
+    border: `${(a?.width ?? 0) * scaleX.value}px ${a?.dashed ? 'dashed' : 'solid'} ${rgb01ToCss((a?.color ?? [0,0,1]) as [number,number,number])}` }
+}
 const annotations = ref<AnnotationInfo[]>([])
 const selectedIndex = ref<number | null>(null)
 
@@ -307,7 +328,8 @@ const scaleY = computed(() => props.pageHeight / props.pdfHeight)
  * discoverable step, and it is not one Acrobat asks for.
  */
 const objectsSelectable = computed(() => ['select', 'edit'].includes(editorStore.currentTool))
-const showLayer = computed(() => editorStore.isAnnotationTool || objectsSelectable.value)
+// Link borders remain visible while adding text or using the hand tool too.
+const showLayer = computed(() => docStore.loaded)
 const isMarkupPreview = computed(() => !!drag.value && MARKUP_TOOLS.includes(drag.value.tool))
 const ftFontPx = computed(() => editorStore.fontSize * scaleY.value)
 
@@ -827,30 +849,29 @@ function pushUndo() {
   if (docStore.pdfBytes) historyStore.pushSnapshot(new Uint8Array(docStore.pdfBytes))
 }
 
+let annotationLoad = 0
 async function loadAnnotations() {
+  const seq = ++annotationLoad, pageIndex = docStore.currentPage - 1
+  const docId = docStore.documentId
   if (!pdfEngine.isReady.value || !pdfEngine.docLoaded.value || !docStore.loaded) {
-    annotations.value = []
-    contentImages.value = []
-    return
+    annotations.value = []; contentImages.value = []; pageLinks.value = []; return
   }
-  try {
-    annotations.value = await pdfEngine.getAnnotations(docStore.currentPage - 1)
-  } catch { annotations.value = [] }
-  try {
-    contentImages.value = await pdfEngine.listContentImages(docStore.currentPage - 1)
-  } catch { contentImages.value = [] }
-  if (selectedImgId.value !== null && !contentImages.value.some(i => i.id === selectedImgId.value)) {
-    selectedImgId.value = null
-  }
-  // Prune group members that no longer exist after a reload.
-  if (multiImgs.value.size) {
-    const ids = new Set(contentImages.value.map(i => i.id))
-    multiImgs.value = new Set([...multiImgs.value].filter(id => ids.has(id)))
-  }
-  if (multiAnnots.value.size) {
-    const idxs = new Set(annotations.value.map(a => a.index))
-    multiAnnots.value = new Set([...multiAnnots.value].filter(i => idxs.has(i)))
-  }
+  const [anns, imgs, links] = await Promise.all([
+    pdfEngine.getAnnotations(pageIndex).catch(() => []),
+    pdfEngine.listContentImages(pageIndex).catch(() => []),
+    pdfEngine.acro<PageLink[]>('listLinks', { pageIndex }).catch(() => [])
+  ])
+  if (seq !== annotationLoad || pageIndex !== docStore.currentPage - 1 || docId !== docStore.documentId) return
+  annotations.value = anns; contentImages.value = imgs; pageLinks.value = links
+  if (selectedImgId.value !== null && !imgs.some(i => i.id === selectedImgId.value)) selectedImgId.value = null
+  if (multiImgs.value.size) multiImgs.value = new Set([...multiImgs.value].filter(id => imgs.some(i => i.id === id)))
+  if (multiAnnots.value.size) multiAnnots.value = new Set([...multiAnnots.value].filter(i => anns.some(a => a.index === i)))
+}
+let loadScheduled = false
+function scheduleLoadAnnotations() {
+  if (loadScheduled) return
+  loadScheduled = true
+  queueMicrotask(() => { loadScheduled = false; void loadAnnotations() })
 }
 
 // --- creation ---
@@ -1147,7 +1168,7 @@ async function commitFreeText() {
   if (!text.trim()) return
   const pageIndex = docStore.currentPage - 1
   const rect = [...ftRect.value] as RectT
-  await annotOp('Text box added', () => pdfEngine.addFreeText(pageIndex, rect, text, editorStore.fontSize, hexToRgb01(editorStore.textColor)))
+  await annotOp('Text box added', () => pdfEngine.addFreeText(pageIndex, rect, text, editorStore.fontSize, hexToRgb01(editorStore.textColor), editorStore.fontFamily))
 }
 function cancelFreeText() { freeTextEditing.value = false; freeTextValue.value = '' }
 
@@ -1204,9 +1225,10 @@ async function insertImageSteps(file: File) {
   const wrap = editorStore.imageWrap
   const inFlow = wrap === 'inline'
 
-  // One undo point for the whole insertion: making room mutates the document
-  // too, so the snapshot has to be taken before ANY of it.
-  pushUndo()
+  // Only reflow needs an early snapshot. Ordinary inserts snapshot inside the
+  // queue, so rapid external pastes each undo exactly one image.
+  const ownsUndo = inFlow && editorStore.reflowOnEdit
+  if (ownsUndo) pushUndo()
   const dropY = imageDropY.value ?? props.pdfHeight * 0.2
   imageDropY.value = null
 
@@ -1263,7 +1285,7 @@ async function insertImageSteps(file: File) {
     // left to select or resize, which the message says rather than leaving the
     // user looking for handles that are not there.
     const behindNote = `Image inserted behind the text${fitNote} — it is part of the page now, so Ctrl+Z to change it`
-    await annotOp(behindNote, () => pdfEngine.drawImageInContent(pageIndex, rect, buf, true), false)
+    await annotOp(behindNote, () => pdfEngine.drawImageInContent(pageIndex, rect, buf, true), !ownsUndo)
     // Switching tool writes its own status line, so the note is put back after
     // it — otherwise the only explanation of what just happened is replaced by
     // "Tool: select" before the user can read it.
@@ -1280,7 +1302,7 @@ async function insertImageSteps(file: File) {
           room.spilled > 0 ? `${room.spilled} line(s) moved to the next page` : null
         ].filter(Boolean).join(' — ')
       : `Image inserted${fitNote} — the text was left as it was (turn on Reflow to move it aside)`
-  await annotOp(note, () => pdfEngine.addImageStamp(pageIndex, rect, buf), false)
+  await annotOp(note, () => pdfEngine.addImageStamp(pageIndex, rect, buf), !ownsUndo)
 
   // Hand the user the select tool: staying on 'image' means the next click on
   // the page opens the file chooser again, so the image they just placed can
@@ -1326,7 +1348,8 @@ async function annotOp(msg: string, mutate: () => Promise<boolean>, pushSnapshot
       if (pushSnapshot) pushUndo()
       docStore.markModified()
       editorStore.setStatus(msg)
-      emit('changed')
+      // Keep mutation, snapshot and save/reload in the SAME queue slot.
+      if (syncDocumentEdit) await syncDocumentEdit(); else emit('changed')
       await loadAnnotations()
     } else {
       editorStore.setStatus(`Failed: ${pdfEngine.error.value || 'unknown error'}`)
@@ -1525,6 +1548,66 @@ async function deleteSelected() {
   await annotOp('Annotation deleted', () => pdfEngine.deleteAnnotation(pageIndex, idx))
 }
 
+function clipboardActive(e?: Event) {
+  const el = (e?.target ?? document.activeElement) as HTMLElement | null
+  return docStore.loaded && ui.view === 'document' && ui.activeTool !== 'organize' && !ui.dialog &&
+    !el?.closest('input, textarea, [contenteditable="true"]')
+}
+function onCopy(e: ClipboardEvent) {
+  if (!clipboardActive(e) || !objectsSelectable.value) return
+  const img = selectedImg.value, annot = selectedAnnot.value
+  if (!img && annot?.type !== 'Stamp') return
+  const pageIndex = docStore.currentPage - 1, docId = docStore.documentId
+  const args = img ? { pageIndex, sourceKey: img.sourceKey, doOffset: img.doOffset, name: img.name } : { pageIndex, annotIndex: annot!.index }
+  e.preventDefault()
+  e.clipboardData?.setData('text/plain', IMAGE_CLIPBOARD_MARKER)
+  const image = enqueueOp(async () => {
+    if (docId !== docStore.documentId) throw new Error('El documento cambió antes de copiar')
+    const result = await pdfEngine.acro<{ bytes: ArrayBuffer; width: number; height: number }>('copyImage', args)
+    return { blob: new Blob([result.bytes], { type: 'image/png' }), width: result.width, height: result.height }
+  })
+  rememberImage(image)
+  pasteOffset = 0
+  // Promise-backed ClipboardItem keeps the user activation while the worker encodes.
+  if (typeof ClipboardItem !== 'undefined') navigator.clipboard.write([new ClipboardItem({
+    'image/png': image.then(i => i.blob), 'text/plain': new Blob([IMAGE_CLIPBOARD_MARKER], {type: 'text/plain'})
+  })]).catch(() => {})
+  image.then(() => editorStore.setStatus('Imagen copiada'), err => editorStore.setStatus(`No se pudo copiar: ${err.message}`))
+}
+let pasteOffset = 0
+async function pasteImage(image: CopiedImage) {
+  if (!clipboardActive()) return
+  const pageIndex = docStore.currentPage - 1, docId = docStore.documentId
+  if (!image.width || !image.height) {
+    await insertImage(new File([image.blob], 'clipboard.png', { type: image.blob.type }))
+    return
+  }
+  const bytes = await image.blob.arrayBuffer()
+  const fit = Math.min(1, (props.pdfWidth - 16) / image.width, (props.pdfHeight - 16) / image.height)
+  const w = image.width * fit, h = image.height * fit
+  const offset = (++pasteOffset % 10) * 12
+  const x = Math.max(8, Math.min(36 + offset, props.pdfWidth - w - 8))
+  const y = Math.max(8, Math.min(36 + offset, props.pdfHeight - h - 8))
+  await annotOp('Imagen pegada', async () => {
+    if (docId !== docStore.documentId || pageIndex !== docStore.currentPage - 1) return false
+    return pdfEngine.addImageStamp(pageIndex, [x, y, x+w, y+h], bytes)
+  })
+}
+function onPaste(e: ClipboardEvent) {
+  if (!clipboardActive(e)) return
+  const data = e.clipboardData
+  const internal = data?.getData('text/plain') === IMAGE_CLIPBOARD_MARKER
+  const file = Array.from(data?.items ?? []).find(i => i.type.startsWith('image/'))?.getAsFile()
+  const stored = copiedImage()
+  if (!file && !(internal && stored)) return
+  e.preventDefault()
+  const image = internal && stored ? stored : Promise.resolve({blob: file!, width: 0, height: 0})
+  image.then(pasteImage).catch(err => editorStore.setStatus(`No se pudo pegar: ${err.message}`))
+}
+window.addEventListener('copy', onCopy)
+window.addEventListener('paste', onPaste)
+setImagePasteHandler(pasteImage)
+
 function onKeyDown(e: KeyboardEvent) {
   if (e.defaultPrevented) return // TextBlockOverlay already consumed this Delete
   const tag = (e.target as HTMLElement)?.tagName
@@ -1542,7 +1625,7 @@ watch(() => editorStore.currentTool, () => {
   selectedImgId.value = null
   clearMultiSelection()
   cancelFreeText()
-  if (showLayer.value) loadAnnotations()
+  if (showLayer.value) scheduleLoadAnnotations()
 })
 /**
  * Load on MOUNT — same reason as the text overlay.
@@ -1552,23 +1635,27 @@ watch(() => editorStore.currentTool, () => {
  * for. Its annotations were simply absent: nothing to select, nothing to
  * resize, nothing to delete.
  */
-onMounted(() => { loadAnnotations() })
+onMounted(scheduleLoadAnnotations)
 
 watch(() => docStore.currentPage, () => {
   // The image ids are per page, so a selection carried across pages points at
   // whatever happens to hold that id on the new one.
   clearObjectSelection()
   cancelFreeText() // an open freetext editor must not commit onto the NEW page
-  loadAnnotations()
+  scheduleLoadAnnotations()
 })
-watch(() => docStore.renderVersion, () => loadAnnotations())
-watch(showLayer, (v) => { if (v) loadAnnotations() }, { immediate: true })
+watch(() => docStore.renderVersion, scheduleLoadAnnotations)
+watch(showLayer, (v) => { if (v) scheduleLoadAnnotations() }, { immediate: true })
 
 window.addEventListener('keydown', onKeyDown)
 onBeforeUnmount(() => {
   setObjectHandler(null)
   objectSelection.value = null
   window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('copy', onCopy)
+  window.removeEventListener('paste', onPaste)
+  setImagePasteHandler(null)
+  annotationLoad++
   window.removeEventListener('mousemove', onCaptureMove)
   window.removeEventListener('mouseup', onCaptureUp)
   window.removeEventListener('mousemove', onMoveMove)
@@ -1585,6 +1672,8 @@ defineExpose({ loadAnnotations, deleteSelected, selectInBand, clearMultiSelectio
   position: absolute; inset: 0; width: 100%; height: 100%;
   pointer-events: none;
 }
+.pdf-link { position: absolute; pointer-events: auto; z-index: 14; box-sizing: border-box; cursor: pointer; }
+.pdf-link:hover, .pdf-link.editing { outline: 1px dashed #2680eb; background: rgba(38,128,235,.08); }
 .annot-capture {
   position: absolute; inset: 0; pointer-events: auto; z-index: 15;
 }

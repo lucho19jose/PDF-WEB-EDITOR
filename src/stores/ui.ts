@@ -37,6 +37,8 @@ export interface AcroToolInfo {
   action: 'Abrir' | 'Agregar'
   /** Opens a dialog instead of a tool bar. */
   dialog?: AcroDialog
+  /** Shown under the tool bar when the tool is opened with no document, as Acrobat does. */
+  headline?: string
   /** Has no document to work on: available from Inicio and Herramientas without one. */
   noDocument?: boolean
 }
@@ -45,16 +47,16 @@ export interface AcroToolInfo {
 export const ACRO_TOOLS: AcroToolInfo[] = [
   { id: 'create', label: 'Crear archivo PDF', color: '#ff7b82', icon: 'create', group: 'create', action: 'Abrir', dialog: 'create', noDocument: true },
   { id: 'combine', label: 'Combinar archivos', color: '#9090fa', icon: 'combine', group: 'create', action: 'Abrir', dialog: 'combine', noDocument: true },
-  { id: 'organize', label: 'Organizar páginas', color: '#a3f858', icon: 'organize', group: 'create', action: 'Abrir' },
-  { id: 'edit', label: 'Editar PDF', color: '#f56bb7', icon: 'edit', group: 'create', action: 'Abrir' },
+  { id: 'organize', label: 'Organizar páginas', color: '#a3f858', icon: 'organize', group: 'create', action: 'Abrir', headline: 'Eliminar, insertar, extraer o rotar páginas' },
+  { id: 'edit', label: 'Editar PDF', color: '#f56bb7', icon: 'edit', group: 'create', action: 'Abrir', headline: 'Edite texto e imágenes en archivos PDF.' },
   { id: 'export', label: 'Exportar archivo PDF', color: '#26c0c7', icon: 'export', group: 'create', action: 'Abrir', dialog: 'export' },
-  { id: 'ocr', label: 'Digitalizar y OCR', color: '#58e06f', icon: 'ocr', group: 'create', action: 'Abrir' },
-  { id: 'comment', label: 'Comentar', color: '#ffe22e', icon: 'comment', group: 'review', action: 'Abrir' },
-  { id: 'stamp', label: 'Sello', color: '#b483f0', icon: 'stamp', group: 'review', action: 'Agregar' },
-  { id: 'measure', label: 'Medir', color: '#e366ef', icon: 'measure', group: 'review', action: 'Agregar' },
-  { id: 'fillsign', label: 'Rellenar y firmar', color: '#b483f0', icon: 'fillsign', group: 'forms', action: 'Abrir' },
-  { id: 'protect', label: 'Proteger', color: '#9090fa', icon: 'protect', group: 'protect', action: 'Abrir' },
-  { id: 'redact', label: 'Redactar', color: '#ff7b82', icon: 'redact', group: 'protect', action: 'Agregar' }
+  { id: 'ocr', label: 'Digitalizar y OCR', color: '#58e06f', icon: 'ocr', group: 'create', action: 'Abrir', headline: 'Convierta documentos digitalizados en PDF editables y con capacidad de búsqueda' },
+  { id: 'comment', label: 'Comentar', color: '#ffe22e', icon: 'comment', group: 'review', action: 'Abrir', headline: 'Agregue comentarios a los archivos PDF' },
+  { id: 'stamp', label: 'Sello', color: '#b483f0', icon: 'stamp', group: 'review', action: 'Agregar', headline: 'Agregue sellos a los archivos PDF' },
+  { id: 'measure', label: 'Medir', color: '#e366ef', icon: 'measure', group: 'review', action: 'Agregar', headline: 'Mida distancias, perímetros y áreas en archivos PDF' },
+  { id: 'fillsign', label: 'Rellenar y firmar', color: '#b483f0', icon: 'fillsign', group: 'forms', action: 'Abrir', headline: 'Rellene, firme y envíe formularios' },
+  { id: 'protect', label: 'Proteger', color: '#9090fa', icon: 'protect', group: 'protect', action: 'Abrir', headline: 'Proteja los archivos PDF con contraseñas' },
+  { id: 'redact', label: 'Redactar', color: '#ff7b82', icon: 'redact', group: 'protect', action: 'Agregar', headline: 'Elimine permanentemente información confidencial' }
 ]
 
 export const TOOL_GROUPS: { id: AcroToolInfo['group']; label: string }[] = [
@@ -84,6 +86,13 @@ export const useUiStore = defineStore('ui', () => {
   const rightPaneOpen = persistedRef<boolean>('ui.rightPaneOpen', true)
   /** "Mostrar cuadros delimitadores": outline every text block and image while editing. */
   const showBoundingBoxes = persistedRef<boolean>('ui.showBoundingBoxes', true)
+  /**
+   * "Reconocer texto" under Documentos digitalizados: entering Editar PDF on a
+   * scanned page converts it to editable text on its own, as Acrobat does.
+   */
+  const autoRecognize = persistedRef<boolean>('ui.autoRecognize', true)
+  /** The conversion in progress, for Acrobat's progress toast (1-based page, 0..100). */
+  const scanConversion = ref<null | { page: number; pct: number; hidden: boolean }>(null)
   /** "Restringir la edición": the edit tool edits text only and leaves the pictures alone. */
   const restrictEditing = persistedRef<boolean>('ui.restrictEditing', false)
   /** Read mode (Ctrl+H): the bars go and the page fills the window. */
@@ -92,6 +101,7 @@ export const useUiStore = defineStore('ui', () => {
   const organizeThumbWidth = persistedRef<number>('ui.organizeThumbWidth', 150)
   /** Pages selected in Organizar páginas and in the thumbnail pane (0-based). */
   const selectedPages = ref<number[]>([])
+  const pageOperationBusy = ref(false)
   /** The signature last drawn or typed in Rellenar y firmar, as a PNG data URL. */
   const signatureImage = persistedRef<string>('ui.signature', '')
   const initialsImage = persistedRef<string>('ui.initials', '')
@@ -120,7 +130,7 @@ export const useUiStore = defineStore('ui', () => {
 
   return {
     view, activeTool, dialog, dialogArgs, leftPaneOpen, leftPanel, rightPaneOpen,
-    showBoundingBoxes, restrictEditing, readMode, organizeThumbWidth, selectedPages,
+    showBoundingBoxes, autoRecognize, scanConversion, restrictEditing, readMode, organizeThumbWidth, selectedPages, pageOperationBusy,
     signatureImage, initialsImage, notifications, unreadNotifications, protection, toolMeta,
     openDialog, closeDialog, notify
   }
