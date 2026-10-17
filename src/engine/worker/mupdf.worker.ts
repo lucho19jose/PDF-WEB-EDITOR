@@ -2397,7 +2397,9 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
  */
 function encodeForSimpleFont(
   text: string,
-  info: SimpleFontInfo
+  info: SimpleFontInfo,
+  /** Kern (thousandths of an em) to draw a space with when the font has none — see kernedSpace. */
+  spaceKu?: number
 ): { bytes: string } | { missing: string[] } {
   const table = info.encodingName === 'MacRoman' ? unicodeToMacRoman() : unicodeToWinAnsi()
   let bytes = ''
@@ -2426,13 +2428,21 @@ function encodeForSimpleFont(
       const inRange = byte >= info.firstChar && byte <= info.lastChar
       const width = inRange ? (info.widths[byte - info.firstChar] || 0) : info.missingWidth
       if (width === 0) {
+        if (cp === 32 && spaceKu) { bytes += kernedSpace(spaceKu); continue }
         missing.push(ch)
         continue
       }
     }
     // A non-zero width is not proof the glyph exists — see loadFontProgram.
-    // The space is exempt: it draws nothing whether or not the program has
-    // it, and its advance comes from /Widths (LaTeX fonts have no space).
+    // The space draws nothing either way, but a code the program cannot name
+    // extracts as U+FFFD: pdfTeX's NimbusRomNo9L lists a width for code 32
+    // and has no /space, so "ImageNet Classification" read back (and copied)
+    // as "ImageNet�Classification". It is set as a kern, as TeX set it.
+    if (cp === 32 && info.program && !programHasGlyph(info.program, 32)) {
+      const w = info.widths?.length && byte >= info.firstChar && byte <= info.lastChar ? info.widths[byte - info.firstChar] : 0
+      const ku = spaceKu ?? (w > 0 ? w : undefined)
+      if (ku) { bytes += kernedSpace(ku); continue }
+    }
     if (info.program && cp !== 32 && !programHasGlyph(info.program, cp)) {
       missing.push(ch)
       continue
@@ -2467,8 +2477,11 @@ function pickSubstituteFont(info: SimpleFontInfo | null, targetBlock?: TextBlock
   const flags = info?.flags || 0
 
   const fixedPitch = (flags & 1) !== 0 || /courier|mono/.test(name)
-  const serif = (flags & 2) !== 0 || /times|georgia|garamond|book|palatino|serif|roman/.test(name)
-  const bold = targetBlock?.isBold || /bold|black|heavy/.test(name) || ((flags & 0x40000) !== 0)
+  // Names, not just the flag: pdfTeX marks its fonts symbolic and never sets
+  // the serif bit, so a Palladio or Computer Modern title fell to Helvetica.
+  const serif = (flags & 2) !== 0 || !/gothic|sans|grotesk|grotesque/.test(name) &&
+    /times|georgia|garamond|book|palatino|palladio|pagella|serif|roman|nimbusrom|termes|minion|caslon|baskerville|bodoni|century|cambria|charter|utopia|schoolbook|didot|sabon|goudy|plantin|constantia|perpetua|^(cm|lm|ec|sf)?(r|bx|ti|sl|csc)\d/.test(name)
+  const bold = targetBlock?.isBold || /bold|black|heavy|^(cm|lm[a-z]*)bx|bx\d/.test(name) || ((flags & 0x40000) !== 0)
   const italic = targetBlock?.isItalic || /italic|oblique/.test(name) || ((flags & 0x40) !== 0)
 
   if (fixedPitch) {
@@ -2730,6 +2743,8 @@ function planTextEncoding(
     mode: 'hex' | 'plain'; fontRef: string; encoding: ReturnType<typeof getFontEncoding>
     /** Glyph codes the run being edited already uses — see encodeTextForFont. */
     preferCodes?: Map<number, number>
+    /** The block's content, read for the inter-word kern a spaceless font sets. */
+    content?: string
   },
   lines: string[],
   targetBlock?: TextBlock
@@ -2786,8 +2801,12 @@ function planTextEncoding(
     if (info && !info.isType0 && info.encodingName !== 'Unknown') {
       const byteLines: string[] = []
       let ok = true
+      // A font that names its glyphs (pdfTeX) and has no space is set with
+      // kerns; a third of an em is TeX's own inter-word space when the block
+      // shows none to copy.
+      const spaceKu = spaceKernOf(block.content) ?? (info.differences ? 333 : undefined)
       for (const line of lines) {
-        const res = encodeForSimpleFont(line, info)
+        const res = encodeForSimpleFont(line, info, spaceKu)
         if ('missing' in res) { ok = false; break }
         byteLines.push(res.bytes)
       }
@@ -3772,11 +3791,7 @@ function replaceTextInStream(
         streamStr = streamStr.slice(0, sp.start) + sp.text + streamStr.slice(sp.end)
       }
 
-      const streamBytes = new Uint8Array(streamStr.length)
-      for (let i = 0; i < streamStr.length; i++) {
-        streamBytes[i] = streamStr.charCodeAt(i) & 0xFF
-      }
-      src.write(streamBytes)
+      src.write(streamBytesOf(streamStr))
       invalidateContentSources(pageIndex)
       return {
         success: true,
@@ -4442,10 +4457,7 @@ function transformInSource(
     }
 
     // Write modified stream back (Latin-1 for byte transparency)
-    const streamBytes = new Uint8Array(modifiedStream.length)
-    for (let i = 0; i < modifiedStream.length; i++) {
-      streamBytes[i] = modifiedStream.charCodeAt(i) & 0xFF
-    }
+    const streamBytes = streamBytesOf(modifiedStream)
 
     src.write(streamBytes)
 
@@ -4656,8 +4668,12 @@ function dropBaselineInBlock(inner: string, stream: string, blockStart: number, 
  * caught 22 such). Same test `applyBlockReplacement` uses to delegate.
  */
 function provablyHoldsMore(block: BtInfo, targetBlock: TextBlock): boolean {
-  const dFree = block.decodedText.replace(/\s+/g, '')
-  const tFree = targetBlock.text.replace(/\s+/g, '')
+  // Folded (ligatures expanded, case-insensitive): a pdfTeX title decodes
+  // "Classiﬁcation" while extraction reports "Classification", the test said
+  // "not contained", and the whole-block rewrite deleted the title's second
+  // line ("Neural Networks") drawn by the same BT.
+  const dFree = foldForMatch(block.decodedText).replace(/\s+/g, '')
+  const tFree = foldForMatch(targetBlock.text).replace(/\s+/g, '')
   return !!tFree && dFree !== tFree && !dFree.includes('?') &&
     dFree.includes(tFree) && dFree.replace(tFree, '').length > 0
 }
@@ -4896,7 +4912,7 @@ function restyleInSource(
 
         const plan = planTextEncoding(
           pageIndex,
-          { mode: block.mode, fontRef: block.fontRef, encoding: block.encoding },
+          { mode: block.mode, fontRef: block.fontRef, encoding: block.encoding, content: block.content },
           wrapped,
           targetBlock
         )
@@ -5111,10 +5127,7 @@ function restyleInSource(
       return { success: false, error: 'The style operators for this text could not be located' }
     }
 
-    const streamBytes = new Uint8Array(modifiedStream.length)
-    for (let i = 0; i < modifiedStream.length; i++) {
-      streamBytes[i] = modifiedStream.charCodeAt(i) & 0xFF
-    }
+    const streamBytes = streamBytesOf(modifiedStream)
 
     src.write(streamBytes)
     invalidateContentSources(pageIndex)
@@ -6665,7 +6678,10 @@ interface BtInfo {
 
 /** Does the block draw anything in this font? (a BT can switch fonts per run) */
 function blockUsesFont(b: BtInfo, ref: string): boolean {
-  return b.fontRef === ref || b.fonts.includes(ref)
+  if (b.fontRef === ref || b.fonts.includes(ref)) return true
+  // A same-named sibling resource (see fontRefAliases) is the same face.
+  return fontRefAliases.size > 1 && fontRefAliases.has(ref) &&
+    (fontRefAliases.has(b.fontRef) || b.fonts.some(f => fontRefAliases.has(f)))
 }
 
 /**
@@ -7413,11 +7429,7 @@ function applyBlockReplacement(
     // deleted the bracket — which belongs to the label in the cell BEFORE.
     // Same test as the op-level gate: not the target, contains it, leftover
     // visible, and no '?' placeholders pretending to be foreign glyphs.
-    const dFree = block.decodedText.replace(/\s+/g, '')
-    const tFreeHere = targetNorm.replace(/\s+/g, '')
-    const provablyHoldsMore = !!tFreeHere && dFree !== tFreeHere && !dFree.includes('?') &&
-      dFree.includes(tFreeHere) && dFree.replace(tFreeHere, '').length > 0
-    if (targetNorm && (blockGlyphs > targetNorm.length * 1.4 || provablyHoldsMore)) {
+    if (targetNorm && (blockGlyphs > targetNorm.length * 1.4 || provablyHoldsMore(block, targetBlock))) {
       const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight, pageWidth)
       if (partial) return partial
       // Falling through would rewrite the WHOLE block, and this block holds far
@@ -8516,7 +8528,32 @@ function fuzzyTextMatch(decoded: string, target: string): boolean {
  * Find the content stream font reference (e.g., "F50") that matches
  * a MuPDF font name (e.g., "CAAAAA+Calibri").
  */
+/**
+ * Every resource name that carries the same face as the ref the last
+ * `findMatchingFontRef` returned. Word embeds one face under SEVERAL names —
+ * a letter's "TimesNewRomanPSMT" was /F1 (a simple TrueType font, used for a
+ * few spaces) and /F4 (a CID font drawing the whole body) — and extraction
+ * reports only the name, so the first ref found stood for both and the font
+ * filter (`blockUsesFont`) discarded every block drawn in the other: no body
+ * line of the letter could be edited ("Could not find matching text … font F1").
+ */
+let fontRefAliases: Set<string> = new Set()
+
 function findMatchingFontRef(
+  mupdfFontName: string,
+  fontRefToBaseName: Map<string, string>
+): string | null {
+  const ref = findMatchingFontRefOnce(mupdfFontName, fontRefToBaseName)
+  fontRefAliases = new Set()
+  if (ref) {
+    const clean = (s: string) => s.replace(/^[A-Z]{6}\+/, '')
+    const base = clean(fontRefToBaseName.get(ref) || '')
+    for (const [r, b] of fontRefToBaseName) if (clean(b) === base) fontRefAliases.add(r)
+  }
+  return ref
+}
+
+function findMatchingFontRefOnce(
   mupdfFontName: string,
   fontRefToBaseName: Map<string, string>
 ): string | null {
@@ -9253,6 +9290,8 @@ function replaceInsideTjArray(
     const fc = simpleInfo.firstChar
     let newW = 0, known = true
     for (const code of newLiteral.codes) {
+      const ks = kernedSpaceKu(code)
+      if (ks !== null) { newW += ks; continue }
       const cw = w[code - fc]
       if (cw === undefined) { known = false } else newW += cw
     }
@@ -10781,7 +10820,7 @@ function applyPartialBlockReplacement(
       const fr = encodingFor(op)
       const plan = planTextEncoding(pageIndex,
         { mode: op.isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding,
-          preferCodes: preferredGlyphCodes(ops, op, block, fr.encoding) },
+          preferCodes: preferredGlyphCodes(ops, op, block, fr.encoding), content: block.content },
         [newText], targetBlock)
       // Only fatal when the array is the ONLY hope; with an op window still in
       // hand, an unencodable cell just means this route is not the one.
@@ -10836,7 +10875,7 @@ function applyPartialBlockReplacement(
     const fr = encodingFor(ops[at])
     return planTextEncoding(pageIndex,
       { mode: ops[at].isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding,
-        preferCodes: preferredGlyphCodes(ops, ops[at], block, fr.encoding) },
+        preferCodes: preferredGlyphCodes(ops, ops[at], block, fr.encoding), content: block.content },
       lines, targetBlock)
   }
   const planFor = (at: number, text: string) => planLinesFor(at, [text])
@@ -10975,6 +11014,8 @@ function applyPartialBlockReplacement(
       const si = encodingFor(ops[winI]).simpleInfo
       if (!si?.widths) return ''
       for (const b of plan.byteLines[0]) {
+        const ks = kernedSpaceKu(b.charCodeAt(0))
+        if (ks !== null) { newAdv += ks / 1000 * stIn.tfSize; continue }
         const cw = si.widths[b.charCodeAt(0) - si.firstChar]
         if (cw === undefined) return ''
         newAdv += cw / 1000 * stIn.tfSize
@@ -11136,6 +11177,90 @@ function unescapePdfString(s: string): string {
       default: return esc // \\ \( \) and any other escaped char → literal
     }
   })
+}
+
+// ── Spaces a font cannot draw ──
+//
+// pdfTeX's fonts have no space glyph: TeX sets inter-word space as a KERN
+// inside a TJ array, `[(Contexts)-333(Optical)]TJ`, and the font's /Widths
+// does not even reach code 32 (FirstChar 40 on an arXiv title). Encoding a
+// typed space through the font therefore "failed", and EVERY multi-word edit
+// on a LaTeX document — deleting a single letter of a title included — fell
+// back to a base-14 substitute: a Palladio title came back in Helvetica.
+//
+// Such a space is encoded as a sentinel carrying the kern (U+E000 + kern in
+// thousandths of an em — a private-use character can never occur in the
+// Latin-1 strings content streams are handled as), and `expandKernedSpaces`
+// turns every literal holding one into a TJ array, just before the stream is
+// written: `(ab) Tj` → `[(a) -333 (b)] TJ`. Doing it there rather than
+// in each writer keeps the dozen emitters of a literal unchanged.
+const KERNED_SPACE_BASE = 0xE000
+const KERNED_SPACE_RE = /[-]/
+
+function kernedSpace(ku: number): string {
+  return String.fromCharCode(KERNED_SPACE_BASE + Math.max(1, Math.min(4095, Math.round(ku))))
+}
+
+/** The kern (thousandths of an em) a sentinel stands for, or null for an ordinary byte. */
+function kernedSpaceKu(code: number): number | null {
+  return code > KERNED_SPACE_BASE && code <= KERNED_SPACE_BASE + 4095 ? code - KERNED_SPACE_BASE : null
+}
+
+/**
+ * The inter-word kern a block already uses: the median of the TJ-array kerns
+ * that read as spaces (past KERN_SPACE, short of a column jump). Undefined
+ * when the block shows none.
+ */
+function spaceKernOf(content: string | undefined): number | undefined {
+  if (!content) return undefined
+  const vals: number[] = []
+  const arrRe = new RegExp(String.raw`\[((?:${STR_LIT_SRC}|${HEX_LIT_SRC}|[^\]])*)\]\s*TJ`, 'g')
+  const litRe = new RegExp(`${STR_LIT_SRC}|${HEX_LIT_SRC}`, 'g')
+  for (const m of content.matchAll(arrRe)) {
+    for (const n of m[1].replace(litRe, ' ').matchAll(/-?\d*\.?\d+/g)) {
+      const v = -parseFloat(n[0])
+      if (v >= KERN_SPACE && v <= 800) vals.push(v)
+    }
+  }
+  if (!vals.length) return undefined
+  vals.sort((a, b) => a - b)
+  return vals[Math.floor(vals.length / 2)]
+}
+
+function splitKernedLiteral(lit: string): string {
+  const body = lit.slice(1, -1)
+  let out = '('
+  for (const ch of body) {
+    const ku = kernedSpaceKu(ch.charCodeAt(0))
+    out += ku === null ? ch : `) ${-ku} (`
+  }
+  return out + ')'
+}
+
+function expandKernedSpaces(s: string): string {
+  if (!KERNED_SPACE_RE.test(s)) return s
+  // A literal shown on its own becomes an array; a `'` or `"` keeps its line
+  // move (and its Tw/Tc operands) by showing nothing, then the array.
+  const showRe = new RegExp(`(${STR_LIT_SRC})(\\s*)(Tj|'|")`, 'g')
+  s = s.replace(showRe, (all, lit: string, _ws: string, op: string) => {
+    if (!KERNED_SPACE_RE.test(lit)) return all
+    const arr = `[${splitKernedLiteral(lit)}] TJ`
+    return op === 'Tj' ? arr : `() ${op} ${arr}`
+  })
+  // Whatever is left sits inside an array already.
+  if (KERNED_SPACE_RE.test(s)) {
+    s = s.replace(new RegExp(STR_LIT_SRC, 'g'), lit => KERNED_SPACE_RE.test(lit) ? splitKernedLiteral(lit) : lit)
+  }
+  // Never let a sentinel reach the bytes: `& 0xFF` would turn it into a letter.
+  return s.replace(/[-]/g, ' ')
+}
+
+/** A content-stream string as the bytes it stands for (Latin-1), sentinels expanded. */
+function streamBytesOf(s: string): Uint8Array {
+  s = expandKernedSpaces(s)
+  const bytes = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xFF
+  return bytes
 }
 
 function escapePdfString(s: string): string {
@@ -12603,9 +12728,7 @@ function writeContentSource(
   for (const sp of [...splices].sort((a, b) => b.start - a.start)) {
     out = out.slice(0, sp.start) + sp.text + out.slice(sp.end)
   }
-  const bytes = new Uint8Array(out.length)
-  for (let i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 0xFF
-  src.write(bytes)
+  src.write(streamBytesOf(out))
   invalidateContentSources(pageIndex)
 }
 
