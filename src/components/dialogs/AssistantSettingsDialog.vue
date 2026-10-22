@@ -2,17 +2,17 @@
   <q-dialog :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)">
     <q-card class="acro-card" style="min-width: 440px">
       <q-card-section>
-        <div class="text-subtitle1">Assistant settings</div>
+        <div class="text-subtitle1">Configuración del asistente</div>
         <div class="text-caption text-grey-5">
-          The assistant sends the text of the page you are on, and your messages, to OpenAI
-          with your own API key. Nothing is sent until you write to it.
+          El asistente envía a OpenAI, con su propia clave de API, el texto de la página en la
+          que está y sus mensajes. No se envía nada hasta que usted le escribe.
         </div>
       </q-card-section>
       <q-card-section class="q-pt-none">
         <q-input
           v-model="key"
           dense outlined
-          label="OpenAI API key"
+          label="Clave de API de OpenAI"
           :type="reveal ? 'text' : 'password'"
           autocomplete="off"
           spellcheck="false"
@@ -22,20 +22,20 @@
           </template>
         </q-input>
         <div class="text-caption text-grey-6 q-mt-xs q-mb-md">
-          Stored only in this browser (localStorage). Clear the field to forget it.
+          Se guarda solo en este navegador (localStorage). Vacíe el campo para olvidarla.
         </div>
-        <q-input v-model="model" dense outlined label="Model" placeholder="gpt-4o-mini" spellcheck="false" />
+        <q-input v-model="model" dense outlined label="Modelo" placeholder="gpt-4o-mini" spellcheck="false" />
         <div class="text-caption text-grey-6 q-mt-xs q-mb-md">
-          Any chat model with tool calling, e.g. gpt-4o-mini (cheap) or gpt-4o.
+          Cualquier modelo de chat con llamadas a herramientas, p. ej. gpt-4o-mini (económico) o gpt-4o.
         </div>
-        <q-input v-model="endpoint" dense outlined label="Endpoint (optional)" placeholder="https://api.openai.com/v1/chat/completions" spellcheck="false" />
+        <q-input v-model="endpoint" dense outlined label="Endpoint (opcional)" placeholder="https://api.openai.com/v1/chat/completions" spellcheck="false" />
         <div class="text-caption text-grey-6 q-mt-xs">
-          Leave empty for the public API. Set a same-origin proxy URL if the API refuses this browser.
+          Déjelo vacío para usar la API pública. Indique la URL de un proxy del mismo origen si la API rechaza este navegador.
         </div>
       </q-card-section>
       <q-card-actions align="right">
-        <q-btn flat label="Cancel" color="grey-4" @click="emit('update:modelValue', false)" />
-        <q-btn unelevated label="Save" color="primary" @click="save" />
+        <q-btn flat label="Cancelar" color="grey-4" @click="emit('update:modelValue', false)" />
+        <q-btn unelevated label="Guardar" color="primary" @click="save" />
       </q-card-actions>
     </q-card>
   </q-dialog>

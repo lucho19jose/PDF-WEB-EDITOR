@@ -1049,11 +1049,13 @@ function computeMarkupQuads(rect: RectT, chars: TextChar[]): Quad[] {
 
 function placeNote(px: number, py: number) {
   $q.dialog({
-    title: 'Sticky note',
-    message: 'Note text:',
+    title: 'Nota adhesiva',
+    message: 'Texto de la nota:',
     prompt: { model: '', type: 'textarea' },
-    cancel: true,
-    dark: true
+    ok: { label: 'Aceptar', unelevated: true },
+    cancel: { label: 'Cancelar', flat: true },
+    dark: true,
+    class: 'acro-dialog'
   }).onOk(async (text: string) => {
     await annotOp('Note added', () => pdfEngine.addStickyNote(docStore.currentPage - 1, px, py, text || '', hexToRgb01(editorStore.highlightColor)))
   })

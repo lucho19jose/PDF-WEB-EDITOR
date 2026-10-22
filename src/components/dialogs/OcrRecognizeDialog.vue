@@ -4,56 +4,56 @@
       <q-card-section>
         <div class="text-subtitle1">Reconocer texto en este archivo</div>
         <div class="text-caption text-grey-5">
-          Reads every scanned page and adds an invisible text layer, so the file can be
-          searched, copied and read aloud — the way Acrobat's "Reconocer texto" does.
-          The page keeps its own pixels; nothing visible changes.
+          Lee cada página digitalizada y le añade una capa de texto invisible, para que el
+          archivo se pueda buscar, copiar y leer en voz alta. La página conserva sus propios
+          píxeles: no cambia nada de lo que se ve.
         </div>
       </q-card-section>
 
       <q-card-section v-if="!running" class="q-pt-none q-gutter-y-sm">
-        <div class="text-caption text-grey-4">Pages</div>
+        <div class="text-caption text-grey-4">Páginas</div>
         <q-option-group
           v-model="pages" dense inline color="primary"
           :options="[
-            { label: `All (${totalPages})`, value: 'all' },
-            { label: `Current (${currentPage})`, value: 'current' },
-            { label: 'Range', value: 'range' }
+            { label: `Todas (${totalPages})`, value: 'all' },
+            { label: `Actual (${currentPage})`, value: 'current' },
+            { label: 'Intervalo', value: 'range' }
           ]"
         />
         <q-input
           v-if="pages === 'range'"
           v-model="range" dense outlined
-          label="Pages, e.g. 3-5, 8"
+          label="Páginas, p. ej. 3-5, 8"
           :error="!!range && parseRange(range, totalPages).length === 0"
-          error-message="No page in that range"
+          error-message="No hay ninguna página en ese intervalo"
         />
         <q-select
           v-model="lang" dense outlined emit-value map-options
-          label="Language"
+          label="Idioma"
           :options="languages"
         />
         <q-toggle v-model="replaceExisting" dense color="primary"
-          label="Also pages that already have a text layer (replace it)" />
+          label="También las páginas que ya tienen una capa de texto (reemplazarla)" />
         <div class="text-caption text-grey-6">
-          Engine: {{ engineLabel }}. Pages with real text are skipped. About 10–40 seconds per page.
+          Motor: {{ engineLabel }}. Las páginas con texto real se omiten. Entre 10 y 40 segundos por página.
         </div>
       </q-card-section>
 
       <q-card-section v-else class="q-pt-none">
-        <div class="text-body2 q-mb-xs">{{ progress.stage || 'Recognising…' }}</div>
+        <div class="text-body2 q-mb-xs">{{ progress.stage || 'Reconociendo…' }}</div>
         <q-linear-progress :value="progress.total ? progress.done / progress.total : 0" color="primary" rounded size="10px" />
         <div class="text-caption text-grey-5 q-mt-xs">
-          Page {{ progress.page }} — {{ progress.done }} of {{ progress.total }} done,
-          {{ progress.layered }} recognised, {{ progress.skipped }} skipped
+          Página {{ progress.page }}: {{ progress.done }} de {{ progress.total }} hechas,
+          {{ progress.layered }} reconocidas, {{ progress.skipped }} omitidas
         </div>
       </q-card-section>
 
       <q-card-actions align="right">
         <template v-if="!running">
-          <q-btn flat label="Cancel" color="grey-4" @click="emit('update:modelValue', false)" />
-          <q-btn unelevated label="Recognise" color="primary" :disable="!canRun" @click="run" />
+          <q-btn flat label="Cancelar" color="grey-4" @click="emit('update:modelValue', false)" />
+          <q-btn unelevated label="Reconocer" color="primary" :disable="!canRun" @click="run" />
         </template>
-        <q-btn v-else flat label="Stop after this page" color="grey-4" @click="emit('cancel')" />
+        <q-btn v-else flat label="Detener tras esta página" color="grey-4" @click="emit('cancel')" />
       </q-card-actions>
     </q-card>
   </q-dialog>
@@ -116,12 +116,12 @@ const engineLabel = computed(() => ENGINE_LABELS[editorStore.ocrEngine])
 
 /** Tesseract language packs shipped under public/tessdata; PaddleOCR reads Chinese and Latin whatever is chosen. */
 const languages = [
-  { label: 'Spanish + Chinese (simplified)', value: 'spa+chi_sim' },
-  { label: 'Spanish', value: 'spa' },
-  { label: 'English', value: 'eng' },
-  { label: 'Spanish + English', value: 'spa+eng' },
-  { label: 'Chinese (simplified)', value: 'chi_sim' },
-  { label: 'English + Chinese (simplified)', value: 'eng+chi_sim' }
+  { label: 'Español + chino (simplificado)', value: 'spa+chi_sim' },
+  { label: 'Español', value: 'spa' },
+  { label: 'Inglés', value: 'eng' },
+  { label: 'Español + inglés', value: 'spa+eng' },
+  { label: 'Chino (simplificado)', value: 'chi_sim' },
+  { label: 'Inglés + chino (simplificado)', value: 'eng+chi_sim' }
 ]
 
 watch(() => props.modelValue, open => { if (open && !running.value) { pages.value = 'all'; range.value = '' } })

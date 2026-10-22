@@ -2,17 +2,17 @@
   <q-dialog :model-value="modelValue" @update:model-value="v => emit('update:modelValue', v)">
     <q-card class="acro-card" style="min-width: 420px">
       <q-card-section>
-        <div class="text-subtitle1">OCR settings</div>
+        <div class="text-subtitle1">Configuración de OCR</div>
         <div class="text-caption text-grey-5">
-          PaddleOCR and Tesseract run inside the browser and never send anything anywhere.
-          Mistral OCR uploads the page image to Mistral's service and needs your own API key.
+          PaddleOCR y Tesseract funcionan dentro del navegador y no envían nada a ninguna parte.
+          Mistral OCR sube la imagen de la página al servicio de Mistral y necesita su propia clave de API.
         </div>
       </q-card-section>
       <q-card-section class="q-pt-none">
         <q-input
           v-model="key"
           dense outlined
-          label="Mistral API key"
+          label="Clave de API de Mistral"
           :type="reveal ? 'text' : 'password'"
           autocomplete="off"
           spellcheck="false"
@@ -22,12 +22,12 @@
           </template>
         </q-input>
         <div class="text-caption text-grey-6 q-mt-xs">
-          Stored only in this browser (localStorage). Clear the field to forget it.
+          Se guarda solo en este navegador (localStorage). Vacíe el campo para olvidarla.
         </div>
       </q-card-section>
       <q-card-actions align="right">
-        <q-btn flat label="Cancel" color="grey-4" @click="emit('update:modelValue', false)" />
-        <q-btn unelevated label="Save" color="primary" @click="save" />
+        <q-btn flat label="Cancelar" color="grey-4" @click="emit('update:modelValue', false)" />
+        <q-btn unelevated label="Guardar" color="primary" @click="save" />
       </q-card-actions>
     </q-card>
   </q-dialog>

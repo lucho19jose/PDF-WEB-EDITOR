@@ -209,9 +209,10 @@ async function runOcrOnPage(lang = OCR_DEFAULT_LANG) {
   const verdict = ocr.judgeScanned(layer.chars, layer.coverage)
   if (!verdict.scanned) {
     $q.dialog({
-      title: 'This page already has text',
-      message: `${verdict.reason}. Running OCR would add a second, guessed copy on top of it. Recognise it anyway?`,
-      cancel: true, persistent: true
+      title: 'Esta página ya tiene texto',
+      message: `La página ya tiene ${verdict.extractedChars} caracteres de texto real, que se pueden editar directamente. Reconocerla con OCR añadiría encima una segunda copia, deducida de la imagen. ¿Desea reconocerla de todos modos?`,
+      ok: { label: 'Reconocer', unelevated: true }, cancel: { label: 'Cancelar', flat: true },
+      persistent: true, dark: true, class: 'acro-dialog'
     }).onOk(() => runOcrNow(pageIndex, lang))
     return
   }
@@ -436,12 +437,13 @@ async function runOcrNowInner(pageIndex: number, lang: string) {
     if (!cloudConsentGiven) {
       const ok = await new Promise<boolean>(resolve => {
         $q.dialog({
-          title: 'Send this page to Mistral?',
-          message: 'The page image will be uploaded to Mistral\'s OCR service to be read. Nothing is sent for any other engine.',
-          ok: 'Send', cancel: true, persistent: true
+          title: '¿Enviar esta página a Mistral?',
+          message: 'La imagen de la página se subirá al servicio de OCR de Mistral para leerla. Con los demás motores no se envía nada.',
+          ok: { label: 'Enviar', unelevated: true }, cancel: { label: 'Cancelar', flat: true },
+          persistent: true, dark: true, class: 'acro-dialog'
         }).onOk(() => resolve(true)).onCancel(() => resolve(false)).onDismiss(() => resolve(false))
       })
-      if (!ok) { stopProgress(); editorStore.setStatus('Cloud recognition cancelled'); return }
+      if (!ok) { stopProgress(); editorStore.setStatus('Reconocimiento en la nube cancelado'); return }
       cloudConsentGiven = true
     }
   }
@@ -1978,13 +1980,13 @@ async function recognizeDocument(opts: RecognizeDocumentOptions): Promise<void> 
   // enough that a still bar reads as a hang.
   const stopProgress = watch([ocr.stage, ocr.progress], ([stage, pct]) => {
     if (!ocr.busy.value) return
-    p.stage = `Recognising page ${p.page}… ${stage && stage !== 'recognizing text' && stage !== 'Recognising text...' ? stage : `${pct}%`}`
+    p.stage = `Reconociendo la página ${p.page}… ${stage && stage !== 'recognizing text' && stage !== 'Recognising text...' ? stage : `${pct}%`}`
   })
   try {
     for (const pi of opts.pageIndices) {
       if (recognizeCancel) break
       p.page = pi + 1
-      p.stage = `Checking page ${pi + 1}…`
+      p.stage = `Comprobando la página ${pi + 1}…`
       const blocks = await pdfEngine.getTextBlocks(pi).catch(() => [])
       const hasLayer = blocks.some(b => b.invisible)
       if (!(await isScanLikePage(pi))) {
@@ -1995,16 +1997,16 @@ async function recognizeDocument(opts: RecognizeDocumentOptions): Promise<void> 
       }
       if (hasLayer && !opts.replaceExisting) { why.layer++; p.skipped++; p.done++; continue }
 
-      p.stage = `Recognising page ${pi + 1}…`
+      p.stage = `Reconociendo la página ${pi + 1}…`
       await runOcrNow(pi, opts.lang)
       // The layer is written from the runs: from the readings the page's own
       // letters give, not the recogniser's ("Lostérminos queenel").
-      p.stage = `Reading page ${pi + 1} again from its own letters…`
+      p.stage = `Releyendo la página ${pi + 1} con sus propias letras…`
       await ocr.settleRepairs()
       const items = ocrStore.itemsFor(pi).filter(i => i.text.trim() && !i.removed)
       if (!items.length) { why.nothing++; p.skipped++; p.done++; continue }
 
-      p.stage = `Writing the text layer of page ${pi + 1}…`
+      p.stage = `Escribiendo la capa de texto de la página ${pi + 1}…`
       const size = await pdfEngine.getPageSize(pi)
       await exclusiveOp(async () => {
         await pdfEngine.removeMarkedContent(pi, OCR_LAYER_TAG)
@@ -2032,7 +2034,7 @@ async function recognizeDocument(opts: RecognizeDocumentOptions): Promise<void> 
       p.layered++; p.done++
     }
     if (changed) {
-      p.stage = 'Saving the document…'
+      p.stage = 'Guardando el documento…'
       // The snapshot is the PRE-run bytes: the worker's document has changed,
       // the store's bytes have not until the sync below.
       pushUndo()
@@ -2040,20 +2042,20 @@ async function recognizeDocument(opts: RecognizeDocumentOptions): Promise<void> 
       await syncAfterEdit()
     }
   } catch (err: any) {
-    editorStore.setStatus(`Recognition stopped: ${err?.message || err}`)
+    editorStore.setStatus(`El reconocimiento se detuvo: ${err?.message || err}`)
   } finally {
     stopProgress()
     p.running = false
   }
   const skipped: string[] = []
-  if (why.text) skipped.push(`${why.text} with text already`)
-  if (why.layer) skipped.push(`${why.layer} with a text layer already`)
-  if (why.blank) skipped.push(`${why.blank} blank`)
-  if (why.nothing) skipped.push(`${why.nothing} where nothing was read`)
-  const tail = skipped.length ? ` — skipped ${skipped.join(', ')}` : ''
+  if (why.text) skipped.push(`${why.text} que ya tenían texto`)
+  if (why.layer) skipped.push(`${why.layer} que ya tenían una capa de texto`)
+  if (why.blank) skipped.push(`${why.blank} en blanco`)
+  if (why.nothing) skipped.push(`${why.nothing} en las que no se leyó nada`)
+  const tail = skipped.length ? `; se omitieron ${skipped.join(', ')}` : ''
   editorStore.setStatus(p.layered
-    ? `Text recognised on ${p.layered} page${p.layered === 1 ? '' : 's'}${recognizeCancel ? ' (stopped)' : ''}: the file is now searchable${tail}. Click a recognised line to edit it; Ctrl+Z undoes the whole run.`
-    : `No page was recognised${tail}`)
+    ? `Texto reconocido en ${p.layered} página${p.layered === 1 ? '' : 's'}${recognizeCancel ? ' (detenido)' : ''}: ya se puede buscar en el archivo${tail}. Haga clic en una línea reconocida para editarla; Ctrl+Z deshace todo el reconocimiento.`
+    : `No se reconoció ninguna página${tail}`)
 }
 function cancelRecognizeDocument() { recognizeCancel = true }
 provide('recognizeDocument', recognizeDocument)
@@ -2078,9 +2080,10 @@ const assistant = createAssistant({
   undo, rotatePage, deletePage, duplicatePage, insertBlankPage, movePage,
   confirmCloud: () => new Promise<boolean>(resolve => {
     $q.dialog({
-      title: 'Send the page text to OpenAI?',
-      message: 'The assistant sends the text of the page you are on and your messages to OpenAI, using your API key. Nothing else leaves the machine.',
-      ok: 'Send', cancel: true, persistent: true
+      title: '¿Enviar el texto de la página a OpenAI?',
+      message: 'El asistente envía a OpenAI, con su clave de API, el texto de la página en la que está y sus mensajes. Nada más sale del equipo.',
+      ok: { label: 'Enviar', unelevated: true }, cancel: { label: 'Cancelar', flat: true },
+      persistent: true, dark: true, class: 'acro-dialog'
     }).onOk(() => resolve(true)).onCancel(() => resolve(false)).onDismiss(() => resolve(false))
   })
 })
