@@ -275,6 +275,17 @@ async function pump() {
         continue
       }
       attempts.delete(page)
+      // A render begun before a zoom change finishes at the OLD zoom, after
+      // `repaintAll` has cleared `painted` and queued the page again. Taken as
+      // painted, the page was never drawn at the new zoom — it kept its old
+      // size for good — and its pdf size was worked out from the OLD viewport
+      // over the NEW scale (twice the paper's width, after zooming 150% to
+      // 75%), so every overlay on it was drawn at half size over the page:
+      // a click on a line opened another. Not painted at this zoom: again.
+      if (Math.abs(result.viewport.scale - docStore.scale) > 1e-6) {
+        renderQueue = [page, ...renderQueue.filter(p => p !== page)]
+        continue
+      }
       painted.add(page)
       // Replacing the Map is what makes Vue notice, and that re-runs every
       // page's style. Nearly every page in a document is the same size as the
@@ -287,8 +298,8 @@ async function pump() {
       }
       if (page === 1) fallbackSize.value = { w: result.width, h: result.height }
       pdfSizes.value.set(page, {
-        w: result.viewport.width / docStore.scale,
-        h: result.viewport.height / docStore.scale
+        w: result.viewport.width / result.viewport.scale,
+        h: result.viewport.height / result.viewport.scale
       })
       if (page === docStore.currentPage) adoptCurrentGeometry(result)
     }
@@ -300,8 +311,8 @@ async function pump() {
 function adoptCurrentGeometry(result: { width: number; height: number; viewport: any }) {
   pageWidth.value = result.width
   pageHeight.value = result.height
-  pdfPageWidth.value = result.viewport.width / docStore.scale
-  pdfPageHeight.value = result.viewport.height / docStore.scale
+  pdfPageWidth.value = result.viewport.width / result.viewport.scale
+  pdfPageHeight.value = result.viewport.height / result.viewport.scale
 }
 
 /** The pages worth measuring: the current one and its neighbours. */
