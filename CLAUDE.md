@@ -7489,6 +7489,56 @@ What production MUST provide, all of which `public/.htaccess` does for Apache:
   JavaScript. The only network calls are the ones the user opts into
   (Mistral OCR, and the editing assistant's OpenAI calls).
 
+## Windows app (Electron)
+The same `dist/` build in an Electron window, installed by an NSIS `.exe`
+that GitHub Releases hosts and the app updates itself from.
+
+- `npm run electron:dev` — Vite + Electron pointed at it (`electron/dev.mjs`).
+- `npm run electron:build` — `release/PDF-Editor-Pro-Setup-<version>.exe`
+  (~165 MB), nothing uploaded.
+- Release: bump `version` in `package.json`, commit, `git tag vX.Y.Z`, push
+  the tag. `.github/workflows/desktop-release.yml` builds on `windows-latest`
+  and uploads the exe, its `.blockmap` and `latest.yml` to a DRAFT release;
+  publishing the draft is what installed copies update to
+  (`electron-updater`, checked at every launch, offered as "Reiniciar y
+  actualizar").
+
+**`dist/` is served over `app://pdf-editor`, never `file://`**
+(`electron/main.cjs`). The app fetches its models, fonts and WASM by
+absolute path (`/paddle/…`, `/fonts/…`, `/pdfjs/…`), which file:// resolves
+against the drive root, and it needs COOP/COEP for SharedArrayBuffer — the
+protocol handler adds them, as `_headers` does on Netlify. COEP is
+`require-corp` there: the app loads nothing cross-origin, and the Clarity tag
+in `index.html` is skipped on `app:`.
+
+**Electron must be 41 or newer** (Chromium 146+). pdf.js 5.5 calls
+`Map.prototype.getOrInsertComputed`; on Electron 38 every page failed to render
+with "getOrInsertComputed is not a function". Check this again whenever pdfjs
+is upgraded.
+
+**The web packages are devDependencies on purpose.** electron-builder packs
+every production dependency into the app, and Vite already bundles them into
+`dist/`; as dependencies they would ship twice. Only `electron-updater` is a
+runtime dependency.
+
+**`electron-builder.yml` excludes `dist/_sweep`.** A local `vite build` copies
+`public/_sweep` — the user's real documents — into `dist/`, and without the
+exclusion they would be inside the installer.
+
+PDFs opened from Explorer ("Abrir con", or a second launch) reach the page
+through `window.desktop.onOpenFile` (preload) and the existing `loadBytes`;
+the listener is registered once the engine is up, and the main process queues
+files until then. A document with unsaved changes blocks unload as on the
+web; Electron would simply refuse to close, so `will-prevent-unload` asks.
+
+The installer is unsigned: Windows SmartScreen shows "Windows protected your
+PC" until the app has a reputation (More info → Run anyway). Azure Trusted
+Signing or an OV certificate fixes it through electron-builder config alone.
+
+Testing the packaged app: Playwright's `_electron.launch` attached once and
+then timed out on every later launch. Start the exe with
+`--remote-debugging-port=9555` and `chromium.connectOverCDP` instead.
+
 ## Vite Config Notes
 - COEP/COOP headers needed for SharedArrayBuffer (WASM)
 - `optimizeDeps: { exclude: ['mupdf'] }` — prevents Vite pre-bundling of MuPDF

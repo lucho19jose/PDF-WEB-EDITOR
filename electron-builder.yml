@@ -1,0 +1,61 @@
+# Windows installer for PDF Editor Pro (electron-builder).
+# `npm run electron:build`   -> release/PDF-Editor-Pro-Setup-<version>.exe
+# `npm run electron:release` -> the same, uploaded to a draft GitHub Release
+appId: com.lucho19jose.pdfeditor
+productName: PDF Editor Pro
+copyright: Copyright © 2026 Jose Luis Barboza
+
+directories:
+  output: release
+  buildResources: build
+
+# Only the web build and the Electron shell. The web dependencies are already
+# bundled into dist/ by Vite, which is why they are devDependencies.
+files:
+  - package.json
+  - electron/main.cjs
+  - electron/preload.cjs
+  - build/icon.png
+  - dist/**/*
+  # A local `vite build` copies public/_sweep into dist: real documents of the
+  # user's. They must never ship.
+  - "!dist/_sweep{,/**/*}"
+  - "!dist/_*.pdf"
+  - "!dist/test.pdf"
+  - "!dist/sample.pdf"
+  # Web-server config, meaningless in the app (main.cjs sends the headers).
+  - "!dist/.htaccess"
+  - "!dist/_headers"
+  - "!dist/_redirects"
+
+asar: true
+
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+      arch: [x64]
+  artifactName: PDF-Editor-Pro-Setup-${version}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false                 # installs for the current user, no admin rights
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: PDF Editor Pro
+  deleteAppDataOnUninstall: false
+
+# Offered under "Open with" for PDFs; Windows keeps the user's default viewer.
+fileAssociations:
+  - ext: pdf
+    name: PDF
+    description: Documento PDF
+    mimeType: application/pdf
+    role: Editor
+
+publish:
+  provider: github
+  owner: lucho19jose
+  repo: PDF-WEB-EDITOR
+  releaseType: draft

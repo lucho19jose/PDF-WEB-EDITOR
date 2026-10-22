@@ -178,6 +178,17 @@ onMounted(async () => {
   document.body.addEventListener('dragover', handleDragOver)
   document.body.addEventListener('drop', handleDrop)
   window.addEventListener('beforeunload', handleBeforeUnload)
+  // The Windows app: PDFs opened from Explorer arrive here. Registered once the
+  // engine is up, and only then is the main process told to send them, so a
+  // file double-clicked to launch the app is never loaded into a dead engine.
+  if (window.desktop) {
+    window.desktop.onOpenFile(({ name, bytes }) => {
+      loadBytes(new Uint8Array(bytes), name).catch((e: unknown) => {
+        editorStore.setStatus(`Could not open ${name}: ${e instanceof Error ? e.message : String(e)}`)
+      })
+    })
+    window.desktop.ready()
+  }
 })
 onUnmounted(() => {
   printCleanup?.()
