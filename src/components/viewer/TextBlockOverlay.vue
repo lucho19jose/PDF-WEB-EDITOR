@@ -8,9 +8,11 @@
       @mousedown="onMarqueeStart"
     />
 
-    <!-- Clickable text blocks (edit + select modes) -->
+    <!-- Clickable text blocks (Editar PDF). Not under the arrow: there, as in
+         Acrobat, a drag over text SELECTS letters (PageTextLayer) instead of
+         picking up the block. -->
     <div
-      v-for="block in scaledBlocks"
+      v-for="block in textInteractive ? scaledBlocks : []"
       :key="block.id"
       class="text-block"
       :class="{
@@ -246,8 +248,16 @@ const showOverlay = computed(() =>
   ['edit', 'select', 'addText'].includes(editorStore.currentTool)
 )
 
+/**
+ * Text is an OBJECT (picked up, moved, banded, deleted) only in Editar PDF.
+ * Under the arrow it is letters to select and copy, which the page's text
+ * layer provides — the overlay stays mounted there only for the services other
+ * layers ask of it (making room in the text for an image).
+ */
+const textInteractive = computed(() => editorStore.currentTool === 'edit')
+
 const marqueeEnabled = computed(() =>
-  ['select', 'edit'].includes(editorStore.currentTool) && !editingBlock.value && !isAddingText.value
+  textInteractive.value && !editingBlock.value && !isAddingText.value
 )
 
 const hasSelection = computed(() => selectedIds.value.length > 0)
@@ -2237,7 +2247,7 @@ function onMarqueeEnd() {
 // ── Move / Resize drag ──
 
 function onBlockMouseDown(event: MouseEvent, blockId: string) {
-  if (!['select', 'edit'].includes(editorStore.currentTool)) return
+  if (!textInteractive.value) return
   const block = blocks.value.find(b => b.id === blockId)
   if (!block) return
   emit('blocksPicked')
@@ -2651,7 +2661,7 @@ function onKeyDown(e: KeyboardEvent) {
   if (e.defaultPrevented) return // another layer already handled this keypress
   const tag = (e.target as HTMLElement)?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
-  if (!['select', 'edit'].includes(editorStore.currentTool)) return
+  if (!textInteractive.value) return
 
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && blocks.value.length > 0) {
     e.preventDefault()
@@ -2697,7 +2707,9 @@ watch(() => editorStore.currentTool, (tool) => {
   if (tool !== 'addText') {
     cancelAddText()
   }
-  if (!['select', 'edit'].includes(tool)) {
+  // A block selection belongs to Editar PDF; under the arrow it would wear
+  // handles nothing can act on.
+  if (tool !== 'edit') {
     clearSelection()
     cleanupDrag()
   }

@@ -16,6 +16,8 @@
       @mousedown="onPageMouseDown(page)"
     >
       <canvas :ref="el => setCanvasRef(el, page)" class="pdf-canvas" />
+      <!-- Selectable text, on EVERY painted page so a selection can cross pages. -->
+      <PageTextLayer :page="page" :paint-stamp="paintStamps[page] ?? 0" />
 
       <!--
         The editing layers live on ONE page: the one being looked at.
@@ -74,7 +76,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount, inject, nextTick, provide } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, inject, nextTick, provide } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
 import type { usePDFViewer } from '@/composables/usePDFViewer'
@@ -82,6 +84,7 @@ import type { usePDFEngine } from '@/composables/usePDFEngine'
 import TextBlockOverlay from './TextBlockOverlay.vue'
 import AnnotationLayer from './AnnotationLayer.vue'
 import SearchHighlights from './SearchHighlights.vue'
+import PageTextLayer from './PageTextLayer.vue'
 import OcrTextLayer from './OcrTextLayer.vue'
 import { enqueueOp } from '@/utils/opQueue'
 
@@ -197,6 +200,12 @@ function onBlocksPicked() {
 }
 function onObjectPicked() {
   textBlockOverlayRef.value?.clearSelection?.()
+  // Likewise letters highlighted with the arrow: picking an image ends that
+  // selection, or Ctrl+C would copy the text the user has moved on from.
+  const sel = window.getSelection()
+  const anchor = sel?.anchorNode
+  const el = anchor instanceof Element ? anchor : anchor?.parentElement
+  if (sel && !sel.isCollapsed && el?.closest('.textLayer')) sel.removeAllRanges()
 }
 
 /**
@@ -244,6 +253,8 @@ function wrapperStyle(page: number) {
 // has to, or a stale page paints over the latest — so firing several at once
 // would leave all but the last blank.
 const painted = new Set<number>()
+/** How many times each page has been painted: its text layer rebuilds on a change. */
+const paintStamps = reactive<Record<number, number>>({})
 let renderQueue: number[] = []
 let renderBusy = false
 
@@ -287,6 +298,7 @@ async function pump() {
         continue
       }
       painted.add(page)
+      paintStamps[page] = (paintStamps[page] ?? 0) + 1
       // Replacing the Map is what makes Vue notice, and that re-runs every
       // page's style. Nearly every page in a document is the same size as the
       // last, so only a page that is actually a different size pays for it.
@@ -528,17 +540,24 @@ function onPageMouseDown(page: number) {
   // Clicking a page makes it the one being edited. Without this, a tool used on
   // a page the scroll detector has not caught up with would act on another one.
   if (page !== docStore.currentPage) {
-    syncingFromScroll = true
+    // A page pressed on is already where the user is looking: it must not be
+    // scrolled to. `syncingFromScroll` cannot say so here — the page watcher
+    // runs after a nextTick, by which time it was reset — so the page jumped to
+    // the top under the pointer, and a text selection begun on it was lost.
+    pickedByPointer = page
     docStore.setPage(page)
-    syncingFromScroll = false
   }
 }
+/** The page made current by a press on it: the watcher leaves the scroll alone. */
+let pickedByPointer = 0
 
 watch(() => docStore.currentPage, async (page) => {
   await nextTick()
   // A page reached by scrolling is already where it should be; one chosen from
   // the thumbnails or the keyboard has to be brought into view.
-  if (continuous.value && !syncingFromScroll) scrollToPage(page)
+  const byPointer = pickedByPointer === page
+  pickedByPointer = 0
+  if (continuous.value && !syncingFromScroll && !byPointer) scrollToPage(page)
   // BOTH geometries, or the overlays scale the new page's blocks by the old
   // page's paper. adoptCurrentGeometry only runs when a page is RENDERED, and
   // a page already painted is not re-rendered on arrival — so every overlay

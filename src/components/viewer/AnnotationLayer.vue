@@ -1621,8 +1621,16 @@ function clipboardActive(e?: Event) {
   return docStore.loaded && ui.view === 'document' && ui.activeTool !== 'organize' && !ui.dialog &&
     !el?.closest('input, textarea, [contenteditable="true"]')
 }
+/** Letters highlighted with the arrow (PageTextLayer): Ctrl+C copies those, not a picked image. */
+function textSelected(): boolean {
+  const sel = window.getSelection()
+  if (!sel || sel.isCollapsed) return false
+  const node = sel.anchorNode
+  const el = node instanceof Element ? node : node?.parentElement
+  return !!el?.closest('.textLayer')
+}
 function onCopy(e: ClipboardEvent) {
-  if (!clipboardActive(e) || !objectsSelectable.value) return
+  if (!clipboardActive(e) || !objectsSelectable.value || textSelected()) return
   const img = selectedImg.value, annot = selectedAnnot.value
   if (!img && annot?.type !== 'Stamp') return
   const pageIndex = docStore.currentPage - 1, docId = docStore.documentId

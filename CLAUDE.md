@@ -1462,6 +1462,41 @@ table torn off its borders is not. The collision plan is still built so the
 status line can say how many lines the drop landed on and that Reflow would
 push them aside; ON, the old behaviour stands for prose.
 
+### The arrow selects LETTERS; Editar PDF moves text
+Acrobat's arrow ("Seleccionar") drags over letters and copies them; moving
+and editing text is Editar PDF's job. Here the arrow used to pick text up as
+blocks (the text block overlay ran for `select` and `edit` alike), and the
+page was a bare canvas, so nothing could ever be selected or copied.
+
+`PageTextLayer.vue` puts pdf.js's own `TextLayer` (transparent spans, the
+same parser that painted the canvas) on EVERY painted page, so a selection
+can cross pages; it is rebuilt from the viewer's `paintStamps`, i.e. exactly
+when the page is repainted (zoom, an edit's reload). It is live only for the
+`select` tool. Under it the text overlay renders no blocks and no band
+(`textInteractive` = `edit` only) but stays MOUNTED: the annotation layer
+still asks it to make room in the text for an image. Invisible text is
+included, so a scan with an OCR layer (Acrobat's or "Reconocer texto") copies
+like any text page; OCR runs recognised in the app but not yet saved are not
+in the PDF and are not selectable.
+
+Stacking: the host is z 4 with `pointer-events: none` and the spans `auto`,
+so a click on letters starts a selection while a click on a picture or blank
+paper still reaches the content-image targets (z 3) and the annotations
+(z 14+) — images stay clickable with the arrow, as in Acrobat. pdf.js's
+`endOfContent` trick (`.selecting` while the button is down) keeps a drag
+across the gaps between lines from jumping. Ctrl+C copies natively; the
+image copy handler stands aside when letters are selected; Ctrl+A under the
+arrow selects the current page's text; the Windows app adds a right-click
+"Copiar" (Electron has no context menu of its own).
+
+**Pressing on a page must not scroll it.** `onPageMouseDown` makes the
+pressed page current, and the page watcher — which runs after a `nextTick`,
+when `syncingFromScroll` had already been reset — scrolled it to the top
+under the pointer. Invisible while the arrow only picked things up; with text
+selection every drag that began on the lower half of a non-current page
+selected nothing, because the page jumped away as the button went down.
+`pickedByPointer` tells the watcher the page was pressed on.
+
 ### Paging keys, and finding the element that actually scrolls
 Up and Down scroll the page they are on first and turn the page only once there
 is nowhere left to scroll — what every PDF reader does, and necessary because on

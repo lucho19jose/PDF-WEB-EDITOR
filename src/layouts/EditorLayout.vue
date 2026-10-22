@@ -1844,6 +1844,21 @@ function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 's') { e.preventDefault(); saveFile(); return }
     if (e.key === 'o') { e.preventDefault(); openFile(); return }
     if (e.key === 'f') { e.preventDefault(); openFind(); return }
+    // Ctrl+A under the arrow selects the page's TEXT, as Acrobat's does (in
+    // Editar PDF the text overlay takes it and selects the blocks instead).
+    if (e.key.toLowerCase() === 'a' && !isTyping && editorStore.currentTool === 'select' &&
+        docStore.loaded && ui.view === 'document' && ui.activeTool !== 'organize') {
+      const layer = document.querySelector(`.page-text-host[data-page="${docStore.currentPage}"] .textLayer`)
+      if (layer) {
+        e.preventDefault()
+        const range = document.createRange()
+        range.selectNodeContents(layer)
+        const sel = window.getSelection()
+        sel?.removeAllRanges()
+        sel?.addRange(range)
+      }
+      return
+    }
     // Ctrl+P must print the EDITED document, not the browser's view of the app
     // shell — the default would print the toolbar and a screen-resolution page.
     if (e.key === 'p') { e.preventDefault(); printFile(); return }

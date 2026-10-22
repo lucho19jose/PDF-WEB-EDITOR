@@ -252,6 +252,51 @@ export function usePDFViewer() {
     return page.getTextContent()
   }
 
+  /**
+   * Build a page's selectable text — pdf.js's TextLayer: transparent spans laid
+   * over the canvas, which the browser selects and copies natively.
+   *
+   * Built into a fresh DETACHED element and returned; the caller swaps it in,
+   * so the old layer stays selectable until the new one is complete. Invisible
+   * text (an OCR layer, `3 Tr`) is included, which is how a scan with a
+   * searchable layer can be copied from. Same reload guard as `renderPage`:
+   * `getPage` on a document that was destroyed under it never settles.
+   */
+  async function buildTextLayer(pageNum: number): Promise<{ el: HTMLDivElement; scale: number } | null> {
+    if (!pdfDoc.value) return null
+    const myGen = docGeneration
+    const reload = untilReload()
+    try {
+      const page = await Promise.race([pdfDoc.value.getPage(pageNum), reload.promise])
+      if (!page || myGen !== docGeneration) return null
+      const scale = docStore.scale
+      const viewport = page.getViewport({ scale })
+      const el = document.createElement('div')
+      el.className = 'textLayer'
+      // pdf.js sizes the layer and its spans from this variable.
+      el.style.setProperty('--total-scale-factor', String(scale))
+      const layer = new pdfjsLib.TextLayer({
+        textContentSource: page.streamTextContent({ includeMarkedContent: true, disableNormalization: true }),
+        container: el,
+        viewport
+      })
+      const done = await Promise.race([layer.render().then(() => true), reload.promise])
+      if (!done || myGen !== docGeneration) { layer.cancel(); return null }
+      // The selection anchor pdf.js's own viewer appends: while a drag is in
+      // progress it covers the page, so moving across the gaps between spans
+      // does not make the selection jump to the end of the document.
+      const end = document.createElement('div')
+      end.className = 'endOfContent'
+      el.append(end)
+      return { el, scale }
+    } catch (err: any) {
+      if (err?.name !== 'AbortException') console.warn('Text layer for page', pageNum, 'failed:', err)
+      return null
+    } finally {
+      reload.done()
+    }
+  }
+
   async function getPageViewport(pageNum: number) {
     if (!pdfDoc.value) return null
     const page = await pdfDoc.value.getPage(pageNum)
@@ -267,6 +312,6 @@ export function usePDFViewer() {
 
   return {
     pdfDoc, isLoading, error,
-    loadDocument, reloadDocument, renderPage, renderPageToCanvas, getTextContent, getPageViewport
+    loadDocument, reloadDocument, renderPage, renderPageToCanvas, getTextContent, getPageViewport, buildTextLayer
   }
 }

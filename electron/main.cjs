@@ -220,6 +220,22 @@ function createWindow() {
     if (choice === 0) e.preventDefault() // ignore the unload block and close
   })
 
+  // Right-click. Electron shows no context menu of its own, so text selected
+  // with the arrow could be copied only by keyboard. Offered only where there
+  // is something to do; the app's own menus (q-menu) handle everything else.
+  win.webContents.on('context-menu', (_e, params) => {
+    const items = []
+    if (params.isEditable) {
+      items.push({ label: 'Cortar', role: 'cut', enabled: params.editFlags.canCut })
+      items.push({ label: 'Copiar', role: 'copy', enabled: params.editFlags.canCopy })
+      items.push({ label: 'Pegar', role: 'paste', enabled: params.editFlags.canPaste })
+      items.push({ type: 'separator' }, { label: 'Seleccionar todo', role: 'selectAll' })
+    } else if (params.selectionText && params.selectionText.trim()) {
+      items.push({ label: 'Copiar', role: 'copy' })
+    }
+    if (items.length) Menu.buildFromTemplate(items).popup({ window: win })
+  })
+
   // F12 still opens DevTools for diagnosis, with the menu bar hidden.
   win.webContents.on('before-input-event', (_e, input) => {
     if (input.type === 'keyDown' && input.key === 'F12') win.webContents.toggleDevTools()
