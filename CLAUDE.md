@@ -7537,9 +7537,14 @@ that GitHub Releases hosts and the app updates itself from.
   the exe, its `.blockmap` and `latest.yml` to a DRAFT release. Letting
   electron-builder publish (`--publish always`) was tried for v2.0.0–2.0.2:
   every run succeeded and no release was created, silently;
-  publishing the draft is what installed copies update to
-  (`electron-updater`, checked at every launch, offered as "Reiniciar y
-  actualizar").
+  publishing the draft is what installed copies are told about at the next
+  launch (`electron-updater`, NOTIFY ONLY: "Descargar" opens the installer's
+  download in the browser and the user runs it). The app never downloads or
+  runs an installer itself: Sophos's "Lockdown" exploit mitigation treats it
+  as a PDF reader (it is the default .pdf handler) and blocked every in-app
+  install — `quitAndInstall` and install-on-quit alike — while the same
+  installer run by the user went through. Copies on 2.0.0–2.0.3 still try
+  the old automatic install and have to be updated by hand once.
 
 **`dist/` is served over `app://pdf-editor`, never `file://`**
 (`electron/main.cjs`). The app fetches its models, fonts and WASM by
@@ -7580,6 +7585,28 @@ copy, start the build with `--user-data-dir=<scratch>`: the single-instance
 lock is per profile, and without it every launch hands its file to the
 installed app. A document with unsaved changes blocks unload as on the
 web; Electron would simply refuse to close, so `will-prevent-unload` asks.
+
+**Printing in the app goes out as page images** (`printPageImages` in
+EditorLayout, taken when `window.desktop` exists). Electron's PDF viewer
+(`plugins: true`) DISPLAYS the hidden print iframe's PDF but ignores
+`print()` on it: "Print dialog opened" was reported and no dialog came.
+Ordinary pages print fine, so each page is rendered by MuPDF at 300 DPI
+(annotations included) and printed from a srcdoc iframe, each image filling
+its sheet with `object-fit: contain`. Windows 11's print dialog runs in its
+own `PrintDialog` process: to see whether a print opened it, watch for that
+process starting — a window search scoped to the app's pids finds nothing.
+
+**Ctrl + wheel zooms the document** (PDFViewer `onCtrlWheel`, one step of
+the toolbar's zoom list per notch, the point under the pointer kept in
+place), web and app alike — left alone it was the browser's page zoom, which
+scales the whole shell, and in Electron did nothing. A zoom now rescales
+every page frame AT ONCE by the ratio; until each page repainted, the frames
+kept their old size and no scroll position could be anchored.
+
+**The update offer waits for a visible window.** The check answers before
+the first window is shown, and a message box owned by a hidden window
+closes at once as "cancel" — the offer flashed by unseen.
+`PDF_EDITOR_UPDATE_LOG=1` prints the updater's log to stdout.
 
 The installer is unsigned: Windows SmartScreen shows "Windows protected your
 PC" until the app has a reputation (More info → Run anyway). Azure Trusted

@@ -1482,6 +1482,15 @@ async function printFile() {
 
   printCleanup?.()
 
+  // The Windows app cannot print the PDF itself: Electron's PDF viewer shows
+  // a document but ignores print() — the iframe loaded, "Print dialog opened"
+  // was reported, and no dialog ever appeared. It prints ordinary pages fine,
+  // so there the pages go out as images instead.
+  if (window.desktop) {
+    await printPageImages()
+    return
+  }
+
   const url = URL.createObjectURL(blob)
   const frame = document.createElement('iframe')
   frame.setAttribute('aria-hidden', 'true')
@@ -1552,6 +1561,74 @@ async function printFile() {
   }
 
   frame.src = url
+  document.body.appendChild(frame)
+}
+
+/**
+ * Print every page as a 300 DPI image, from a hidden same-origin page — the
+ * Windows app's print path (see printFile). Rendered by MuPDF from the
+ * engine's document, i.e. exactly what was just saved, annotations included.
+ * 300 DPI is twice what pdf.js's own viewer prints at; the cost is that text
+ * goes to the printer as pixels rather than as outlines.
+ *
+ * Each image fills its sheet with `object-fit: contain`, so whatever paper is
+ * chosen in the dialog the page is scaled to fit and never clipped.
+ */
+async function printPageImages() {
+  const total = docStore.totalPages
+  const urls: string[] = []
+  const cleanup = () => {
+    if (printCleanup !== cleanup) return
+    printCleanup = null
+    frame?.remove()
+    for (const u of urls) URL.revokeObjectURL(u)
+  }
+  let frame: HTMLIFrameElement | null = null
+  printCleanup = cleanup
+  try {
+    await enqueueOp(async () => {
+      for (let i = 0; i < total; i++) {
+        if (printCleanup !== cleanup) return // superseded by another print
+        editorStore.setStatus(`Preparando la impresión: página ${i + 1} de ${total}…`)
+        const canvas = await pdfEngine.renderPageBitmap(i, 300 / 72)
+        if (!canvas) throw new Error(`no se pudo dibujar la página ${i + 1}`)
+        const png = await new Promise<Blob | null>(res => canvas.toBlob(res, 'image/png'))
+        if (!png) throw new Error(`no se pudo codificar la página ${i + 1}`)
+        urls.push(URL.createObjectURL(png))
+      }
+    })
+  } catch (err: any) {
+    cleanup()
+    editorStore.setStatus(`No se pudo imprimir: ${err?.message || err}`)
+    return
+  }
+  if (printCleanup !== cleanup) return
+
+  frame = document.createElement('iframe')
+  frame.setAttribute('aria-hidden', 'true')
+  frame.style.cssText = 'position:fixed;right:0;bottom:0;width:1px;height:1px;border:0;opacity:0'
+  frame.srcdoc = '<!doctype html><html><head><meta charset="utf-8"><style>' +
+    '@page{margin:0}html,body{margin:0;padding:0;background:#fff}' +
+    '.pg{width:100vw;height:100vh;break-after:page;page-break-after:always;overflow:hidden}' +
+    '.pg:last-child{break-after:auto;page-break-after:auto}' +
+    'img{display:block;width:100%;height:100%;object-fit:contain}' +
+    '</style></head><body>' +
+    urls.map(u => `<div class="pg"><img src="${u}"></div>`).join('') +
+    '</body></html>'
+  frame.onload = () => {
+    try {
+      const win = frame!.contentWindow
+      if (!win) throw new Error('sin contexto de impresión')
+      editorStore.setStatus('Diálogo de impresión abierto')
+      win.focus()
+      win.print()
+    } catch (err: any) {
+      editorStore.setStatus(`No se pudo imprimir: ${err?.message || err}`)
+    }
+    // print() returns when the dialog closes in Electron; the delay covers
+    // any spooling still reading the images.
+    setTimeout(cleanup, 60_000)
+  }
   document.body.appendChild(frame)
 }
 

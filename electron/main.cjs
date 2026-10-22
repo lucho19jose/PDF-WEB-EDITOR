@@ -175,10 +175,14 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      // Chromium's PDF viewer. Printing loads the saved document into a hidden
+      // iframe and prints THAT (vector, not the screen canvas); without the
+      // viewer the iframe never loads and the print button did nothing.
+      plugins: true
     }
   })
-  const state = { win, ready: false, hasDoc: false, claimed: false, pending: [] }
+  const state ={ win, ready: false, hasDoc: false, claimed: false, pending: [] }
   const id = win.webContents.id
   editors.set(id, state)
 
@@ -247,27 +251,65 @@ function createWindow() {
 }
 
 // ===== Updates from GitHub Releases =====
+/** The focused window, or any visible one; waits for one to be shown. Null on timeout. */
+function visibleWindow(timeoutMs) {
+  const pick = () => {
+    const focused = BrowserWindow.getFocusedWindow()
+    if (focused && focused.isVisible()) return focused
+    return BrowserWindow.getAllWindows().find(w => !w.isDestroyed() && w.isVisible()) || null
+  }
+  const now = pick()
+  if (now) return Promise.resolve(now)
+  return new Promise(resolve => {
+    const started = Date.now()
+    const timer = setInterval(() => {
+      const w = pick()
+      if (w || Date.now() - started > timeoutMs) { clearInterval(timer); resolve(w) }
+    }, 500)
+  })
+}
+
 function setupUpdates() {
   if (!app.isPackaged) return
   let autoUpdater
   try { ({ autoUpdater } = require('electron-updater')) } catch { return }
   // Its default logger prints a stack trace to stderr whenever there is no
   // release to read (offline, or before the first one is published).
-  autoUpdater.logger = null
-  autoUpdater.autoDownload = true
-  autoUpdater.on('update-downloaded', (info) => {
-    const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0]
+  // PDF_EDITOR_UPDATE_LOG=1 brings it back, for diagnosing an update.
+  autoUpdater.logger = process.env.PDF_EDITOR_UPDATE_LOG ? console : null
+  // NOTIFY ONLY: never download, never run the installer from here.
+  //
+  // Endpoint protection (Sophos's "Lockdown" exploit mitigation) treats this
+  // app as a PDF READER — it is the default .pdf handler — and a PDF reader
+  // launching an executable is exactly what a malicious PDF does. Every
+  // in-app install (quitAndInstall, and install-on-quit) was blocked with
+  // "Comportamiento malicioso 'Lockdown' evitado", while the same installer
+  // run by the user installed fine. So the app only says a version exists and
+  // opens its download in the browser; the user runs it.
+  autoUpdater.autoDownload = false
+  autoUpdater.autoInstallOnAppQuit = false
+  autoUpdater.on('update-available', async (info) => {
+    const version = info.version
+    const url = `https://github.com/lucho19jose/PDF-WEB-EDITOR/releases/download/v${version}/PDF-Editor-Pro-Setup-${version}.exe`
+    // The check usually answers before the first window is SHOWN, and a
+    // message box owned by a hidden window closes at once as "cancel" — the
+    // offer flashed by unseen. Wait for a visible window (up to a minute).
+    const parent = await visibleWindow(60000)
     const options = {
       type: 'info',
-      buttons: ['Reiniciar y actualizar', 'Más tarde'],
+      buttons: ['Descargar', 'Más tarde'],
       defaultId: 0,
       cancelId: 1,
       title: 'Actualización disponible',
-      message: `La versión ${info.version} de PDF Editor Pro está lista.`,
-      detail: 'Guarde su trabajo antes de reiniciar. Si elige "Más tarde", se instalará al cerrar la aplicación.'
+      message: `Hay una nueva versión de PDF Editor Pro: ${version} (tiene la ${app.getVersion()}).`,
+      detail: 'Al elegir "Descargar" se abre la descarga del instalador en el navegador. ' +
+        'Cuando termine, cierre PDF Editor Pro y ejecute el instalador: se instala encima de esta versión.'
     }
-    const choice = parent ? dialog.showMessageBoxSync(parent, options) : dialog.showMessageBoxSync(options)
-    if (choice === 0) autoUpdater.quitAndInstall()
+    if (!parent) return // no window ever appeared: offer again at the next launch
+    autoUpdater.logger?.info?.(`Offering ${version} (download page: ${url})`)
+    const { response } = await dialog.showMessageBox(parent, options)
+    autoUpdater.logger?.info?.(`Offer answered: ${response === 0 ? 'download' : 'later'}`)
+    if (response === 0) shell.openExternal(url).catch(() => {})
   })
   autoUpdater.on('error', () => { /* offline, or no release yet: try next launch */ })
   autoUpdater.checkForUpdates().catch(() => {})

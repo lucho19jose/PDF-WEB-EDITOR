@@ -596,7 +596,21 @@ watch(() => props.hidden, async (hidden) => {
   requestVisible()
 })
 
-watch(() => docStore.scale, repaintAll)
+// A zoom resizes every page frame AT ONCE, by the ratio, rather than as each
+// page happens to be repainted: until then the frames kept their old size, so
+// the scroll position could not be anchored to the point under the pointer
+// (Ctrl+wheel) and the layout jumped page by page as the renders came in.
+// Each page still corrects its own entry when it is painted.
+watch(() => docStore.scale, (now, before) => {
+  if (before && now && before !== now) {
+    const r = now / before
+    const next = new Map<number, { w: number; h: number }>()
+    for (const [p, s] of sizes.value) next.set(p, { w: s.w * r, h: s.h * r })
+    sizes.value = next
+    fallbackSize.value = { w: fallbackSize.value.w * r, h: fallbackSize.value.h * r }
+  }
+  repaintAll()
+})
 // A version bump is nearly always one page being rewritten. Page inserts,
 // deletions and reorders change the COUNT, and that watcher repaints the lot.
 watch(() => docStore.renderVersion, () => repaintAround(docStore.currentPage))
@@ -615,16 +629,53 @@ watch(() => docStore.loaded, async (loaded) => {
   }
 })
 
+// ── Ctrl + mouse wheel zooms the DOCUMENT, as in Acrobat ──
+// Left alone, Ctrl+wheel is the browser's own page zoom, which scales the
+// whole application — toolbars included — and in the Windows app does
+// nothing at all. One wheel notch is one step of the toolbar's zoom list, and
+// the point under the pointer stays under it.
+const acroShell = inject<{ zoomIn: () => void; zoomOut: () => void } | null>('acroShell', null)
+let wheelAccum = 0
+let wheelLast = 0
+function onCtrlWheel(e: WheelEvent) {
+  if (!e.ctrlKey || !docStore.loaded) return
+  e.preventDefault()
+  const el = containerRef.value
+  if (!el || !acroShell) return
+  // A precision touchpad sends many small deltas; a mouse notch is ~100.
+  wheelAccum += e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY
+  const now = performance.now()
+  if (Math.abs(wheelAccum) < 60 || now - wheelLast < 90) return
+  const zoomingIn = wheelAccum < 0
+  wheelAccum = 0
+  wheelLast = now
+  const box = el.getBoundingClientRect()
+  const px = e.clientX - box.left, py = e.clientY - box.top
+  const before = docStore.scale
+  const anchorX = el.scrollLeft + px, anchorY = el.scrollTop + py
+  if (zoomingIn) acroShell.zoomIn(); else acroShell.zoomOut()
+  const ratio = docStore.scale / before
+  if (ratio === 1) return
+  // The wrappers take their new size on the next render; scroll once they have.
+  nextTick(() => requestAnimationFrame(() => {
+    el.scrollLeft = anchorX * ratio - px
+    el.scrollTop = anchorY * ratio - py
+  }))
+}
+
 onMounted(() => {
   // Capture, so a scroll on any inner container is seen as well as the window's.
   window.addEventListener('scroll', onScroll, true)
   window.addEventListener('resize', onScroll)
+  // Not passive: preventDefault is what stops the browser zooming the app.
+  containerRef.value?.addEventListener('wheel', onCtrlWheel, { passive: false })
   if (docStore.loaded) requestVisible()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('scroll', onScroll, true)
   window.removeEventListener('resize', onScroll)
+  containerRef.value?.removeEventListener('wheel', onCtrlWheel)
   if (scrollFrame) cancelAnimationFrame(scrollFrame)
 })
 
