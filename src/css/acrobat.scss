@@ -141,9 +141,12 @@ select.acro-input option { background: #fff; color: var(--acro-text); }
 /* Tooltips the way Acrobat draws them. */
 .q-tooltip { background: #fff; color: var(--acro-text); border: 1px solid #cfcfcf; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15); font-size: 12px; font-family: var(--acro-font); border-radius: 3px; padding: 4px 8px; }
 
-/* Bounding boxes ("Mostrar cuadros delimitadores") while editing. */
+/* Bounding boxes ("Mostrar cuadros delimitadores") while editing — around what
+   can be edited only. A scan's paper is not an object, and neither are the
+   scan edit's pixel overlays: outlined, the page wore a frame and every
+   edited figure a box that read as part of the edit. */
 .acro-bboxes .text-block { outline: 1px solid rgba(70, 140, 220, 0.55); outline-offset: 0; }
-.acro-bboxes .cimg-hit { outline: 1px solid rgba(70, 140, 220, 0.55); }
+.acro-bboxes .cimg-hit:not(.paper) { outline: 1px solid rgba(70, 140, 220, 0.55); }
 
 /* Quasar's plugin dialogs (confirmations, the password prompt) in Acrobat's dress. */
 .q-dialog-plugin { border-radius: 4px; font-family: var(--acro-font); }
