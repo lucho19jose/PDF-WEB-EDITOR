@@ -624,6 +624,15 @@ export interface LineInk {
   /** Which channels its analysis inverted (`domainPage`): 7 for light on dark, fewer for coloured lettering. */
   domain?: number
   /**
+   * The reading was already re-read from the page's own letters
+   * (`repairReading`). A re-read is not idempotent: on a contract's
+   * "Fecha de firma: 10 de octubre", which the background pass had read from
+   * "octtubre", a second re-read put the second "t" back — and the edit path
+   * re-read every line it planned, so the text layer said "octtubre" again
+   * under a page and an editor that both said "octubre". Read once.
+   */
+  reread?: boolean
+  /**
    * Which ink each pixel of the ROI belongs to: the cell index of the nearest
    * core pixel within `ownR` (a Voronoi partition of the line's surroundings),
    * −2 when the nearest ink is another line's or a rule's, −1 when no ink is

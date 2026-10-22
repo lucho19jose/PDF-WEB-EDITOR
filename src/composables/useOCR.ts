@@ -820,6 +820,7 @@ function createOCR() {
             if (genOf(pageIndex) !== gen) return null
           }
           const li = analyzeLine(pi, { id: it.id, text: it.originalText, inkRect: it.inkRect, confidence: it.confidence })
+          if (li && it.reread) li.reread = true
           lines.set(it.id, li)
           if (!li) unread.set(it.id, lastLineFailure())
         }
@@ -869,7 +870,7 @@ function createOCR() {
     const store = useOcrStore()
     let n = 0
     for (const [id, li] of [...sp.lines]) {
-      if (!li) continue
+      if (!li || li.reread) continue
       await new Promise(r => setTimeout(r, 0))
       if (genOf(pageIndex) !== gen) return n
       const it = store.pages.get(pageIndex)?.items.find(i => i.id === id)
@@ -877,7 +878,7 @@ function createOCR() {
           it.text !== it.originalText || it.originalText !== li.text || !isProseLine(li)) continue
       const rep = repairReading(pageOfLine(sp.pi, li), li, atlas)
       if (!rep || rep.text === it.text || !repairIsDisplayable(li, rep.text)) continue
-      store.updateItem(id, { text: rep.text, originalText: rep.text })
+      store.updateItem(id, { text: rep.text, originalText: rep.text, reread: true })
       sp.lines.set(id, rep.li)
       n++
     }

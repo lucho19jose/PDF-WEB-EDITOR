@@ -116,6 +116,12 @@ export interface OcrTextItem {
    * the run redrawn from its original ink.
    */
   applied?: boolean
+  /**
+   * The reading was re-read from the page's own letters in the background
+   * (`repairReadings`): its `originalText` is that re-read, and it is never
+   * re-read again — see `LineInk.reread`.
+   */
+  reread?: boolean
 }
 
 /** What one page's OCR pass produced. */

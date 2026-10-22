@@ -12,6 +12,8 @@
  *   atlas <page>                  the page's glyph atlas: coverage and styles
  *   edit <page> <suite.json> <outDir>   apply a suite's edits on that page,
  *                                 write before/after crops and the overlays
+ *   dropped [page]                edits the ink does not show that are taken
+ *                                 for corrections (silently dropped edits)
  *
  * Everything is imported through Vite's SSR loader, so the modules are the
  * app's own (aliases and TypeScript included).
@@ -434,6 +436,48 @@ if (cmd === 'look') {
   }))
   savePng(args[0], W, H, img, 2)
   console.log('columns: page |', faces.map(f => `${f.family} R | ${f.family} B`).join(' | '))
+}
+
+if (cmd === 'dropped') {
+  // `dropped [page]`: edits the ink does NOT show, taken for what it already
+  // says. In every word cut one ink run per letter, one figure is changed
+  // (d -> d+5) and one letter (to another of its case and height class); a
+  // plan whose `corrected` count is non-zero has read the change as a
+  // misreading the ink confirms — it draws nothing and only the text layer
+  // changes, i.e. the user's edit is silently dropped. Compare with VARIANT.
+  const GA = await load('/src/utils/ocr/glyphAtlas.ts')
+  const SE = await load('/src/utils/ocr/scanEdit.ts')
+  const only = args[0] !== undefined ? Number(args[0]) : null
+  const { pages, atlas } = await pagesAndAtlas(GA)
+  const swapLetter = { a: 'e', e: 'a', o: 'a', c: 'e', n: 'u', u: 'n', r: 'n', s: 'z', m: 'w', i: 'l', l: 't', t: 'f', d: 'b', b: 'd', p: 'q', g: 'y', h: 'k',
+    A: 'R', E: 'F', O: 'D', C: 'G', N: 'H', R: 'P', S: 'B', T: 'Y', I: 'T', L: 'E', D: 'O', M: 'W', P: 'F', B: 'E', U: 'V', G: 'C', H: 'N' }
+  let trials = 0, drops = 0
+  for (const [p, { s, pi, lis }] of pages) {
+    if (only !== null && p !== only) continue
+    for (const li of lis) {
+      for (const w of li.words) {
+        if (!w.cut || !w.exact) continue
+        const word = li.chars.slice(w.from, w.to)
+        const tries = []
+        const di = word.findIndex(c => /\d/.test(c))
+        if (di >= 0) tries.push([di, String((Number(word[di]) + 5) % 10)])
+        const ci = word.findIndex(c => swapLetter[c])
+        if (ci >= 0) tries.push([ci, swapLetter[word[ci]]])
+        for (const [at, to] of tries) {
+          // Rebuild the reading with the change, spaces where the reading has them.
+          let text = ''
+          for (let i = 0; i < li.chars.length; i++) {
+            if (i > 0 && li.spaceAfter.has(i)) text += ' '
+            text += i === w.from + at ? to : li.chars[i]
+          }
+          const res = SE.applyLineEdit(pi, li, atlas, text, s.data.slice(), {})
+          trials++
+          if (res.ok && res.corrected) { drops++; console.log(`DROPPED p${p} ${li.id} "${word.join('')}" ${word[at]}->${to}  | ${res.notes?.join('; ')}`) }
+        }
+      }
+    }
+  }
+  console.log(`${drops} of ${trials} edits the ink does not show were taken for corrections`)
 }
 
 if (cmd === 'refine') {

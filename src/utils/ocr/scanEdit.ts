@@ -426,8 +426,10 @@ export function applyLineEdit(pi: PageInk, li: LineInk, atlas: Atlas, newText: s
   // "(6claves". The line's misread words are re-read from the page's own
   // letters, and the user's change is carried onto that reading
   // (`mergeReadings`): the change lands on the ink it was meant for, and
-  // every word the user did not touch is the ink's own reading.
-  const rep = repairReading(pi, li, atlas)
+  // every word the user did not touch is the ink's own reading. A line the
+  // background pass already re-read is the reading the user edited: it is
+  // not re-read again (see `LineInk.reread`).
+  const rep = li.reread ? null : repairReading(pi, li, atlas)
   if (rep) {
     const res = planWithCorrections(pi, rep.li, atlas, mergeReadings(li.text, newText, rep.text), work, opts)
     if (res.ok) {
@@ -499,8 +501,16 @@ function columnRuns(pi: PageInk, L: LineInk, from: number, to: number): number[]
  * says drops the edit, so a letter the page cannot vouch for is never
  * evidence that it does — "(4)" retyped "(5)" on a page with no 5 in it
  * read as confirmed on its brackets alone, and nothing was drawn.
+ *
+ * A changed letter must also be the ink's BEST explanation, and beat the
+ * letter the recogniser read in its place (`wasRead`) by the margin
+ * `findCorrections` asks for. Its own shape alone is not enough: the grid
+ * barely tells figures apart, and a contract's "10" retyped "15" had its "0"
+ * agree 0.77 with the page's "5" and 0.79 with its "0" — under the 0.15 by
+ * which another letter had to win, so the date was "confirmed", nothing was
+ * drawn, and the page kept saying 10 while its text layer said 15.
  */
-function wordReadsAs(pi: PageInk, L: LineInk, atlas: Atlas, k: number, mustKnow?: Set<number>): boolean {
+function wordReadsAs(pi: PageInk, L: LineInk, atlas: Atlas, k: number, mustKnow?: Set<number>, log?: (line: string) => void, wasRead?: Map<number, string>): boolean {
   const w = L.words[k]
   if (!w) return false
   const bold = atlas.boldAt !== null && (w.weight ?? 0) >= atlas.boldAt
@@ -526,15 +536,26 @@ function wordReadsAs(pi: PageInk, L: LineInk, atlas: Atlas, k: number, mustKnow?
     // letter: that refuses the word outright. A weak match alone does not —
     // a thin letter's established shape is a poor one (this page's "i"
     // agrees 0.24–0.44 with correct i's).
-    let other = 0
+    let other = 0, otherCh = ''
     for (const [key, med] of atlas.medoids) {
       const bar = key.lastIndexOf('|')
       if (key.slice(bar + 1) !== String(bold) || key.slice(0, bar) === L.chars[i]) continue
       const a = shapeAgreement(shape, med.shape)
-      if (a > other) other = a
+      if (a > other) { other = a; otherCh = key.slice(0, bar) }
     }
     if (other >= Math.max(0.8, own + 0.15)) return false
-    if (mustKnow?.has(i) && (!m || own < Math.max(0.62, m.cohesion - 0.12))) return false
+    if (mustKnow?.has(i)) {
+      // The recogniser's letter here, judged in this weight or the other.
+      const was = wasRead?.get(i)
+      const wasMed = was !== undefined && was !== L.chars[i]
+        ? atlas.medoids.get(`${was}|${bold}`) ?? atlas.medoids.get(`${was}|${!bold}`)
+        : undefined
+      const b = wasMed ? shapeAgreement(shape, wasMed.shape) : null
+      log?.(`    changed "${L.chars[i]}": own ${m ? own.toFixed(2) : '-'} (coh ${m ? m.cohesion.toFixed(2) : '-'}) best other "${otherCh}" ${other.toFixed(2)}${was !== undefined ? ` read "${was}" ${b === null ? '-' : b.toFixed(2)}` : ''}`)
+      if (!m || own < Math.max(0.62, m.cohesion - 0.12)) return false
+      if (other > own) return false
+      if (b !== null && own < b + CORRECTION_MARGIN) return false
+    }
     if (!m) continue
     checked++
     if (own >= Math.max(0.58, m.cohesion - 0.16)) passed++
@@ -580,12 +601,23 @@ export function refineReading(pi: PageInk, li: LineInk, atlas: Atlas, newText: s
       const { w, k } = us[0]
       used.add(k)
       const user = labelOf(lu, w)
-      // The letters the typed word has and the recogniser's had not.
+      // The letters the typed word has and the recogniser's had not, and —
+      // where the two read as many letters between the same kept ones — the
+      // letter the recogniser read in each one's place.
       const changed = new Set<number>()
+      const wasRead = new Map<number, string>()
       if (user !== ocr) {
+        const old = li.chars.slice(v.from, v.to)
         const typed = lu.chars.slice(w.from, w.to)
-        const kept = new Set(alignChars(li.chars.slice(v.from, v.to), typed).map(([, j]) => j))
+        const pairs = alignChars(old, typed)
+        const kept = new Set(pairs.map(([, j]) => j))
         typed.forEach((_, j) => { if (!kept.has(j)) changed.add(w.from + j) })
+        const anchors: [number, number][] = [[-1, -1], ...pairs, [old.length, typed.length]]
+        for (let a = 0; a + 1 < anchors.length; a++) {
+          const [i0, j0] = anchors[a], [i1, j1] = anchors[a + 1]
+          if (i1 - i0 !== j1 - j0) continue
+          for (let d = 1; d < j1 - j0; d++) wasRead.set(w.from + j0 + d, old[i0 + d])
+        }
       }
       if (user === ocr) spaceBefore = lu.spaceAfter.has(w.from)
       // An ACCENT is never confirmed by the ink's shapes: an "O" and an "Ó"
@@ -593,7 +625,7 @@ export function refineReading(pi: PageInk, li: LineInk, atlas: Atlas, newText: s
       // taken for what the ink already said — the accent stayed on the page
       // while the text layer dropped it. A change in marks alone is an edit.
       else if (stripMarks(user) === stripMarks(ocr)) log?.(`"${ocr}" -> "${user}" differs in marks only: an edit`)
-      else if (wordReadsAs(pi, lu, atlas, k, changed)) { text = user; spaceBefore = lu.spaceAfter.has(w.from); confirmed++ }
+      else if (wordReadsAs(pi, lu, atlas, k, changed, log, wasRead)) { text = user; spaceBefore = lu.spaceAfter.has(w.from); confirmed++ }
       log?.(`"${ocr}" -> "${user}" cut=${w.cut} exact=${w.exact} ${text === user ? 'TYPED' : 'ocr'}`)
     } else log?.(`"${ocr}" -> ${us.length} typed words: kept`)
     parts.push({ x0: v.x0, text, spaceBefore })
@@ -689,10 +721,18 @@ export function findCorrections(pi: PageInk, li: LineInk, atlas: Atlas, newText:
       }
       // A changed letter: the page must know it, the ink must look like it…
       if (a === null || !m || a < Math.max(0.62, m.cohesion - 0.12)) return
+      // …more than like any other letter the page knows (as `wordReadsAs`
+      // asks of a typed word)…
+      const shape = shapeOfCore(pi, li, runs[r])
+      if (shape) for (const [key, med] of atlas.medoids) {
+        const bar = key.lastIndexOf('|')
+        if (key.slice(bar + 1) !== String(bold) || key.slice(0, bar) === letters[r]) continue
+        if (shapeAgreement(shape, med.shape) > a) return
+      }
       // …and more like it than like the letter the old reading put there.
       if (sameLength && old[r] !== letters[r]) {
         const b = agree(runs[r], old[r], bold)
-        if (b !== null && a < b + 0.04) return
+        if (b !== null && a < b + CORRECTION_MARGIN) return
       }
     }
     // The unchanged letters vouch for the alignment of runs to letters.
@@ -739,6 +779,22 @@ const NO_DETACHED_TOP = /^[lI1|!aeouAEIOUnN]$/
 
 /** Letters that hang below the baseline. */
 const DESCENDS = /^[gjpqy]$/
+
+/**
+ * How much more a changed letter's ink must look like the TYPED letter than
+ * like the one the recogniser read there, for the change to be taken as a
+ * misreading the ink already corrects. The shape grid barely tells look-alikes
+ * apart (a bold "P" agreed 0.85 with the page's "F" and 0.81 with its "P"),
+ * and the two errors are not alike: refusing a true correction redraws the
+ * word from the page's own letters, while accepting a false one draws nothing
+ * and drops the edit. Measured with the lab's `dropped` on a scanned contract
+ * (one figure and one letter changed in each of its cut words): with no such
+ * comparison 58 of 211 edits the ink did not show were dropped (C to G, P to
+ * F, 0 to 5 …); at 0.04 one still was (that "P"); at 0.1 none, and the same
+ * page's real misreadings ("ARENADo,BAsE" retyped "ARENADO, BASE") are still
+ * taken as corrections.
+ */
+const CORRECTION_MARGIN = 0.1
 
 /** The share of a line's kept letters its shapes must read right for it to be re-read. */
 const READ_RATE = 0.8
@@ -985,6 +1041,21 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
         const a = pairAgree(j, ch)
         if (a > Math.max(own, runs[j + 1].agree.get(ch) ?? 0) + 0.05) relax(i, j, i + 1, j + 2, 1 - a + 0.1, { op: 'broken', text: ch, fit: 1 - a, run: j, label: i, labels: 1 })
       }
+      // …and a letter the page holds NO shape for, broken in two. No shape
+      // can say whether the two runs make it, so their joined width has to:
+      // about the letter's own advance, both halves sitting where it sits, at
+      // the price of keeping an unknown label and a little more. Without it
+      // the second half HAD to take a label: a contract's "octubre", its "u"
+      // broken at the foot and the page holding one "u", came back "octtubre"
+      // — every label after the "c" shifted by one and a "t" invented to make
+      // up the count. Latin letters and figures only: an ideograph is several
+      // runs by design, and joined that way a heading's "数量" came back
+      // ". 数It量".
+      if (j + 1 < M && runs[j + 1].word === r.word && !r.known.has(ch) && /^[\p{Script=Latin}\p{Nd}]$/u.test(ch) && sits && fits(ch, runs[j + 1].g) &&
+          runs[j + 1].x0 - r.x1 <= Math.max(1, li.fit.emPx * 0.06)) {
+        const width = runs[j + 1].x1 - r.x0, want = expectedAdvance(ch) * li.fit.emPx
+        if (width >= want * 0.6 && width <= want * 1.25) relax(i, j, i + 1, j + 2, 0.4, { op: 'broken', text: ch, fit: 0.4, run: j, label: i, labels: 1 })
+      }
       // A character drawn in separate strokes by design — a double quote's
       // two ticks — that the page holds no shape for: two neighbouring runs
       // that both sit where it sits are that one character, at the price of
@@ -1071,14 +1142,25 @@ function rereadLine(pi: PageInk, li: LineInk, atlas: Atlas, log?: (line: string)
     // over the word — a signature's stroke, a stamp's edge — and the word
     // under it cannot be read from its runs: "Add-Ons" came back "Adddnns".
     const marked = mine.some(o => o.run >= 0 && runs[o.run].g.rise + runs[o.run].g.drop > 1.25 && runs[o.run].a1 < 0.6)
-    const ok = text !== old && text.length > 0 && scored.length > 0 && meanFit <= 0.33 && !oddCase && !marked && changes <= Math.max(2, Math.ceil(Math.max(old.length, text.length) * 0.5))
+    // An ideograph is several runs by design and its copies are few, so the
+    // runs of a word that holds one read as radicals matched to whatever
+    // ideographs the page holds: "2、技术规格" came back "2. 瓷、瓷技术规格" and
+    // "内衬92瓷" "内衬9 92 瓷". The background pass never shows such a reading
+    // (prose only) but an EDIT of the line used it whole, and the text layer
+    // said it. A word with an ideograph on either side keeps its labels.
+    const han = /\p{Script=Han}/u.test(old) || /\p{Script=Han}/u.test(text)
+    const ok = text !== old && text.length > 0 && scored.length > 0 && meanFit <= 0.33 && !oddCase && !marked && !han && changes <= Math.max(2, Math.ceil(Math.max(old.length, text.length) * 0.5))
     log?.(`"${old}" -> "${text}" ${mine.map(o => `${o.op}${o.text ? ':' + o.text : ''}`).join(' ')} fit ${meanFit.toFixed(2)}${ok ? '' : text === old ? '' : ' REFUSED'}`)
     // The runs of a word read differently, each with its three best letters.
     if (log && text !== old) for (const o of mine) {
       if (o.run < 0) continue
       const r = runs[o.run]
       const top = [...r.agree].filter(([ch]) => fits(ch, r.g)).sort((x, y) => y[1] - x[1]).slice(0, 4).map(([ch, v]) => `${ch}${v.toFixed(2)}`).join(' ')
-      log(`      run ${o.run} x ${r.x0}-${r.x1} rise ${r.g.rise.toFixed(2)} drop ${r.g.drop.toFixed(2)} ${o.op}:${o.text} chosen ${r.b1} ${r.a1.toFixed(2)} next ${r.a2.toFixed(2)} | ${top}`)
+      // Joined with the next run of its word, against the labels either side of the op.
+      const nx = o.label >= 0 && o.run + 1 < M && runs[o.run + 1].word === r.word
+        ? [...new Set([labels[o.label], labels[o.label + 1]].filter((c): c is string => !!c))].map(c => `${c}${pairAgree(o.run, c).toFixed(2)}`).join(' ')
+        : ''
+      log(`      run ${o.run} x ${r.x0}-${r.x1} rise ${r.g.rise.toFixed(2)} drop ${r.g.drop.toFixed(2)} ${o.op}:${o.text} chosen ${r.b1} ${r.a1.toFixed(2)} next ${r.a2.toFixed(2)} | ${top}${nx ? ` | +next ${nx}` : ''}`)
     }
     if (ok) out[k] = text
   })
@@ -1152,6 +1234,7 @@ export function repairReading(pi: PageInk, li: LineInk, atlas: Atlas, log?: (lin
     text = lookalikeFix(li, text, atlas, log)
     const ln = analyzeLine(pi, { id: li.id, text, inkRect: li.inkRect, confidence: li.confidence })
     log?.(`repaired: "${text}" ${ln ? 'analysed' : 'NOT analysed'}`)
+    if (ln) ln.reread = true
     return ln ? { text, li: ln, repaired } : null
   }
   return null
