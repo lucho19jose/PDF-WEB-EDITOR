@@ -45,6 +45,10 @@ public/_sweep/r3/
 public/_sweep/r4/
 public/_sweep/r5/
 public/_sweep/r6/
+# Rounds 7 and 8 were staged from the user's Downloads: their documents.
+public/_sweep/r7/
+public/_sweep/r8/
+public/_sweep/acro/
 
 # chrome-devtools MCP session artefacts
 .playwright-mcp/
