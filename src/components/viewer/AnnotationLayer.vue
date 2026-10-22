@@ -271,7 +271,7 @@ function selectInBand(rect: number[], additive: boolean) {
     r[0] < rect[2] && rect[0] < r[2] && r[1] < rect[3] && rect[1] < r[3]
   const imgs = new Set<number>(additive ? multiImgs.value : [])
   const anns = new Set<number>(additive ? multiAnnots.value : [])
-  for (const img of contentImages.value) if (touches(img.rect)) imgs.add(img.id)
+  for (const img of contentImages.value) if (!isPaperImg(img) && touches(img.rect)) imgs.add(img.id)
   for (const a of annotations.value) if (touches(a.rect)) anns.add(a.index)
 
   // One element alone is a PRIMARY selection — it keeps its handles.
@@ -474,6 +474,23 @@ const scanPage = computed(() =>
 // has no tile bigger than a ninth, and every tile is paper.
 const paperArea = computed(() => Math.max(1, props.pdfWidth * props.pdfHeight) * 0.05)
 
+/**
+ * A picture that IS the page, not an object on it: on a scan, the scan (or its
+ * tiles) — and the scan edit's own pixel overlays (`OcrPx…`), which are the
+ * edited letters themselves. Offered as an object, an overlay showed a
+ * bounding box over the changed figure, and dragging or deleting it put the
+ * old figure back on the page while the editor still called the edit applied.
+ * Every way of selecting asks this, not only the click: the rubber band used
+ * to sweep the whole scan into the selection, a Delete away from losing the
+ * page.
+ */
+function isPaperImg(img: ContentImageInfo): boolean {
+  if (!scanPage.value) return false
+  if (img.name.startsWith('OcrPx')) return true
+  const r = img.rect
+  return Math.max(0, r[2] - r[0]) * Math.max(0, r[3] - r[1]) >= paperArea.value
+}
+
 const scaledContentImgs = computed(() => contentImages.value
   .map(img => {
     const r = liveImgRect(img)
@@ -481,7 +498,7 @@ const scaledContentImgs = computed(() => contentImages.value
     return {
       id: img.id,
       area,
-      paper: scanPage.value && area >= paperArea.value,
+      paper: isPaperImg(img),
       style: {
         left: `${r[0] * scaleX.value}px`,
         top: `${r[1] * scaleY.value}px`,
