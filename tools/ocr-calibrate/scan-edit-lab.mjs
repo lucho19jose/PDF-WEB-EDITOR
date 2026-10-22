@@ -155,7 +155,7 @@ if (cmd === 'lines' || cmd === 'debug') {
   const items = itemsOf(p).filter(i => cmd === 'lines' || i.id === args[1])
   let words = 0, cut = 0
   for (const it of items) {
-    const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+    const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
     if (!li) { console.log(`${it.id.padEnd(9)} FAIL ${LI.lastLineFailure()}  "${it.text.slice(0, 50)}"`); if (process.env.PALE) console.log('     smooth', JSON.stringify(LI.lastSmoothTest?.() ?? null), 'flat', JSON.stringify(LI.lastFlatTest?.() ?? null)); continue }
     words += li.words.length; cut += li.words.filter(w => w.cut).length
     const ws = li.words.map(w => `${li.chars.slice(w.from, w.to).join('')}${w.cut ? '' : '~'}${w.weight ? '/' + w.weight.toFixed(3) : ''}`).join(' ')
@@ -201,7 +201,7 @@ async function pagesAndAtlas(GA) {
     const pi = LI.preparePage(s)
     const lis = []
     for (const it of pg.items.filter(i => !i.vertical)) {
-      const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+      const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
       if (li) { lis.push(li); lines.push({ pi, li, page: pg.pageIndex }) }
     }
     pages.set(pg.pageIndex, { s, pi, lis })
@@ -542,7 +542,7 @@ if (cmd === 'exact') {
   const tally = { words: 0, exact: 0, cutNotExact: 0, notCut: 0, runsMatch: 0 }
   const samples = []
   for (const it of itemsOf(p)) {
-    const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+    const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
     if (!li) continue
     for (const w of li.words) {
       tally.words++
@@ -759,7 +759,7 @@ if (cmd === 'cell') {
   const s = scanOf(p)
   const pi = LI.preparePage(s)
   const it = itemsOf(p).find(i => i.id === args[1])
-  const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+  const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
   const k = Number(args[2]) < 0 ? li.cells.length + Number(args[2]) : Number(args[2])
   const c = li.cells[k]
   console.log(`cell ${k} "${c.char}" x ${c.x0}-${c.x1} ink ${c.inkL}-${c.inkR} rows ${c.top}-${c.bottom} pix ${c.pix.length} word ${c.word} words: ${li.words.map(w => `[${w.x0}-${w.x1}]`).join(' ')}`)
@@ -850,7 +850,7 @@ if (cmd === 'heights') {
   const pi = LI.preparePage(s)
   for (const id of args.slice(1)) {
     const it = itemsOf(p).find(i => i.id === id)
-    const li = it && LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+    const li = it && LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
     if (!li) { console.log(id, 'not analysed'); continue }
     const WS = await load('/src/utils/ocr/wordSeg.ts')
     const base = WS.baselineAtOf(li.fit)
@@ -871,7 +871,7 @@ if (cmd === 'bend') {
   const DESC = /^[gjpqyQJ]$/
   const all = []
   for (const it of itemsOf(p)) {
-    const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+    const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
     if (!li) continue
     const base = (x) => li.fit.y + li.fit.slope * (x - li.fit.centreX)
     const feet = li.cells.filter(c => c.pix.length && !c.approx && !c.suspect && SITS.test(c.char) && !DESC.test(c.char)).map(c => ({ x: (c.inkL + c.inkR) / 2, r: c.bottom + 1 - base((c.inkL + c.inkR) / 2) }))
@@ -952,7 +952,7 @@ if (cmd === 'darkgrid') {
   const s = scanOf(p)
   const pi = LI.preparePage(s)
   const it = itemsOf(p).find(i => i.id === args[1])
-  const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+  const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
   if (!li) { console.log('not analysed'); process.exit(0) }
   const { x0, y0, x1, y1 } = li.roi
   const cx = (x0 + x1) / 2
@@ -1109,7 +1109,7 @@ if (cmd === 'errs') {
   const pi = LI.preparePage(s)
   const ex = [], nx = []
   for (const it of itemsOf(p)) {
-    const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+    const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
     if (!li) continue
     for (const w of li.words) (w.exact ? ex : nx).push({ e: w.err, t: li.chars.slice(w.from, w.to).join('') })
   }
@@ -1126,7 +1126,7 @@ if (cmd === 'inspect') {
   const s = scanOf(p)
   const pi = LI.preparePage(s)
   const it = itemsOf(p).find(i => i.id === args[1])
-  const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence })
+  const li = LI.analyzeLine(pi, { id: it.id, text: it.text, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
   if (!li) { console.log('FAIL', LI.lastLineFailure()); }
   else {
     const base = (x) => li.fit.y + li.fit.slope * (x - li.fit.centreX)

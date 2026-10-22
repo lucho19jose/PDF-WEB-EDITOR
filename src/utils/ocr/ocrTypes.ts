@@ -122,6 +122,13 @@ export interface OcrTextItem {
    * re-read again — see `LineInk.reread`.
    */
   reread?: boolean
+  /**
+   * A run of a tilted line, read levelled (`deskew.ts`): `rect` and `inkRect`
+   * enclose the tilted line, and the letters occupy a band inside it — its
+   * top `dy` points below the rect's top at the rect's left edge, `height`
+   * tall, sloping by `slope` (dy/dx). Where the layer draws the run's target.
+   */
+  tilt?: { slope: number; dy: number; height: number }
 }
 
 /** What one page's OCR pass produced. */

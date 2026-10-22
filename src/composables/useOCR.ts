@@ -19,6 +19,7 @@ import { planScanEdits, inkAwareFallback, type ScanEditPlan, type FallbackOps, t
 import { wantKey, repairReading, repairIsDisplayable, isProseLine, type GlyphImage } from '@/utils/ocr/scanEdit'
 import { fitScanLook, synthGlyph, type Rasterize, type ScanLook, type LookNear } from '@/utils/ocr/glyphSynth'
 import { watermarkLevel, whitenFrom, linesMissed } from '@/utils/ocr/ocrWatermark'
+import { estimateSkew, levelCanvas, unlevelRecognition } from '@/utils/ocr/deskew'
 import { useOcrStore } from '@/stores/ocr'
 import { withoutFaintLayer, whitenAbove } from '@/utils/ocr/faintLayer'
 
@@ -134,6 +135,14 @@ const VERTICAL_SCALE = 0.7
 const VERTICAL_MIN_CONFIDENCE_CJK = 78
 /** A CJK glyph's box as a fraction of its em — the ideograph fills the square. */
 const GLYPH_BOX_PER_EM_CJK = 0.92
+/**
+ * PaddleOCR's box of a line read LEVELLED (`OcrLine.tilt`), in ems of the
+ * letters — the median over a tilted contract page measured against the em
+ * the scan analysis fits from the letters themselves: 1.24 for 67 Latin lines
+ * (p10 1.15, p90 1.61, short table cells at the top end), 1.42 for 22 CJK.
+ */
+const LEVEL_BOX_PER_EM = 1.24
+const LEVEL_BOX_PER_EM_CJK = 1.42
 
 /**
  * The em of a CJK run, from the MEDIAN glyph box.
@@ -819,7 +828,7 @@ function createOCR() {
             await new Promise(r => setTimeout(r, 0))
             if (genOf(pageIndex) !== gen) return null
           }
-          const li = analyzeLine(pi, { id: it.id, text: it.originalText, inkRect: it.inkRect, confidence: it.confidence })
+          const li = analyzeLine(pi, { id: it.id, text: it.originalText, inkRect: it.inkRect, confidence: it.confidence, tilt: it.tilt })
           if (li && it.reread) li.reread = true
           lines.set(it.id, li)
           if (!li) unread.set(it.id, lastLineFailure())
@@ -1572,7 +1581,16 @@ function createOCR() {
         // A CJK glyph fills its em, ascender to descender, so the box IS
         // the em; the Latin rule (tallest box = 0.76 of an em when nothing
         // descends) sized a 10pt Chinese cell at 13pt.
-        const emPx = isMostlyCjk(text) ? cjkEm(run, pxRect.height) : emOf(run, pxRect.height, text)
+        const emRaw = isMostlyCjk(text) ? cjkEm(run, pxRect.height) : emOf(run, pxRect.height, text)
+        // A line read levelled (deskew.ts) sits in the box ENCLOSING it, and
+        // ink measured in that box takes in the rise across the line and the
+        // corners of its neighbours: a 10pt line on a page tilted 1.75° came
+        // out anywhere between 5 and 25pt. The detector's LEVEL box is the
+        // steady measure — LEVEL_BOX_PER_EM of the letters' em — and caps it.
+        const levelEm = !vertical && line.tilt
+          ? (2 * line.tilt.half) / (isMostlyCjk(text) ? LEVEL_BOX_PER_EM_CJK : LEVEL_BOX_PER_EM)
+          : Infinity
+        const emPx = Math.min(emRaw, levelEm)
         const { color } = sampleLineColors(colorCtx, pxRect)
         const background = samplePatchColor(colorCtx, pxRect)
 
@@ -1646,6 +1664,15 @@ function createOCR() {
             : 'left',
           rotation,
           vertical,
+          // The band a tilted line's letters occupy inside its enclosing box,
+          // relative to the box: the layer draws the run's target there, or
+          // neighbouring lines' boxes overlap and a click at the end of one
+          // line opens the next.
+          tilt: !vertical && line.tilt ? {
+            slope: line.tilt.slope,
+            dy: (line.tilt.midY + line.tilt.slope * (bb.x0 - line.tilt.midX) - line.tilt.half - bb.y0) * toPt,
+            height: 2 * line.tilt.half * toPt
+          } : undefined,
           confidence: Math.round(conf),
           edited: false,
           removed: false
@@ -1711,15 +1738,28 @@ function createOCR() {
       let engine = engineFor(engineId)
       let fallbackNote: string | undefined
       let data: OcrRecognition
+      // A TILTED page is read levelled and its boxes put back (deskew.ts): in
+      // axis-aligned boxes a 1.75° tilt made every full-width line two lines
+      // tall, the detector merged the paragraph's lines and whole clauses of a
+      // contract had no run to edit. Everything below works on the page as
+      // scanned; only the recogniser sees it level.
+      const cleanPx = clean.ctx.getImageData(0, 0, target.width, target.height).data
+      const skew = estimateSkew(cleanPx, target.width, target.height)
+      const levelled = skew ? levelCanvas(clean.canvas, skew.degrees) : null
+      const recognise = async (c: HTMLCanvasElement): Promise<OcrRecognition> => {
+        const L = !levelled ? null : c === clean.canvas ? levelled : levelCanvas(c, levelled.degrees)
+        if (!L) return engine.recognize(c, { lang, onProgress })
+        return unlevelRecognition(L, await engine.recognize(L.canvas, { lang, onProgress }))
+      }
       try {
         stage.value = 'Recognising text...'
-        data = await engine.recognize(clean.canvas, { lang, onProgress })
+        data = await recognise(clean.canvas)
       } catch (err: any) {
         if (engineId !== 'paddle') throw err
         fallbackNote = `${ENGINE_LABELS.paddle} could not run (${err?.message || err}); read with ${ENGINE_LABELS.tesseract} instead`
         engine = engineFor('tesseract')
         stage.value = 'Recognising text...'
-        data = await engine.recognize(clean.canvas, { lang, onProgress })
+        data = await recognise(clean.canvas)
       }
 
       // A light grey watermark printed over the text hides whole lines from
@@ -1730,7 +1770,7 @@ function createOCR() {
       // It reads the same copy the first pass did — a pale faint layer already
       // painted out — so the two readings differ only by this whitening.
       if (engine.id !== 'mistral') {
-        const level = watermarkLevel(clean.ctx.getImageData(0, 0, target.width, target.height).data)
+        const level = watermarkLevel(cleanPx)
         if (level !== null) {
           const under = document.createElement('canvas')
           under.width = target.width
@@ -1741,7 +1781,7 @@ function createOCR() {
             whitenFrom(img.data, level - 20)
             uctx.putImageData(img, 0, 0)
             stage.value = 'Reading under the watermark...'
-            const again = await engine.recognize(under, { lang, onProgress }).catch(() => null)
+            const again = await recognise(under).catch(() => null)
             const missed = again ? linesMissed(data.lines, again.lines) : []
             if (missed.length) data = { ...data, lines: [...data.lines, ...missed] }
           }

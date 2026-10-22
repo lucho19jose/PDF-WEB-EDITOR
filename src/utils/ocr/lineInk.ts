@@ -1,4 +1,4 @@
-import { pxRectOf, readerCtx, lumAt, type ScanRaster } from './scanRaster'
+import { pxRectOf, readerCtx, lumAt, apply, type ScanRaster } from './scanRaster'
 import { pushPull } from './inpaint'
 import { fitLine, fitBend, baselineAtOf, splitWords, alignCharsToWords, spaceBoundaries, type Blob, type LineFit } from './wordSeg'
 import { cutGlyphs, expectedAdvance } from './glyphCut'
@@ -577,11 +577,29 @@ export interface LineWord {
   err: number
 }
 
+/**
+ * The band a tilted line's letters occupy inside its enclosing `inkRect`
+ * (`OcrTextItem.tilt`, page points): its top `dy` below the rect's top at the
+ * rect's left edge, `height` tall, rising by `slope` (dy/dx).
+ */
+export interface LineTilt { slope: number; dy: number; height: number }
+
+/** A tilt band in scan pixels: its top at x, and its height. */
+function tiltBandPx(s: ScanRaster, r: { x: number; y: number; width: number }, t: LineTilt): { top: (x: number) => number; h: number } {
+  const [lx, ly] = apply(s.toPx, r.x, r.y + t.dy)
+  const [rx, ry] = apply(s.toPx, r.x + r.width, r.y + t.dy + t.slope * r.width)
+  const [, lyb] = apply(s.toPx, r.x, r.y + t.dy + t.height)
+  const slope = (ry - ly) / (Math.abs(rx - lx) > 1 ? rx - lx : 1)
+  return { top: (x: number) => ly + slope * (x - lx), h: Math.abs(lyb - ly) }
+}
+
 export interface LineInk {
   id: string
   text: string
   /** The recogniser's box the line was analysed in (page points) — to analyse it again with another reading. */
   inkRect: { x: number; y: number; width: number; height: number }
+  /** Its band inside that box when the line is tilted (read levelled) — analysed again with it too. */
+  tilt?: LineTilt
   /** The reading's characters, spaces removed. */
   chars: string[]
   /** Non-space indices the reading puts a space BEFORE (the first character of each word after the first). */
@@ -1349,7 +1367,7 @@ function shortInkEm(pi: PageInk, box: { x0: number; y0: number; x1: number; y1: 
  * cannot be shared among the words) — the caller then leaves the line to the
  * vector redraw.
  */
-export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRect: { x: number; y: number; width: number; height: number }; confidence?: number }, opts: { inverted?: boolean; growX?: [number, number]; typed?: boolean; domain?: number; recolored?: boolean } = {}): LineInk | null {
+export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRect: { x: number; y: number; width: number; height: number }; confidence?: number; tilt?: LineTilt }, opts: { inverted?: boolean; growX?: [number, number]; typed?: boolean; domain?: number; recolored?: boolean } = {}): LineInk | null {
   failedBecause = ''
   const s = pi.s
   const text = item.text
@@ -1357,6 +1375,18 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   if (!chars.length) return fail('no characters')
   const box = pxRectOf(s, item.inkRect)
   if (box.x1 - box.x0 < 2 || box.y1 - box.y0 < 2) return fail('box too small')
+  // A line read levelled (deskew.ts) comes in the box ENCLOSING it, which on
+  // a tilted page holds the corners of the lines above and below: counted as
+  // its letters they failed every full-width line of a contract's clause as
+  // "more than one printed line". Its own letters are those in its BAND.
+  const bandOf = item.tilt ? tiltBandPx(s, item.inkRect, item.tilt) : null
+  /** Whether a centre lies in the line: its band (grown by `padEm` ems), or the box. */
+  const inLine = (cx: number, cy: number, padEm: number, em: number) => {
+    if (cx < box.x0 || cx > box.x1) return false
+    if (!bandOf) return cy >= box.y0 - em * padEm && cy <= box.y1 + em * padEm
+    const top = bandOf.top(cx)
+    return cy >= top - em * padEm && cy <= top + bandOf.h + em * padEm
+  }
   const advSum = chars.reduce((t, c) => t + expectedAdvance(c), 0) || 1
   // The em the box's WIDTH implies: a skewed line's box is too tall, never too wide.
   let emGuess = (box.x1 - box.x0) / advSum
@@ -1557,7 +1587,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   // whose count is nearer one a character is the line's. Ideographs are
   // several radicals each by design and keep the fixed level.
   let stacking = false
-  const piecesPerChar = (cs: Comp[]) => cs.filter(c => c.area >= 2 && c.cx >= box.x0 && c.cx <= box.x1 && c.cy >= box.y0 - emGuess * 0.3 && c.cy <= box.y1 + emGuess * 0.3).length / Math.max(1, chars.length)
+  const piecesPerChar = (cs: Comp[]) => cs.filter(c => c.area >= 2 && inLine(c.cx, c.cy, bandOf ? 0.15 : 0.3, emGuess)).length / Math.max(1, chars.length)
   if (weakLevel !== null && weakLevel < CORE && chars.length >= 3 && !chars.some(c => CJK_CHAR.test(c))) {
     const atCore = piecesPerChar(comps)
     // The lower level only says which pieces BELONG together; every pixel a
@@ -1637,16 +1667,19 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   // something else — an underline's stub — and joined to the letter it pulled
   // the baseline down onto the rule.
   const sized = (stacking ? stackPieces(comps, emGuess) : comps).filter(c => { const h = c.y1 - c.y0; return c.area >= 4 && h >= emGuess * 0.25 && h <= emGuess * 1.5 })
-  const inBox = (c: Comp) => c.cy >= box.y0 && c.cy <= box.y1 && c.cx >= box.x0 && c.cx <= box.x1
+  const inBox = (c: Comp) => inLine(c.cx, c.cy, 0, emGuess)
   const letters = sized.filter(inBox)
-  const band = sized.filter(c => c.cx >= box.x0 && c.cx <= box.x1 && c.cy >= box.y0 - emGuess * 0.6 && c.cy <= box.y1 + emGuess * 0.6)
+  // Around a tilted line's band only a little: the band is where its letters
+  // are, and 0.6 em past it is where the next line's are.
+  const band = sized.filter(c => inLine(c.cx, c.cy, bandOf ? 0.15 : 0.6, emGuess))
   if (letters.length < Math.min(2, chars.length) && band.length < Math.min(3, chars.length)) return fail('no letters in the box')
   const asBlob = (c: Comp, w = 1): Blob => ({ x0: c.x0, x1: c.x1, y0: c.y0, y1: c.y1, area: c.area, cx: c.cx, cy: c.cy, w })
   fitBlobs = band.map(c => asBlob(c, inBox(c) ? 2 : 1))
   let fit: LineFit | null = band.length >= 2 ? fitLine(band.map(c => asBlob(c, inBox(c) ? 2 : 1)), emGuess, text) : null
   if (fit) {
-    const mid = fit.y + fit.slope * ((box.x0 + box.x1) / 2 - fit.centreX)
-    if (mid < box.y0 || mid > box.y1 + fit.emPx * 0.9) fit = null
+    const xc = (box.x0 + box.x1) / 2
+    const mid = fit.y + fit.slope * (xc - fit.centreX)
+    if (bandOf ? (mid < bandOf.top(xc) || mid > bandOf.top(xc) + bandOf.h + fit.emPx * 0.5) : (mid < box.y0 || mid > box.y1 + fit.emPx * 0.9)) fit = null
   }
   if (!fit && letters.length >= 2) fit = fitLine(letters.map(c => asBlob(c)), emGuess, text)
   if (!fit) {
@@ -2423,7 +2456,7 @@ export function analyzeLine(pi: PageInk, item: { id: string; text: string; inkRe
   if (smoothGround && words.some(w => !(w.cut && w.exact))) return fail('the line is set on a gradient and could not be cut cleanly')
 
   return {
-    id: item.id, text, inkRect: { ...item.inkRect }, chars, spaceAfter, confidence: item.confidence ?? 100, roi, fit, words, cells, rules, borders, protect, own,
+    id: item.id, text, inkRect: { ...item.inkRect }, tilt: item.tilt, chars, spaceAfter, confidence: item.confidence ?? 100, roi, fit, words, cells, rules, borders, protect, own,
     letterGapPx: letterGaps.length >= 3 ? median(letterGaps) : em * 0.08,
     wordGapPx: wordGaps.length ? median(wordGaps) : 0,
     ink: inkRgb,

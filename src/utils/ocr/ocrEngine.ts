@@ -37,6 +37,13 @@ export interface OcrLine {
   angle?: number
   /** The paragraph the line belongs to, for alignment inference. */
   paragraph?: { box: OcrBox; lineCount: number }
+  /**
+   * The line was read on a LEVELLED raster (`deskew.ts`): `box` is the
+   * axis-aligned box enclosing it on the page, and this is the band its
+   * letters actually occupy — a centre line through (midX, midY) at `slope`
+   * (dy/dx, raster pixels, y down), `half` its level box's half-height.
+   */
+  tilt?: { slope: number; midX: number; midY: number; half: number }
 }
 
 export interface OcrRecognition {

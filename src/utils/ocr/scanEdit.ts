@@ -580,7 +580,7 @@ function stripMarks(s: string): string {
 export function refineReading(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, log?: (line: string) => void): { li: LineInk; confirmed: number } | null {
   const squash = (t: string) => t.replace(/\s+/g, '')
   if (squash(newText) === squash(li.text)) return null
-  const lu = analyzeLine(pi, { id: li.id, text: newText, inkRect: li.inkRect, confidence: li.confidence }, { typed: true })
+  const lu = analyzeLine(pi, { id: li.id, text: newText, inkRect: li.inkRect, confidence: li.confidence, tilt: li.tilt }, { typed: true })
   if (!lu || !lu.words.length) { log?.('the line cannot be read with the typed text'); return null }
   const overlap = (a: { x0: number; x1: number }, b: { x0: number; x1: number }) =>
     Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0) > 0.5 * Math.min(a.x1 - a.x0, b.x1 - b.x0)
@@ -642,7 +642,7 @@ export function refineReading(pi: PageInk, li: LineInk, atlas: Atlas, newText: s
   if (!confirmed) return null
   parts.sort((a, b) => a.x0 - b.x0)
   const text = parts.map((p, i) => (i > 0 && p.spaceBefore ? ' ' : '') + p.text).join('')
-  const ln = analyzeLine(pi, { id: li.id, text, inkRect: li.inkRect, confidence: li.confidence }, { typed: true })
+  const ln = analyzeLine(pi, { id: li.id, text, inkRect: li.inkRect, confidence: li.confidence, tilt: li.tilt }, { typed: true })
   log?.(`refined: "${text}" ${ln ? 'analysed' : 'NOT analysed'}`)
   return ln ? { li: ln, confirmed } : null
 }
@@ -1232,7 +1232,7 @@ export function repairReading(pi: PageInk, li: LineInk, atlas: Atlas, log?: (lin
       continue
     }
     text = lookalikeFix(li, text, atlas, log)
-    const ln = analyzeLine(pi, { id: li.id, text, inkRect: li.inkRect, confidence: li.confidence })
+    const ln = analyzeLine(pi, { id: li.id, text, inkRect: li.inkRect, confidence: li.confidence, tilt: li.tilt })
     log?.(`repaired: "${text}" ${ln ? 'analysed' : 'NOT analysed'}`)
     if (ln) ln.reread = true
     return ln ? { text, li: ln, repaired } : null

@@ -159,6 +159,37 @@ const patches = computed(() =>
     })
 )
 
+/**
+ * The skew of a run's target, in radians, when it is drawn as its tilted
+ * band (`item.tilt`) — null for the plain box.
+ *
+ * A line read levelled sits in the box ENCLOSING it, and on a tilted page
+ * those boxes overlap their neighbours' by up to a line: the next line's box,
+ * later in the layer, took the click at the end of this one and opened the
+ * wrong line. The band is the line's own. A run the user moved or turned has
+ * left its band behind and keeps the box.
+ */
+function bandSkew(item: OcrTextItem): number | null {
+  const t = item.tilt
+  const ink = item.inkRect ?? item.rect
+  const moved = (['x', 'y', 'width', 'height'] as const).some(k => item.rect[k] !== ink[k])
+  if (!t || item.vertical || item.rotation || moved) return null
+  return Math.atan(t.slope * scaleY.value / scaleX.value)
+}
+
+function targetStyle(item: OcrTextItem) {
+  const skew = bandSkew(item)
+  if (skew === null || !item.tilt) return styleFor(item)
+  return {
+    left: `${item.rect.x * scaleX.value}px`,
+    top: `${(item.rect.y + item.tilt.dy) * scaleY.value}px`,
+    width: `${item.rect.width * scaleX.value}px`,
+    height: `${item.tilt.height * scaleY.value}px`,
+    transform: `skewY(${skew}rad)`,
+    transformOrigin: 'left top'
+  }
+}
+
 const scaled = computed(() =>
   ocrStore.itemsFor(pageIndex.value).map(item => ({
     id: item.id,
@@ -168,8 +199,10 @@ const scaled = computed(() =>
     removed: item.removed,
     vertical: item.vertical,
     confidence: item.confidence,
-    boxStyle: styleFor(item),
+    boxStyle: targetStyle(item),
     textStyle: {
+      // Level text inside a band drawn skewed.
+      transform: bandSkew(item) !== null ? `skewY(${-(bandSkew(item) as number)}rad)` : undefined,
       fontSize: `${shownSize(item) * scaleY.value}px`,
       fontFamily: faceStack(item),
       fontWeight: item.bold ? '700' : '400',
@@ -383,9 +416,16 @@ function editAt(x: number, y: number): boolean {
   // A few points of slack: the boxes hug the ink now, and a click on the
   // paper just under a label is a click on the label.
   const pad = 3
-  const inside = (i: OcrTextItem, p: number) =>
-    x >= i.rect.x - p && x <= i.rect.x + i.rect.width + p &&
-    y >= i.rect.y - p && y <= i.rect.y + i.rect.height + p
+  const inside = (i: OcrTextItem, p: number) => {
+    if (x < i.rect.x - p || x > i.rect.x + i.rect.width + p) return false
+    // A tilted line's box overlaps its neighbours' (see `bandSkew`): it is
+    // hit only where its own band is.
+    if (i.tilt && bandSkew(i) !== null) {
+      const top = i.rect.y + i.tilt.dy + i.tilt.slope * (x - i.rect.x)
+      return y >= top - p && y <= top + i.tilt.height + p
+    }
+    return y >= i.rect.y - p && y <= i.rect.y + i.rect.height + p
+  }
   const hit = items.find(i => !i.removed && inside(i, 0)) ?? items.find(i => !i.removed && inside(i, pad))
   if (!hit) return false
   const along = hit.vertical
