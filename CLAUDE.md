@@ -7533,7 +7533,10 @@ that GitHub Releases hosts and the app updates itself from.
   (~165 MB), nothing uploaded.
 - Release: bump `version` in `package.json`, commit, `git tag vX.Y.Z`, push
   the tag. `.github/workflows/desktop-release.yml` builds on `windows-latest`
-  and uploads the exe, its `.blockmap` and `latest.yml` to a DRAFT release;
+  (`electron:build`, publish never) and `softprops/action-gh-release` uploads
+  the exe, its `.blockmap` and `latest.yml` to a DRAFT release. Letting
+  electron-builder publish (`--publish always`) was tried for v2.0.0–2.0.2:
+  every run succeeded and no release was created, silently;
   publishing the draft is what installed copies update to
   (`electron-updater`, checked at every launch, offered as "Reiniciar y
   actualizar").
