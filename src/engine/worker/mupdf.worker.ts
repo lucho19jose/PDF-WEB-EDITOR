@@ -2790,7 +2790,8 @@ function planTextEncoding(
     content?: string
   },
   lines: string[],
-  targetBlock?: TextBlock
+  targetBlock?: TextBlock,
+  opts?: { sameFace?: boolean }
 ): EncodingPlan {
   // Empty replacement (deletion) never needs substitution
   const isEmpty = lines.every(l => l.length === 0)
@@ -2884,6 +2885,12 @@ function planTextEncoding(
       return { kind: 'subst', fontRef: sibling.ref, fontName: sibling.baseFont, byteLines: [], hex: true, hexLines: sibling.hexLines }
     }
   }
+
+  // A caller that wants the block's own face or nothing (`sameFace`) is told
+  // so here, BEFORE a foreign face is planned: planning one registers it (the
+  // CJK fallback embeds a font in the resources), and a probe whose answer may
+  // be thrown away must leave the document as it found it.
+  if (opts?.sameFace) return { kind: 'error', error: 'only a foreign face can draw it' }
 
   // ── Substitution fallback ──
   const byteLines: string[] = []
@@ -7876,7 +7883,9 @@ function applyLineReplacement(
   pageIndex: number,
   targetBlock?: TextBlock,
   pageWidth?: number,
-  rotation = 0
+  rotation = 0,
+  /** Draw only in the line's own face (its fonts, or a sibling subset); see planTextEncoding. */
+  sameFace = false
 ): { stream: string; substitutedFont?: string; strategy?: string; anchorOffset?: number; lines?: number; retags?: SpanRetag[]; applied?: AppliedEdit[] } | { error: string } | null {
   // A block that reads as nothing a font can NAME (a bullet from a symbol
   // subset decodes to a control character) and sits BEYOND the target's
@@ -7949,7 +7958,7 @@ function applyLineReplacement(
    * no line that encodes today changes, and the recursion terminates because
    * each pass strictly shrinks the run or stops.
    */
-  const narrowLineAndRetry = (fontChangeOnly = false): ReturnType<typeof applyLineReplacement> => {
+  const narrowLineAndRetry = (fontChangeOnly = false, keepFace = sameFace): ReturnType<typeof applyLineReplacement> => {
     if (!contributing.every(b => b.hasPos)) return lineRefuse('L7282')
     const reading = [...contributing].sort(readCmp)
     // Consume a block's space-free text from newText at `pos` forward (or
@@ -8025,7 +8034,7 @@ function applyLineReplacement(
     // from the target's own glyphs, so its width is what the word occupies.
     const share = targetBlock ? shareOfTarget(targetBlock, middle.map(b => b.decodedText).join('')) : targetBlock
     return applyLineReplacement(stream, run, middleText,
-      pageIndex, share, pageWidth, rotation)
+      pageIndex, share, pageWidth, rotation, keepFace)
   }
 
   // Every block here except the primary gets blanked, so refuse when the run
@@ -8103,7 +8112,7 @@ function applyLineReplacement(
     if (i === primaryIdx) {
       // Primary block: insert the new text, word-wrapped if it won't fit the line
       const lines = targetBlock && pageWidth && newText.length > 0
-        ? layoutReplacementLines(newText, targetBlock, pageWidth, 1, substituteFaceFor(pageIndex, block, newText, targetBlock))
+        ? layoutReplacementLines(newText, targetBlock, pageWidth, 1, sameFace ? undefined : substituteFaceFor(pageIndex, block, newText, targetBlock))
         : [newText]
       drawnLines = lines.length
 
@@ -8112,7 +8121,7 @@ function applyLineReplacement(
       const proactive = narrowLineAndRetry(true)
       if (proactive && !('error' in proactive)) return proactive
 
-      const plan = planTextEncoding(pageIndex, block, lines, targetBlock)
+      const plan = planTextEncoding(pageIndex, block, lines, targetBlock, { sameFace })
       if (plan.kind === 'error') {
         // Before giving up, stop re-encoding the blocks the edit never
         // touched — the CJK label beside an edited Latin value, or the other
@@ -8120,6 +8129,19 @@ function applyLineReplacement(
         return narrowLineAndRetry() ?? { error: plan.error }
       }
       if (plan.kind === 'subst') {
+        // A substitute redraws the WHOLE line in another face, and the edit
+        // may have touched one figure of it. A WPS form draws every glyph as
+        // its own BT and its subsets hold no space glyph, so retyping the last
+        // digit of "15675838714 联系邮箱laisee185@126.com" could not encode the
+        // line's spaces, and the whole bold cell came back in regular Noto.
+        // So first the blocks the edit changed, on their own, in the line's
+        // OWN face (their font or a sibling subset of it): the rest of the
+        // line is untouched and still in that face, so no line gets two faces
+        // this way. Only when that cannot be done does the whole line take the
+        // substitute, as before. `sameFace` keeps the probe from registering a
+        // foreign font it would then throw away.
+        const narrowed = narrowLineAndRetry(false, true)
+        if (narrowed && !('error' in narrowed)) return narrowed
         newContent = rebuildBtContent(block.content, substLines(plan), plan.fontRef, !!plan.hex, undefined, undefined, block.inheritedTf,
           plan.hex ? null : substituteTz(targetBlock, lines[0] ?? newText, plan.fontName), spacingForRebuild(stream, block))
         substitutedFont = plan.fontName

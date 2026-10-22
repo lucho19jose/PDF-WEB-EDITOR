@@ -93,6 +93,14 @@ side is ONE worker message, `acro`, dispatched in `worker/acroTools.ts`;
   appeared — use `pill-sm`.
 - **A dialog closes itself only while it is still the open one** (`closeIf`):
   the previous dialog's hide event lands after the next one was asked for.
+- **Quasar runs with its Spanish language pack** (`main.ts`, with "Aceptar"
+  for OK, as the shell's own dialogs say): with the default English pack every
+  `$q.dialog({ cancel: true })` offered "Cancel"/"OK" inside the Spanish shell.
+  Status-bar messages are still largely English.
+- **`index.html` declares `/favicon.svg`.** Without an icon Chrome asks for
+  `/favicon.ico`, which neither the dev server nor the deploy has, and every
+  fresh session logged a 404 console error — enough to fail
+  `tools/acro/organize-browser.mjs`'s "no browser runtime errors" check.
 
 ### Ask where to save BEFORE saving, not after
 Both ways of writing a file out — `showSaveFilePicker` and a programmatic
@@ -7282,6 +7290,157 @@ per row (the "consulta:" stub was 55 pixels in broken pieces). Measured on the
 main OCR corpus, 1229 runs over the scanned pages: three change, all
 corrections (a checkbox "x" 10.8 → 9.5pt, a fax line under a logo 9 → 4.7pt
 twice).
+
+### A changed letter is the user's edit unless the ink says otherwise by a MARGIN
+Retyping "10" as "15" in a scanned contract's date drew nothing. The typed
+text "confirmed" the word: its changed "0" agreed 0.77 with the page's "5"
+(0.79 with its own "0"), `wordReadsAs` passed a changed letter on its own
+shape, and another letter refused it only when it WON by 0.15. Planned as what
+the ink already said, the edit changed the text layer and no pixel: the page
+kept printing 10 while search found 15. A false correction loses the user's
+edit without a word, so a changed letter must now be the ink's BEST
+explanation (no letter agrees better) and beat the letter the recogniser read
+at that position (`wasRead`, aligned on the letters kept either side) by
+`CORRECTION_MARGIN` (0.1), in `refineReading` and `findCorrections` alike.
+
+The margin is measured. `scan-edit-lab.mjs dropped [page]` changes one figure
+(d → d+5) and one letter (from a swap table) in every cut word of a page and
+counts the edits the planner takes for corrections. On one page, with no
+comparison against the old letter, 58 of 211 edits the ink did not show were
+dropped (C to G, P to F, 0 to 5…); a 0.04 margin still dropped one (a bold "P"
+that agreed 0.85 with the page's "F" and 0.81 with its "P"); 0.1 dropped none.
+Over the contract's 11 pages: 513 of 1713 dropped before, 4 after. The page's
+real misreadings ("ARENADo,BAsE" retyped "ARENADO, BASE") are still taken as
+corrections — refusing one only redraws the word from the page's own letters,
+where accepting a false one drops the edit.
+
+### A line is re-read from its letters ONCE, and never where an ideograph stands
+`rereadLine` is not idempotent. Run again on the "octubre" its own first pass
+had produced, it read the line's broken "u" — two ink runs, of a letter the
+page holds no shape for — as two letters and put back "octtubre"; and the
+edit path re-read every line it planned, so the text layer said the
+misreading again. A line is re-read once (`LineInk.reread`, kept on the run as
+`OcrTextItem.reread`; `applyLineEdit` and `repairReadingsNow` skip a run that
+has been). The cause is fixed as well: two adjacent runs of an unknown Latin
+letter or figure may be joined into one letter when their joined width is
+0.6–1.25 of its advance (cost 0.4).
+
+Words holding an ideograph are never re-read: their radicals read as other
+ideographs ("2、技术" came back "2. 瓷、瓷技术", "10." as "100."). On the
+contract seven such re-reads, all wrong, are gone and every other line reads
+exactly as before. The first version of the join admitted CJK as well and
+invented a character in a heading — which is why it is Latin and figures only.
+
+### A tilted scan is recognised LEVELLED
+A bilingual contract scanned 1.75° off level had six lines of its main clause
+come back as ONE box reading "L" at 45%, and its dense pages lost most of
+their text the same way: in axis-aligned boxes a tilted full-width line is two
+lines tall, PaddleOCR's padded regions of neighbouring lines merge, and the
+recogniser is handed crops holding three lines. Those lines could not be
+clicked, edited or searched.
+
+- **`deskew.ts`.** `estimateSkew` reads the page's skew from a projection
+  profile (quarter scale; ink darker than min(170, 0.75 × the median); the
+  summed squared differences of sheared row sums over ±6° in 0.1° steps, then
+  ±0.1° in 0.02° steps) and answers null under 0.3°, past 6°, with a gain
+  under 1.1 or fewer than 1500 ink pixels. The recogniser reads the raster
+  turned level (`levelCanvas`) — the first pass, the Tesseract fallback and the
+  watermark's second reading alike — and `unlevelRecognition` maps every line,
+  word, glyph box and baseline back as the axis-aligned box ENCLOSING it, the
+  shape everything downstream already handles, with the line's band kept
+  beside it (`OcrLine.tilt` → `OcrTextItem.tilt`: the slope, and the band's top
+  offset and height relative to the rect).
+- **The band is what is clicked.** The layer draws a tilted run's target as
+  its band (`skewY`, the text counter-skewed) and `editAt` hits bands: two
+  neighbouring tilted lines' enclosing boxes overlap, and a click at the end of
+  one opened the next.
+- **The band is what is analysed.** `analyzeLine` takes the run's tilt and
+  counts only the letters inside the band (`inLine`, 0.15 em of pad), so a
+  tilted line is no longer refused as "more than one printed line" and is
+  edited on the scan's pixels.
+- **The size comes from the LEVEL box.** The enclosing box's ink read 5 to
+  25pt for 10pt lines; `buildItems` takes the level box's height over
+  `LEVEL_BOX_PER_EM` (1.24; 1.42 for CJK, both measured against the letters'
+  em on the contract) whenever that is the smaller.
+
+Measured with `tools/ocr-calibrate/deskew-survey.mjs [--compare] [--pages N]
+<pdf|dir>…` (Paddle in node, the app's models, before and after levelling) on
+every scan in Downloads: 29 tilted pages, characters read at 80% or better
+34258 → 52168 (17 pages more, 9 the same, 3 about 2% fewer); the contract's
+page 5 318 → 3694, page 9 273 → 3802. In the app the clause reads at 98–100%,
+and "El Comprador" → "El Cliente", "16 días" → "20 días" and "por DHL" → "por
+DHL o FedEx" on formerly unrecognised lines are made on the scan.
+
+### A render that finishes at the old zoom is not the page at the new one
+`pump()` took any render that came back as the page painted. A render begun
+before a zoom change finishes at the OLD zoom after `repaintAll` has cleared
+`painted` and queued the page again: marked painted, the queued re-render was
+skipped and the page kept its old size for good — and its pdf size was
+computed from the old viewport over the NEW scale, twice the paper's width
+after 150% → 75%, so every overlay on it was drawn at half size over the
+canvas and a click on one line opened another. Seen on a scanned contract
+while a recognition kept the CPU busy; reproduced by slowing renders by 400ms
+and zooming 200% → 100% 250ms apart (stuck at 1190px; right with the fix). A
+result whose viewport scale is not the current one goes back to the front of
+the queue, and `pdfSizes`/`adoptCurrentGeometry` use the viewport's own scale.
+
+### After an edit the selection stays on the edited line, never on its twin
+The selection is re-found after every reload by its anchors (text and centre),
+and the edited block's anchor kept its OLD text. On a fund request whose
+PROGRAMADO and SALDO lines both read "4,000.00", editing PROGRAMADO left SALDO
+the only "4,000.00" — and a sole text match was taken at any distance, so the
+selection (the target of the next Delete or style click) moved onto SALDO 24pt
+below. `commitEdit` re-points the edited block's anchor at its new text (its
+first line, which is what a wrapped block reads as); a sole match is taken
+only within 72pt of its anchor, and the spill path, which BLANKS what it
+finds, within 24pt; anchors compare space-free (re-extraction of a rewritten
+cell can invent a space: "3,613.72" read back "3 ,613.72").
+
+### On a scan, the rubber band and the bounding boxes skip the paper too
+The click path already treated a scan's page-covering image as paper, but
+`selectInBand` added every content image the band touched: a drag across a
+scanned form in the select tool selected the whole scan, a Delete away from
+losing the page. The scan edit's own pixel overlays (`OcrPx…` images) were
+offered as objects as well, and dragging or deleting one put the old figure
+back while the editor still called the edit applied. `isPaperImg()` (a scan
+page and an `OcrPx…` name, or 5% of the page or more) decides the hit-target
+class and the band; "Mostrar cuadros delimitadores" outlines only
+`.cimg-hit:not(.paper)` — an outline over each edited figure read as part of
+the edit.
+
+### Fill & Sign text commits when you leave it, at the size its text needs
+The FreeText box committed only on Ctrl+Enter or its tick. A click elsewhere
+— how Acrobat's Fill & Sign commits — left it open, the next tool's click went
+nowhere, and Save (whose `flushOpenEditor` commits editors by blurring them)
+wrote the file WITHOUT the text while the screen still showed it. It commits on
+blur now; commit and cancel close it before it is removed, so the blur its
+removal fires does nothing. A click used to place a fixed 120×27pt box: a name
+at 14pt wrapped and its second line was clipped by the annotation's /Rect, in
+the file. `fitFreeTextRect` measures the text: a clicked box takes its width
+(to the paper's edge, wrapping only past it), any box grows downward until its
+lines fit, and neither ever shrinks.
+
+### A whole-line substitute is tried NARROWED first, in the line's own face
+WPS draws every glyph of a form as its own BT, and its subsets hold no space
+glyph. Retyping the last digit of "15675838714 联系邮箱laisee185@126.com" could
+not encode the LINE (its spaces), the plan substituted, and the whole bold
+cell came back in regular Noto — for one figure the subset holds. Before
+taking a substitute, `applyLineReplacement` now retries the blocks the edit
+changed on their own (`narrowLineAndRetry`) with `sameFace`: drawn in their
+own font or a sibling subset of it, never a foreign face, so the untouched
+rest of the line keeps its face and no line gets two. Only when that cannot be
+done does the whole line take the substitute, as before.
+
+`sameFace` is threaded down to `planTextEncoding`, which returns an error
+instead of planning a foreign face: planning one REGISTERS it (the CJK
+fallback embeds a font in the resources at plan time), and a probe that may be
+thrown away must leave the document as it found it. Measured: the digit edit
+keeps DengXian-Bold; a CJK edit on the same line ("联系邮件") still takes the
+fallback and adds exactly one font, as at the baseline; realistic and marker
+sweeps over the eight text corpora (main, r2–r8, about 15 000 operations) are
+experiment-identical but for two appends (" ok" after a Calibri title and
+after a bold heading) that now keep their own face instead of being redrawn in
+Helvetica.
 
 ### Known Limitations
 - **CID fonts with incomplete CMaps**: Some glyphs (especially ligatures like 'ti', 'fi') may not have ToUnicode mappings → decoded as '?' → fuzzy matching compensates
