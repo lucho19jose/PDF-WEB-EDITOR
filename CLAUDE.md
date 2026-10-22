@@ -7528,7 +7528,19 @@ exclusion they would be inside the installer.
 PDFs opened from Explorer ("Abrir con", or a second launch) reach the page
 through `window.desktop.onOpenFile` (preload) and the existing `loadBytes`;
 the listener is registered once the engine is up, and the main process queues
-files until then. A document with unsaved changes blocks unload as on the
+files until then.
+
+**One document per window.** The page holds one document (one engine, one
+document store), and v2.0.0 loaded every opened PDF into the one window — the
+document already open was replaced, unsaved edits with it. A file now goes to
+a window that reports no document (`desktop.setHasDocument`, watched on
+`docStore.loaded`), preferring the focused one, or to a new cascaded window.
+A window a file was routed to is `claimed` until its load reports back, so
+several files opened at once each get their own. Tested with three files
+and a closed tab: the emptied window is reused. To test beside an installed
+copy, start the build with `--user-data-dir=<scratch>`: the single-instance
+lock is per profile, and without it every launch hands its file to the
+installed app. A document with unsaved changes blocks unload as on the
 web; Electron would simply refuse to close, so `will-prevent-unload` asks.
 
 The installer is unsigned: Windows SmartScreen shows "Windows protected your

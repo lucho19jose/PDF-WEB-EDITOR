@@ -5,6 +5,7 @@ interface DesktopBridge {
   isDesktop: true
   onOpenFile(callback: (file: { name: string; bytes: Uint8Array }) => void): void
   ready(): void
+  setHasDocument(hasDoc: boolean): void
 }
 interface Window {
   desktop?: DesktopBridge

@@ -182,12 +182,20 @@ onMounted(async () => {
   // engine is up, and only then is the main process told to send them, so a
   // file double-clicked to launch the app is never loaded into a dead engine.
   if (window.desktop) {
-    window.desktop.onOpenFile(({ name, bytes }) => {
-      loadBytes(new Uint8Array(bytes), name).catch((e: unknown) => {
-        editorStore.setStatus(`Could not open ${name}: ${e instanceof Error ? e.message : String(e)}`)
-      })
+    const desktop = window.desktop
+    desktop.onOpenFile(({ name, bytes }) => {
+      loadBytes(new Uint8Array(bytes), name)
+        .catch((e: unknown) => {
+          editorStore.setStatus(`Could not open ${name}: ${e instanceof Error ? e.message : String(e)}`)
+        })
+        // Report even when nothing changed (a file that would not open), so the
+        // main process stops holding this window for it.
+        .finally(() => desktop.setHasDocument(docStore.loaded))
     })
-    window.desktop.ready()
+    // A file opened from Explorer goes to a window with no document, or to a
+    // new one: the main process has to know which this is.
+    watch(() => docStore.loaded, loaded => desktop.setHasDocument(loaded))
+    desktop.ready()
   }
 })
 onUnmounted(() => {

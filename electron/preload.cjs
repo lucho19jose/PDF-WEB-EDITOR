@@ -11,5 +11,12 @@ contextBridge.exposeInMainWorld('desktop', {
   /** The page is ready to receive files: flushes any queued at launch. */
   ready() {
     ipcRenderer.send('desktop:ready')
+  },
+  /**
+   * Whether this window shows a document. A PDF opened from Windows goes to a
+   * window without one, or to a new window — never over an open document.
+   */
+  setHasDocument(hasDoc) {
+    ipcRenderer.send('desktop:has-document', !!hasDoc)
   }
 })

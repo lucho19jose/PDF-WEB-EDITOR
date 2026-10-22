@@ -83,34 +83,86 @@ function registerAppProtocol() {
   })
 }
 
-// ===== Files opened from Windows (Open with…, double-click, a second launch) =====
-let mainWindow = null
-let rendererReady = false
-const pendingFiles = []
+// ===== Windows and the files opened in them =====
+// The editor holds ONE document per page (one engine, one document store), so
+// a PDF opened from Explorer while a window already shows a document must get
+// a window of its own — loaded into the open one it would replace that
+// document, and lose whatever was unsaved in it. Acrobat with tabs off does
+// the same: one document, one window.
+//
+// Each editor window's state, keyed by webContents id:
+//   ready   — the page registered its open-file listener (engine is up)
+//   hasDoc  — the page reports a document is loaded
+//   pending — files waiting for `ready`
+//   claimed — a file was routed here and has not loaded yet, so a second file
+//             arriving in the same burst does not take this window too
+const editors = new Map()
 
 function pdfArgs(argv) {
   return argv.slice(1).filter(a => !a.startsWith('-') && /\.pdf$/i.test(a) && fs.existsSync(a))
 }
 
-function sendFile(filePath) {
-  if (!mainWindow || !rendererReady) { pendingFiles.push(filePath); return }
+function deliver(state, filePath) {
   fs.promises.readFile(filePath).then(buf => {
-    mainWindow.webContents.send('desktop:open-file', {
+    if (state.win.isDestroyed()) return
+    state.win.webContents.send('desktop:open-file', {
       name: path.basename(filePath),
       bytes: new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
     })
   }).catch(err => {
+    state.claimed = false
     dialog.showErrorBox('PDF Editor Pro', `No se pudo abrir ${filePath}:\n${err.message}`)
   })
 }
 
-ipcMain.on('desktop:ready', () => {
-  rendererReady = true
-  while (pendingFiles.length) sendFile(pendingFiles.shift())
+function focus(win) {
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+/** Open a PDF: in an empty window if there is one, otherwise in a new one. */
+function openFile(filePath) {
+  const free = [...editors.values()].filter(s => !s.win.isDestroyed() && !s.hasDoc && !s.claimed)
+  const focused = BrowserWindow.getFocusedWindow()
+  const target = free.find(s => s.win === focused) || free[0]
+  if (target) {
+    target.claimed = true
+    if (target.ready) deliver(target, filePath)
+    else target.pending.push(filePath)
+    focus(target.win)
+    return
+  }
+  const state = createWindow()
+  state.claimed = true
+  state.pending.push(filePath)
+}
+
+function stateOf(event) {
+  return editors.get(event.sender.id)
+}
+
+ipcMain.on('desktop:ready', (e) => {
+  const s = stateOf(e)
+  if (!s) return
+  // A page that just (re)loaded holds no document, whatever it held before.
+  s.ready = true
+  s.hasDoc = false
+  while (s.pending.length) deliver(s, s.pending.shift())
+})
+
+ipcMain.on('desktop:has-document', (e, hasDoc) => {
+  const s = stateOf(e)
+  if (!s) return
+  s.hasDoc = !!hasDoc
+  // Loaded (or the load failed and the window is still empty): either way the
+  // claim is settled.
+  s.claimed = false
 })
 
 function createWindow() {
-  mainWindow = new BrowserWindow({
+  const others = BrowserWindow.getAllWindows().filter(w => editors.has(w.webContents.id))
+  const win = new BrowserWindow({
     width: 1400,
     height: 900,
     minWidth: 900,
@@ -126,45 +178,56 @@ function createWindow() {
       sandbox: true
     }
   })
-  mainWindow.maximize()
-  mainWindow.once('ready-to-show', () => mainWindow.show())
+  const state = { win, ready: false, hasDoc: false, claimed: false, pending: [] }
+  const id = win.webContents.id
+  editors.set(id, state)
+
+  // The first window fills the screen; later ones open cascaded over it so it
+  // is plain that a new window appeared rather than the document changing.
+  if (others.length === 0) win.maximize()
+  else {
+    const [x, y] = others[others.length - 1].getPosition()
+    win.setPosition(x + 32, y + 32)
+  }
+  win.once('ready-to-show', () => win.show())
 
   const allowed = DEV_URL ? new URL(DEV_URL).origin : ORIGIN
   // Links to the web open in the user's browser; the app's own popups (the
   // print fallback's "open in new tab", blob: previews) stay in the app.
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+  win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url) && !url.startsWith(allowed)) {
       shell.openExternal(url)
       return { action: 'deny' }
     }
     return { action: 'allow' }
   })
-  mainWindow.webContents.on('will-navigate', (e, url) => {
+  win.webContents.on('will-navigate', (e, url) => {
     if (!url.startsWith(allowed)) e.preventDefault()
   })
 
   // The app blocks unload while the document has unsaved changes. A browser
   // asks the user; Electron simply refuses to close. Ask here instead.
-  mainWindow.webContents.on('will-prevent-unload', (e) => {
-    const choice = dialog.showMessageBoxSync(mainWindow, {
+  win.webContents.on('will-prevent-unload', (e) => {
+    const choice = dialog.showMessageBoxSync(win, {
       type: 'warning',
       buttons: ['Salir sin guardar', 'Cancelar'],
       defaultId: 1,
       cancelId: 1,
       title: 'PDF Editor Pro',
       message: 'El documento tiene cambios sin guardar.',
-      detail: 'Si sale ahora, los cambios se perderán.'
+      detail: 'Si cierra esta ventana ahora, los cambios se perderán.'
     })
     if (choice === 0) e.preventDefault() // ignore the unload block and close
   })
 
   // F12 still opens DevTools for diagnosis, with the menu bar hidden.
-  mainWindow.webContents.on('before-input-event', (_e, input) => {
-    if (input.type === 'keyDown' && input.key === 'F12') mainWindow.webContents.toggleDevTools()
+  win.webContents.on('before-input-event', (_e, input) => {
+    if (input.type === 'keyDown' && input.key === 'F12') win.webContents.toggleDevTools()
   })
 
-  mainWindow.on('closed', () => { mainWindow = null; rendererReady = false })
-  mainWindow.loadURL(DEV_URL || `${ORIGIN}/`)
+  win.on('closed', () => editors.delete(id))
+  win.loadURL(DEV_URL || `${ORIGIN}/`)
+  return state
 }
 
 // ===== Updates from GitHub Releases =====
@@ -177,8 +240,8 @@ function setupUpdates() {
   autoUpdater.logger = null
   autoUpdater.autoDownload = true
   autoUpdater.on('update-downloaded', (info) => {
-    if (!mainWindow) return
-    const choice = dialog.showMessageBoxSync(mainWindow, {
+    const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0]
+    const options = {
       type: 'info',
       buttons: ['Reiniciar y actualizar', 'Más tarde'],
       defaultId: 0,
@@ -186,7 +249,8 @@ function setupUpdates() {
       title: 'Actualización disponible',
       message: `La versión ${info.version} de PDF Editor Pro está lista.`,
       detail: 'Guarde su trabajo antes de reiniciar. Si elige "Más tarde", se instalará al cerrar la aplicación.'
-    })
+    }
+    const choice = parent ? dialog.showMessageBoxSync(parent, options) : dialog.showMessageBoxSync(options)
     if (choice === 0) autoUpdater.quitAndInstall()
   })
   autoUpdater.on('error', () => { /* offline, or no release yet: try next launch */ })
@@ -197,21 +261,23 @@ function setupUpdates() {
 if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
+  // A second launch: from Explorer with files, or from the Start menu without.
   app.on('second-instance', (_e, argv) => {
-    for (const f of pdfArgs(argv)) sendFile(f)
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
-    }
+    const files = pdfArgs(argv)
+    if (files.length) { for (const f of files) openFile(f); return }
+    const any = BrowserWindow.getAllWindows().find(w => editors.has(w.webContents.id))
+    if (any) focus(any)
+    else createWindow()
   })
 
   app.whenReady().then(() => {
     Menu.setApplicationMenu(null)
     registerAppProtocol()
-    for (const f of pdfArgs(process.argv)) pendingFiles.push(f)
-    createWindow()
+    const files = pdfArgs(process.argv)
+    if (files.length) for (const f of files) openFile(f)
+    else createWindow()
     setupUpdates()
-    app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow() })
+    app.on('activate', () => { if (!editors.size) createWindow() })
   })
 
   app.on('window-all-closed', () => app.quit())
