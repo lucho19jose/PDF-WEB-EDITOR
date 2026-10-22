@@ -4,6 +4,7 @@ import type { WorkerRequest, WorkerResponse } from './worker-protocol'
 import { glyphNameToUnicode } from './glyphNames'
 import { readPkcs7Signer } from './pkcs7Signer'
 import { createAcroTools } from './acroTools'
+import { rasterizeGlyph } from '../../utils/ocr/glyphRaster'
 import * as opentype from 'opentype.js'
 // opentype.js is CJS: the browser bundle gives the namespace itself, the
 // SSR loader (tools/pdf-sweep/node-harness.mjs) wraps it under `default`.
@@ -377,6 +378,44 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         break
       }
 
+      case 'rasterGlyphs': {
+        if (!mupdf) throw new Error('MuPDF not initialized')
+        const font = await matchFont(req.data.fontFile)
+        const glyphs = (req.data.chars as string[]).map(ch => rasterizeGlyph(mupdf, font, ch, req.data.emPx))
+        const transfer: ArrayBuffer[] = []
+        const data = glyphs.map(g => {
+          if (!g) return null
+          const buf = g.cov.buffer as ArrayBuffer
+          transfer.push(buf)
+          return { ...g, cov: buf }
+        })
+        self.postMessage({ id: req.id, type: 'success', data }, transfer as any)
+        break
+      }
+
+      case 'getScanImage': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        const scan = getScanImage(req.data.pageIndex)
+        if (!scan) { respond({ id: req.id, type: 'success', data: null }); break }
+        const buf = scan.rgba.buffer as ArrayBuffer
+        self.postMessage(
+          { id: req.id, type: 'success', data: { width: scan.width, height: scan.height, rgba: buf, ctm: scan.ctm, pageWidth: scan.pageWidth, pageHeight: scan.pageHeight, name: scan.name } },
+          [buf] as any
+        )
+        break
+      }
+
+      case 'drawPixelOverlays': {
+        if (!pdfDoc) throw new Error('No document loaded')
+        respond({
+          id: req.id, type: 'success',
+          data: drawPixelOverlays(req.data.pageIndex, (req.data.overlays as any[]).map(o => ({
+            rect: o.rect, width: o.width, height: o.height, rgb: new Uint8Array(o.rgb), alpha: new Uint8Array(o.alpha)
+          })))
+        })
+        break
+      }
+
       case 'drawImageInContent': {
         if (!pdfDoc) throw new Error('No document loaded')
         respond({
@@ -471,7 +510,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         const page = pdfDoc.loadPage(req.data.pageIndex)
         try {
           const s = req.data.scale
-          const pix = page.toPixmap(mupdf.Matrix.scale(s, s), mupdf.ColorSpace.DeviceRGB, false, true)
+          // `contentOnly`: the page's content without its annotations — the
+          // raster a scan edit reads must not take a stamp or a highlight for scan.
+          const pix = page.toPixmap(mupdf.Matrix.scale(s, s), mupdf.ColorSpace.DeviceRGB, false, !req.data.contentOnly)
           const w = pix.getWidth(), h = pix.getHeight()
           const n = pix.getNumberOfComponents()
           const src = pix.getPixels()
@@ -2399,7 +2440,9 @@ function getSimpleFontInfo(pageIndex: number, fontRefName: string): SimpleFontIn
  */
 function encodeForSimpleFont(
   text: string,
-  info: SimpleFontInfo
+  info: SimpleFontInfo,
+  /** Kern (thousandths of an em) to draw a space with when the font has none — see kernedSpace. */
+  spaceKu?: number
 ): { bytes: string } | { missing: string[] } {
   const table = info.encodingName === 'MacRoman' ? unicodeToMacRoman() : unicodeToWinAnsi()
   let bytes = ''
@@ -2428,13 +2471,21 @@ function encodeForSimpleFont(
       const inRange = byte >= info.firstChar && byte <= info.lastChar
       const width = inRange ? (info.widths[byte - info.firstChar] || 0) : info.missingWidth
       if (width === 0) {
+        if (cp === 32 && spaceKu) { bytes += kernedSpace(spaceKu); continue }
         missing.push(ch)
         continue
       }
     }
     // A non-zero width is not proof the glyph exists — see loadFontProgram.
-    // The space is exempt: it draws nothing whether or not the program has
-    // it, and its advance comes from /Widths (LaTeX fonts have no space).
+    // The space draws nothing either way, but a code the program cannot name
+    // extracts as U+FFFD: pdfTeX's NimbusRomNo9L lists a width for code 32
+    // and has no /space, so "ImageNet Classification" read back (and copied)
+    // as "ImageNet�Classification". It is set as a kern, as TeX set it.
+    if (cp === 32 && info.program && !programHasGlyph(info.program, 32)) {
+      const w = info.widths?.length && byte >= info.firstChar && byte <= info.lastChar ? info.widths[byte - info.firstChar] : 0
+      const ku = spaceKu ?? (w > 0 ? w : undefined)
+      if (ku) { bytes += kernedSpace(ku); continue }
+    }
     if (info.program && cp !== 32 && !programHasGlyph(info.program, cp)) {
       missing.push(ch)
       continue
@@ -2469,8 +2520,11 @@ function pickSubstituteFont(info: SimpleFontInfo | null, targetBlock?: TextBlock
   const flags = info?.flags || 0
 
   const fixedPitch = (flags & 1) !== 0 || /courier|mono/.test(name)
-  const serif = (flags & 2) !== 0 || /times|georgia|garamond|book|palatino|serif|roman/.test(name)
-  const bold = targetBlock?.isBold || /bold|black|heavy/.test(name) || ((flags & 0x40000) !== 0)
+  // Names, not just the flag: pdfTeX marks its fonts symbolic and never sets
+  // the serif bit, so a Palladio or Computer Modern title fell to Helvetica.
+  const serif = (flags & 2) !== 0 || !/gothic|sans|grotesk|grotesque/.test(name) &&
+    /times|georgia|garamond|book|palatino|palladio|pagella|serif|roman|nimbusrom|termes|minion|caslon|baskerville|bodoni|century|cambria|charter|utopia|schoolbook|didot|sabon|goudy|plantin|constantia|perpetua|^(cm|lm|ec|sf)?(r|bx|ti|sl|csc)\d/.test(name)
+  const bold = targetBlock?.isBold || /bold|black|heavy|^(cm|lm[a-z]*)bx|bx\d/.test(name) || ((flags & 0x40000) !== 0)
   const italic = targetBlock?.isItalic || /italic|oblique/.test(name) || ((flags & 0x40) !== 0)
 
   if (fixedPitch) {
@@ -2732,6 +2786,8 @@ function planTextEncoding(
     mode: 'hex' | 'plain'; fontRef: string; encoding: ReturnType<typeof getFontEncoding>
     /** Glyph codes the run being edited already uses — see encodeTextForFont. */
     preferCodes?: Map<number, number>
+    /** The block's content, read for the inter-word kern a spaceless font sets. */
+    content?: string
   },
   lines: string[],
   targetBlock?: TextBlock
@@ -2788,8 +2844,12 @@ function planTextEncoding(
     if (info && !info.isType0 && info.encodingName !== 'Unknown') {
       const byteLines: string[] = []
       let ok = true
+      // A font that names its glyphs (pdfTeX) and has no space is set with
+      // kerns; a third of an em is TeX's own inter-word space when the block
+      // shows none to copy.
+      const spaceKu = spaceKernOf(block.content) ?? (info.differences ? 333 : undefined)
       for (const line of lines) {
-        const res = encodeForSimpleFont(line, info)
+        const res = encodeForSimpleFont(line, info, spaceKu)
         if ('missing' in res) { ok = false; break }
         byteLines.push(res.bytes)
       }
@@ -3274,6 +3334,26 @@ function addTextToPage(
  * Ensure a standard PDF font (Helvetica, Times-Roman, Courier) is registered
  * in the page's Resources/Font dictionary. Returns the font reference name (e.g. "F10").
  */
+// ── Faces for letters a scan never printed (src/utils/ocr/glyphSynth.ts) ──
+
+/** The bundled metric-compatible faces, loaded on first use from /fonts/match. */
+const matchFonts = new Map<string, Promise<any>>()
+function matchFont(file: string): Promise<any> {
+  if (!/^[A-Za-z0-9-]+$/.test(file)) return Promise.reject(new Error(`bad font name ${file}`))
+  let p = matchFonts.get(file)
+  if (!p) {
+    p = (async () => {
+      const res = await fetch(`/fonts/match/${file}.ttf`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return new mupdf!.Font(file, new Uint8Array(await res.arrayBuffer()))
+    })()
+    // A failed load is not remembered: the next request may succeed.
+    p.catch(() => matchFonts.delete(file))
+    matchFonts.set(file, p)
+  }
+  return p
+}
+
 // ── A CJK face for text WinAnsi cannot hold ──
 
 /** Where the shipped CJK face lives; fetched once, on the first run that needs it. */
@@ -3754,11 +3834,7 @@ function replaceTextInStream(
         streamStr = streamStr.slice(0, sp.start) + sp.text + streamStr.slice(sp.end)
       }
 
-      const streamBytes = new Uint8Array(streamStr.length)
-      for (let i = 0; i < streamStr.length; i++) {
-        streamBytes[i] = streamStr.charCodeAt(i) & 0xFF
-      }
-      src.write(streamBytes)
+      src.write(streamBytesOf(streamStr))
       invalidateContentSources(pageIndex)
       return {
         success: true,
@@ -4424,10 +4500,7 @@ function transformInSource(
     }
 
     // Write modified stream back (Latin-1 for byte transparency)
-    const streamBytes = new Uint8Array(modifiedStream.length)
-    for (let i = 0; i < modifiedStream.length; i++) {
-      streamBytes[i] = modifiedStream.charCodeAt(i) & 0xFF
-    }
+    const streamBytes = streamBytesOf(modifiedStream)
 
     src.write(streamBytes)
 
@@ -4638,8 +4711,12 @@ function dropBaselineInBlock(inner: string, stream: string, blockStart: number, 
  * caught 22 such). Same test `applyBlockReplacement` uses to delegate.
  */
 function provablyHoldsMore(block: BtInfo, targetBlock: TextBlock): boolean {
-  const dFree = block.decodedText.replace(/\s+/g, '')
-  const tFree = targetBlock.text.replace(/\s+/g, '')
+  // Folded (ligatures expanded, case-insensitive): a pdfTeX title decodes
+  // "Classiﬁcation" while extraction reports "Classification", the test said
+  // "not contained", and the whole-block rewrite deleted the title's second
+  // line ("Neural Networks") drawn by the same BT.
+  const dFree = foldForMatch(block.decodedText).replace(/\s+/g, '')
+  const tFree = foldForMatch(targetBlock.text).replace(/\s+/g, '')
   return !!tFree && dFree !== tFree && !dFree.includes('?') &&
     dFree.includes(tFree) && dFree.replace(tFree, '').length > 0
 }
@@ -4878,7 +4955,7 @@ function restyleInSource(
 
         const plan = planTextEncoding(
           pageIndex,
-          { mode: block.mode, fontRef: block.fontRef, encoding: block.encoding },
+          { mode: block.mode, fontRef: block.fontRef, encoding: block.encoding, content: block.content },
           wrapped,
           targetBlock
         )
@@ -5093,10 +5170,7 @@ function restyleInSource(
       return { success: false, error: 'The style operators for this text could not be located' }
     }
 
-    const streamBytes = new Uint8Array(modifiedStream.length)
-    for (let i = 0; i < modifiedStream.length; i++) {
-      streamBytes[i] = modifiedStream.charCodeAt(i) & 0xFF
-    }
+    const streamBytes = streamBytesOf(modifiedStream)
 
     src.write(streamBytes)
     invalidateContentSources(pageIndex)
@@ -6647,7 +6721,10 @@ interface BtInfo {
 
 /** Does the block draw anything in this font? (a BT can switch fonts per run) */
 function blockUsesFont(b: BtInfo, ref: string): boolean {
-  return b.fontRef === ref || b.fonts.includes(ref)
+  if (b.fontRef === ref || b.fonts.includes(ref)) return true
+  // A same-named sibling resource (see fontRefAliases) is the same face.
+  return fontRefAliases.size > 1 && fontRefAliases.has(ref) &&
+    (fontRefAliases.has(b.fontRef) || b.fonts.some(f => fontRefAliases.has(f)))
 }
 
 /**
@@ -7395,11 +7472,7 @@ function applyBlockReplacement(
     // deleted the bracket — which belongs to the label in the cell BEFORE.
     // Same test as the op-level gate: not the target, contains it, leftover
     // visible, and no '?' placeholders pretending to be foreign glyphs.
-    const dFree = block.decodedText.replace(/\s+/g, '')
-    const tFreeHere = targetNorm.replace(/\s+/g, '')
-    const provablyHoldsMore = !!tFreeHere && dFree !== tFreeHere && !dFree.includes('?') &&
-      dFree.includes(tFreeHere) && dFree.replace(tFreeHere, '').length > 0
-    if (targetNorm && (blockGlyphs > targetNorm.length * 1.4 || provablyHoldsMore)) {
+    if (targetNorm && (blockGlyphs > targetNorm.length * 1.4 || provablyHoldsMore(block, targetBlock))) {
       const partial = applyPartialBlockReplacement(stream, block, newText, pageIndex, targetBlock, pageHeight, pageWidth)
       if (partial) return partial
       // Falling through would rewrite the WHOLE block, and this block holds far
@@ -8498,7 +8571,32 @@ function fuzzyTextMatch(decoded: string, target: string): boolean {
  * Find the content stream font reference (e.g., "F50") that matches
  * a MuPDF font name (e.g., "CAAAAA+Calibri").
  */
+/**
+ * Every resource name that carries the same face as the ref the last
+ * `findMatchingFontRef` returned. Word embeds one face under SEVERAL names —
+ * a letter's "TimesNewRomanPSMT" was /F1 (a simple TrueType font, used for a
+ * few spaces) and /F4 (a CID font drawing the whole body) — and extraction
+ * reports only the name, so the first ref found stood for both and the font
+ * filter (`blockUsesFont`) discarded every block drawn in the other: no body
+ * line of the letter could be edited ("Could not find matching text … font F1").
+ */
+let fontRefAliases: Set<string> = new Set()
+
 function findMatchingFontRef(
+  mupdfFontName: string,
+  fontRefToBaseName: Map<string, string>
+): string | null {
+  const ref = findMatchingFontRefOnce(mupdfFontName, fontRefToBaseName)
+  fontRefAliases = new Set()
+  if (ref) {
+    const clean = (s: string) => s.replace(/^[A-Z]{6}\+/, '')
+    const base = clean(fontRefToBaseName.get(ref) || '')
+    for (const [r, b] of fontRefToBaseName) if (clean(b) === base) fontRefAliases.add(r)
+  }
+  return ref
+}
+
+function findMatchingFontRefOnce(
   mupdfFontName: string,
   fontRefToBaseName: Map<string, string>
 ): string | null {
@@ -9235,6 +9333,8 @@ function replaceInsideTjArray(
     const fc = simpleInfo.firstChar
     let newW = 0, known = true
     for (const code of newLiteral.codes) {
+      const ks = kernedSpaceKu(code)
+      if (ks !== null) { newW += ks; continue }
       const cw = w[code - fc]
       if (cw === undefined) { known = false } else newW += cw
     }
@@ -10763,7 +10863,7 @@ function applyPartialBlockReplacement(
       const fr = encodingFor(op)
       const plan = planTextEncoding(pageIndex,
         { mode: op.isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding,
-          preferCodes: preferredGlyphCodes(ops, op, block, fr.encoding) },
+          preferCodes: preferredGlyphCodes(ops, op, block, fr.encoding), content: block.content },
         [newText], targetBlock)
       // Only fatal when the array is the ONLY hope; with an op window still in
       // hand, an unencodable cell just means this route is not the one.
@@ -10818,7 +10918,7 @@ function applyPartialBlockReplacement(
     const fr = encodingFor(ops[at])
     return planTextEncoding(pageIndex,
       { mode: ops[at].isHex ? 'hex' : 'plain', fontRef: fr.fontRef, encoding: fr.encoding,
-        preferCodes: preferredGlyphCodes(ops, ops[at], block, fr.encoding) },
+        preferCodes: preferredGlyphCodes(ops, ops[at], block, fr.encoding), content: block.content },
       lines, targetBlock)
   }
   const planFor = (at: number, text: string) => planLinesFor(at, [text])
@@ -10957,6 +11057,8 @@ function applyPartialBlockReplacement(
       const si = encodingFor(ops[winI]).simpleInfo
       if (!si?.widths) return ''
       for (const b of plan.byteLines[0]) {
+        const ks = kernedSpaceKu(b.charCodeAt(0))
+        if (ks !== null) { newAdv += ks / 1000 * stIn.tfSize; continue }
         const cw = si.widths[b.charCodeAt(0) - si.firstChar]
         if (cw === undefined) return ''
         newAdv += cw / 1000 * stIn.tfSize
@@ -11118,6 +11220,90 @@ function unescapePdfString(s: string): string {
       default: return esc // \\ \( \) and any other escaped char → literal
     }
   })
+}
+
+// ── Spaces a font cannot draw ──
+//
+// pdfTeX's fonts have no space glyph: TeX sets inter-word space as a KERN
+// inside a TJ array, `[(Contexts)-333(Optical)]TJ`, and the font's /Widths
+// does not even reach code 32 (FirstChar 40 on an arXiv title). Encoding a
+// typed space through the font therefore "failed", and EVERY multi-word edit
+// on a LaTeX document — deleting a single letter of a title included — fell
+// back to a base-14 substitute: a Palladio title came back in Helvetica.
+//
+// Such a space is encoded as a sentinel carrying the kern (U+E000 + kern in
+// thousandths of an em — a private-use character can never occur in the
+// Latin-1 strings content streams are handled as), and `expandKernedSpaces`
+// turns every literal holding one into a TJ array, just before the stream is
+// written: `(ab) Tj` → `[(a) -333 (b)] TJ`. Doing it there rather than
+// in each writer keeps the dozen emitters of a literal unchanged.
+const KERNED_SPACE_BASE = 0xE000
+const KERNED_SPACE_RE = /[-]/
+
+function kernedSpace(ku: number): string {
+  return String.fromCharCode(KERNED_SPACE_BASE + Math.max(1, Math.min(4095, Math.round(ku))))
+}
+
+/** The kern (thousandths of an em) a sentinel stands for, or null for an ordinary byte. */
+function kernedSpaceKu(code: number): number | null {
+  return code > KERNED_SPACE_BASE && code <= KERNED_SPACE_BASE + 4095 ? code - KERNED_SPACE_BASE : null
+}
+
+/**
+ * The inter-word kern a block already uses: the median of the TJ-array kerns
+ * that read as spaces (past KERN_SPACE, short of a column jump). Undefined
+ * when the block shows none.
+ */
+function spaceKernOf(content: string | undefined): number | undefined {
+  if (!content) return undefined
+  const vals: number[] = []
+  const arrRe = new RegExp(String.raw`\[((?:${STR_LIT_SRC}|${HEX_LIT_SRC}|[^\]])*)\]\s*TJ`, 'g')
+  const litRe = new RegExp(`${STR_LIT_SRC}|${HEX_LIT_SRC}`, 'g')
+  for (const m of content.matchAll(arrRe)) {
+    for (const n of m[1].replace(litRe, ' ').matchAll(/-?\d*\.?\d+/g)) {
+      const v = -parseFloat(n[0])
+      if (v >= KERN_SPACE && v <= 800) vals.push(v)
+    }
+  }
+  if (!vals.length) return undefined
+  vals.sort((a, b) => a - b)
+  return vals[Math.floor(vals.length / 2)]
+}
+
+function splitKernedLiteral(lit: string): string {
+  const body = lit.slice(1, -1)
+  let out = '('
+  for (const ch of body) {
+    const ku = kernedSpaceKu(ch.charCodeAt(0))
+    out += ku === null ? ch : `) ${-ku} (`
+  }
+  return out + ')'
+}
+
+function expandKernedSpaces(s: string): string {
+  if (!KERNED_SPACE_RE.test(s)) return s
+  // A literal shown on its own becomes an array; a `'` or `"` keeps its line
+  // move (and its Tw/Tc operands) by showing nothing, then the array.
+  const showRe = new RegExp(`(${STR_LIT_SRC})(\\s*)(Tj|'|")`, 'g')
+  s = s.replace(showRe, (all, lit: string, _ws: string, op: string) => {
+    if (!KERNED_SPACE_RE.test(lit)) return all
+    const arr = `[${splitKernedLiteral(lit)}] TJ`
+    return op === 'Tj' ? arr : `() ${op} ${arr}`
+  })
+  // Whatever is left sits inside an array already.
+  if (KERNED_SPACE_RE.test(s)) {
+    s = s.replace(new RegExp(STR_LIT_SRC, 'g'), lit => KERNED_SPACE_RE.test(lit) ? splitKernedLiteral(lit) : lit)
+  }
+  // Never let a sentinel reach the bytes: `& 0xFF` would turn it into a letter.
+  return s.replace(/[-]/g, ' ')
+}
+
+/** A content-stream string as the bytes it stands for (Latin-1), sentinels expanded. */
+function streamBytesOf(s: string): Uint8Array {
+  s = expandKernedSpaces(s)
+  const bytes = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xFF
+  return bytes
 }
 
 function escapePdfString(s: string): string {
@@ -12245,6 +12431,186 @@ function flattenAnnotationBehind(
   }
 }
 
+/**
+ * The page's SCAN at its own resolution: the largest image the content draws,
+ * if it covers at least half the paper, decoded to RGBA at its native pixel
+ * size, with the CTM that places its unit square in the VISIBLE frame
+ * (bottom-up user space, /Rotate composed in, as `getFullCtmAtOffset` gives).
+ *
+ * An edit that has to be indistinguishable from the scan is made on these
+ * pixels and drawn back over exactly them (see src/utils/ocr/scanEdit.ts); a
+ * render at any other resolution straddles the scan's pixels and its edge
+ * shows.
+ */
+function getScanImage(pageIndex: number): { width: number; height: number; rgba: Uint8ClampedArray; ctm: Mat6; pageWidth: number; pageHeight: number; name: string } | null {
+  if (!pdfDoc || !mupdf) return null
+  const size = getPageSize(pageIndex)
+  const images = listContentImages(pageIndex)
+  let best: ContentImageInfo | null = null, bestArea = 0
+  for (const im of images) {
+    const area = Math.abs((im.rect[2] - im.rect[0]) * (im.rect[3] - im.rect[1]))
+    if (area > bestArea) { bestArea = area; best = im }
+  }
+  if (!best || bestArea < size.width * size.height * 0.5) return null
+  // A LAYERED scan — an office scanner's "compact PDF": a JPEG background and
+  // the text as 1-bit masks painted over it — keeps its letters out of the
+  // largest image, which then holds paper and nothing to edit. Other images
+  // covering a tenth of the page say so; the caller then reads a render of
+  // the page instead.
+  // Only MASKS are layers — 1-bit stencils painted over the background; a
+  // slide's other pictures are pictures, and its largest image still holds
+  // the text. This editor's own overlays (OcrPx…) are edits, not layers.
+  const isMask = (im: ContentImageInfo): boolean => {
+    try {
+      const s = getContentSources(pageIndex).find(x => x.key === im.sourceKey)
+      let res: any = s?.resources
+      if (!res) { const pg = pdfDoc.loadPage(pageIndex); try { res = pageResourcesOf(pg.getObject()) } finally { pg.destroy() } }
+      const xo = (res?.resolve?.() ?? res)?.get?.('XObject')
+      if (!xo || String(xo) === 'null') return false
+      const d = (xo.resolve ? xo.resolve() : xo).get(im.name)?.resolve?.()
+      if (!d || String(d) === 'null') return false
+      const mask = d.get('ImageMask'), bpc = d.get('BitsPerComponent')
+      return String(mask) === 'true' || Number(String(bpc)) === 1
+    } catch (_) { return false }
+  }
+  let others = 0
+  for (const im of images) {
+    if (im === best || im.name.startsWith('OcrPx') || !isMask(im)) continue
+    others += Math.abs((im.rect[2] - im.rect[0]) * (im.rect[3] - im.rect[1]))
+  }
+  if (others > size.width * size.height * 0.1) return null
+  const src = getContentSources(pageIndex).find(s => s.key === best!.sourceKey)
+  if (!src) return null
+  let page: any = null, pix: any = null, rgbPix: any = null, image: any = null
+  try {
+    let resources: any = src.resources
+    if (!resources) {
+      page = pdfDoc.loadPage(pageIndex)
+      resources = pageResourcesOf(page.getObject())
+    }
+    const res = resources?.resolve?.() ?? resources
+    const xo = res?.get?.('XObject')
+    if (!xo || String(xo) === 'null') return null
+    // The INDIRECT reference: MuPDF's image loader wants the reference, not
+    // the resolved dictionary (the same quirk as `readStream`).
+    const ref = (xo.resolve ? xo.resolve() : xo).get(best.name)
+    if (!ref || String(ref) === 'null') return null
+    image = pdfDoc.loadImage(ref)
+    pix = image.toPixmap()
+    const cs = pix.getColorSpace?.()
+    const isRgb = cs && String(cs.getName?.() ?? '').toLowerCase().includes('rgb') && pix.getNumberOfComponents() - (pix.getAlpha() ? 1 : 0) === 3
+    rgbPix = isRgb ? pix : pix.convertToColorSpace(mupdf.ColorSpace.DeviceRGB, false)
+    const w = rgbPix.getWidth(), h = rgbPix.getHeight(), n = rgbPix.getNumberOfComponents(), stride = rgbPix.getStride?.() ?? w * n
+    const samples = rgbPix.getPixels()
+    const rgba = new Uint8ClampedArray(w * h * 4)
+    for (let y = 0; y < h; y++) {
+      let s = y * stride, o = y * w * 4
+      for (let x = 0; x < w; x++, s += n, o += 4) {
+        rgba[o] = samples[s]; rgba[o + 1] = samples[s + 1]; rgba[o + 2] = samples[s + 2]; rgba[o + 3] = 255
+      }
+    }
+    // In the DISPLAYED frame, as the page size is: on a /Rotate page the
+    // content's own frame is turned against what the reader sees.
+    const inContent = withSource(src, () => getFullCtmAtOffset(src.stream, best!.doOffset))
+    const rot = pageRotationCtm(pageIndex)
+    const ctm = rot ? matConcat(inContent, rot) : inContent
+    return { width: w, height: h, rgba, ctm, pageWidth: size.width, pageHeight: size.height, name: best.name }
+  } catch (err) {
+    console.warn('[MuPDF Worker] getScanImage failed:', err)
+    return null
+  } finally {
+    try { if (rgbPix && rgbPix !== pix) rgbPix.destroy() } catch (_) {}
+    try { pix?.destroy() } catch (_) {}
+    try { image?.destroy() } catch (_) {}
+    try { page?.destroy() } catch (_) {}
+  }
+}
+
+/**
+ * Draw pixel overlays over the page — the scan edits of scanEdit.ts — in ONE
+ * stream rewrite. Each is an RGB image with an 8-bit soft mask: opaque where
+ * the scan changed, transparent where it did not, so the overlay cannot
+ * disagree with the scan under it anywhere it left alone. Written as plain
+ * DeviceRGB/DeviceGray streams (no ICC profile, Flate on save), placed at
+ * `rect` in the visible frame (top-left points) with the same /Rotate and
+ * end-of-stream CTM corrections `drawImageInContent` applies. Names `OcrPx<n>`
+ * are fresh on the page.
+ */
+function drawPixelOverlays(
+  pageIndex: number,
+  overlays: { rect: number[]; width: number; height: number; rgb: Uint8Array; alpha: Uint8Array }[]
+): { success: boolean; names?: string[]; error?: string } {
+  if (!pdfDoc || !mupdf) return { success: false, error: 'No document' }
+  if (!overlays.length) return { success: true, names: [] }
+  let page: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    const pageObj = page.getObject()
+    const pageHeight = getPageSize(pageIndex).height
+    let resources = ownPageResources(pageObj).resolve()
+    let xobjects = resources.get('XObject')
+    if (!xobjects || String(xobjects) === 'null') {
+      xobjects = pdfDoc.newDictionary()
+      resources.put('XObject', xobjects)
+    }
+    xobjects = xobjects.resolve()
+    const existing = readContentStream(pageIndex)
+    let correction: Mat6 | null = null
+    const pageRot = pageRotationCtm(pageIndex)
+    if (pageRot) correction = matInvert(pageRot)
+    const endCtm = getCtmAtOffset(existing, existing.length)
+    if (endCtm.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
+      const inv = matInvert(endCtm)
+      if (inv) correction = correction ? matConcat(correction, inv) : inv
+    }
+    const undo = correction ? `${correction.map(v => fmtNum(v)).join(' ')} cm ` : ''
+    const names: string[] = []
+    let ops = ''
+    let slot = 0
+    for (const o of overlays) {
+      if (!(o.width > 0 && o.height > 0) || o.rgb.length !== o.width * o.height * 3 || o.alpha.length !== o.width * o.height) continue
+      const mk = (bytes: Uint8Array, cs: string, smask?: any) => {
+        const d = pdfDoc.newDictionary()
+        d.put('Type', pdfDoc.newName('XObject'))
+        d.put('Subtype', pdfDoc.newName('Image'))
+        d.put('Width', o.width)
+        d.put('Height', o.height)
+        d.put('ColorSpace', pdfDoc.newName(cs))
+        d.put('BitsPerComponent', 8)
+        if (smask) d.put('SMask', smask)
+        return pdfDoc.addStream(bytes, d)
+      }
+      const imgRef = mk(o.rgb, 'DeviceRGB', mk(o.alpha, 'DeviceGray'))
+      let name = ''
+      for (; slot < 5000; slot++) {
+        const candidate = `OcrPx${slot}`
+        const taken = xobjects.get(candidate)
+        if (!taken || String(taken) === 'null') { name = candidate; slot++; break }
+      }
+      if (!name) break
+      xobjects.put(name, imgRef)
+      names.push(name)
+      const x = Math.min(o.rect[0], o.rect[2]), w = Math.abs(o.rect[2] - o.rect[0])
+      const top = Math.min(o.rect[1], o.rect[3]), h = Math.abs(o.rect[3] - o.rect[1])
+      const y = pageHeight - top - h
+      ops += `\nq ${undo}${fmtNum(w)} 0 0 ${fmtNum(h)} ${fmtNum(x)} ${fmtNum(y)} cm /${name} Do Q`
+    }
+    const combined = existing + ops + '\n'
+    const bytes = new Uint8Array(combined.length)
+    for (let i = 0; i < combined.length; i++) bytes[i] = combined.charCodeAt(i) & 0xFF
+    const contents = pageObj.get('Contents')
+    const isStream = !!contents && String(contents) !== 'null' && typeof contents.isStream === 'function' && contents.isStream()
+    if (isStream) contents.writeStream(bytes)
+    else pageObj.put('Contents', pdfDoc.addStream(bytes, {}))
+    invalidateContentSources(pageIndex)
+    return { success: true, names }
+  } catch (err: any) {
+    return { success: false, error: err.message || String(err) }
+  } finally {
+    try { page?.destroy() } catch (_) {}
+  }
+}
+
 function drawImageInContent(
   pageIndex: number,
   rect: number[],
@@ -12405,9 +12771,7 @@ function writeContentSource(
   for (const sp of [...splices].sort((a, b) => b.start - a.start)) {
     out = out.slice(0, sp.start) + sp.text + out.slice(sp.end)
   }
-  const bytes = new Uint8Array(out.length)
-  for (let i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 0xFF
-  src.write(bytes)
+  src.write(streamBytesOf(out))
   invalidateContentSources(pageIndex)
 }
 

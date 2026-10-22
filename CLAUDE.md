@@ -2395,6 +2395,35 @@ box instead. Runs the model hardly believes — the stamp read as "ci Y", "ee",
 "N" at 0–40% — are dropped by `isJunkRun`; two-character Chinese cells and
 numbers are kept whatever their confidence above 30.
 
+### A watermark over the text is read UNDER, in a second reading that only adds
+A registry certificate prints a light grey diagonal watermark ("verify at…",
+each letter a hand tall) over its text, and PaddleOCR returned seven of the
+page's lines as nothing at all — four list items, a heading, the notary line —
+though every one is black and legible. Those lines could not be clicked, edited
+or searched. `watermarkLevel` (`ocrWatermark.ts`) finds such a page by its
+luminance histogram: paper the mode (230 or lighter), and a PLATEAU between
+170 and 20 below it — the tallest local maximum of the smoothed histogram,
+holding 0.4% of the page and twice what the histogram holds 25 levels darker
+(the soft edges of black text make a smooth tail there, never a bump). Darker
+plateaus are left alone: a band of colour behind reversed white lettering
+lies there.
+
+`recognizePage` then reads the page again with every pixel from 20 below the
+plateau whitened, and `linesMissed` ADDS the lines that reading found where
+the first found nothing — confident (90+), three letters or figures at least,
+overlapping no first-reading box by a quarter of the smaller — and changes
+nothing else. Whitening is no cure on its own, which is why it never
+replaces a line: on an ordinary grey scan it eats the soft edges of letters
+("GERENTE" read back "CERENTE", "Thumbnails" "Thurmbnails", measured on
+twelve plateau pages of the corpus), and whitening only the plateau's own
+grey band did the same. Measured on those twelve: the registry page gains
+its seven lines, every other page gains nothing (what its second reading
+found it had already). The cost is one more recognition on such pages — the
+status line says "Reading under the watermark…" — and none for the cloud
+engine, where a second call costs money. Editing the recovered lines works
+like any other: five edits across them draw on the scan with no damage, the
+watermark intact behind the new words.
+
 ### Three OCR engines behind one contract; PaddleOCR reads first
 `src/utils/ocr/ocrEngine.ts` is what every recogniser answers to — lines with
 a box, text and confidence, and OPTIONAL words, glyph boxes, baseline and
@@ -4322,6 +4351,1964 @@ period. `msp.pdf` hangs the sweep driver at HEAD as well (not investigated).
 `tools/ocr-calibrate/store-regression.test.mjs` covers the store rules
 (`node --experimental-strip-types --test …`).
 
+### A scanned edit is made ON THE SCAN: kept letters are its pixels, new ones are its own letters
+Every earlier path redrew an edited line (or its changed stretch) with a FONT —
+a base-14 face, or one traced from the scan — over a patch, and however good
+the trace, the result read as another face set into the page: lighter or
+heavier, crisper than the scan's blur, an underline cut off under the new
+letters, a bold word coming back regular. The user's bar is an edit that cannot
+be told from the scan, and only the scan itself can meet it. The scan edit
+(`src/utils/ocr/scanEdit.ts` and what it stands on) works on the page's OWN
+pixels:
+
+- **The scan at its own resolution** (`getScanImage` in the worker: the largest
+  content image, decoded at native pixels, with the CTM placing it; `scanRaster.ts`).
+  A render at another DPI straddles the scan's pixels and its overlay's edge shows.
+- **The paper behind the ink** (`preparePage` in `lineInk.ts`): ink is found with a
+  max filter wider than any stroke, then every inked pixel AND ~1.8 pt around it
+  is filled from the paper beyond (`inpaint.ts`, push-pull). The margin matters:
+  a scan's strokes are ringed by blur and JPEG ringing a few levels darker than
+  the paper (measured 248–252 at 2–4 px, 254 beyond 6 px at 200 DPI); paper
+  sampled inside that ring erased a word into a soft grey blob.
+- **Each line analysed once** (`analyzeLine`): its baseline, the ink that is its
+  own (not the lines above/below, not a rule), its words split on the ink's own
+  gaps, the reading shared among them by width (`wordSeg.ts`), each word cut
+  into letters on the LINE's em and baseline, and every pixel of the area given
+  to the nearest ink (`owner`, a Voronoi partition out to ~2.2 pt — as far as a
+  letter's JPEG ringing reaches). A letter's REGION is what is erased, moved or
+  harvested with it: its core, fringe and haze, never a neighbour's.
+- **The page's letters as an atlas** (`glyphAtlas.ts`): every letter of an EXACT
+  word (one ink run per character — a reading that dropped a digit of
+  "20515471681" shifts every cell after it, and digits all being one width,
+  nothing else sees it), kept as transmittance over its paper. A letter is
+  picked as the MEDOID of its compatible copies (same weight class, x-height or
+  cap height within ~10%; the em a fit reports varies 21–25 px across lines set
+  in one 9pt face, so sizes compare on what both lines measured); copies that
+  look more like ANOTHER letter's established shape are doubted out. Weight is
+  measured per word as darkness summed across vertical strokes only (a crossing
+  wider than a stem is a bar — counted, every all-caps word read bold).
+- **The edit** (`applyLineEdit`): old and new text aligned with contiguity
+  preferred (a continuing match is worth twice a lone one, so "iento" stays one
+  run rather than six letters picked from all over "cientocincuenta"); a word
+  keeps its letters only when its cut is exact, the change is at its start or
+  end or leaves most of it, and every kept letter LOOKS like its label (ink
+  "claves" read ")laves" cuts cleanly). The line is laid out in three parts:
+  everything before the first change keeps its place to the pixel; everything
+  after the last change moves as ONE rigid block (letters, ink the reading never
+  named such as handwriting in a form's blank, the line's own rules); only the
+  middle is typeset — new gaps from the line's own word gap or a fitted
+  letter-gap model `g ≈ μ + R[a] + L[b]`. A justified line (it ended at the
+  page's right margin) is respaced over its word gaps (−30%/+60% each), but only
+  when it is CLEAN (no loose ink, no rule of its own); otherwise a tail that
+  would leave the paper is refused. The gaps after the change take the
+  difference alone while they take it lightly (a tenth of their width when
+  closing, a quarter when opening); past that EVERY gap of the line gives its
+  share, the words before the change included (see "A justified line is
+  re-justified whole" below).
+- **Underlines** are carried: extended with the rule's own columns and end cap
+  under new letters of the SAME word, trimmed where letters went. A rule is an
+  underline only when letters cover 45%+ of it — a form's blank is left alone.
+- **Printing** is multiplication of transmittance onto the paper (`printGlyph`),
+  as ink prints; borrowed letters are toned to the line's ink.
+- **Overlays** (`scanEditPage.ts`, worker `drawPixelOverlays`): one DeviceRGB
+  image + DeviceGray SMask per edited line, drawn on exactly the scan's pixel
+  rectangle (no ICC, Flate on save), plus the line's words as invisible text
+  fitted to their ink so it extracts and searches. **The mask is opaque for
+  three pixels AROUND every changed pixel, not on the changed pixels alone,
+  and three more carry the scan's colour while transparent.** A renderer
+  interpolates the image and its soft mask separately (MuPDF does), so the
+  layers mix wherever the mask steps; a mask that was exactly the changed
+  pixels stepped ON the old letters' anti-aliased edges — the edge pixels just
+  outside an erased stroke were already paper, so unchanged, so transparent —
+  and the old ink showed through at half strength: a grey outline of every
+  erased letter, and (with white carried under transparent pixels) pale specks
+  along every moved one. Invisible at 9pt, plain on a 24pt book title. The
+  margin pixels carry the scan's own values, so an exact render is unchanged.
+  The lab cannot show this class (it inspects the working copy, not a render):
+  check a MuPDF render of the baked page at 6x.
+
+Letters the document never printed come from `glyphSynth.ts`: the bundled
+metric-compatible faces (`public/fonts/match`, OFL: Carlito≈Calibri,
+Arimo≈Arial, Tinos≈Times, Caladea≈Cambria; subset to Latin, ~450 KB) are
+rasterised by MuPDF (`rasterGlyphs`, `glyphRaster.ts`), the face and its blur and
+tone chosen against the page's own letters (MSP: Carlito at 0.93 agreement), the
+stems toned to the line's core darkness and re-weighed to the stem of the word
+the letter goes into. Only from a look scoring ≥ 0.75, and never more than two
+(or a quarter) of a line's new letters — a brochure title redrawn ten letters
+out of ten read as another face, worse than the vector fallback. A letter the
+page holds in the OTHER weight is re-weighed (`reweighImage`) rather than
+synthesised.
+
+Four things the synthesis got wrong, each visible only on a crop (013, a
+96-DPI receipt; the lab's `look` command draws the references beside every
+face, now with their ink masses and stems):
+- **Shape agreement cannot tell the weights apart.** It is a correlation, and
+  once the blur has spread the strokes a regular glyph correlates with a heavy
+  bold serif as well as the bold does (0.89–0.95 either way), so the weight was
+  a coin toss and "Universidad" got a pale, thin "s". Total ink does not
+  separate them either — a compact bold letter holds what a wider regular one
+  does. STROKE WIDTH does: darkness summed across a stem is its width whatever
+  the blur. `fitOnRefs` picks each reference's weight by the stem nearer the
+  page's (the page's over its ink's darkness, at least 0.75 — a thin black
+  stroke on a coarse scan never prints full, and read as grey ink it measured
+  twice its width), and the face, blur and tone by shape, as before; letting
+  stems weigh in on the face too chose a sans for that serif line.
+- **Toning compared unlike things.** The glyph's 90th-percentile darkness was
+  aimed at the line's MEDIAN core darkness, so stems came out at four fifths of
+  the scan's. The glyph's own core-level pixels (≥ `CORE`) are now matched,
+  median to median.
+- **Re-weighing compared units.** The page's stem is absolute darkness summed
+  across a stroke, the glyph's is in shares of its ink colour; on grey ink the
+  letter was thinned to the grey's share. The target is also the stem of the
+  WORD the letter goes into (`GlyphWant.stem`, its neighbours' when it is too
+  short to measure), not the page's median for its weight class.
+- **A line with no cut word had no cap height**, so a letter was sized from the
+  em and an "X" after "S/ 250.00" came out lowercase-sized. `lineMetrics(li,
+  { loose: true })` falls back to the approximately cut letters' heights — only
+  for sizing new letters; the re-reader and the harvest keep the exact ones —
+  and a capital the line shows outranks its figures, which in an old-style face
+  stand lower.
+
+The gate went from 0.85 to 0.75 because the refusal's alternative is no
+better: a letter the page does not hold is drawn in a foreign face by the
+vector redraw too — crisp Helvetica, placed by the coarser glyph-cut
+measurement, which set that "X" two points over the baseline. Handwriting
+still fails it (0.43–0.69 on the corpus).
+
+Lowering the gate exposed the atlas's weakest copies, and two things now keep
+them out:
+- **An atypical copy that is a coin-flip with another letter is doubted**
+  (`markDoubts`): agreeing with its own letter more than 0.12 below how that
+  letter's copies agree with each other, and within 0.03 of another letter.
+  The old rule needed the other letter to win outright by 0.02, and an "N"
+  cut from a misread line (0.72 own, 0.73 "R") was picked for a reversed
+  "LEVANTAMIENTO" on a photographed label and printed as an "A". With it
+  doubted the word is refused (6 of 13 letters wanting) — the honest outcome.
+- **A letter borrowed from the other weight is toned to the line's core**
+  (`matchCore`): re-weighing widens a regular letter's thinner strokes but not
+  their paler cores, and the "s" and "t" borrowed into MSP's bold
+  "30 de septiembre de 2026" read grey. Its core-level median is brought to
+  `LineInk.coreDark`, never past the line's ink.
+
+**A correction is not an edit of the pixels.** When the user retypes a word to
+what the page already says ("026" → "2026", "Businss" → "Business"), the ink
+already reads the new token, and redrawing it would at best put the scan's
+letters back where they were. `findCorrections` plans such tokens on the
+pixels as their OLD reading (untouched) and changes only the text layer. The
+evidence has to be strong, because a false correction silently drops the
+user's edit: the token lands on exactly one ink word and takes all of it, the
+word's ink falls into exactly as many column runs as the token has letters,
+every CHANGED letter matches that letter's established shape on the page (a
+letter the page holds no copy of refuses), and — where the old reading had a
+letter in that position — matches it better than the old letter ("2025" →
+"2026" over ink that shows 2025 stays an edit). Letters that touch ("ís" and
+"ca" in bold Calibri) defeat the column runs, and the word is redrawn from the
+page's own letters instead — visually equivalent, and the safe direction.
+
+**The line starts where it always started**, whatever letter now comes first:
+the first new character used to be placed at its OWN old ink, so a reversed
+"PERU" (first letter = the old last one) moved the whole line right by the
+rest of the word.
+
+**A synthesised letter takes the LINE's look, not the page's.** A page sets a
+logo, headings and body in different faces, and one look fitted to the page's
+letters fitted their mix: on a certificate whose body is Times Bold, the four
+reference letters came from the flared-sans logo and an "X" appended to the
+body was drawn in Carlito. `lookRefs(atlas, near)` takes its references from
+the wanting line first, then from lines at its size (em within 12%) on its
+page, then from the document; looks are cached per line, and synthesised
+glyphs are keyed `line|wantKey`. Three things the fit needed besides:
+- **Capital and figure probes** (`CAP_PROBES`, sized by their own ink
+  height): a page of capitals or amounts has no lowercase to judge by, and
+  "no face could be fitted" sent every line needing one letter to the vector
+  redraw. A sparse page (fewer than four probes with three copies) is judged
+  on single copies.
+- **Both weights of every face per reference** (`regularAs`/`boldAs`): a
+  page set almost entirely in bold has no regular to split it from — its
+  "regular" class IS bold — and scored against the regular face, Times lost
+  to a sans. The weight that fitted is the one synthesised for that class.
+- The lab's `look <out.png>` draws each reference beside every face as it is
+  compared; it is what showed the references were the logo's letters.
+  `look <out.png> <sigma> <gamma> <page> <lineId>` fits a LINE's look and
+  prints which lines its references came from.
+- **Known limitation:** a line whose own letters could not be harvested (its
+  word not exact) is judged on OTHER lines at its size on the page, which
+  may be set in another face — a bold condensed "PUNTOS" heading took its
+  look from neighbouring headings and was given a serif-like "X". Checking
+  the made letter against the line's own ink is not implemented.
+
+**The baseline is the line most letters SIT on** (`fitLine`): a search over
+slopes (±0.09) for the densest band of letter bottoms, refined by least
+squares. The median of pairwise slopes it replaced was dragged by the letters
+of the lines above and below that a tilted line's tall box takes in, went past
+its clamp and was reset to level — the "baseline" then ran through the middle
+of a 3° line, every capital measured half its height, no word could be cut, and
+a synthesised letter came out at half size. The letters are taken from a band
+around the recogniser's box (the box's own counted double, and the fit must
+pass through the box), because a tilted line's box is not where its letters
+are: on a phone photo of a certificate it sat 30 px above the line's left half
+and held the centres of only two letters.
+
+**A line whose thin strokes break apart is GROUPED at a lower level.** `CORE`
+(darkness 110) is where a stroke stops being fringe. A 96-DPI receipt's light
+sans has strokes a pixel wide peaking at ~175, and at 110 every letter fell
+apart into specks one to three pixels tall (the S's spine, the 2's diagonal):
+the baseline was fitted to the specks' bottoms two pixels above the letters',
+so a letter set on it floated, and 24% of the page's words could be cut. Now
+60%. What it took, each measured with an A/B of the lab over seven documents
+(`damage` plus `lines`, original files swapped in and out):
+- **The trigger is fragmentation, not darkness.** Lowering the level for every
+  line whose ink peaks under 200 cost a grey bilingual form twenty of its
+  edits: its thick strokes are whole at 110, and lowered its letters fattened,
+  its words merged and its em grew by a third. The lower level (half the
+  stroke peak) is taken only where its pieces-per-character count is nearer
+  one than the fixed level's — the receipt's lines run 1.7–2.4 at 110 and about
+  one lower; the form's sit at 0.7–1.3 already — and never on a line with
+  ideographs in it, whose radicals are pieces by design.
+- **The lower level only groups.** A letter taken whole at it gains its fringe
+  rows: every height grew a pixel or two, the em up to a quarter, and the
+  letters such a line gave the atlas matched no letter wanted elsewhere ("no
+  letter on the page" for an X the form had printed). Components are found at
+  the lower level and keep only their pixels at `CORE`, so every measurement
+  is the fixed level's. `LineInk.coreLevel` says which level grouped the line.
+- **Pieces stacked in one letter's columns join** (`stackPieces`) for the
+  baseline fit and the letter count — on those lines only: where letters print
+  whole, a piece under a letter is an underline's stub, and joined to it the
+  baseline was pulled onto the rule (MSP's underlined title touched twice the
+  ink). Growing the core into paler pixels (hysteresis) was tried first and
+  joined whole words at this resolution, whose letter gaps are one pale column.
+- **The baseline band is narrower** (`tol = max(0.6, 0.06 em)`, was
+  `max(1, 0.08 em)`): at a 12 px em an old-style 9, 4 or 5 hangs only two
+  pixels below the line and the old band took it in, tilting "Bo08-190845"
+  towards its last three figures.
+- **An arc bends the letters' tops with their feet.** The arc test refused
+  "RUC: 20319363221" once its descending figures were whole letters (the
+  median foot of the middle third two pixels low). Bottoms alone are fooled by
+  descenders, tops alone by capitals beside figures; a line is set on a curve
+  only when both bend the same way, the middle third off BOTH ends — the
+  seal's "REPÚBLICA DEL PERÚ" bends 2.7 px at the feet and 2.3 at the tops on a
+  16.6 px em. A first fix (judging the higher bottoms only) let the seal
+  through, and an edit moved its tail along a straight line.
+
+**A form's blank does not count as the line's word spacing.** The recogniser
+boxes a printed line together with the blank after it, so the line's ink ends
+with the handwriting written in it. Two defects followed, on "el mismo que
+acredita con copia de mi recibo de: ___LUZ___":
+- `splitWords` sets its word-gap threshold by Otsu over the line's gaps, and
+  one 58 px gap before the handwriting outvoted the rest — the threshold went
+  over every word space (9–11 px), clamped to 0.4 em, and the whole sentence
+  came out as one word. Gaps are capped at 0.6 em for the threshold.
+- `alignCharsToWords` then shared the reading over eleven ink words for ten
+  printed ones: the width scale included the handwriting, and fitting the
+  reading over it cost less than skipping it, so "de:" landed on "LUZ" and an
+  edit of "mismo" typeset 58 px word spaces and dragged the field left. Up to
+  two ink words at either END may be left out (the scale taken from the rest,
+  0.3 each) — but only ink set apart by a blank of an em or more: trimmed
+  freely, a table row's short final cells were dropped whenever the scale was
+  off, which cost two tables two edits each. That edit now changes the word
+  alone (1.9k px in its own box, no damage).
+
+Tried and dropped: keeping the searched slope when least squares moves the
+line by under 1.5 px across its letters (to stop a round S a pixel above flat
+figures from tilting a short line). The MSP scan really is tilted about 0.5°,
+which over a 133 px title is 1.2 px — the same size as the artefact — and the
+guard flattened it: the underlined "APÉNDICE 25" touched twice the other ink
+and a form's date could no longer be set.
+
+**The vector cut's baseline is found the same way** (`baselineOf` in
+`glyphCut.ts`): the densest band of letter bottoms over a scan's slopes, then
+least squares on that band. Its plain least-squares fit (with one 1.5 px
+outlier pass) was tilted by old-style figures it does not know descend, past
+the partial redraw's 0.03 "tilted" limit — so "Bo08-190845" + " X" was redrawn
+WHOLE from glyphs traced off a 96-DPI scan (a B cut through, a 5 in halves)
+instead of keeping the number's pixels.
+
+**The page size for recognition comes from the render when the engine cannot
+give it.** `runOcrNow` fell back to a LETTER page (612×792) when
+`getPageSize` failed — which it does while the worker is busy right after a
+load — and `recognizePage` then stretched the A4 render into a Letter-shaped
+raster: every box came back at 0.94 of its height down the page and 1.03 of
+its x. On a results table that is a whole row: the box of "223.5" sat on
+"213.9", the reading fitted that ink's width, and the line analysis took the
+wrong row for the edited one. It showed as recognition "not being
+reproducible" between runs. The size is now the render's own (its pixels over
+its scale) whenever the engine fails or disagrees about the shape.
+
+**A letter-spaced line is read and set as letter-spaced.** A book's title page
+sets "J U D E A  P E A R L": far wider than its letters' advances, so the
+"reading does not fit the ink" test refused every tracked line and the vector
+fallback redrew the title with a broken J and a seam. When the widths disagree
+but the line's letter-sized pieces are as many as the reading's visible
+characters (±12%), the reading is accepted. In `applyLineEdit` a new letter on
+such a line takes the line's TRACKING — what its own letter gaps exceed the
+page's typical gap by — on top of the pair model, or it reads as a word
+squeezed in. Joining "JUDEA PEARL" into one word now just closes the gap with
+every letter the scan's own.
+
+**A pair the page never prints is spaced OPTICALLY.** Gaps are modelled ink
+to ink (`g ≈ μ + R[a] + L[b]`, fitted on the pairs the page prints); a pair
+with either side unobserved used to get μ alone. It now gets the gap that
+makes the mean WHITE between the two letters' profiles (each row's depth
+capped at a quarter em) equal the median of the line's own exact pairs. The
+lab's layout log marks such gaps `o` (and model gaps `p`). Measured: "PEARL" +
+"S" comes out at the line's typical white — the gap still reads a little wide
+to the eye, because the L's open upper half is wider than the quarter-em cap.
+
+**The user's text re-reads the line where the ink confirms it**
+(`refineReading`). A user retypes a garbled line as it is printed plus the
+change they mean, and the recogniser's reading is then the worse of the two:
+it drops letters at word joins ("(5) claves" read "(5)laves", "Productivo y
+cuatro" read "Productivoyuatro"), and the analysis shares the remaining
+labels out shifted by a letter across whole words ("Productiv | o | yuatro"
+over the ink "Productivo | y | cuatro"). Planned on that, an edit of the line
+printed "y y cuatro" and "claves s serán". The line is analysed again with
+the TYPED text; every ink word whose letters look like the typed ones
+(`wordReadsAs`: cut exactly, or with as many column runs as letters; no
+letter plainly another letter's shape; 70% of the letters passing their own)
+takes the typed words, every other ink word keeps the recogniser's — those
+are the user's real change — and the line is analysed once more with that
+mixed reading and planned on it. On the MSP line, 13 of 15 words are read from
+the typed text and the only pixels drawn are "seis (6)"; the rest of the line
+is the scan's own, moved as a block and re-justified. It costs one or two
+extra line analyses per edited line (up to ~0.15 s). The status note says "N
+words read from the text typed". Two things it needed in the app, invisible
+in the lab: a refined plan refused for want of letters RETURNS that refusal
+(its `wanting` is what gets synthesised — falling back made the caller
+synthesise for the other plan, and the refined one never got its letters);
+and the synthesis gate counts LETTERS only — "seis (6)" needed its brackets
+and figure made, three of seven glyphs, and was refused while the fallback
+plan, redrawing twenty more letters, passed the same gate.
+
+**A change the typed text "confirms" must be vouched for by the page.**
+`wordReadsAs` passes a word on 70% of its letters, so a changed letter the
+page holds NO shape for rode along on the rest: "(4)" retyped "(5)" on a page
+with no 5 in it was confirmed on its brackets, read as what the ink already
+said, and nothing was drawn — the edit silently lost. The letters a typed word
+changes (and every letter of ink the recogniser never read) must have an
+established shape and match it (`mustKnow`), as `findCorrections` demands.
+
+**An edit of the garbled reading itself is carried onto the ink's own
+reading** (`repairReading` + `mergeReadings`). More often than retyping a
+line, the user edits the reading AS THE EDITOR SHOWS IT, garbage and all:
+"(5)laves" → "(6)laves" over ink that says "(5) claves". Planned on that, the
+"(5" word — one label short of its ink — was redrawn whole, its ")" lost, and
+the line came out "Licenciatarioseis (6claves". Now, when the typed text
+confirms nothing, the line is READ AGAIN from the page's own letters
+(`rereadLine`): every ink word's column runs against every letter the page
+has a shape for, and the recogniser's labels aligned to the runs of the
+WHOLE line (a DP: keep a label on a run that looks like it, replace it where
+the run plainly is another letter, drop a label with no ink, add the letter a
+run plainly is where no label names it, two touching letters in one run, one
+broken letter over two). Over the line, not word by word: the labels were
+shared among the ink's words by width, and "presente contrato" read
+"presentecontrat" was shared "present | econtrat" — a word alone cannot hand
+its "e" back, and re-read alone it became "eontrato". The user's change is
+then carried onto that reading by a three-way merge (base = the recogniser's
+reading, the user's text, the repaired one): where only one side changed a
+stretch it is taken, where both did the user's text wins, keeping a word gap
+the ink shows at either end. "(5)laves" → "(6)laves" becomes "(6) claves" on
+the pixels; the MSP line re-reads EXACTLY as printed, "Licenciatario cinco (5)
+claves por cada instalación del Software, uno para Uso Productivo y cuatro (4)
+… Las claves serán emitidas", from "Liceniatariocinco (5)laves por cad
+nstalación del Softwar , no par Uso Productivoyuatro (4) … clavesserá
+mitidas". The text layer reads the merged text. What made the re-read honest,
+each measured on that line:
+- **Where a run sits about the baseline decides what it can be** (`extentOf`,
+  in ems of 1.92 x-heights): an accent rises above the x-height, a comma hangs
+  at the foot. The shapes alone confuse "á" with "a" and "é" with "e" (0.79 vs
+  0.78 — an accent is a few pixels a shape barely weighs), and the line's
+  right end, its baseline a pixel off, read every "e" as "é". An accented
+  letter is chosen only where the plain one does clearly worse.
+- **A label the page has no shape for is no evidence either way.** "5" over
+  its own ink looked 0.81 like an "S" and was replaced; a digit is replaced
+  only by one of its own kind, or where it cannot sit (a comma's label on an
+  x-height letter).
+- **Every change costs** (replace 0.25, add 0.3, drop 0.5 over the shape
+  cost), so the reading keeps the recogniser's labels unless the ink plainly
+  says otherwise: cheap replacements made "sserá" "serrn".
+- **A broken letter is two runs that look MORE like it together** — a "v" and
+  the "o" beside it are not a "v".
+- **A word whose letters mostly read is re-read too, more strictly** — "yuatro"
+  over "cuatro" passes `wordReadsAs` on five letters of six.
+- **A dot or an accent standing apart on top rules out "l", "I" and the plain
+  vowels** (`NO_DETACHED_TOP`) — the shapes put "I", "l" and "i" within a few
+  hundredths and read "instalación" as "lnstalación". Only that way round: in
+  bold type an accent touches its letter, and the converse rule read bold
+  "dólares" as "ddlares".
+- **An ascender rises well above the x-height** (0.62 em, a "t" 0.5): with the
+  looser bound an "o" could be a "d", and "calculado" read "calculadd".
+- **An ambiguous letter may be added at a price, not refused**: refused, the
+  alignment explained the run worse ("calculad" kept its "d" on the "o").
+- **The word's case decides between look-alikes** ("I" against "i" in a word
+  of small letters, a letter against a figure in a number).
+- **Two to four letters may share a run, and dropping a label costs more than
+  any of that** — "00/100", its "00/" one run, read "0/100" by dropping a "0".
+- **A space the reading missed is put back only between two words whose labels
+  fit their ink**: between two that do not, the gap is not where the labels
+  part ("l\"|Contrato\"" over ink saying "el \"Contrato\"").
+- A word that does not read well this way (mean shape cost over 0.33, or
+  changes on more than half its letters) keeps its labels, and so does any
+  neighbour the alignment gave one of them to — a label is never read twice.
+
+The text layer of a repaired line reads the MERGED text — the ink's reading
+with the user's change — not the garbled text typed over: it is what the page
+now shows. `fidelity-driver.js`'s read-back (`readsBack`) accepts it when it
+carries the stretch the user changed, and says so (`found: 'repaired'`).
+
+**A change as wide as what it replaced keeps the tail where it is.** "5" →
+"6" moved the rest of the line by the pixel the "6" is wider, and a justified
+line was then respaced to its margin — 26 000 pixels rewritten for one figure.
+A difference of up to two pixels (or 0.08 em) is split between the gaps either
+side of the change, as a figure set in the same advance; the overlay is the
+figure's box alone.
+
+**Only a line of a justified PARAGRAPH is respaced to the margin**
+(`justifiedMargin` in scanEditPage, shared with the lab): one just above or
+below it must end at the same margin. A slide's title "Introduction to Deep
+Learning" happened to end at the page's estimated margin, and deleting the
+"o" of "to" spread every word gap of it to keep an edge it never kept; now
+the line simply ends shorter.
+
+**A justified line is re-justified whole when the change is large.** Only the
+gaps after the change used to give way, a quarter of each at most: "el 31 de
+agosto de 2026" → "el 30 de septiembre de 2026" closed the gaps after the date
+to "porlas" and "quesu" and still ran the line 18 px past the margin, and
+"veinte" → "veinticinco" ran 15 px past it — in a justified paragraph a line
+sticking out of the margin is the first thing an eye catches. A difference the
+gaps after the change take lightly (a tenth of their width closing, a quarter
+opening) still stays there and the words before it keep their pixels; past
+that every gap of the line takes the same share, up to three tenths closing,
+and the words before the change are moved too, as a typesetter re-justifies.
+Measured on the MSP appendix: both lines end at the margin with every gap
+5–7 px (was 7–8 before the change and 6 after it), and inserting "y uno" into
+the same line overshoots by 7 px where it overshot by 31. A line still past
+the scan's own pixels after that, where no overlay can draw it, is refused
+("the edit would run the line off the paper") and the vector redraw sets it
+smaller; before, it was drawn there with a note and its end clipped away.
+Only the image's edge is the bar: refused 6pt short of it, an "X" appended to
+a book cover's "NATURE" went from the page's own letters (damage 0) to a
+redraw in another face (22 497 px).
+
+**A figure is set like a figure.** Hand-written edits of numbers on two forms
+(a payment checklist: cost centre, amount, reference, project code; a public
+service order: order number, day, year, amount, page number) found six ways
+a new figure came out wrong, each measured on the crops (glyph extents per
+5x zoom, ink under 140):
+- **Sized by the wrong measure.** A copy is compared on what both lines
+  measured, and a line that measured neither x-height nor cap height (a lone
+  "8" in a table cell) was compared by its em — the least reliable measure —
+  so "9408100" → "9408200" took an "8" 2 px short of the figures beside it.
+  And x-height first is wrong for a figure or a capital: a form sets "RUC:
+  20613872893" larger than the "Teléfono :" after it, so that line's x-height
+  matched the header's while its figures stood 13% taller, and its "2" went
+  into "Página: 2 de 3" two pixels taller than the "1" it replaced.
+  `sizeRatioOf` (glyphAtlas) measures a capital by the copy's OWN height
+  over the baseline first (`ownCapHeight`, core pixels), then cap height,
+  then x-height; a figure by the lines' cap heights first and its own height
+  (over 0.98, as `lineMetrics` takes figures) only where its line measured
+  neither; any other letter by x-height first. Own height first for figures
+  was tried and is wrong for OLD-STYLE figures, which stand at the x-height
+  or rise and fall below it: a receipt's "1980" → "1985" had every page
+  figure refused and came back in synthesised lining figures.
+- **Typeset instead of placed.** "13,000.00" → "13,500.00" put the new "5"
+  where the gap model said, two pixels right of the old "0", and moved
+  ",00.00" with it. Figures replacing as many figures (each with the same
+  space before it, from cut, not approximate, cells) now take the old ones'
+  cells, centred where each stood — lining figures share one advance — and
+  the tail stays to the pixel: the edit rewrites one figure. Kept characters
+  BETWEEN such figures stay put too, so two changes in one line are two
+  figure swaps: a certificate's "del 03 de abril al 01" → "del 04 de abril
+  al 02" moved "de abril al 0" by the new "4"'s width when typeset, and now
+  redraws the "4" and the "2" alone.
+- **Rounded onto the baseline.** Every borrowed glyph was placed at a whole
+  pixel, half a pixel off the fitted baseline either way, so two neighbours
+  could stand a pixel apart ("PYT000123": the first new "0" a pixel above the
+  next). A fractional offset between 0.2 and 0.8 is now applied by
+  resampling (`shiftDown`, the cubic kernel `scaleImage` uses).
+- **Grown to the right in a right-aligned cell.** "20,000.00" →
+  "25,000.00" redrawn from the line's start ran its last figure into the
+  cell's border. A line mostly of figures that ends within an em and a half
+  of a vertical rule (`li.borders`), with more room on its left than its
+  right, keeps its right edge ("set flush right in its cell").
+- **A number whose figures touch was never cut.** At 150 DPI "9408100" has
+  its "08" in one run of ink, the word was not exact, and changing one figure
+  redrew all five after the "94". `figureCellsOf` (lineInk) cuts a word of
+  figures alone by its PITCH — lining figures share one advance, so a run
+  holding k figures is k equal cells — when every run's width is a whole
+  number of figures within a third and the counts add up to the reading's
+  exactly. A number's separators (". , : / -") stand apart as narrow runs of
+  their own; which runs they are is decided with the counts in reading order
+  (a small DP over the reading's tokens and the runs), so a bold "20,000.00"
+  whose "20", "000" and "00" each touch is cut too. The edit's kept-letter
+  shape check still refuses a figure cut wrong. Measured: "9408100" →
+  "9408200" redraws the "2" alone, "PYT000000" → "PYT000123" keeps "PYT000"
+  and adds "123", and "20,000.00" → "25,000.00" redraws the "5" alone.
+- **A borrowed glyph brought its colour fringes.** `toned` scaled each
+  channel by the ratio of the two lines' inks, so a copy kept the chroma of
+  where it was taken from (JPEG fringes, a stamp's red): "123" borrowed into
+  a grey form came with a pink haze, ten levels of red over the green that
+  the line around it did not have. Each pixel's darkness, as a share of the
+  copy's ink, is now printed in the target line's ink (within the old
+  0.75–1.35 bound on how much darker or lighter); the haze is gone, and the
+  MSP edits move by at most 8 levels on a few pixels.
+
+The MSP suite in the browser is unchanged (14/14 on the scan, damage 0); in
+the lab the misread amount now keeps its tail in place and two figures change
+their source copy. **Known:** a figure the page does not hold is synthesised
+in LINING figures, the bundled faces' default: on a 96 DPI receipt set in
+old-style figures, "28/08/2025" → "29/08/2025" (too small to cut, so redrawn
+whole) came back with its synthesised zeros standing a head taller than the
+page's own.
+
+**Letters that stand apart are the cut** (`runCellsOf` in lineInk). The cutter
+refuses a line under 16 px of em ("too small to trace" — a floor for outlines,
+not for moving pixels) and vets widths against a face it guesses; on a 150 DPI
+office scan 70 of 72 words were uncut, and an edit could keep none of their
+letters — deleting a letter of a logo redrew the word from letters the page
+did not hold, and fell to the vector path. A word whose ink pieces fall into
+exactly one run per character, each about as wide as its letter, is cut on the
+runs. On a very small scan (em 8–13 px) most such counts are coincidences — a
+"U" one pixel wide — and the width test refuses them.
+
+**A word whose letters only PARTLY stand apart is split where they do**
+(`peelWord`): its leading runs that each hold one letter (about that letter's
+width, short of a pair's) and its trailing ones, counted from each end, are
+words of their own; the touching middle stays whole. "MSP-SIST-202309006" at
+150 DPI has "20" and "900" touching, so it was never exact, and reversing
+"MSP" redrew all eighteen characters — four figures synthesised, read back as
+"PSM-SIST-2023000б". Split "MSP-SIST-" | "20230900" | "6", the edit moves the
+"P", draws "S" and "M" from the page and leaves the rest where it was. Two
+rules had to give for it:
+- **A letter typed against a word glues only THAT word** (`insertions`, with
+  the old letters either side): a code without spaces is one token, and "SM"
+  typed into "MSP-SIST-" made the figures "glued" and redrawn.
+- **A kept letter must not plainly be another letter — it need not match its
+  label as well as the page's best copies do.** The old bar (the class's own
+  cohesion less 0.16) redrew "SIST" at 14 px of em for an "I" at 0.67; a kept
+  letter now fails under 0.5, or where another letter beats it by 0.15 and
+  reaches 0.75 (the ")" on a "c" of ")laves" is 0.34).
+
+**A redrawn word takes its letters from lines set in its own face**
+(`inStyle` in glyphAtlas). A form sets its labels in one face and its values
+in another, at one size and weight, and the medoid of all their copies drew a
+reversed serif label in the sans of the values. Each request carries the
+shapes of the exact letters nearest the word on its own line (its own, when
+it is exact; at most two words away — a label and its value sit side by
+side); each source line of a candidate copy is scored on the letters it
+shares with those (two at least), and only the lines within 0.05 of the best
+are drawn from. All of them when no line can be scored. **Known limitation:**
+on a 150 DPI form whose serif labels are small enough that their letters
+touch, no label word is exact — there is no same-face copy to choose, and
+"CORRELATIVO" reversed is still drawn in the values' sans.
+
+**A pale dot or accent belongs to the letter under it.** A colon's top dot at
+darkness 106 (a core is 110) was no ink of its own: moving the colon moved
+its bottom dot and the part of the top one within reach of it, and left the
+rest behind — half a dot where the colon had been. Before the owner map
+grows, a small faint piece (darkness 60+) that touches no core and sits over
+a letter's columns within half an em of it is seeded as that letter's.
+
+**A table's rules and borders are never a cell's letters.** The lab's
+automatic edits over a 585-run table page (ocr/007: names, amounts, "NO
+INGRESÓ") changed other ink in 17 of 45 edits, up to 296 px — the table's
+grid broken under and beside the edited cells, inside the edit's own box
+where the sweep's damage measure cannot see it. Five causes, each in
+lineInk/scanEdit:
+- **A vertical rule cut into row-high pieces** by the horizontal rules it
+  crosses was shorter than the 1.45 em "tall thin stroke" test and became the
+  cell's first letter: reversing "QUISPE" erased the border. A piece that is
+  thin, stands from above the capitals to below the baseline and is STRAIGHT
+  (`isStraightUpright` — a parenthesis is as tall and bows) is protected.
+- **A cell's text stops at its borders**: the recogniser's box of "QUISPE…"
+  reached across the border, and the "51" of "351" was read as its "Q". Where
+  a border stands within the box's span, the line's ink is the stretch between
+  borders that holds most of it.
+- **A rule is followed out through its pale ends**, and a piece lying on a
+  rule's line is the rule's: the last twelve pixels of a cell's rule, paler
+  than a core and then dark again, went to the nearest letter — moving the
+  "Ó" carried them along (darker where they landed, a gap where they had been).
+- **A rule that runs past the analysed box is not an underline**: cut to the
+  box, a narrow cell's text covered most of it, and an edit "trimmed the
+  underline" by breaking the table's rule.
+- **Nothing is printed on ink the line does not own** — another line, the
+  next cell, a border; beyond the analysed box any ink at all (the next cell's
+  letters lie outside it). Core on core: a letter's soft edge beside its cell's
+  rule is how every letter of the page sits. " X" appended to a narrow cell was
+  set onto the first letter of the next one; it is now refused.
+- **A border welded to the cell's first or last letter** is carved off the
+  piece (`carveBorder`): columns at its edge inked unbroken from above the
+  capitals to below the baseline — or to the baseline, where they meet the
+  rule the text sits on (`ruleMask` under the column's end). A stem of "l" or
+  "d" ends at the baseline and meets no rule, so it is never carved.
+- **A rule is judged with the steps it continues into** (`ruleChain`): a
+  tilted rule is found as stair-steps, and its last step, ending inside the
+  box, passed for an underline. A rule that ends at a border or crosses one
+  (`LineInk.borders`) is never an underline either.
+After them: 2 of 45 edits touch other ink (21 px and 1 px), one append is
+refused, and every MSP edit is unchanged. **Known:** a border at the very
+edge of the analysed box, welded to a number's last digit, still moves with
+that digit's cell (an eight-digit ID number on ocr/007, 21 px). **Fixtures exported before the
+page-size fix** (`pageWidth` 612×792 on an A4 page) put every box on the
+wrong row — re-export before trusting a lab result on them.
+
+**A page whose scan is not ONE upright image is read from its render.** An
+office scanner's "compact PDF" (Konica's MRC: a JPEG background with the text
+removed, and the text as 1-bit masks painted over it), a /Rotate page whose
+image is turned, or a scan in tiles never reached the scan edit: the largest
+image held paper and no letters, or its pixel grid was not the page's. The
+worker's `getScanImage` now returns null when image MASKS (`/ImageMask` or
+1-bit images) other than the largest image cover a tenth of the page — only
+masks: a slide deck's other pictures are pictures, its largest image still
+holds the text, and treating them as layers sent a 3628×2041 pt slide to a
+106 DPI render too coarse to read (this editor's own `OcrPx…` overlays are
+excepted too) — and gives its CTM in the DISPLAYED frame (composed with
+`pageRotationCtm`); the layout's scan
+loader then falls back to MuPDF's render of the page CONTENT (no annotations —
+`renderPixmap` takes `contentOnly`) at up to 300 DPI and 16 MP, and the edits'
+overlays are drawn on that render's grid. On the Konica scan (a /Rotate 90
+MRC results table) four of six edits now go through the scan edit.
+
+**A line set over a picture is refused** ("the line is set over a picture"):
+a book cover's sticker over a photograph of water, where the water read as
+ink against the sticker's yellow, so the plain-paper test (which samples only
+the light) saw a plain ground and an erase smeared yellow over the photo. Ink
+no letter can be — wide AND tall, or vast — covering 6% of the line's area
+says so; thin rules and table borders do not count. Only its pixels in the
+LINE's band count — within 0.6 em of the median centre of the letter-sized
+pieces: the recogniser's box of a results table's first row reached past the
+rule into the speckled grey header above it, one wide tall component, and
+"250.80" was refused while its figures sat on clean white. (The same table
+read through a fixture exported before the page-size fix put every box a row
+off and failed two more cells — re-export before believing a lab refusal.)
+
+**On squared paper the grid is paper.** A student's notes on squared paper
+(ocr3/020 and 023) had their grid read as ink: every grid line within reach
+of a letter was filled in under the letters as if it were a stroke, and the
+line analysis gave its pieces to the nearest letters — so an edit moved grid
+segments along with the moved words and left white gaps in the grid where
+they had stood ("x1+2x2+x3+x4=0" → "x1+2x2x3+x4=0" broke four lines of it).
+`preparePage` now finds FAINT, THIN, LONG straight lines — lighter than 120
+and not within two pixels of anything darker, a few pixels thick at most,
+unbroken over 8pt — and takes them as paper. Where a letter crosses one, the
+line is bridged across it (up to 40pt), its paper the line's own colour from
+one end to the other, so a moved letter's grid pixels are transmittance one
+(they stay put) and an erased letter is refilled WITH the grid. "Faint" is
+judged on the pixel's own lightness: against the local maximum a bold
+title's stem edges read faint, and the thinness test alone let a large
+title's crossbars through. Three things the real pages needed that the
+synthetic one did not:
+- **The line is no source for the paper AROUND it.** Taken as known paper,
+  the grid fed the fill under every letter beside it, and the paper estimate
+  came out with grey smudges at each crossing — an erase would have painted
+  them. The fill sees the line and its blurred fringe (two pixels each side)
+  as unknown; afterwards the line's own pixels take back their colour.
+- **The plain-paper tests look past the line AND its fringe**
+  (`PageInk.lines` is the widened band): a scanned grid line is blurred, its
+  pale edges are paper of the grid's tint, and counted as the page's paper
+  they read every squared page as rough — "x1+2x2+x3+x4=0" and "La matriz
+  escalonada es:" were refused as "not plain paper" where they had been
+  edited on the scan before. `paperRoughness` bridges a line pixel with the
+  first paper outward from it, `relaxErased` holds a line pixel inside an
+  erased hole at the grid's colour instead of relaxing it into the white.
+- **Not on the inverted page.** A cover's art reversed holds long faint
+  strokes of its own; taken as paper there they made a reversed author line
+  (ocr3/008, "W. Chan Kim • Renée Mauborgne") read as set on rough ground.
+Measured with a synthetic squared page (scanedit.test.mjs): 66 grid pixels
+changed by an edit before, under 20 after; the MSP appendix is
+pixel-identical. **Known:** handwriting on squared paper cuts unreliably —
+"escalonada" → "eslonada" removes the wrong letters and reads "esnada" —
+at HEAD before this change as well; the grid is now kept round it.
+
+**The ink colour is the LETTERS'.** New letters are toned to the line's ink,
+and that was the darkest pixels of ALL the line's own ink — a bullet the
+reading never named included. A dashboard's solid green disc in front of
+"49.7% good" outweighed the grey letters, and an "X" appended to them came
+out green. It is now taken from the cores of the line's letter and figure
+cells, and from every pixel of the line only when those give fewer than 24.
+
+**A small tinted ground is paper of its own colour.** The paper filter is a
+max over 3.6pt, so a ground darker than what surrounds it — a dashboard's
+light-blue button, a shaded table cell — has a band of that width inside its
+edge that read as ink. On a button barely taller than its words (ocr3/021,
+"Last 3 days": 36 px tall at 3.5 px a point, a 13 px band top and bottom)
+the band and the margin round the letters left NONE of the button known, the
+paper under the letters came from the panel outside, and every letter an
+edit moved carried a box of ground × ground/panel over the button — measured
+(166,204,236) on (199,224,244), exactly that product. Two steps:
+- **A closing restores the ground.** The max filter followed by a min filter
+  as wide brings back any region wider than the filter; where it lowered the
+  paper level by more than 12, the closed level is light (150+) and the pixel
+  itself is that ground within 6 levels, the pixel is paper. A thick black
+  stem is closed too and stays ink: its closed level is dark.
+- **A restored ground is filled from its OWN known pixels** (`fillGrounds`):
+  the region a closed level runs through without a step (neighbours within 2
+  levels), push-pulled inside its own bounding box with only its own pixels
+  known, or — when the margins leave it almost none — the median of its bare
+  pixels. It must be flat (closed levels within 6) and mostly bare (half its
+  pixels at the ground level), which keeps chart bars, gradients and photos
+  on the page's fill; and under a quarter of the page, which keeps the page's
+  own paper there.
+Measured on the dashboard: the paper under the button's letters matches the
+button everywhere (it was 8+ levels lighter round "days"), and "Last 3 days"
+→ "Last days" moves the word with no box. Costs ~190 ms a page (the closing
+125, the fills 66 on a 5.6 MP raster), paid once per page — and nothing on a
+page with no ground, which skips the region pass. The MSP appendix is
+pixel-identical.
+
+**A bullet the reading does not name takes no label.** Recognisers drop list
+bullets more often than not, and the alignment of the reading to the ink
+then gave the bullet the line's first label and shifted every label after it
+by one: "● 49.7% good" read "49.7% good" put the "4" on the disc, the "9" on
+the real "4", and so on — an edit of the number would have rewritten the
+wrong figures, deleting its first character would have deleted the bullet,
+and the line's ink colour came out the bullet's, so an "X" appended to grey
+text was green. The same dashboard's legend dots took the "Se" of
+"Sessions" and the "C" of "Chrome". An end ink word may already be left out
+when a blank of an em sets it apart; a bullet sits an ordinary word space
+from its text. `markBullets` (lineInk) marks an end ink word that is ONE
+piece, about square (0.65–1.5), solid (68%+ of its box inked), 0.3–1.1 em
+tall and with no counter — no letter is all of that: an "o" or a "0" has a
+hole, an "l" is thin, a full stop a fifth the size — unless the reading's own
+end character is bullet-like (then the reading named it). `alignCharsToWords`
+must then leave it out (its width is a letter's, so it fits a label about as
+well as the trim costs, and the label went on it anyway), falling back to
+the unforced alignment only if that leaves nothing to fit. Left out, the
+bullet is the line's loose ink: it stays where it is before the first change
+and travels with the tail after the last.
+
+**Ink the recogniser's box barely touches may be left out for nothing.** The
+line's region is the box padded by more than half an em each side, and it
+takes in whatever stands there: a university seal's right edge beside its
+stencil "UNAJMA" became an ink word, took the reading's "U", and every label
+after it moved one letter on — deleting the J erased the A ("UNJMA"). On a
+results table the same thing happened to the NEXT cell's first figure, which
+took the last digit's label in a dozen cells ("6205804 | 0" for "62058040").
+An END ink word whose span is 70% outside the box, every piece of it at
+least half outside, is marked `outside` (`analyzeLine`), and
+`alignCharsToWords` may leave it out at no trim cost — the width fit decides.
+Three things were wrong first, each measured:
+- **Loosening exactness was the wrong fix.** The deletion was refused ("too
+  many letters the page does not hold") because the stencil N and M break into
+  several pieces, so the word was not exact; admitting a cut whose cells hold
+  every run whole made the edit go through and erase the wrong letter. The
+  refusal was right; the labels were shifted.
+- **Every piece, not just the span.** A cell's vertical border outside the box
+  makes one ink word with the first letter just inside it; by span alone it was
+  "outside", and "INGRESÓ" read its N as the I.
+- **Not forced, and not free when the reading names it as a word.** A table
+  cell's box stopped short of the " -" the reading ends with; the dash's ink is
+  clipped to a pixel or two by the region's edge and fits its label badly, so a
+  free trim folded the "-" into the "00" before it. A trim is free only when
+  the remaining end word holds no reading space.
+Measured: the lab A/B over 18 suites gains two edits (the UNAJMA delete, which
+now keeps every letter's pixels, and "CURSO DE ACTUALIZACIÓN") with nothing
+lost; in the app all three UNAJMA documents' deletes go on the scan with no
+damage (they were vector redraws).
+
+**A dash the recogniser boxed short is read whole.** A book cover's
+"—LAS 4 VIRTUDES ESTOICAS—" came with a box that stopped inside the closing
+dash, past even the 0.6 em the line's region adds: the part of the dash
+outside the region belonged to no line, so deleting the "D" moved the
+dash's inside half with "ESTOICAS" and left the outside half where it was —
+two dashes, a gap between them. When an owned piece at the region's left or
+right edge is a DASH (no taller than a quarter em, at least 0.3 em long)
+that visibly runs on past the edge and ENDS within an em and a half,
+`analyzeLine` reads the line again once on a region two ems wider on that
+side, and owns a dash that starts inside its margin however far it runs.
+Both limits were learned from the corpus: widened for ANY piece at the edge
+(a cover's specks, a title's last letter) the line read differently and
+some lines could no longer be read at all; widened for a form's blank, its
+underline running on for ems, a date typed into it was set somewhere else
+(MSP's "Fecha: ____" fill moved 47 px).
+
+**A letter is judged against its own face, not the page's commonest.** A
+cover sets its title in a big sans and its subtitle in a small serif, and a
+letter's medoid is whichever face holds more copies: the subtitle's serif
+"I"s agreed 0.49 with the title's sans "I", looked more like an "L", and
+were doubted — so deleting the "D" of "VIRTUDES" redrew the whole word (a
+kept "I" scored under 0.5) and synthesised its "I", blurrier and paler than
+the scan's. Two changes, both only where the medoid is another SIZE (on a
+page, size goes with face; more than 20% apart):
+- `markDoubts` marks a doubted copy `peerVouched` when the copies of its
+  letter at its own size from OTHER words agree with it (median 0.8+, and
+  more than with any other letter). `pickGlyph` uses such copies only when
+  nothing else can be picked. Un-doubted outright they were picked over true
+  copies on MSP — a re-weighed regular "7" and "0" where the page's own bold
+  ones had been, visibly lighter than the bold digits beside them.
+- The kept-letter check in `applyLineEdit` accepts a kept letter that its
+  own size's copies (doubted ones the peers vouch for included) agree with.
+Measured: the cover's "VIRTUES" keeps every letter of the scan; MSP's edits
+are pixel-identical.
+
+**A correction cannot hold two letters in one run.** `findCorrections`
+reads a token as what the ink already says when the word's ink falls into
+as many column runs as the token has letters. Two letters that touch make
+one run, so deleting the first of them ("VIRTUDES" → "VIRTUES" in a bold
+serif, its D against its E) left exactly as many runs as letters — and with
+no CHANGED letter to check the shape of, it passed: the edit changed the
+text layer and drew nothing. Each run must now be no wider than its letter
+(its advance × 1.3 + 0.12 em).
+
+**A synthesised letter is as soft as the LINE's edges.** The look's blur is
+fitted on the page's reference letters, and those may come from anywhere on
+the page: a cover's crisp 44 px "RYAN" has no lowercase to judge by, the
+references fell to small lowercase elsewhere, and a face that does not quite
+match correlates BETTER blurred — the fit took the grid's softest (1.3 px)
+and the appended "X" came out a blur beside sharp capitals. `edgeWidthOf`
+(lineInk) measures the line itself: the median 20–80% width of its letters'
+stroke edges, each stroke against its own peak so grey and black ink are
+measured alike (`strokeEdgeWidths`). The want carries it (`GlyphWant.edge`)
+and `synthGlyph` picks the blur, 0 to 2.5 px, whose rendered glyph measures
+the same by the same rule; the look's blur stands only where the line gives
+under a dozen edges. Measured on a page built like the cover
+(scanedit.test.mjs): the "X"'s edges went from 2.28 px to within 0.6 px of
+the line's 1.05; on the cover itself the "X" is now as crisp as "RYAN", and
+MSP's one synthesised "W" comes out a little sharper beside its "L" and "E".
+
+**Ten hand-written edits of a scanned purchase order** (dates, amounts,
+quantities, payment terms, a model, a supplier name) found four defects the
+automatic corpora never had, all on ordinary small print:
+- **A full stop fainter than its figures was no piece.** "1.00" printed its
+  stop at darkness 80 against the figures' 180, under the core level: the
+  reading's "." went on the first "0", the second "0" was split over two
+  halves, and changing the "1" erased a stop the analysis never knew about —
+  "2.00" came out "200". A faint mark of its own (touching no piece's core)
+  that is stop-sized, sits on the baseline in a GAP between pieces, now joins
+  the line's pieces — but only as many as the reading has stops and commas
+  its own small pieces do not already account for, the darkest first: on
+  handwriting any faint mark near the baseline would do, and with no count
+  a page of notes on squared paper lost a third of its cut words.
+- **A thin diagonal breaks into a staircase.** Each "/" of a 7.8pt
+  "09/08/2023" was three pieces in neighbouring columns, so the date counted
+  fourteen ink runs for ten characters, was never exact, and changing its day
+  redrew all of it from figures off other lines — resized, visibly heavier.
+  `inkSpans` (lineInk) joins pieces that only touch column to column when
+  their rows barely overlap — steps of one stroke — and `columnRuns`,
+  `runCellsOf` and `figureCellsOf` all count runs through it; a run held by
+  one cell goes to that cell whole, or the slash's foot, in the gap before
+  its cell, went with the figure beside it. Two letters that touch stand side
+  by side, rows overlapping, and stay two runs. The edit now changes the two
+  figures alone.
+- **A word in a replaced word's place takes that word's gap.** A new word
+  after a letter that stays was set at the line's TYPICAL word gap — on
+  ": Mantenimiento Instrumentacion" that was the 10 px after the colon, so
+  "Electrico" stood 3 px further off than the word it replaced. And where
+  the INK broke but the reading did not (":09/08/2023" read without the space
+  the scan shows) the new figure was set at a letter gap, glued to the colon.
+  `gapBefore` gives a new letter after a kept one the old gap there, when the
+  old text broke there — a space in the reading, or a word boundary in the
+  ink.
+- **Only a line of a paragraph is a paragraph's.** `justifiedMargin` now asks
+  that the line and the neighbour vouching for the margin each span half the
+  text's width (from where its lines usually start): two value fields of a
+  form's right-hand column ending at the same x are not justified prose.
+MSP: every edit as before but for a pixel's shift where a redrawn word
+picked a slightly different copy, and "30 de septiembre" set at the scan's
+own gap before the date rather than the line's typical one.
+
+**A number redrawn whole keeps its characters' places** (`sameSpan` in
+`applyLineEdit`). A bold "18/07/2022." whose slashes touched its figures
+could keep none of them — not exact, so redrawn whole — and the redraw was
+set at the spacing model's gaps: the touching original came back
+"25/07/2022." letter-spaced, wider than the date it replaced. When the
+changed stretch replaces exactly as many old characters, figure for figure
+and every other character the same (a number and its separators), each new
+glyph is centred in the old character's cell and anything after it stays
+put — `sameCells` did this only for figures between kept characters.
+Approximate cells count here, unlike there: lining figures share one
+advance, so a share of the run by advance IS a figure's place, and the span
+keeps its extent either way. On MSP the "5" of "APÉNDICE 25" now sits in
+the old "4"'s cell (it was set a pixel tight against the "2") and the
+underline under it ends where it did. Seen on a scanned service-acceptance
+letter edited by hand, which also showed: a justified line that takes a
+longer word closes its gaps to about 0.2 em, the same as MSP's — tight but
+accepted there — rather than running past the margin.
+
+**New figures are set on the figures' PITCH, centre to centre.** Lining
+figures share one advance and a stop or comma takes about half of one, so
+an amount's characters sit at fixed centre distances whatever their ink
+widths (a "1" is narrow ink in a full cell). The pair model sets ink GAPS,
+and a figure the page never printed — synthesised, or one of a pair never
+observed — came out a pixel or two off: "0.00" retyped "2,500.00" opened a
+gap after the comma that "13,000.00" above it does not have. `gapBefore`
+places a figure or separator next to a figure on the pitch the line's own
+figures measure, or, with fewer than three pairs of its own ("0.00" has
+one), the page's lines at its size (`pageLines`, ±8% em); a stop or comma
+without a sample of its own is three quarters of a pitch from its figures.
+The chain runs on exact centres (`figCentre`) and is rounded once per
+figure: rounded at every step, three new figures drifted a pixel and a half
+off their column.
+
+**Figures changed for figures are aligned by POSITION** (`positional` in
+`applyOnPixels`). When every word of the new text has the old word's length
+and every changed character is a figure where a figure stood — an amount, a
+date, a code — character k of each word is character k of the old one:
+whatever did not change (the separators, a figure that happens to stay)
+keeps its pixels, and every new figure takes its predecessor's cell
+(`sameSpan`). The value alignment paired the "1" of "16,949.15" with the
+"1" of "21,186.44": the comma between them could not be kept, the word fell
+under the "kept too little" rule and was redrawn whole. Such a word is not
+redrawn for keeping little — what it keeps is in its own place. And a
+number laid in its old cells is not then set flush right: a new last
+figure narrower than the old one is not a shorter number, and the shift
+moved the kept separators a pixel.
+
+**A kept character that is plainly its label's LOOK-ALIKE is kept**
+(`lookAlike` in scanEdit). The kept-letter check redraws a word when one of
+its kept letters plainly is another letter — that is how a shifted reading
+(")laves" over "claves") is caught. A receipt's code "B008-190845", read
+"Bo08", tripped it: its zero is an old-style one, shaped like an "o", and
+matched the page's "0" at 0.98 against "o" at 0.21; changing the code's last
+figure redrew all eleven characters and synthesised the "B". Characters drawn
+alike by design (B/8, o/0, l/1, S/5, Z/2, G/6, g/9, case pairs) say nothing
+about a shift, and keeping their pixels shows exactly what the page showed.
+
+**Old-style figures are sized as x-height glyphs** (`fitLine` in wordSeg).
+A line that is mostly figures is measured as capitals (`median / 0.72`), and
+old-style figures stand at the x-height: "Fecha: 28/08/2025" on a Raleway
+receipt fitted a 9.6 px em where its letters and its box's width say 14, so
+every figure was too wide to cut and an edit redrew the date from glyphs of
+the wrong size. When a line is a third figures or more, its em is under 0.85
+of the width's guess, and more of its pieces hang below the baseline than its
+reading has descending characters (g j p q y Q J ( ) , ;), the x-height
+measure (`median / 0.52`) is taken if it is nearer the guess. Lining figures
+sit on the baseline and keep the capitals' measure: the em guard decides,
+the hanging count only confirms. A slash is NOT counted as descending: it
+hangs in some faces and not in others (not in this receipt's), and counted,
+the date line's one hanging "5" no longer outnumbered its two slashes.
+
+**An amount in a column set flush right grows to the LEFT** (`alignedRight`
+in scanEditPage, `columnRight` in `applyLineEdit`). `flushRight` already
+kept the right edge of a figure line ending against a cell's vertical rule;
+a payment checklist's amounts column has no rule, and "0.00" under
+"13,000.00" retyped "2,500.00" ran out past the column. A line of figures
+(60% digits) is in such a column when another line of figures within six
+ems, at its size, ends where it ends (within 0.12 em) and starts elsewhere.
+
+**A box's side is carved off whole, rounded corner and blurred edge
+included** (`carveBorder`). A form's day cell ("05" under "Dia") is a box
+whose left side runs down from the cell above and curves into the bottom
+rule. The carve demands columns inked unbroken through the letters' band,
+and the side's outer column was inked over a third of it (blur), so no
+column at the very edge qualified; the side and its corner stayed one
+piece, the two touching figures one run, and the cut took the side for the
+"0" and "05" for the "5". Changing the day to "12" erased the border and
+printed the "1" where it had stood. On a piece taller than any letter (1.3
+em), two blurred edge columns may be stepped over and the side may be as
+thick as the band's horizontal rules plus one; what is left wholly outside
+the letters' band touching the carved columns — the corner — is the
+border's too. Only on such a piece: stepping over the edge columns of a
+bold "l" whose stem ends two pixels under the fitted baseline carved it as
+a border, and reshuffled a whole MSP line's word split.
+
+**A stop, a comma or a colon is harvested only if it is SMALL**
+(`harvestLine`). A purchase order's quantity column reads "1.00" over ink
+whose stop is too faint to be a piece; the word split gave the "." the
+first "0", every row did the same, and the page's established "full stop"
+was a zero — an amount typed "1,050.00" printed "1,050000", and every real
+stop on the page failed the kept-letter check against it. A cell labelled
+". , : ; ' ·" wider than 0.24 em (or, but for a colon, taller than 0.4 em) is
+not taken.
+
+**Peers vouch for a kept letter at any real size difference.** The
+kept-letter check compares a letter with its medoid; on that order the
+medoid "0" came from rows fitted at a 13.9 px em and the "930.00" rows at
+15.3, the same face, and a perfectly good "0" scored 0.49 — under the 0.5
+bar — so "930.00" was redrawn whole to become "1,050.00". Copies at the
+line's own size now speak for it from an 8% em difference (it was 20%).
+
+**A figure is sized by FIGURES first** (`figH`: the median height of a
+line's figures, on `lineMetrics`, every `Exemplar` and the request). The
+same face's figures stand at one height on every line, whatever the em fit
+made of a line of figures alone; by capital height, a purchase order's
+"930.00" rows (fitted 10% larger than its "1.00" rows) took their "1" re-
+weighed from the bold header, and a bold day cell's "12" came out in the
+regular figures, visibly lighter than the "05" it replaced. Old-style
+figures compare x-height-ish with x-height-ish the same way. Capital
+height and the figure's own height remain the fallbacks.
+
+**Each line's wanted letter is its own** (`wanting` keyed by line in
+`planScanEdits`). A synthesised letter is made in its line's look and looked
+up under the line's id; keyed by the letter alone, two edited amounts on one
+page wanting the same comma kept only the last line's want, and the other
+amount went on wanting its comma — a vector redraw in the middle of a
+column of scan edits.
+
+**Amounts in a column are set flush right even when all are as wide**
+(`amount` in `alignedRight`): a column of "930.00" down every row gives no
+left edge that differs, and amounts are set flush right; a code column as
+wide as itself (923-002) is not taken for one.
+
+**A signature or stamp crossing the line is another LAYER of ink**
+(`LineInk.overInk`, `layers` in `applyOnPixels`). A notarised deed's blue
+signature crosses three lines of grey text; the owner map gave each letter
+the stretch of stroke within its reach, so a respaced line carried those
+stretches along with its words and an erased letter took its stretch with
+it — the signature came back broken at every line it crossed. Where the
+line's box holds ink of another colour, every pixel's density is shared out
+between the two inks (densities add where inks overlap: least squares of
+`-ln(pixel / paper)` over the three channels against the two inks' density
+vectors, both non-negative). An erased pixel becomes the paper under the
+other ink, a moved letter carries only its own ink, and the other ink's
+pixels are held through the erase's relaxation.
+Two traps, both measured on a service order whose navy letters fringe into
+greyish blue on its tinted paper — taken for a second ink there, the
+letters' own density was shared out to it and erased letters stayed:
+- the other ink is judged as a DENSITY DIRECTION, on unclipped pixels only
+  (a dark core is cut off at zero in one channel and points anywhere), at
+  ten degrees or more from the letters' own mid-dark pixels — hue alone
+  calls a dark ink's anti-aliased edge another colour;
+- it must come in STROKES at least an em long — colour noise round other
+  letters and a form's rules comes in specks — and the two inks must be
+  fifteen degrees apart for the split to be trusted.
+A grey scan, and any page without such strokes, takes the old path to the
+pixel.
+
+**A rule before the change does not stop a line being respaced**
+(`cleanAfter`). The respacing moves the line from its first change on, so
+only loose ink and rules there forbid it; one before the change (a deed's
+underlined "INTRODUCCIÓN.-" opening the line) never moves. Such a line is
+respaced over the gaps after the change only, never the whole line.
+
+**A word given a new first letter keeps the gap before it.** "Moneda :
+S/." retyped "US$" kept the "S" and put the new "U" a word gap off the
+colon — the line's typical word gap, ten pixels more than the form's colon
+gap. The gap before an old word whose first letter now comes second is
+that word's own gap (`leadsOld` in `gapBefore`).
+
+**Word gaps are measured where the READING has a space.** The ink's own word
+split also cuts one word at a wide letter gap ("ESTE | FAN | I" in a capitals
+cell); counted as word gaps those gave a page of table cells a 0.15 em word
+space and an "X" appended to a first name came out glued. `LineInk.wordGapPx` is 0 when the
+reading has no space on the line, and the edit then takes the page's word gap
+clamped to 0.25–0.6 em. (`LineInk.spaceAfter` holds the index of the first
+character AFTER each space — the name is the old one.) A line of FIGURES alone
+takes its digits' height as its cap height, or a capital set beside them was
+sized from the em at four fifths of their height.
+
+**A bowed line is followed, not fitted straight** (`fitBend` and
+`LineFit.bend` in wordSeg, read through `baselineAtOf` wherever a line's
+baseline is evaluated). A phone photo of a curled page bows its lines: on a
+CamScanner letter the letters' feet sag one to three pixels in the middle of
+most lines against their ends (up to 0.12 em at a 19 px em). Measured against
+the straight fit, the bold date "18/07/2022." at a line's risen end stood
+15.3 px tall where its figures are 13.5 — every bold digit the page printed
+elsewhere was then the wrong size for it, and changing the date synthesised
+two of its four new digits. A letter set on the straight fit at such an end
+also sits a pixel or two low. Knots every three ems or so, each the median
+foot of the letters within two ems of it, linear between and held beyond the
+ends; only where the knots stray from their own best straight line by a pixel
+and a twentieth of an em — on a flat scan the feet scatter by half a pixel,
+and those lines keep the straight fit exactly. The straight fit still decides
+whether the box holds two printed lines and whether the line is set on an arc
+(a seal's); the bend is added after both. A letter or a tail moved along a
+bowed line rises or falls with it (`base(x + dx) − base(x)`, not
+`slope × dx`).
+
+**The request's own line is its own style; the other lines compete among
+themselves** (`inStyle`). The face filter scored the requesting line as a
+perfect 1 and kept only lines within 0.05 of it — and one face agrees with
+itself across lines at 0.85–0.9, so every other line was shut out whenever
+the requesting line held a copy. On that letter's bold date the copy was the
+"8" of "18", touching its slash and so not whole, and no bold "8" printed
+elsewhere could stand in for it. The own line is now always kept and the
+others within 0.05 of the best OTHER line; where no other line can be scored,
+only the own line's copies, as before.
+
+**A copy doubted only across sizes is still its own line's best**
+(`ownLineOnly`). A small phone number's "7" agreed 0.64 with the body text's
+"7" — a third larger — and 0.65 with its "1", and was doubted; with no copy at
+its own size to vouch for it, an edit of the number synthesised its "7" where
+the line's own was there to borrow. Such a copy (its medoid another size, no
+peers, no more like another letter than its own) is picked for a request from
+its OWN line, and only when nothing else can be — the second pass, beside
+`peerVouched`.
+
+**A word the cutter cut is still cut on its runs when the two agree**
+(`exactRuns`, `runsAgree` in `addWord`). A word is exact when its ink falls
+into one run per letter, but its letters' boundaries came from the cutter,
+which places them by the letters' advances: on a notarial deed's bold
+"FBERERO" it put the F|B boundary four pixels into the B's stem, the B's piece
+straddled it and was divided by column, and the F took a strip of the stem.
+"FEBRERO" then erased the B and left the strip standing after the F —
+"F|EBRERO", at HEAD as well. The cutter's suspect flags stand; its boundaries
+give way to the runs when every run is about as wide as its letter
+(`runCellsOf`) AND lies mostly inside the cell the cutter gave that letter.
+The second condition is not decoration: without it, a typed text's re-read
+gave the ink of "G." the reading "ING." (its G, its stop and two specks made
+four runs), every letter cut on those runs "looked like" its label, and a
+table cell's "ING. CIVIL" + " X" printed "I. CIVIL X".
+
+**The lab gates synthesis like the app** (`look.score < 0.75`, as in
+`useOCR`). It synthesised from any fitted look, so a display title fitted at
+0.63 "passed" in the lab with a sans "I" and "Ó" set into a condensed serif
+word — an edit the app refuses and redraws as vectors. A lab result that
+synthesises has to be one the app would make.
+
+Measured for these four: the letter's 11-edit suite in the browser draws
+every edit on the scan with 0 px of damage outside the plan, the bold date
+from the page's own bold digits (was two synthesised) and the phone number's
+"7" from its own line; the lab A/B over 16 suites (235 edits) against HEAD
+takes synthesised letters from 45 to 36 and refusals from 27 to 26 (a
+reversed "FACTURA" drawn from page letters), and every changed plan was
+inspected — MSP's "30 de septiembre" now takes its "s" and "t" from the
+page's bold copies instead of re-weighing regular ones. `bend <page>` and
+`heights <page> <lineId...>` in the lab print a page's bows and a line's
+letter heights over its (bent) baseline.
+
+**A synthesised letter is re-weighed like for like** (`GlyphWant.stemChars`,
+`synthGlyph`). A word's stem is the median darkness summed across every stroke
+its letters cross, and a curve or a diagonal is crossed wider than a stem — in
+many faces a date's 0, 2, 3, 8 and 9 read heavier than its "1". Aiming a
+synthesised "1" at that raw median made it visibly bold beside the scan's own
+"1" on a service order's date. The target is now `have × pageStem / faceStem`:
+the same characters the word's stem was measured on (`stemSource` names them),
+rendered in the face and look that will draw the new letter and measured by the
+same rule (`stemRuns`), so the bias of the word's shapes cancels. Where those
+characters cannot be measured (fewer than four stems) the old target stands.
+Measured in the lab A/B: only synthesised glyphs change, and that "1" comes out
+at the scan's weight. The unit test pins the neutral case: a date printed
+exactly as the look prints it gets its "1" un-re-weighed (ink within 3%).
+
+**A letter is never borrowed from text set in the other kind of face**
+(`footRatio`, `faceAt` in glyphAtlas; `GlyphRequest.style.face`). A registry
+page sets its headings in a serif and its body in a sans, and "SIGA TICS" →
+"SIGA TECH" drew the "E" and the "H" from the body: a sans "E" and "H" inside
+a serif heading, visible at a glance. The shape scores could not see it — one
+coarse grid per letter, and a sans "E" agreed 0.76 with the heading's letters
+where one face agrees 0.78 with itself across a table's lines. What does
+separate them is the FOOT of a stem: a serif widens it into a slab, a sans
+leaves it as wide as the stem. `footRatio` (the darker of the last two rows
+over the median of the lower stem, on I T H F P i l) read 1.9–2.3 on every
+serif line of that page and exactly 1.0 on every sans one; across twelve other
+documents sans lines sit at 0.8–1.2 and serif capitals at 1.5–2.9. n, m and r
+are left out: at body sizes their serifs are a pixel and merge into the stem
+(a Times paragraph read 0.5 to 1.4 on them). `faceAt` classes a place on a
+line by the median of the five nearest stem feet within eight ems — two at
+least, and under 0.75 is a baseline a pixel off, not a face — and where that
+stretch cannot tell, by all the line's feet (three at least): a serif
+paragraph shows its feet somewhere along the line even where a stretch holds
+none, and a sans amount line ("(CIEN MIL CON 00/100 SOLES)") went unclassed
+at its "E" and lent it to the serif heading. Three things hang off it:
+- **`pickFrom` drops copies set in the other class**, and a letter the page
+  holds only there is MADE in the line's own look (Caladea Bold at 0.87 for
+  that heading). The foreign copy is a stand-in, used only where the letter
+  cannot be made (no face prints like the line, or the line may not take that
+  many made letters — the gate swaps made letters back to their copies before
+  refusing). Such an edit succeeds and still reports `wanting`;
+  `planScanEdits` collects wants from successful lines too, and `useOCR`
+  harvests more pages for them, makes them and plans again.
+- **Doubts are judged within a face.** `markDoubts` compares each copy with
+  its letter's medoid, and the medoid is whichever face holds more copies:
+  the heading's serif bold "E"s agreed 0.57 with the body's sans "E" and 0.74
+  with a "D", every one was doubted, and even a page holding serif "E"s gave
+  the sans one. When the medoid's face (its own, or that of two thirds of the
+  copies like it — the medoid may stand where no stem foot is near) is the
+  other class, the copy's peers in ITS face vouch for it (`faceVouched`) —
+  and only for a request KNOWN to want that face. Vouched for anyone, they
+  filled in for a one-word bold sans header (one stem foot: its face cannot
+  be told) and drew serif letters into it. Telling such a word's face from
+  its letters' SHAPES was tried and dropped: on a bold serif title the coarse
+  grid scored the sans lines 0.92 against the serif ones' 0.86.
+- **A made letter is as crisp as its line** (`sharpenTo` in glyphSynth). No
+  blur still leaves a rendered glyph's edges about a pixel wide, and
+  re-weighing adds part-dark columns; that page is a bilevel archive copy
+  (edges 0.6 px) and its made "H" measured 1.3, a soft letter in a sharp
+  heading. Its darkness is steepened about the middle until its edges
+  measure like the line's; a line at 0.6 px has nothing between ink and
+  paper, and the letter is thresholded. On such a line the sub-pixel baseline
+  shift (a cubic resample that puts grey rows into a glyph) is not made: the
+  glyph lands on the nearest whole pixel, as the scan's own letters do.
+
+**A regular paper texture is kept under the ink** (`paperTexture` in
+lineInk, `PageInk.texture`). The registry page is printed on security paper
+with a hatch of dots at an eight-pixel pitch. Push-pull filled an erased
+letter with the paper's smoothed level, a clean patch in the hatch; and a
+letter borrowed from elsewhere carried the hatch of where it was taken (its
+fringe's transmittance against the smooth fill), a faint box of misaligned
+dots 3–5 levels darker round every new letter. Where the paper's residual
+against its own blur repeats on a lattice — autocorrelation over 0.6 at a
+shift of three pixels or more, measured on 48 px windows of plain paper (the
+hatch measured 1.00 at (8,0) and (0,8)) — every pixel the fill made takes the
+residual of the nearest lattice translate that is plain paper.
+`relaxErased` then relaxes the hole's LEVEL only: the residual comes off
+every value first and goes back on the hole after, or the harmonic fill
+smooths it away again. Selective by construction: of eight other documents,
+five have under a level of residual and stop at the first test, and the two
+grainy ones peak at 0.18 and 0.32. It costs about 1.5 s once, on the
+textured page.
+
+Measured: lab A/B over 18 suites (246 edits) against the last commit: 15
+changed, all inspected — the registry heading (its own serif "E", a crisp
+made serif "H"), its "CIENTO CINCUENTA" and "ESTATUTOS" now from same-face
+lines (the base drew letters with grey fringes from the other face), its
+other edits by the hatch alone (no pixel by more than 40 levels), and
+synthesised letters elsewhere crisper. The four browser corpora (ocr, ocr2,
+ocr3, ocr4: 261 automatic edits) are unchanged in damage, edits on the scan
+and read-back; one page makes one letter fewer. The registry suite draws
+10/10 on the scan with no damage. **Known limitation:** a reversed one-word
+bold sans header on a page whose body is serif (a service order's
+"Descripción") still takes serif letters from the body — one stem foot
+cannot tell its face, so no filter applies; that was so before this change
+as well. Lab: `serif <page>` prints each line's stem-foot
+ratios, `texture <page>` the paper's residual and autocorrelation peaks,
+`explain` takes FACE=serif|sans and prints each copy's face, and `edit`
+prints made letters' edge widths with EDGES=1 and plans again with made
+letters when an edit drew foreign copies.
+
+**Text lighter than its ground is read on the INVERTED scan.** Reversed-out
+titles, a book cover's lettering and logo badges are not ink on paper: read as
+such, the paper estimate takes their white letters for paper, and an edit
+painted pale blobs around letters it never removed. On paper the median
+luminance of a line and the ring around it sits near the LIGHT end of its
+range; reversed out, near the dark one. Such a line is analysed on
+`invertedPage(pi)` — every pixel's colour inverted, prepared like the page and
+kept with it — where it is dark ink on light paper, and `LineInk.inverted`
+says so: the harvest reads its letters there (`pageOfLine`), and
+`planScanEdits` edits it in an inverted working copy and inverts the changed
+pixels back before the overlays are cut. The multiply-onto-paper print model
+holds in the inverted domain, so a letter moved, erased or synthesised there
+comes back as light lettering on the ground's own colour. The test runs BEFORE
+the plain-paper one, which the paper estimate around white letters always
+failed. Measured on a book cover (white serif on red and on a blue circle):
+every line was refused, the vector fallback painted rectangles (22.5k px of
+damage in the sweep); now 38 of 39 words cut, and deleting, reversing and
+appending letters (the X synthesised) all draw on the scan with no damage —
+including the two title lines that straddle the circle's edge. Lettering over
+a photograph still fails, in either domain, as not plain paper.
+
+**A cover's big title: a flat ground, its own face at another size, its own
+colour, its own shadow.** The covers of the OCR sweep (a red "PIENSE Y HÁGASE
+RICO", a purple "$100M OFFERS", a blue "$100M LEADS") had every big title
+refused and redrawn in Helvetica by the vector path. Seven separate things,
+each found on the crops:
+- **The ground is flat, its estimate was not** (`flattenGround`). The page's
+  paper is found with a 3.6 pt max filter and a title's strokes are wider: on
+  the inverted page their middles were read as paper, and so were the LIGHTER
+  letters of a neighbouring line ("NAPOLEON HILL" above the white "PIENSE").
+  The plain-paper test measured 47–99 of roughness against a bar of 8. Where
+  it fails, the region's ground is taken as the commonest colour of its
+  padding ring (refined by a mean shift) and accepted only if it dominates
+  that ring (60% within 32 levels), is tight (median 8, 90th percentile 20 —
+  JPEG chroma noise on a 72 DPI cover reaches 18) and covers 30% of the
+  region; the paper is then filled from the ground's own pixels. An ocean
+  photograph put 10–14% of its ring near its commonest colour, the picture
+  behind a sign 30%, a flat cover 70–82%. Only pixels the page's estimate got
+  WRONG are rewritten, so a later line on the same pixels reads what it read.
+  Off-colour pixels lighter than paper (a shadow, read with channels
+  inverted) get the darkness of haze (`HAZE`): erased and moved with their
+  letter, never a core. On a flat ground a letter's region reaches 0.1 em.
+  It runs up front for every reversed line and every line whose padding is
+  not near white (median under 215): the page's estimate under a thick
+  stroke can be a smooth MIX of ground and stroke, against which the
+  stroke's middle reads as ink, the plain-paper test passes, and an erase
+  wrote the mix (a white "E" on red came back pinkish white). On the 18 office
+  suites this changes no pixel by more than 8 levels. Two bars are relative
+  to the ground's own measured noise, and both were fixed numbers first: the
+  estimate is rewritten where it is off by more than 1.5× the noise (3 at
+  least; a fixed ten left it a few levels off beside every letter, and on a
+  noiseless blue cover an erased "M" showed as a ghost of that), and a pixel
+  beside a letter's core (within 0.1 em) is haze when it is 0.8× the ground's
+  tolerance off its colour (6 at least) — the JPEG ringing round a letter on
+  a clean cover is five to twelve levels off, and left as ground it was what
+  the fill of the erased letter was made from. Haze is marked only beside
+  letters: strewn over a noisy ground it counts as faint ink to every
+  measure of the line's strokes. Holding an erased hole's border at the
+  paper wherever there was haze was tried and dropped: pinned to clean
+  ground next to a neighbour's shadow, the fill stepped into it.
+- **The page's own letter at another size beats a bundled face**
+  (`pickGlyphRescaled`): an "A" made for "PIENSA" came out a wide regular sans
+  in a condensed bold title while the "Á" of "HÁGASE", a third smaller, was
+  the letter. 0.6–1.7 times, from a line whose letters agree with the word's
+  own (0.8, `SAME_STYLE`), same weight and kind of face, whole letters only,
+  scaled down before up. It also replaced two synthesised figures on office
+  forms (a "6", an "8") with rescaled copies of the page's own — inspected,
+  equivalent.
+- **A capital or x-height letter whose ink rises over its class carries a
+  mark the reading dropped**, and is not harvested: that "Á" filed as "A"
+  printed "PIENSÁ".
+- **Kept letters are judged only against letters at their own size.** The
+  medoids of a cover's small subtitle read a heavy "H" as an "O" (0.82) and
+  an "N" as nothing (0.46), and deleting two letters from "HÁGASE" redrew the
+  four it kept. A kept letter with nothing at its size to judge it by is
+  unverifiable, not wrong; a letter with no established shape at all needs
+  0.86 to be called another letter (a mark still 0.8) — a heavy "L" agreed
+  0.83 with the big "C" of its own line.
+- **Runs over the cutter, when the runs are letters.** The cutter places its
+  cells by an ordinary face's advances; on the condensed "NAPOLEON" they
+  drifted a letter by the end, the word stayed "exact", and deleting the O
+  erased the E. Where the runs and the cutter disagree, the runs win if every
+  run taking a letter is letter-sized (0.35 em) and their widths are
+  CONSISTENT over their advances (within 0.6–1.67 of the word's median,
+  narrow letters aside); otherwise the word is not exact. Never in a reading
+  the user typed (`analyzeLine(…, { typed: true })`): there the typed "ING."
+  laid over the ink of "G." in a table cell was confirmed on a border
+  fragment and a speck and printed "INING. CIVIL" — exactly the case the
+  cutter preference was written for, caught by the A/B.
+- **Coloured lettering is read with its lighter CHANNELS inverted**
+  (`domainPage(pi, mask)`, `LineInk.domain`): multiplying ink onto paper only
+  darkens, and peach on purple is lighter in red and green and darker in
+  blue. Inverting just those makes it darker in every channel; the edit is
+  made there and only those channels flipped back. The "ink lighter than its
+  ground" refusal now re-reads the line once in that domain. White on a band
+  is mask 7 — the inverted page, which `invertedPage` still returns.
+- **A second ink must cross the letters and run away from them.** The
+  two-ink split (a signature over grey text) took the white "$100M" above
+  "OFFERS", and the title's own drop shadow, for a second ink of "OFFERS",
+  and an erased "S" kept a lilac share of it. Its strokes must now lie partly
+  inside the letters' band and at least 30% outside the letters grown by
+  max(3 px, 0.12 em) — grown from the letters' pixels, not the core, or the
+  signature (core too) was never away from anything.
+
+- **A title's band takes in its neighbours; its own letters say which are
+  its own.** The band that decides a line's ink is a fixed share of the em,
+  and a title's em is huge: the 166 px band of "RICO" took in the bottom of
+  "Y HÁGASE" above and both lines of the subtitle below, their letters were
+  shared out among R, I, C and O, and reversing the word dragged chunks of
+  the subtitle along. With three letter-sized pieces at least, a piece whose
+  bottom stands higher above the baseline than the letters' tops (too big for
+  an accent) is the line above's, and an upright piece starting below the
+  baseline by 8% of the letters' height and under 35% of it is the line
+  below's — a comma or a descender starts at the baseline, a handwritten
+  tail is half a letter, and a form blank's flat fragments stay the line's
+  (taken away, the date typed into MSP's "Fecha: ____" moved off the blank).
+- **Too few shared letters to compare shapes, the CONDENSATION decides**
+  (`lineWidthRatio`): each letter's ink width over an ordinary face's advance,
+  the median over a line, every copy counted (a title's letters are doubted
+  for want of peers at its size, which says nothing about their width).
+  "RICO" shares only an I with "PIENSE" and measures 0.59 to its 0.69; a
+  regular sans is 0.85–0.9. Within a fifth, the line counts as the same face
+  and its "S" is taken, enlarged half again, for "RICOS". For DISPLAY lines
+  only (an em of 60 px and more): on a form, a bold italic label with no two
+  letters in common with its neighbours took upright letters from three
+  other lines this way, and a checkbox for its "R" — body text has letters to
+  compare, and its lines are too alike in width for this to tell faces apart.
+- **An enlarged copy's interior is evened out** (`solidified`, over 1.2×):
+  the scan's speckle inside its strokes became pink dots in a white "S", and
+  the region's outer pixels a faint frame. Pixels within three quarters of
+  the core's median darkness take that median; those within 6% of paper
+  become paper.
+
+Two print-model fixes came with it: a moved letter keeps the channels where
+it is LIGHTER than its paper (black lettering on red carries twice the red's
+green as JPEG tint; clamped, every moved letter printed darker) — added as
+the excess over the paper, not multiplied, since a ratio over the red's green
+of 15 glowed green — and an erased hole takes the grain of the ground beside
+it (`groundGrain`, a residual copied from clean ground shifted by a multiple
+of 8 px so JPEG blocks stay aligned; only where that grain is measurable, so
+white paper is untouched). A letter's region reaches up to 6 px on big
+letters: 2.2 pt is two pixels at 72 DPI and the ringing round an erased "SE"
+stayed as its outline. And a line with fewer than two word spaces is never
+"justified" (`justifiedMargin`): "$100M" over "OFFERS" both end at the page's
+right edge, and a deleted "0" pushed the space it freed into the only gap
+there was, at the edit.
+
+Measured: on the red cover "NAPOLEON HILL" → "NAPOLEN HILL", "PIENSE" →
+"PIENSA" (its own A, rescaled) and "Y HÁGASE" → "Y HÁGA" all draw on the scan
+from its own letters; both "$100M" titles take deletions and "$001M"; on the
+purple cover "OFFERS" → "OFFER" and "SREFFO" draw in the title's own face
+and colour. The 18 lab suites are unchanged but for those two rescaled
+figures. **Known:** where a letter was erased the ground is filled smooth,
+and on a JPEG cover that shows at high zoom as a patch without the
+compression's texture (or a trace of a neighbour's shadow cut at the patch's
+edge); new letters borrowed from the page carry no shadow; reversing "RICO"
+is refused (the moved letters' regions would land on the subtitle);
+lettering over a photograph is still refused.
+
+Tried and dropped: letting a letter's region follow its pale strokes past the
+2.2 pt reach (ink of fringe darkness connected to the letter, bounded to its
+neighbourhood), for what looked at 5x like the ghost of a deleted italic "L".
+Contrast-stretched, the "ghost" was the erase itself: inpainted paper is flat
+and the scan's paper around it has 1–3 levels of grain — invisible at any
+normal contrast. The extension changed nothing on that edit, nothing on MSP,
+and on a certificate with a patterned ground it walked the pattern: two edits
+went from 0 and 6 to 40 and 181 px of damage. Stretch a crop (`lo` ≈ 215)
+before calling something a remnant.
+
+**A stippled header band is its own paper** (`screenGround`, lineInk). A
+results table's header row — white bold capitals on a grey band a copier laid
+down as a coarse stipple, 40 to 190 within a few pixels — was refused cell by
+cell: "the text is lighter than its ground, and reversed: no letters in the
+box". On the inverted scan the page's paper estimate under the band was BLACK
+(every stipple dot read as ink and was filled from the white page around the
+band), so the letters had no darkness at all, and `flattenGround` found no
+flat colour (ring 0.44 near its mode, median deviation 10.8). Where it fails,
+for reversed lettering:
+- **The band is told by its LOCAL MEAN**: a box mean of radius 0.15 em, away
+  from the letters, varies 5–9 levels at the median and 13–23 at the 90th
+  percentile on that header; a photograph's or a gradient's does not (bars
+  10 and 24).
+- **The stipple's level and spread are measured on the stipple alone** — what
+  is plainly ink (under 0.35 of the region's light decile) and its fringe set
+  aside. Over the whole region a three-line cell between two white rules is a
+  third ink, and the spread came out a third too wide: no room was left below
+  it for the letters.
+- **Ink is what the stipple never reaches**: three spreads under its level and
+  core-dark against it; pieces under 4 px are grain.
+- **Off the letters each pixel is its own paper** (darkness 0): a moved letter
+  carries none of the stipple, a harvested glyph is transparent there, and the
+  stipple's dark grain is never ink — measured against the mean, a third of it
+  read as cores and welded the letters into one blob. Only the letters and a
+  fringe of 0.08 em take the mean (push-pulled under them) as paper, and even
+  there grain lighter than the mean stays its own paper: with the mean for
+  paper it travelled with a moved letter as tint above the paper (the excess
+  rule) and printed a ring of dark specks round it.
+- **Reversed lettering on a band is read inside the band**: the region is
+  clipped to the rows where a quarter of the box's width is as light as the
+  band, or the white page above and below (black, inverted) defeats every
+  ground test.
+- **Only for REVERSED lettering.** Dark letters on a light textured ground keep
+  the gradient rule, which asks for a clean cut: a certificate's condensed
+  capitals on a mottled blue ("ALTIMETRÍA", level 213±10) passed the screen
+  test with their touching tops read as a rule and the first cell holding
+  "AL" — deleting the "A" deleted the "L" with it. HEAD refused that line and
+  still does.
+
+**Grain is copied only from ground at the fill's LEVEL** (`groundGrain`,
+scanEdit): a clean pixel's 9×9 clean mean must lie within max(6, min(20,
+0.6 × the frame's grain spread)) of the relaxed fill's luminance at the hole
+pixel it feeds. Swapping the words of a header cell makes a hole as wide as the
+cell: the sideways shifts land outside it, and the downward one (a hole's
+height) on the band's edge, where the residual against a mean straddling
+stipple and page is sixty levels — the vacated letters came back as their own
+lower halves in solid black. Where no single shift qualifies, each 8×8 block
+takes the nearest same-level block within six blocks, and what is left pixel by
+pixel; a smooth leftover showed as a flat grey square in the stipple. On white
+paper the grain is still null.
+
+Measured: ten header cells of the results table now read on the scan (DNI,
+APELLIDOS Y NOMBRES, PROGRAMA, PUNTAJE ×2, PRIMER, SEGUNDO, EXAMEN, FINAL,
+CONDICIÓN; all refused at HEAD), and "NOMBRES Y APELLIDOS", "CONDICION",
+"FINALES", "PUNTAJES", "PRIMERO", "SEGUND" draw on the stipple without an
+artefact. Line survey over 38 recorded pages: those ten and two junk runs the
+recogniser made of the stipple change, nothing else. A/B over the 18 suites: only that page changes, plus paper grain under
+moved letters elsewhere (level-matched now, inspected, equivalent); its title
+edit "RESULTADOS" → "SODATLUSER", which HEAD drew as "SOLATLFSER" (the title
+was classed bold and took a bold "D" cut from a mis-boxed neighbour), draws
+right, because the header's bold letters move the bold threshold. Two unit
+tests (a stippled cell: one letter deleted; a whole line swapped).
+
+**Known:** "DNI" → "DIN" draws its "D" thin — DNI's letters touch, so none of
+its own can be reused, and the page's one clean bold "D" (CONDICIÓN's) has
+one-pixel bars. A table's row numbers ("1", "2", …) are still refused as set
+over a picture: a one-digit cell's padded box gives an em guess three times the
+letter's, and the region it implies spans several rows and reaches into the
+stippled header. Counting only the box's rows and leaving thin straight runs
+out of the picture test was tried: the cell then analysed with the whole grid
+as its one letter. Refused is right until the em guess is.
+
+Two lab traps found on the way: a rotated or layered (MRC) scan must be read
+with `RENDER=1`, as the app does, or every line reads "box too small" / "no
+letters in the box" (three whole pages of the survey did); and a lab output
+path with a colon in it (a line id) silently fails on Windows. `glyph <lineId>
+<char> <out.png>` (with `VALUES=1`) prints a letter's harvested copies, and
+`PALE=1` now also prints each ground test's verdict.
+
+**A short reading is sized by its ink, not by its box** (`shortInkEm`). The
+recogniser pads a lone "1" in a table cell out to the cell — 39×33 px round a
+13 px figure — and the em its width implied was three times the figure's: the
+region spanned three rows and reached into the stippled header above, and
+every row number of the results table was refused as "set over a picture".
+For readings of three characters or fewer, the tallest core piece inside the
+box (pieces spanning most of the box and sparse in their own bounds are rules
+or rule corners, and do not count) is taken as a capital or figure height
+(0.72 em; 0.52 for x-height letters alone), and replaces the guess when it is
+under three quarters of it. The row numbers now read with their figure as the
+one cell, the row rules as rules and the neighbouring rows protected, and
+"1"→"7", "3"→"31", "2"→"4" draw from the page's own figures, centred in the
+cell. Leaving thin straight runs out of the picture test instead was tried
+first: with the inflated em the cell analysed with the whole grid as its one
+letter.
+
+**A one-character reading gives the atlas no letter.** It is the recogniser's
+least reliable output — a speck, a corner of artwork, a stamp — with no
+neighbour to vet it. Sized better, a stray reversed "L" on the 96-DPI receipt
+started to pass analysis, moved the shapes that page's few copies are judged
+by, and a word reversal there ("UNIVERSIDAD" → "DADISREVINU", over a cut that
+slides mid-word) went from refused to drawn with remnants of its old letters;
+without the harvest it is refused again. The cost is the occasional useful
+lone letter (an "X" mark) no longer offered as a copy.
+
+Measured: the 18 suites change only in which page copy a few edits take
+(inspected, equivalent: MSP's "30 de septiembre", the purchase order's
+amounts, "213.3 X"), and on the results table one edit draws a smaller "X" from
+another copy. A unit test (a ruled cell padded to the cell, its em and its
+edit) fails at HEAD with an em of 43 px for a 24 px figure.
+
+**Fixtures without the browser.** `ppu-paddle-ocr` runs in node on
+`onnxruntime-node` with the app's own models (`public/paddle/*`): 132 lines of
+a page in under 4 s. A scratch script rendering pages at 220 DPI with MuPDF
+and writing the lab's fixture format (raw detector boxes — the app's
+`buildItems` refinement is NOT applied) surveyed 29 never-recorded documents.
+Printed pages read well; what is refused there is handwriting ("the reading
+does not fit the ink": students' maths notes on squared paper, a dozen pages)
+and pages that are not one scan image (read them with `RENDER=1`).
+
+**A DARK grid of squares is paper too** (`latticeLines`, in `preparePage`).
+On a phone photo of squared paper (CamScanner, ~280 DPI) the rules are
+grey-blue, four pixels wide and as dark as luminance 80–130 at their centres —
+darker than the faint-line test's bar (no pixel under 120 within 2 px), so
+the whole grid read as ink: a handwritten line welded into one piece with its
+squares, no word gap was found, and every edit fell back to Helvetica over the
+grid. A second pass finds thin straight runs clearly LIGHTER than the pen
+(above the ink's 10th percentile by 30, never within a pixel of anything that
+dark; a run may cross 3 px of grain; 12 pt at least) and takes them as paper —
+their own colour, however dark (`gridPix`) — only when the page is a lattice:
+the row and the column profiles each repeat at a pitch of 8–30 pt
+(autocorrelation 0.3 or more, five lines or more spread over a fifth of the
+page or more) and the two pitches agree within 12%. A form's table has rows at
+one pitch and columns at none, and its rules are as dark as its text.
+
+Three versions were wrong first, each on real pages:
+- **Pitch from 2.5 pt** took a halftone screen — itself a lattice of dots a
+  point or two apart, bridged dot to dot — for squares: the results table's
+  stippled header and its halftone title went to paper.
+- **Runs of 20 pt** and **lines spread over half the page** lost the
+  notebooks: noise breaks a rule every few pixels, and a curled page shows its
+  verticals over a quarter of its width.
+- **An Otsu split of the ink into pen and grid** (written for a synthetic page
+  with more squares than writing) fell above the grid on real notes, between
+  pen-and-grid and their fringes, and took a book cover's texture for squares.
+  The synthetic test page now carries a page of writing, as real notes do.
+
+Measured on every recorded page (61 documents' first pages): the nine
+handwritten notebooks are lattices, none of the 52 printed documents is; the
+18 lab suites are pixel-identical. Two unit tests (a dark grid with pen
+writing; a form ruled as dark as its text at one row pitch).
+
+**Known, and the next large gap: handwriting itself.** With the grid as paper
+the notebooks' lines fail for handwriting's own reasons — "set on a curve"
+(the baseline wanders), "more than one printed line" (ascenders and descenders
+against a type-sized em), "the reading does not fit the ink" (handwriting is
+wider than type's advances) — and with those checks lifted, the word split
+(a gap threshold tuned to type) joined words ("De la", "misma forma"). Every
+edit of handwriting still falls back to Helvetica.
+
+**A whole-run vector redraw erases on the scan's pixels where the line was
+read** (`inkAwareFallback`): when the scan edit declines a line for want of
+letters (or too many to synthesise) its line analysis still holds which pixels
+are whose, so a WHOLE or REMOVED run's paper rectangles become an erase of
+that line's own letters and nothing else. A painted rectangle erased whatever
+fell inside it — under a tilted line, the top of the line beneath (an edit of
+"EMPRESA : MINERA SHOUXIN PERU S.A." took "RUC : 20392776975" with it). The
+mode gains ` {ink-aware}`. Two limits, both measured wrong first:
+- **Not for partial redraws.** Their rectangles and moved tails are placed on
+  the vector planner's own letter cut; erasing this analysis' letters inside
+  them disagreed by a letter, and a deleted "J" stayed under the "M" moved
+  onto it. Partial redraws keep the painted patch and the tail crop.
+- **Only on a trusted analysis** (`analysisTrusted`: half its words cut one
+  ink run per letter). On handwritten graph paper the grid's segments came out
+  as "letters", and the erase took the grid with it.
+
+**Every other vector patch is filled from the run's GROUND, and stops at its
+neighbours** (`groundFill.ts`, mode ` {ground}`). Where the scan edit refuses
+a line for its background — a book cover's gradient, a band of colour, a
+photograph — the vector redraw painted a rectangle of one colour over it: a
+flat green box on a green-to-yellow gradient, a navy block over a photograph
+of water. And the box reached: its pads are 12% of the run's height, and the
+detector's box around a 140pt title already held the line beneath it, so
+editing "RICO" on a red cover took the bottom half of "Y HÁGASE" above and the
+whole of "LA RIQUEZA Y LA REALIZACIÓN PERSONAL" below (42 000 px of damage);
+"$100M" took the tops of "LEADS". Now a run's patches are filled the way the
+scan edit erases a letter — what is printed in them is found against the
+ground around it and only those pixels are filled from that ground
+(`pushPull`) — and only the run's OWN letters are:
+
+- **All of a run's patches are judged together.** A tilted line's patch is a
+  staircase of rectangles; judged step by step, some steps were refused and
+  painted flat yellow on a sticker while letters straddling the others were
+  half erased.
+- **The max filter is as wide as the strokes** (a quarter of the run's em):
+  at 3.6pt a 160pt title's stems read as ground inside, and the fill left a
+  blurred copy of the word.
+- **Thresholds are relative to the run's contrast and above the ground's
+  grain**, the grain measured in a ring around the patches with every shape
+  set aside first. Dark red on red is 35 levels deep; the fixed 12 left a
+  ghost of every letter, and grain taken for letters smoothed the whole
+  rectangle into a visible box. Specks are never letters.
+- **Ownership is decided letter by letter**, never by cutting the rectangle:
+  a letter whose centre lies in another line's box (centre outside this run's
+  middle band) or another run's along it is that run's — inside two boxes (a
+  tilted sticker's line ending inside the box of the line beneath) the nearer
+  middle wins, each box in its own half-size — and a box covering most of the
+  run is no neighbour at all (a junk run over half a cover's artwork held a
+  title whole). A shape over half outside the run's box (a quarter, when it
+  also reaches the working region's edge), 1.6 em tall or 2.5 em² is the
+  PICTURE: the photograph beyond a sticker's edge read as "ink" against its
+  yellow and was filled yellow. Reaching the edge alone is no proof — a
+  title's "L" welded to a photograph's ripples was kept as picture while the
+  rest of the word went. A shape outside the box, widened for accents, is a
+  feature of the ground and stays.
+- **The ground is measured twice**: from everything, and from what lies
+  outside the other runs' boxes (with a margin — the tops of white letters
+  poke out of a tight box), the second winning wherever it found anything in
+  reach. White letters beside a dark line were the brightest thing around and
+  the red between them read as ink; a single brightness to cap the boxes at
+  was fooled every time (the white page beyond a navy band took a title's
+  whole ground away); blanking the boxes outright lost the ground where two
+  tilted lines' boxes overlap.
+- **The fill draws only on the ground the letters stand on**: what can be
+  reached from beside them without crossing a colour step bigger than grain.
+  A gradient is all small steps; a narrow navy band between red stripes is
+  not, and filled from both a title came out pink — from the white page beyond
+  the band, white.
+- **It refuses rather than half-erase**: print in the patches with none of it
+  the run's, or over a third of the run's middle band taken for picture,
+  keeps the flat patches (old behaviour). Patches with nothing printed in them
+  paint nothing.
+- **A partial redraw's tail moves over the ground too**: each of the run's
+  own pixels as its transmittance over the filled ground, laid on the ground
+  where it lands (on the inverted colours for light lettering). Pasted as a
+  crop, the tail brought its old ground with it — a box on a gradient.
+
+The flat patches themselves are clamped in `planOcrExport`
+(`clampToNeighbours`): a neighbour whose centre lies outside the run's box
+trims only the pad — on tightly set text honest boxes overlap by an ascender,
+and cut there the tops of erased capitals would stay — while one whose centre
+lies INSIDE it (an inflated box) stops the patch, never nearer the run's middle
+than a quarter of its height.
+
+Partial redraws take the fill too. The limit above ("not for partial redraws")
+was about erasing the ANALYSIS' letters inside a rectangle placed on the
+planner's cut; the ground fill works inside the planner's own rectangle, so the
+two cannot disagree.
+
+**Known limitations:** on a photograph the fill is smooth — the letters go, but
+their place shows as a soft patch of the picture's colours (texture synthesis
+is not implemented); text a few pixels tall on a band barely taller than it
+has no band left to fill from and smears the stripes beside it; and the
+replacement the vector path draws is still Helvetica in the colour it sampled,
+which on a narrow band can be the band's own. Verified in the lab (`fill <page>
+<id> <out.png>`: the original, the flat patch, the fill, stacked; `COMPS=1`
+prints every shape and what it was taken for) on the red, green, water and
+sticker covers, and in `scanedit.test.mjs` (a white title on a gradient, its
+box over the line beneath: the title goes, the line beneath keeps every pixel).
+
+Refused, with the reason in the mode, and left to the vector path: a box holding
+two printed lines, a line set on a curve (a seal's arc), a reading that cannot
+fit the ink, lettering over a picture (paper luminance spread > 40 levels), ink
+the reading does not account for where the edit lands, a line outside the scan
+image (phone apps inset it), moved/restyled/vertical runs, and scans over 16
+megapixels (the paper estimate's working memory).
+
+Measured on the MSP appendix suite (14 hand-written edits over 3 pages, the
+fidelity driver, in the app): 14/14 drawn on the scan (was 0 — every edit was a
+vector redraw), 14/14 read back, damage outside the planned pixels 0 on every
+page, underline coverage kept (0.99, 0.995). In the lab every crop was inspected:
+inserted, replaced and moved letters are the page's own; the misread amount
+"USD 30.00" (ink "630.00") edits to "700.00" because the whole ink word is
+replaced. Timing: the first edit on a page ~1.5 s (scan read, paper, ~60 lines
+analysed, harvest), every later live bake 100–260 ms.
+
+Tools: `tools/ocr-calibrate/scan-edit-lab.mjs` (node, the app's modules through
+Vite SSR: `lines`, `debug`, `atlas`, `edit` (writes `-before/-after/-zoom` and a
+`-context` crop of the change in its line), `damage` (also counts any pixel
+written OUTSIDE the edit's box — the overlay would drop it), `explain`, `who`,
+`cell`, `inspect`, `corr` (why an edit is or is not a correction), `look` (the
+look fit's references beside every face), `repair <page> <id> [text]` (the
+line re-read from the page's letters, op by op, and a typed text merged onto
+it), `exact <page>` (how many words were cut, and how many more stand one run
+per letter; `WIDTHS=1` prints each run's width in ems), `fill <page> <id> <out.png>` (a
+vector patch: original, flat, ground-filled), `repairall <page>` (every line's
+reading beside its repair from the page's letters), `colors <page>` (each
+run's sampled ink and ground); `VARIANT=<dir>` loads the OCR
+modules from a copy of `src/utils/ocr` there, so a change can be measured
+against `src/` without touching it while a browser run is going — the unit
+tests below take it too),
+`tools/ocr-calibrate/scanedit.test.mjs` (node --test; alignment, push-pull, an
+end-to-end edit on a synthetic MuPDF-rendered scan asserting nothing outside
+the edited line changes, a correction that changes no pixel, a real edit not
+taken for one, the overlay mask's margins, the three-way merge, an edit of
+a garbled reading landing on the ink it meant, and a heavy title on white
+paper whose paper estimate stays white under its strokes), `fidelity-driver.js`'s
+`runAuto` (delete/reverse/
+append on readable runs of any scan, with damage and crops) and
+`public/_sweep/auto-corpus.js` (`start({ only })` runs `runAuto` over a staged
+corpus; results in `window.__autoResults`, crops in `__autoSheets`). The lab
+finds the scan by replaying q/Q/cm to its `Do` — a page that wraps its scan in
+a flip and then places it (`0.72 0 0 -0.72 72 842 cm` … `627 0 0 -971 0 1081
+cm`) was read at the wrong place by the first version, which grepped one `cm`.
+The fixtures it needs are exported from the app (`__fidelity.exportFixture()`
+after a `runSuite` that recognised the page).
+Test drivers set `window.__noUnloadPrompt` — the "unsaved changes" prompt
+otherwise blocks every automation call after a hot reload. **Do not edit `src/`
+while a browser run is going**: a hot reload replaced the OCR controller mid-run
+once and every later document read as a text page. To keep working while a
+corpus runs, run it on a FROZEN build: `NODE_ENV=development npx vite build
+--mode development --outDir <scratch>/snap` (development, so the DEV-only
+hooks such as `__ocrBakePlans` and `__noUnloadPrompt` survive; it copies
+`public/_sweep` too) and `npx vite preview --outDir <scratch>/snap --port
+9100`; nothing written to `src/` reaches that page.
+
+### A smooth ground is ground; the lines that are not the scan's are left alone
+Found by the full OCR sweep (three corpora, 51 documents), each measured with
+the lab before it went in:
+
+- **A wide range of ground is accepted when it is SMOOTH** (`paperRoughness`:
+  the 90th percentile of |paper − box blur(paper)| over the line's non-ink
+  pixels, at most 8 levels). A cover's gradient spans a hundred levels across
+  one title and was refused as "not plain paper"; a photograph's texture reads
+  tens. On such a ground only a line cut CLEANLY is taken — every word one ink
+  run per letter: a title printed in two inks (black "APOCALÍP", grey "SEX")
+  reached the core level only in places in its grey half, its reading was
+  shared out over the wrong ink, and deleting "SEX" erased the "P". A guard on
+  two ink darknesses was tried first; it refused good lines on two forms and
+  could not tell that title from them. Both failures had an approximate cut.
+- **The erased hole is relaxed after the push-pull** (`relaxErased`: SOR on
+  Laplace's equation over the erased pixels, 120 sweeps at ω = 1.85, held at
+  the scan where it is not ink and at the paper estimate where it is).
+  Push-pull is a pyramid average: on a gradient it leaves a faint plateau
+  where a letter was.
+- **An accent below the baseline is the line beneath's** when it is shaped
+  like one (at most 0.06 em² and 0.35 em tall, starting 0.08 em under the
+  baseline, none of this line's letters reaching down to it) and sits right
+  on top of a letter that is NOT this line's. Set tight, the next line's
+  accents fall inside this line's band; taken as its loose ink, deleting "LOS"
+  from a title carried the accent of "SEDUCCIÓN" onto its U. Asking less (any
+  piece below the baseline that nothing reaches) took a form's handwritten
+  blank and a tilted heading's "S".
+- **A change in marks alone is an edit, never a correction** (`stripMarks`).
+  An "O" and an "Ó" are one letter to the shapes, so "SEDUCCIÓN" retyped
+  "SEDUCCION" was taken for what the ink already said: the accent stayed on
+  the page and only the text layer lost it.
+- **Light-on-dark is judged on a box padded by min(15% of the width, half
+  the height)**, not 15% of the width: on a long title the padding reached
+  past the band, outvoted it, and white lettering on navy was sampled as
+  navy. Identical on 1088 runs on plain paper.
+- **A run the recogniser read off the page's own VISIBLE text is not the
+  scan's** (`dropRunsOnVisibleText`): visible blocks covering 60% of its width
+  on its row and reading what it read (LCS ≥ 0.7) take it, and the status line
+  says those lines are real text. A translation service draws its banner and
+  the book's title as text over the scan; edited as OCR runs, "ALEX HORMOZI"
+  baked as "XELA" — the partial redraw kept "HORMOZI" as scan pixels while the
+  bake blanked the real text under it. 11.7k damaged pixels on that page to 0.
+- **A first edit blanks only the INVISIBLE text under a run**;
+  `blankInvisibleText(…, all)` is for runs already baked, whose first bake
+  has to go. With `all` on a first edit, visible text overlapping the patch —
+  the same banner, a stamp's ID strip — was blanked too.
+
+### A re-read is held to what the document reads, and to letters it can read
+`repairReading` re-reads a line from the page's own letters when the user
+edits a garbled reading, and its text is what the edited line's text layer
+says. On the MSP appendix it turned "Lostérminos queenel … deinidos" into
+"Los términos que en el … definidos" and "USD 30.00" into "USD 630.00", but it
+also made words worse: "Limitado" → "Lmitado", "Upgrade" → "Uugrade", `("Software")`
+→ `("SSoftware"))`, "o Licencia:" → "ooi Ucencia:", and on a form whose small
+bold letters the atlas cannot tell apart every repair it made was wrong
+("Normal" → "Normel", "Valorización:" → "Valorizacien"). Each defect, fixed:
+
+- **A line is re-read only when its shapes can read it.** Where the alignment
+  KEEPS a label, the run should plainly be that letter (thin strokes agree
+  with each other). Under 80% of at least 8 kept letters, nothing on the line
+  changes. MSP lines read 88–99%; the form's failed.
+- **A word the document reads elsewhere is not re-read into one it reads
+  nowhere** (`wordsLeavingVocab`). The atlas counts every word of the
+  recognised pages (`forms`, `vocab`); each token of the old reading that is
+  a word of the document (three letters read elsewhere once, two letters
+  three times) is followed into the new text by aligning the two letter by
+  letter, and unless it comes back intact or only as words the document also
+  reads, the ink words holding it keep their old labels and the line is
+  re-read around them.
+- **A double quote is two strokes**, and the page holds no shape for it: two
+  neighbouring runs that both hang where a quote hangs are one quote. Read as
+  two, the second tick took the next label and its letter was read twice.
+- **A label the analysis found no ink for is not shown absent if it is a
+  mark** — a colon's dots are specks, and "PROYECTO:" came back "PROYECTO".
+- **A full stop or comma is named by its PLACE** (`markAt`: a small blob at
+  the foot of the line, on the baseline or hanging below it). Its shape is a
+  blob the atlas barely knows, so the shapes never named it: unnamed, the
+  comma after "Perú" took the "ú" label and the "ú" was read as a "d" —
+  "Perdú". Named, "Perú,", "período. La forma" and "Business One, versión"
+  came back right.
+- **A word's FIRST letter may be a capital, and a word of letters takes no
+  figure**: read by the rest of its word, the "S" of "Software" became the "3"
+  it looks like, and the "L" of "Licencia" an "l". When the word's kind
+  decides, its rivals are of that kind too.
+- **Thin strokes**: where the line's own exact i's show their dot apart, an
+  undotted stroke is no "i", "í" or "j" ("el" came back "ei"); a stroke
+  clearly taller than the line's capitals is no capital ("la" came back "Ia");
+  and a re-read word one i/l/I stroke from a word the document reads twice is
+  that word (`lookalikeFix`, only for words the re-read changed).
+- **A small letter followed by a capital inside one word** ("eL") is refused
+  unless the reading had that shape already.
+- **Ink taller than any letter, that looks like none, is drawn OVER the
+  word** — a signature's stroke, a stamp's edge — and the word under it is
+  not re-read from its runs: "Add-Ons" came back "Adddnns".
+- **An accented vowel is also read from the letter under its mark**: judged
+  whole, the mark outweighs the vowel. (It did not fix "número" → "nómero":
+  this page's "u" under its accent matches the "o" medoid 0.73 against 0.70 —
+  the shape grid barely sees an open top. `lookalikeFix` now does: its pairs
+  include ó/ú, á/í and v/y besides i/l/I, so a re-read word the document reads
+  nowhere, one such swap from a word it reads twice, is that word. A v/y swap
+  needs three characters — "va" and "ya" are both words.)
+- **Over a rule, a descender is cut off**: an underline or a table cell's
+  rule runs where a descender hangs, so such a run may show none and a
+  descender label is never replaced by a letter without one ("Upgrade" came
+  back "Uugrade").
+- **A refused word hands its labels back both ways**: a word that keeps its
+  old labels reverts every neighbour whose alignment took one of them AND
+  every neighbour one of whose labels its own alignment took. Refused, "N" →
+  "N2" kept the "2" of "2039277697", which came back "039277697".
+
+Measured with `repairall <page>` (every line's reading beside its repair):
+MSP 18/29/15 lines repaired on its three pages; the errors left are
+"Regaláas" (for "Regalías") and "v/o" (for "y/o") — "nómero" is now read
+"número" by the wider look-alike pairs; the other two appear nowhere else
+on the three pages the lab reads, so there is no second reading to defer
+to — each replacing a word the recogniser had wrong too ("Professional", which looked like one, is
+what the scan says); the form 12 repairs, every
+one wrong (an amount among them, "13,000.00" → "1 3,000 00"), to none; a
+certificate 6, all wrong, to none. The MSP edit suites draw exactly the same
+pixels; `scanedit.test.mjs` passes.
+
+### The editor opens on the page's own reading
+PaddleOCR loses the spaces and letters at the joins of small body text, so the
+editor opened a contract's lines as "Lostérminos queenel presente Apéndice
+sean,serán términos deinidos" and the user edited THAT: every change landed in
+a garbled line, and whatever they did not retype stayed garbled in the text
+layer. After a page is recognised, `repairReadings` (useOCR) re-reads every
+untouched run from the page's own letters in the background — the same
+`repairReading` an edit uses, with all of its gates, so a line whose shapes
+the atlas cannot read stays as recognised — and stores the result as the
+run's text AND its original: it is the reading, not an edit, and nothing is
+baked.
+
+- **Only runs nobody has touched**: not edited, removed, moved, restyled or
+  baked, not the selected one (an editor may be open on it), and still read
+  as they were analysed. It yields between lines and stops if the page is
+  recognised again.
+- **Only prose, and never a figure** (`repairIsDisplayable`): three ink
+  words, fifteen letters, mostly small letters, the same digits before and
+  after, and no mark put in front of a line that began with a word (a bullet
+  read as the "*" the page has). On a table of names in capitals every repair the re-read made
+  was wrong — a cell border or a speck after a name has no label, the
+  alignment shifts the letters onto it, and a name came back with two letters
+  inserted; and an RUC came back with a "5" in the wrong place, which reads
+  as the document's number, not as a typo. An edit's own repair is not held
+  to this: the user is changing that line, and the repair only steers where
+  the change lands.
+- **"Reconocer texto en este archivo" waits for it** before writing each
+  page's layer (`settleRepairs`), so the searchable text is the corrected
+  reading as well — a couple of seconds a page on top of recognition.
+- **The page analysis it needs yields every eight lines**, and two callers
+  asking for the same page share one build (`scanPageFor`): it now runs the
+  moment recognition ends, where before it ran as one block of a second and a
+  half at the first edit.
+- **The atlas keeps the letters of eight pages, the eight used last**
+  (`MAX_HARVESTS`). A page's harvest holds 4 to 10 MB of glyph crops
+  (measured: 2,700–4,100 exemplars a page on the MSP appendix), and with every
+  recognised page harvested, "Reconocer texto" on a hundred-page document
+  would have kept well over half a gigabyte. A document sets its pages in the
+  same few faces; a page in use is touched, so it is the last to go.
+- **Whatever looks runs up by their text waits for it**: the editing
+  assistant's `recognise` awaits `settleRepairs()`, and so does the fidelity
+  driver (`__pdfHooks.ocrController.settleRepairs`). A suite entry may carry
+  an `alt` lookup for the line as the re-read leaves it ("USD 30.00" comes
+  back "USD 630.00", "de 026" comes back "de 2026").
+
+Measured on the MSP appendix: 16, 28 and 14 lines of its three pages read
+again (`BG=1 repairall <page>` in the lab), the editor opening on "Los
+términos que en el presente Apéndice sean, serán términos definidos …"; in
+the browser the 14-edit suite stays on the scan with no damage, and a page
+recognised with "Reconocer texto" carries "Niveles de Corrección, paquetes de
+actualización" in its layer where the recogniser read "Corrcción,aquetes de
+actualizción". Over 17 other recorded documents the gate lets 2 lines through
+(and the bullet rule then none); a table of 496 names, none. The OCR sweep
+(51 documents) is unchanged on the scan path; without the gate a short
+heading's changed reading moved a deletion onto the wrong letters and left a
+grey smear on a cover — the gate keeps such lines as recognised.
+
+**After `cp` into `src/`, rewrite the file once** (read and write it back):
+the dev server missed a copied `scanEdit.ts` and kept serving its old
+transform, the new import failed, and the app came up with no stores at all.
+
+### A title's thick strokes are ink, and ink brighter than its ground cannot be printed
+`preparePage` finds ink with a 3.6pt max filter and fills it from the paper
+around it. A stem wider than the filter's reach is never seen through: on a
+300 DPI bilevel cover the 45pt bold title's stems are 34 px, their middles
+were read as PAPER, and the estimate around every letter came out grey —
+deleting one letter printed grey halos round the letters it moved and left a
+grey smear where the line had ended. A near-black pixel with white paper
+(247 or more) on BOTH sides along one axis, within 24pt, is now ink too: the
+inside of a stroke, or of letters that touch (dark runs of 80 px on that
+title).
+
+Each limit on that rule was measured, and each was a failure first:
+
+- **Only on white paper** — a page whose non-ink pixels are 240 or more at the
+  median and 225 or more at the 10th percentile, and white paper on both
+  sides of the pixel. Applied anywhere, a certificate's patterned light-blue
+  ground (243 at its lightest) stopped reading as a gradient, and two of its
+  lines were let through and edited badly: a moved word carried a pale box of
+  smoothed ground, and "ALTIMETRÍA" came back "ALLTIMETRA". The old estimate
+  had refused them for the wrong reason, but rightly.
+- **Never on the inverted page** — lettering reversed out of a band
+  ("OFFERS" in yellow on purple, "PIENSE" in white on red) was let through
+  the same way and came back pinkish, with the old letters' drop shadows left
+  as ghost rings and colour fringes as red specks.
+- **Ink brighter than its ground in any channel is refused** ("the lettering
+  is a colour its ground cannot be printed with"): letters are printed as ink
+  MULTIPLIED onto the paper, channel by channel, and a product is never
+  brighter than the paper. Yellow on purple, read inverted, is blue on green
+  — its blue channel above the ground's — and that is what came back pinkish.
+
+On 22 recorded documents the analysis changes on one page only (the cover
+itself, where words' measured weights move by a few thousandths); the MSP
+suite is pixel-identical, and the cover's deletion comes back clean white.
+The rule costs about 0.4 s on a 300 DPI page.
+
+### The vector redraw on a condensed cover: no lost letter, and the face's width kept
+Deleting one letter of a condensed bold cover title ("NAPOLEON HILL" →
+"NAPOLEN HILL", red ground, so the vector path) erased the "H" of "HILL" and
+never drew it again. Three separate things, each found by following that one
+edit through the bake:
+
+- **The word split was wrong, and nothing checked it.** On the coloured
+  ground no word could be cut, so the line was split into words by its ink
+  and the reading shared out by width — and the split fell between the "H"
+  and the "I" (first word 230pt where the scan's is 199pt; second word 30%
+  narrower than its letters). The partial redraw widened the edit to the
+  whole first word, the "H" with it, and patched it out. `planPartial` now
+  refuses when the boundary at an edge of the edit is one LETTER off
+  (`boundaryOffByOne`): one word too wide and its neighbour too narrow, both
+  fitting once a letter crosses over (0.12 and 0.30 off; 0.01 and 0.05 with
+  the "H" moved). The run is then redrawn whole and nothing of it is lost.
+  A word's width error on its own is NOT the test, and was tried first: a
+  wide display face ("UNAJMA" in a techno face, its "U" and "N" half again the
+  advance table's width) is off by 0.3–0.5 letter by letter with every split
+  right, and the guard sent a partial redraw that kept four of the scan's
+  letters to a whole redraw in Helvetica.
+- **A whole-run redraw keeps the original's width.** Its size is the
+  letters' own once the cut has measured them, so a base-14 face set wider
+  than the scanned one ran a fifth past the box. The original words, measured
+  in the drawing face (`originalWidthAt10`), against the ink they took, give
+  the squeeze; the new text gets the same (`fitWidth`, never below 0.7), for
+  a left-aligned run neither restyled nor moved. The bake measures in the
+  base-14 face as well and falls back to it when the traced face cannot
+  measure a run exactly.
+- **A single text op dropped its fit.** The bake drew a group of one with
+  `addText`, which has no width to fit to; a fitted single op now goes
+  through `addTextRun` like a group.
+
+And in `groundFill`: a shape of the run that the patches only CLIP, most of it
+outside them, is left alone — a kept letter a misplaced boundary cuts into is
+not half-erased. (It did not save this "H", which the bad split had put wholly
+inside the patch; that is what the planner check is for.)
+
+Measured in the browser on that cover: before, `partial` with the "H"
+erased; after, `whole` with "NAPOLEN HILL" set condensed inside the old box,
+damage outside the plan 0 (was 7068 px with the plain whole-run redraw).
+
+**Known limitations, both on covers:** a STENCIL face whose letters break at
+a notch as wide as its letter spacing (the "N" of that "UNAJMA": 33px inside
+the letter, 26–33px between letters, at a 141px em) is split into ink words
+mid-letter by any gap threshold, and a partial redraw next to that letter
+cuts off its far half. A TWO-TONE title ("APOCALÍP" black, "SEX" grey on a
+green gradient) is measured on its dark half only: the ink box stops at the
+grey letters, the reading's last letters are shared over the black ink, and
+whichever redraw follows leaves the grey half on the page beside the new
+text.
+
 ### Text drawn under `3 Tr` cannot be edited into view — a searchable layer makes the page a SCAN
 Acrobat's "Reconocer texto" (and ABBYY, and this editor's own layer below)
 leaves a scan's words in the content stream as INVISIBLE text: render mode 3,
@@ -4509,6 +6496,22 @@ and each traced glyph remembers the weight measured on the bitmap it was
 traced FROM (`strokeRatioOfImage`). At HALF the nominal width — potrace leaves
 many short segments and a round-joined stroke puffs every one, so 0.37pt
 took the title to 0.197 em where 0.185pt lands it on the scan's 0.172.
+
+**On light lettering the ink is the LIGHT side.** `detectFace` split ink from
+ground at the midpoint and called the darker side ink, so on a reversed title
+it measured the GROUND: the blue between the letters of a cover's
+letter-spaced "NATURE" read as stems, the run came out heavier than any bold,
+the stroke went to its cap (0.05 em — 3.3pt on a traced glyph at 132pt, 6.6pt
+on a fallback one) and every redrawn letter's serifs melted into blobs.
+`detectFace` takes `lightOnDark` (`isLightOnDark(color, background)`, from the
+colours the recogniser and the bake already sample) and measures the light
+side. Measured on the four reversed-text covers: "NATURE X" redraws with the
+traced letters' own thin serifs and a regular X (damage 22 497 → 13 744 px),
+"OFFERS X" 86 660 → 62 868, "$100M X" 7 918 → 5 762. The same wrong polarity
+had marked every reversed run bold and measured its slant on the ground.
+**Known:** the traced "$100M" is visibly thinner than the scan's extra-bold
+figures; the wrong stroke used to hide that, and the trace's own weight there
+is not fixed.
 
 ### The patch covers the ink's HALO, measured
 Deleting "MINERA SHOUXIN PERÚ S.A." left the accent of the Ú on the page: the
@@ -5288,8 +7291,18 @@ twice).
 
 ## Deploying
 `npm run build` → `dist/` (≈85 MB without `public/_sweep`, which is
-gitignored and must not be shipped: delete `dist/_sweep` before upload). What
-production MUST provide, all of which `public/.htaccess` does for Apache:
+gitignored and must not be shipped: delete `dist/_sweep` before upload).
+
+**Zip it with `tar.exe`, never `Compress-Archive`.** Windows PowerShell 5.1's
+`Compress-Archive` writes entry names with BACKSLASHES (241 of 246 entries in
+a build zip), and a Linux unzip extracts those as single files literally named
+`assets\index-….js` — the site then loads nothing. From inside `dist/`,
+`C:\Windows\System32\tar.exe -a -c -f <out>.zip <every top-level item>` writes
+forward slashes. Build from a commit in a throwaway `git worktree` (junction
+`node_modules` in, `cmd /c rmdir` it before removing the worktree) so the zip
+is what was pushed, not the working tree.
+
+What production MUST provide, all of which `public/.htaccess` does for Apache:
 - **Cross-origin isolation headers** — `Cross-Origin-Opener-Policy:
   same-origin` and `Cross-Origin-Embedder-Policy: credentialless` on every
   response. Without them there is no SharedArrayBuffer and the workers lose

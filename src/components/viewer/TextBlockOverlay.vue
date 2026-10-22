@@ -965,9 +965,15 @@ function extractionIndex(block: TextBlock): number {
   return Number.isFinite(n) ? n : 0
 }
 
-/** Whitespace-only differences are not edits worth rewriting a page for. */
+/**
+ * Whitespace-only differences are not edits worth rewriting a page for — but a
+ * LINE BREAK is. Collapsing every `\s` made "one two" and "one\ntwo" equal, so
+ * pressing Enter in a line was cancelled on blur as "nothing changed" and the
+ * break was silently lost.
+ */
 function sameText(a: string, b: string): boolean {
-  return a.replace(/\s+/g, ' ').trim() === b.replace(/\s+/g, ' ').trim()
+  const norm = (s: string) => s.split('\n').map(l => l.replace(/\s+/g, ' ').trim()).join('\n').trim()
+  return norm(a) === norm(b)
 }
 
 function onBlur() {
@@ -1165,27 +1171,73 @@ async function commitEdit(block: TextBlock, newText: string) {
       const guess = countLines(newText) - 1
       const plannedFor = planReplacementShift(block, guess + 1, 1, block.fontSize)
 
-      const result = await pdfEngine.replaceText(pageIndex, block.id, newText)
+      // Lines the user TYPED are given room BEFORE the text is written. Made
+      // afterwards, the new line already lies over the one below it, extraction
+      // merges the two into one interleaved block ("cfiurmmpadlioms…"), the
+      // planned anchor for that row no longer resolves, and the row it collides
+      // with is the one row the push leaves behind. The rows below are moved
+      // first, the edited line is found again by its anchor (moving renumbers
+      // the ids), and only what the MARGIN adds is pushed after the write.
+      let preMoved = 0
+      let target: TextBlock | undefined = block
+      if (guess > 0 && plannedFor.moves.length > 0) {
+        const anchor = anchorOf(block)
+        preMoved = await applyReflow(pageIndex, plannedFor)
+        if (preMoved > 0) {
+          blocks.value = await pdfEngine.getTextBlocks(pageIndex)
+          target = findByAnchor(anchor, new Set()) ?? undefined
+        }
+      }
+      const preShifted = preMoved > 0
+
+      const result = target
+        ? await pdfEngine.replaceText(pageIndex, target.id, newText)
+        : { success: false as const, lines: 1 }
       if (result.success) {
         pushUndoSnapshot() // snapshot pre-edit bytes only on success (before re-render)
         docStore.markModified()
 
         const delta = (result.lines ?? 1) - 1
-        const shift = delta === guess ? plannedFor : planReplacementShift(block, (result.lines ?? 1), 1, block.fontSize)
         // A line the user ADDED has to be given room, toggle or no toggle.
-      //
-      // This is the same distinction the drag makes: rearranging a page as a
-      // side effect of an edit is what the toggle governs, but pressing Enter
-      // IS a request for another line, and a content stream has no flow to make
-      // room by itself. Gated, the new line was drawn on top of the one below
-      // it — or, inside a one-line clip, not visibly drawn at all.
-      const moved = delta !== 0 ? await applyReflow(pageIndex, shift) : 0
+        //
+        // This is the same distinction the drag makes: rearranging a page as a
+        // side effect of an edit is what the toggle governs, but pressing Enter
+        // IS a request for another line, and a content stream has no flow to make
+        // room by itself. Gated, the new line was drawn on top of the one below
+        // it — or, inside a one-line clip, not visibly drawn at all.
+        let shift = delta === guess ? plannedFor : planReplacementShift(block, (result.lines ?? 1), 1, block.fontSize)
+        let moved = preMoved
+        if (preShifted) {
+          // Room for the typed lines is already made; only the margin's extra
+          // lines (or none) are left, measured from where the line now ends.
+          const extra = delta - guess
+          let last: TextBlock | undefined
+          if (extra !== 0) {
+            // Anchor on the run's LAST line, or the push would move the new
+            // lines themselves: the lowest block starting at the run's left
+            // edge within the lines it now draws.
+            blocks.value = await pdfEngine.getTextBlocks(pageIndex)
+            const span = (delta + 0.5) * lineStep(block.fontSize)
+            last = blocks.value
+              .filter(b => Math.abs(b.bbox[0] - block.bbox[0]) < 2 && b.bbox[1] >= block.bbox[1] - 2 && b.bbox[1] <= block.bbox[1] + span)
+              .sort((a, b) => b.bbox[1] - a.bbox[1])[0]
+          }
+          shift = last ? planRowShift(last, extra * lineStep(block.fontSize)) : { moves: [], capped: plannedFor.capped }
+          moved += shift.moves.length ? await applyReflow(pageIndex, shift) : 0
+        } else if (delta !== 0) {
+          moved = await applyReflow(pageIndex, shift)
+        }
 
         emit('textChanged')
         await loadBlocks()
-        editorStore.setStatus(describeEdit(result, countLines(newText), moved, delta !== 0 && shift.capped))
+        editorStore.setStatus(describeEdit(result, countLines(newText), moved, delta !== 0 && (shift.capped || plannedFor.capped && preShifted)))
       } else {
-        editorStore.setStatus(`Edit failed: ${pdfEngine.error.value || 'unknown error'}`)
+        // The rows were moved for an edit that did not land: put the engine back
+        // on the bytes the viewer still shows, or the page would come back
+        // rearranged around a line that never changed.
+        const why = pdfEngine.error.value || (target ? 'unknown error' : 'the line could not be found again after making room')
+        if (preShifted && docStore.pdfBytes) await pdfEngine.loadDocument(docStore.pdfBytes.slice().buffer)
+        editorStore.setStatus(`Edit failed: ${why}`)
       }
     })
   } catch (err: any) {

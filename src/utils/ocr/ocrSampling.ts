@@ -107,8 +107,10 @@ export function sampleLineColors(
   // read by its bands the red was the ink. A third of the height above and
   // below and a sixth of the width to each side is enough paper (or band) to
   // outvote the letters, and too little of a neighbouring rule or header to
-  // outvote the paper.
-  const padY = Math.max(2, Math.round(h * 0.3)), padX = Math.max(2, Math.round(w * 0.15))
+  // outvote the paper — but never more than half the height to a side: on a
+  // long title a sixth of its width reached past the navy band it sits on,
+  // and white lettering was sampled navy.
+  const padY = Math.max(2, Math.round(h * 0.3)), padX = Math.max(2, Math.round(Math.min(w * 0.15, h * 0.5)))
   const px0 = Math.max(0, x - padX), py0 = Math.max(0, y - padY)
   const pw = Math.min(ctx.canvas.width - px0, w + 2 * padX), ph = Math.min(ctx.canvas.height - py0, h + 2 * padY)
   let darkShare = 0

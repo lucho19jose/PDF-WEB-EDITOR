@@ -357,6 +357,25 @@ export class MuPDFBridge {
     return this.send('drawImageInContent', { pageIndex, rect, bytes, behind }, [bytes])
   }
 
+  /**
+   * The page's scan at its own resolution (the largest content image covering
+   * half the page or more), RGBA, with the CTM placing its unit square in the
+   * visible frame — or null when the page has no such image.
+   */
+  async getScanImage(pageIndex: number): Promise<{ width: number; height: number; rgba: ArrayBuffer; ctm: [number, number, number, number, number, number]; pageWidth: number; pageHeight: number; name: string } | null> {
+    return this.send('getScanImage', { pageIndex })
+  }
+
+  /** Glyphs of a bundled match face rasterised at `emPx` (coverage as Float32 buffers) — for letters a scan never printed. */
+  async rasterGlyphs(fontFile: string, chars: string[], emPx: number): Promise<({ w: number; h: number; cov: ArrayBuffer; baseY: number; originX: number; inkL: number; inkR: number; top: number; bottom: number; advance: number } | null)[]> {
+    return this.send('rasterGlyphs', { fontFile, chars, emPx })
+  }
+
+  /** Draw RGB + soft-mask pixel overlays over the page in one rewrite (scan edits). */
+  async drawPixelOverlays(pageIndex: number, overlays: { rect: RectT; width: number; height: number; rgb: ArrayBuffer; alpha: ArrayBuffer }[]): Promise<{ success: boolean; names?: string[]; error?: string }> {
+    return this.send('drawPixelOverlays', { pageIndex, overlays }, overlays.flatMap(o => [o.rgb, o.alpha]))
+  }
+
   /** Paint a filled rectangle into the page content, behind anything drawn after it. */
   async fillRect(pageIndex: number, rect: RectT, color: [number, number, number]): Promise<{ success: boolean; error?: string }> {
     return this.send('fillRect', { pageIndex, rect, color })
@@ -462,8 +481,8 @@ export class MuPDFBridge {
   }
 
   /** The page rendered by MuPDF at `scale` (1 = 72 DPI), /Rotate applied, as RGBA pixels. */
-  async renderPixmap(pageIndex: number, scale: number): Promise<{ width: number; height: number; rgba: ArrayBuffer }> {
-    return this.send('renderPixmap', { pageIndex, scale })
+  async renderPixmap(pageIndex: number, scale: number, contentOnly = false): Promise<{ width: number; height: number; rgba: ArrayBuffer }> {
+    return this.send('renderPixmap', { pageIndex, scale, contentOnly })
   }
 
   /**
