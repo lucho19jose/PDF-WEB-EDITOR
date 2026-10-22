@@ -630,19 +630,35 @@ function toggleSelection(block: TextBlock) {
  * would move somebody else's paragraph on the next drag. `taken` keeps two
  * anchors with the same text from both resolving to the same block.
  */
+const spaceFree = (s: string) => s.replace(/\s+/g, '')
+
 function findByAnchor(anchor: Anchor, taken: Set<string>): TextBlock | null {
-  let candidates = blocks.value.filter(b => b.text === anchor.text && !taken.has(b.id))
+  // Compared without spaces: re-extraction of a rewritten run can invent one
+  // ("3,613.72" read back "3 ,613.72"), and the selection was dropped for it.
+  const want = spaceFree(anchor.text)
+  let candidates = blocks.value.filter(b => spaceFree(b.text) === want && !taken.has(b.id))
   if (candidates.length === 0) {
     // Scaling text up can push its tail past the page edge, so re-extraction
     // returns a clipped string — match on the surviving prefix instead.
-    const prefix = anchor.text.slice(0, 3)
+    const prefix = want.slice(0, 3)
     candidates = prefix.length === 3
-      ? blocks.value.filter(b => !taken.has(b.id) && b.text.startsWith(prefix) &&
-          (b.text.startsWith(anchor.text) || anchor.text.startsWith(b.text)))
+      ? blocks.value.filter(b => {
+          const t = spaceFree(b.text)
+          return !taken.has(b.id) && t.startsWith(prefix) && (t.startsWith(want) || want.startsWith(t))
+        })
       : []
   }
   if (candidates.length === 0) return null
-  if (candidates.length === 1) return candidates[0]
+  // A sole match is still somebody else's text when it is far from where the
+  // anchor was: after a fund request's PROGRAMADO "4,000.00" was edited, the
+  // only "4,000.00" left was the SALDO line 24pt below, and the selection —
+  // the target of the next Delete or style click — silently moved onto it.
+  // A block's own moves re-anchor it, so a sole match far away is a twin.
+  if (candidates.length === 1) {
+    const b = candidates[0]
+    const dist = Math.hypot((b.bbox[0] + b.bbox[2]) / 2 - anchor.cx, (b.bbox[1] + b.bbox[3]) / 2 - anchor.cy)
+    return dist < 72 ? b : null
+  }
 
   let best: { block: TextBlock; dist: number } | null = null
   for (const b of candidates) {
@@ -1228,6 +1244,15 @@ async function commitEdit(block: TextBlock, newText: string) {
           moved = await applyReflow(pageIndex, shift)
         }
 
+        // The selection is re-found after the reload by its anchors, and the
+        // edited block's anchor still held the OLD text: the reload found that
+        // text on a twin instead (the other "4,000.00" of a form) and selected
+        // it. It now holds the text the block was given — its first line,
+        // which is what the block reads as once a wrap has split it.
+        const was = [anchorOf(block), anchorOf(target!)]
+        const firstLine = newText.split('\n')[0]
+        selectionAnchors.value = selectionAnchors.value.map(a =>
+          was.some(w => a.text === w.text && Math.hypot(a.cx - w.cx, a.cy - w.cy) < 1) ? { ...a, text: firstLine } : a)
         emit('textChanged')
         await loadBlocks()
         editorStore.setStatus(describeEdit(result, countLines(newText), moved, delta !== 0 && (shift.capped || plannedFor.capped && preShifted)))
@@ -2091,7 +2116,8 @@ function findByAnchorIn(list: TextBlock[], anchor: Anchor): TextBlock | null {
   const exact = list.filter(b => b.text === anchor.text)
   const pool = exact.length > 0 ? exact : list.filter(b => b.text.startsWith(anchor.text.slice(0, 3)))
   if (pool.length === 0) return null
-  if (pool.length === 1) return pool[0]
+  // What is found here is BLANKED (a spilled row cleared off its page), and
+  // the row has not moved: a sole match elsewhere is another row's text.
   let best: { b: TextBlock; d: number } | null = null
   for (const b of pool) {
     const d = Math.hypot((b.bbox[0] + b.bbox[2]) / 2 - anchor.cx, (b.bbox[1] + b.bbox[3]) / 2 - anchor.cy)
