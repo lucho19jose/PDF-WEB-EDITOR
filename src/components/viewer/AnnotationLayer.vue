@@ -133,6 +133,7 @@
         :style="{ color: editorStore.textColor, fontSize: ftFontPx + 'px' }"
         @keydown.escape.prevent="cancelFreeText"
         @keydown.enter.ctrl.prevent="commitFreeText"
+        @blur="onFreeTextBlur"
       />
       <div class="ft-actions" @mousedown.prevent>
         <q-btn dense flat size="xs" color="positive" icon="check" @click.stop="commitFreeText" />
@@ -846,12 +847,17 @@ const inkPreviewPoints = computed(() => {
   return drag.value.inkPts.map(p => `${p[0] * scaleX.value},${p[1] * scaleY.value}`).join(' ')
 })
 
-const freeTextStyle = computed(() => ({
-  left: `${ftRect.value[0] * scaleX.value}px`,
-  top: `${ftRect.value[1] * scaleY.value}px`,
-  width: `${Math.max(120, (ftRect.value[2] - ftRect.value[0]) * scaleX.value)}px`,
-  minHeight: `${Math.max(30, (ftRect.value[3] - ftRect.value[1]) * scaleY.value)}px`
-}))
+const freeTextStyle = computed(() => {
+  // A clicked box shows the size its text will be committed at, growing as
+  // it is typed into (see `fitFreeTextRect`).
+  const r = ftFromClickRef.value ? fitFreeTextRect(ftRect.value, freeTextValue.value || ' ') : ftRect.value
+  return {
+    left: `${r[0] * scaleX.value}px`,
+    top: `${r[1] * scaleY.value}px`,
+    width: `${Math.max(120, (r[2] - r[0]) * scaleX.value)}px`,
+    minHeight: `${Math.max(30, (r[3] - r[1]) * scaleY.value)}px`
+  }
+})
 
 // --- helpers ---
 function pageCoords(e: MouseEvent): { sx: number; sy: number; px: number; py: number } {
@@ -940,7 +946,7 @@ async function onCaptureUp() {
 
   // Ignore tiny accidental drags (except draw/note)
   if (d.tool !== 'draw' && (x1 - x0 < 3 && y1 - y0 < 3)) {
-    if (d.tool === 'freetext') { openFreeText([x0, y0, x0 + 180 / scaleX.value, y0 + 40 / scaleY.value]) }
+    if (d.tool === 'freetext') { openFreeText([x0, y0, x0 + 180 / scaleX.value, y0 + 40 / scaleY.value], true) }
     return
   }
 
@@ -1172,13 +1178,45 @@ async function handleObjectAction(action: ObjectAction) {
 onMounted(() => setObjectHandler(handleObjectAction))
 
 // --- FreeText ---
-function openFreeText(rect: RectT) {
+/** Whether the open box was placed by a click (its size is a default) rather than dragged out. */
+let ftFromClick = false
+const ftFromClickRef = ref(false)
+function openFreeText(rect: RectT, fromClick = false) {
   ftRect.value = rect
+  ftFromClick = fromClick
+  ftFromClickRef.value = fromClick
   // The Fill & Sign "date" button opens the box already holding today's date.
   freeTextValue.value = editorStore.freeTextPreset
   editorStore.freeTextPreset = ''
   freeTextEditing.value = true
   nextTick(() => ftRef.value?.focus())
+}
+let measureCtx: CanvasRenderingContext2D | null = null
+/**
+ * The box a text needs. A click placed a fixed 120×27pt box whatever was
+ * typed, so a name at 14pt wrapped and its second line was CLIPPED by the
+ * annotation's rectangle — in the file, not just on screen. Acrobat's Fill &
+ * Sign field grows with its text: a clicked box takes the text's width (up to
+ * the paper's edge, wrapping only past it), and any box grows downward until
+ * its lines fit. A dragged box keeps the width it was given.
+ */
+function fitFreeTextRect(rect: RectT, text: string): RectT {
+  measureCtx ??= document.createElement('canvas').getContext('2d')
+  const size = editorStore.fontSize
+  const family = editorStore.fontFamily || 'Helvetica'
+  const css = family.startsWith('Times') ? '"Times New Roman", Times, serif' : family.startsWith('Courier') ? '"Courier New", Courier, monospace' : 'Helvetica, Arial, sans-serif'
+  const weight = /Bold/.test(family) ? 'bold ' : ''
+  const style = /Oblique|Italic/.test(family) ? 'italic ' : ''
+  const pad = 4
+  const lines = text.split('\n')
+  const widthOf = (s: string) => measureCtx ? measureCtx.measureText(s).width * 1.08 : s.length * size * 0.6
+  if (measureCtx) measureCtx.font = `${style}${weight}${size}px ${css}`
+  const room = Math.max(30, props.pdfWidth - rect[0] - 6)
+  const w = ftFromClick ? Math.min(room, Math.max(30, Math.max(...lines.map(widthOf)) + pad * 2)) : rect[2] - rect[0]
+  const inner = Math.max(10, w - pad * 2)
+  const count = lines.reduce((n, l) => n + Math.max(1, Math.ceil(widthOf(l) / inner)), 0)
+  const h = Math.max(ftFromClick ? 0 : rect[3] - rect[1], count * size * 1.25 + pad * 2)
+  return [rect[0], rect[1], rect[0] + w, Math.min(props.pdfHeight, rect[1] + h)]
 }
 async function commitFreeText() {
   // Read from the DOM element directly (source of truth) to avoid v-model sync edge cases.
@@ -1186,10 +1224,21 @@ async function commitFreeText() {
   freeTextEditing.value = false
   if (!text.trim()) return
   const pageIndex = docStore.currentPage - 1
-  const rect = [...ftRect.value] as RectT
+  const rect = fitFreeTextRect([...ftRect.value] as RectT, text)
   await annotOp('Text box added', () => pdfEngine.addFreeText(pageIndex, rect, text, editorStore.fontSize, hexToRgb01(editorStore.textColor), editorStore.fontFamily))
 }
 function cancelFreeText() { freeTextEditing.value = false; freeTextValue.value = '' }
+/**
+ * Leaving the box commits it, as Acrobat's Fill & Sign does. Only Ctrl+Enter
+ * and the tick did: a click elsewhere left the text typed and uncommitted,
+ * the next tool's click went nowhere, and Save — whose `flushOpenEditor`
+ * commits editors by BLURRING them — wrote the file without the text while
+ * the screen still showed it. Cancel and commit close the box before it is
+ * removed, so the blur its removal fires finds nothing to do.
+ */
+function onFreeTextBlur() {
+  if (freeTextEditing.value) void commitFreeText()
+}
 
 // --- Image ---
 /** Clearance left between an inserted image and the text it sits between. */
