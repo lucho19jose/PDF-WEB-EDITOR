@@ -57,6 +57,8 @@ export async function createEngine() {
       const b = fs.readFileSync(file)
       return send('loadDocument', { bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) })
     },
+    /** Any other app module, through the same loader (e.g. the export writers). */
+    ssrLoad: (id) => server.ssrLoadModule(id),
     close: () => server.close(),
   }
 }

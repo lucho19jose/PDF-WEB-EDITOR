@@ -54,6 +54,7 @@ const menus: { label: string; items: Item[] }[] = [
       { label: 'Guardar', icon: 'sym_o_save', key: 'Ctrl+S', run: shell.save, disabled: noDoc },
       { label: 'Guardar como...', key: 'Mayús+Ctrl+S', run: shell.saveAs, disabled: noDoc },
       { label: 'Guardar como otro ▸ Word (.docx)', run: () => shell.commands.exportAs('docx'), disabled: noDoc },
+      { label: 'Guardar como otro ▸ Excel (.xlsx)...', run: () => ui.openDialog('export', { format: 'xlsx' }), disabled: noDoc },
       { label: 'Guardar como otro ▸ Texto (.txt)', run: () => shell.commands.exportAs('txt'), disabled: noDoc },
       { label: 'Exportar a ▸ Imagen (PNG)...', run: () => ui.openDialog('export', { format: 'png' }), disabled: noDoc },
       sep,

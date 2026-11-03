@@ -1,11 +1,13 @@
 /**
- * A minimal ZIP writer — STORE only, no compression.
+ * A minimal ZIP writer.
  *
- * Two things here need a zip and nothing else does: a .docx is a zip of XML
- * parts, and "export every page as an image" or "split into files" hands back
- * many files where one download is wanted. The entries are mostly PNG/JPEG
- * (already compressed) or small XML, so deflate would buy little for a
- * dependency; STORE with a CRC-32 is what every unzipper reads.
+ * Three things here need a zip and nothing else does: a .docx and an .xlsx
+ * are zips of XML parts, and "export every page as an image" or "split into
+ * files" hands back many files where one download is wanted. `makeZip` STOREs
+ * (the images are already compressed, and it is synchronous);
+ * `makeZipAsync` DEFLATEs through the browser's own `CompressionStream` —
+ * a workbook is XML that shrinks about tenfold — and stores any entry the
+ * browser cannot compress. Both write a CRC-32, which every unzipper reads.
  */
 
 const CRC_TABLE = (() => {
@@ -36,43 +38,81 @@ function dosStamp(d = new Date()): { time: number; date: number } {
 
 export function makeZip(entries: ZipEntry[]): Blob {
   const enc = new TextEncoder()
+  return assemble(entries.map(e => {
+    const data = typeof e.data === 'string' ? enc.encode(e.data) : e.data
+    return { name: e.name, data, stored: data, method: 0 }
+  }))
+}
+
+async function deflateRaw(data: Uint8Array): Promise<Uint8Array | null> {
+  const CS = (globalThis as any).CompressionStream
+  if (!CS) return null
+  try {
+    const stream = new Blob([data as BlobPart]).stream().pipeThrough(new CS('deflate-raw'))
+    return new Uint8Array(await new Response(stream).arrayBuffer())
+  } catch (_) {
+    return null
+  }
+}
+
+/**
+ * The same archive with its entries DEFLATED, where the browser can do it
+ * (`CompressionStream`, in every current engine). An .xlsx is mostly XML
+ * that compresses tenfold; stored, a long table comes out many times the size
+ * Excel itself would write. Falls back to STORE entry by entry.
+ */
+export async function makeZipAsync(entries: ZipEntry[]): Promise<Blob> {
+  const enc = new TextEncoder()
+  const prepared = []
+  for (const e of entries) {
+    const data = typeof e.data === 'string' ? enc.encode(e.data) : e.data
+    const packed = data.length > 64 ? await deflateRaw(data) : null
+    prepared.push(packed && packed.length < data.length
+      ? { name: e.name, data, stored: packed, method: 8 }
+      : { name: e.name, data, stored: data, method: 0 })
+  }
+  return assemble(prepared)
+}
+
+function assemble(entries: { name: string; data: Uint8Array; stored: Uint8Array; method: number }[]): Blob {
+  const enc = new TextEncoder()
   const { time, date } = dosStamp()
   const chunks: Uint8Array[] = []
   const central: Uint8Array[] = []
   let offset = 0
   for (const e of entries) {
     const name = enc.encode(e.name)
-    const data = typeof e.data === 'string' ? enc.encode(e.data) : e.data
+    const data = e.data, stored = e.stored
     const crc = crc32(data)
     const local = new DataView(new ArrayBuffer(30))
     local.setUint32(0, 0x04034B50, true)
     local.setUint16(4, 20, true)          // version needed
     local.setUint16(6, 0x0800, true)      // UTF-8 names
-    local.setUint16(8, 0, true)           // STORE
+    local.setUint16(8, e.method, true)    // 0 STORE, 8 DEFLATE
     local.setUint16(10, time, true)
     local.setUint16(12, date, true)
     local.setUint32(14, crc, true)
-    local.setUint32(18, data.length, true)
+    local.setUint32(18, stored.length, true)
     local.setUint32(22, data.length, true)
     local.setUint16(26, name.length, true)
     local.setUint16(28, 0, true)
-    chunks.push(new Uint8Array(local.buffer), name, data)
+    chunks.push(new Uint8Array(local.buffer), name, stored)
 
     const cd = new DataView(new ArrayBuffer(46))
     cd.setUint32(0, 0x02014B50, true)
     cd.setUint16(4, 20, true)
     cd.setUint16(6, 20, true)
     cd.setUint16(8, 0x0800, true)
-    cd.setUint16(10, 0, true)
+    cd.setUint16(10, e.method, true)
     cd.setUint16(12, time, true)
     cd.setUint16(14, date, true)
     cd.setUint32(16, crc, true)
-    cd.setUint32(20, data.length, true)
+    cd.setUint32(20, stored.length, true)
     cd.setUint32(24, data.length, true)
     cd.setUint16(28, name.length, true)
     cd.setUint32(42, offset, true)
     central.push(new Uint8Array(cd.buffer), name)
-    offset += 30 + name.length + data.length
+    offset += 30 + name.length + stored.length
   }
   const cdSize = central.reduce((n, c) => n + c.length, 0)
   const end = new DataView(new ArrayBuffer(22))

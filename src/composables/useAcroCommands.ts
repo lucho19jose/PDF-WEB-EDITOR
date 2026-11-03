@@ -5,6 +5,10 @@ import { useUiStore } from '@/stores/ui'
 import { enqueueOp, beginTransaction, settleTransactions } from '@/utils/opQueue'
 import { makeZip } from '@/utils/acro/zip'
 import { buildDocx, type StPage } from '@/utils/acro/docx'
+import { layoutPage, buildSheet } from '@/utils/acro/sheetLayout'
+import { buildXlsx } from '@/utils/acro/xlsx'
+import type { SheetPageData, SheetWord } from '@/engine/worker/sheetExtract'
+import { useOcrStore } from '@/stores/ocr'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
 import type { RectT } from '@/engine/types'
 
@@ -25,6 +29,25 @@ export interface AcroCommandDeps {
   loadBytes: (bytes: Uint8Array, name: string) => Promise<void>
   flushOpenEditor: () => Promise<void>
   bakeOcrEdits: () => Promise<number>
+  /** Recognise one scanned page (OCR) into the OCR store; absent where OCR is unavailable. */
+  recognisePage?: (pageIndex: number) => Promise<void>
+}
+
+export interface ExportOptions {
+  dpi?: number
+  quality?: number
+  pages?: number[]
+  /** Excel: one worksheet per page, or the whole document in one. */
+  sheetMode?: 'page' | 'single'
+  /** Excel: turn amounts, percentages and dates into numbers (default true). */
+  convertValues?: boolean
+}
+
+/** A page that is a picture with (almost) no text on it: a scan. */
+function isScannedPage(d: SheetPageData): boolean {
+  if (d.imageCover < 0.4) return false
+  const textArea = d.words.reduce((a, w) => a + (w.x1 - w.x0) * (w.y1 - w.y0), 0)
+  return textArea < d.width * d.height * 0.015
 }
 
 type Result = { success: boolean; error?: string; [k: string]: any }
@@ -34,6 +57,7 @@ export function useAcroCommands(deps: AcroCommandDeps) {
   const docStore = useDocumentStore()
   const editorStore = useEditorStore()
   const ui = useUiStore()
+  const ocrStore = useOcrStore()
   const { pdfEngine } = deps
 
   function say(msg: string) {
@@ -309,11 +333,88 @@ export function useAcroCommands(deps: AcroCommandDeps) {
 
   // ───────────────────────── Export ─────────────────────────
 
-  async function exportAs(format: 'docx' | 'txt' | 'html' | 'png' | 'jpeg', opts: { dpi?: number; quality?: number; pages?: number[] } = {}) {
+  /**
+   * The recognised runs of a scanned page as words, in the page's own points.
+   * They stand in for the page's text: whatever text the page does hold under
+   * them (an edit already baked in) is the same words again.
+   */
+  function withOcrWords(d: SheetPageData): SheetPageData {
+    const res = ocrStore.resultFor(d.pageIndex)
+    const items = ocrStore.itemsFor(d.pageIndex).filter(i => !i.removed && i.text.trim())
+    if (!res || !items.length) return d
+    const sx = d.width / (res.pageWidth || d.width), sy = d.height / (res.pageHeight || d.height)
+    const runs: SheetWord[] = items.map(i => {
+      const x0 = i.rect.x * sx, y0 = i.rect.y * sy, x1 = (i.rect.x + i.rect.width) * sx, y1 = (i.rect.y + i.rect.height) * sy
+      const [r, g, b] = (i.color ?? [0, 0, 0]).map(v => Math.max(0, Math.min(255, Math.round(v * 255))))
+      return {
+        x0, y0, x1, y1, base: y1 - (y1 - y0) * 0.22, size: i.fontSize || (y1 - y0) * 0.8, text: i.text.replace(/s+/g, ' ').trim(),
+        bold: !!i.bold, italic: !!i.italic, color: (r << 16) | (g << 8) | b, font: i.fontFamily || '', vertical: i.vertical || undefined, sp: 1
+      }
+    })
+    // A recogniser's point sizes are estimates from the ink and scatter far
+    // more than the page did (a 9pt value read as 20pt beside a 5pt label):
+    // held to the page's typical size, a title still reads a little larger.
+    const sizes = runs.map(r => r.size).sort((a, b) => a - b)
+    const typical = sizes[sizes.length >> 1] || 10
+    for (const r of runs) r.size = Math.min(typical * 1.5, Math.max(typical * 0.8, r.size))
+    const under = (w: SheetWord) => runs.some(r => (w.x0 + w.x1) / 2 >= r.x0 && (w.x0 + w.x1) / 2 <= r.x1 && (w.y0 + w.y1) / 2 >= r.y0 && (w.y0 + w.y1) / 2 <= r.y1)
+    return { ...d, words: [...d.words.filter(w => !under(w)), ...runs] }
+  }
+
+  /**
+   * "Exportar a Microsoft Excel": every chosen page read by the engine (its
+   * words and the lines of its tables), rebuilt as rows, columns and merged
+   * cells (`sheetLayout.ts`) and written as an .xlsx (`xlsx.ts`).
+   *
+   * A scanned page holds no text to export, only a picture of it. Pages the
+   * user has already recognised use their OCR runs; for the rest the user is
+   * offered recognition first — a page left as a picture becomes a sheet that
+   * says so, rather than an empty one that looks like a failure.
+   */
+  async function exportXlsx(name: string, opts: ExportOptions) {
+    const pages = opts.pages?.length ? opts.pages : Array.from({ length: docStore.totalPages }, (_, i) => i)
+    let data: SheetPageData[] = []
+    for (const [k, i] of pages.entries()) {
+      say(`Exportando a Excel: analizando la página ${i + 1} (${k + 1} de ${pages.length})…`)
+      data.push(await pdfEngine.acro<SheetPageData>('sheetPage', { pageIndex: i }))
+    }
+    const unread = data.filter(d => isScannedPage(d) && !ocrStore.itemsFor(d.pageIndex).length)
+    if (unread.length && deps.recognisePage) {
+      const which = unread.length === 1 ? `La página ${unread[0].pageIndex + 1} es una imagen escaneada` : `${unread.length} páginas son imágenes escaneadas`
+      const ok = await confirm('Exportar a Excel', `${which}, sin texto que llevar a Excel. ¿Reconocer su texto (OCR) antes de exportar? Tarda unos segundos por página.`)
+      if (ok) {
+        for (const [k, d] of unread.entries()) {
+          say(`Exportando a Excel: reconociendo el texto de la página ${d.pageIndex + 1} (${k + 1} de ${unread.length})…`)
+          try { await deps.recognisePage(d.pageIndex) } catch (err: any) { say(`No se pudo reconocer la página ${d.pageIndex + 1}: ${err?.message || err}`) }
+        }
+      }
+    }
+    data = data.map(withOcrWords)
+    say('Exportando a Excel: armando las tablas…')
+    const layouts = data.map(d => layoutPage(d))
+    const still = data.filter(d => isScannedPage(d)).map(d => d.pageIndex + 1)
+    const note = (n: number[]) => n.length
+      ? `${n.length === 1 ? 'La página' : 'Las páginas'} ${n.join(', ')} ${n.length === 1 ? 'es una imagen escaneada' : 'son imágenes escaneadas'} sin texto: use «Reconocer texto» (OCR) para exportar su contenido.`
+      : undefined
+    const sheets = opts.sheetMode === 'single'
+      ? [Object.assign(buildSheet(layouts, { name }), { note: note(still) })]
+      : layouts.map((L, k) => Object.assign(buildSheet([L], { name: `Página ${pages[k] + 1}` }), { note: note(still.filter(p => p === pages[k] + 1)) }))
+    const blob = await buildXlsx(sheets, { convertValues: opts.convertValues !== false, title: name })
+    download(blob, `${name}.xlsx`)
+    if (still.length) say(`Excel listo. ${note(still)}`)
+  }
+
+  async function exportAs(format: 'docx' | 'xlsx' | 'txt' | 'html' | 'png' | 'jpeg', opts: ExportOptions = {}) {
     if (!docStore.loaded) return
     await deps.flushOpenEditor()
     await deps.bakeOcrEdits()
     const name = baseName()
+    if (format === 'xlsx') {
+      // Recognition (offered for scanned pages) does queue work of its own,
+      // so this export holds no transaction: it only reads the document.
+      try { await exportXlsx(name, opts) } catch (err: any) { say(`No se pudo exportar: ${err?.message || err}`) }
+      return
+    }
     const end = beginTransaction()
     try {
       if (format === 'docx') {

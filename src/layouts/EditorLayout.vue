@@ -2214,7 +2214,10 @@ watch(
 
 // ===== THE ACROBAT SHELL =====
 const acroCommands = useAcroCommands({
-  pdfEngine, syncAfterEdit, pushUndo, forgetOcr, loadBytes, flushOpenEditor, bakeOcrEdits
+  pdfEngine, syncAfterEdit, pushUndo, forgetOcr, loadBytes, flushOpenEditor, bakeOcrEdits,
+  // Exporting a scan to Excel recognises it first; the export reads the runs
+  // once the background re-read from the page's own letters has settled.
+  recognisePage: async (pageIndex: number) => { await runOcrNow(pageIndex, OCR_DEFAULT_LANG); await ocr.settleRepairs() }
 })
 const acroShell = createAcroShell({
   pdfEngine,

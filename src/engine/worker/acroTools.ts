@@ -15,6 +15,8 @@
  * walk the OCR layer uses.
  */
 
+import { extractSheetPage } from './sheetExtract'
+
 type Mat6 = [number, number, number, number, number, number]
 
 export interface AcroTextPart {
@@ -952,6 +954,7 @@ export function createAcroTools(ctx: AcroContext) {
       case 'exportText': return { data: exportText() }
       case 'exportHtml': return { data: exportHtml() }
       case 'exportStructured': return { data: exportStructured() }
+      case 'sheetPage': return { data: extractSheetPage(ctx.mupdf(), doc(), a.pageIndex, watermarkTextOf(a.pageIndex)) }
       case 'renderImage': { const b = renderImage(a.pageIndex, a.scale, a.format, a.quality); return { data: b, transfer: [b] } }
       case 'createPdf': { const r = createPdf(a.images ?? [], a.blank); return { data: r, transfer: r.bytes ? [r.bytes] : [] } }
       case 'combinePdf': { const r = combinePdf(a.files); return { data: r, transfer: r.bytes ? [r.bytes] : [] } }

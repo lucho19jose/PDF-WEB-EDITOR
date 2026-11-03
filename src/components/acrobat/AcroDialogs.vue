@@ -322,6 +322,15 @@
           </div>
           <PageRangePicker v-model="exp.pages" class="q-mt-sm" />
         </div>
+        <div v-if="exp.format === 'xlsx'" class="q-mt-md">
+          <fieldset class="xl-opts">
+            <legend>Hojas de cálculo</legend>
+            <label class="acro-check"><input v-model="xlSheetMode" type="radio" value="page" /> Una hoja por página</label>
+            <label class="acro-check"><input v-model="xlSheetMode" type="radio" value="single" /> Todo el documento en una sola hoja</label>
+            <label class="acro-check"><input v-model="xlConvert" type="checkbox" /> Convertir importes, porcentajes y fechas en números</label>
+          </fieldset>
+          <PageRangePicker v-model="exp.pages" class="q-mt-sm" />
+        </div>
       </div>
       <div class="acro-card-actions">
         <button class="acro-pill outline" @click="close">Cancelar</button>
@@ -482,6 +491,7 @@ import { useEditorStore } from '@/stores/editor'
 import { useUiStore } from '@/stores/ui'
 import { hexToRgb01 } from '@/utils/color'
 import { parsePageRange } from '@/composables/useAcroCommands'
+import { persistedRef } from '@/utils/persist'
 import ColorSwatch from '@/components/toolbar/ColorSwatch.vue'
 import PageRangePicker from './PageRangePicker.vue'
 import SignaturePad from './SignaturePad.vue'
@@ -746,14 +756,19 @@ async function applyCreate() {
 // ═════════════ Export ═════════════
 const exportFormats = [
   { v: 'docx', l: 'Microsoft Word', d: 'Documento de Word (*.docx)', icon: 'sym_o_description', color: '#4b9cf5' },
+  { v: 'xlsx', l: 'Microsoft Excel', d: 'Libro de Excel (*.xlsx): tablas en celdas, importes como números', icon: 'sym_o_table_view', color: '#21a366' },
   { v: 'png', l: 'Imagen PNG', d: 'Una imagen por página (*.png)', icon: 'sym_o_image', color: '#26c0c7' },
   { v: 'jpeg', l: 'Imagen JPEG', d: 'Una imagen por página (*.jpg)', icon: 'sym_o_photo', color: '#26c0c7' },
   { v: 'txt', l: 'Texto', d: 'Texto sin formato (*.txt)', icon: 'sym_o_article', color: '#cfcfcf' },
   { v: 'html', l: 'Página web HTML', d: 'HTML con el diseño de la página (*.html)', icon: 'sym_o_code', color: '#f5a623' }
 ] as const
 const exp = reactive({ format: 'docx' as typeof exportFormats[number]['v'], dpi: 150, quality: 90, pages: [] as number[] })
+// Remembered between sessions: someone who exports bank statements wants one
+// sheet every time, someone who exports forms one per page.
+const xlSheetMode = persistedRef<'page' | 'single'>('export.xlsx.sheetMode', 'page')
+const xlConvert = persistedRef<boolean>('export.xlsx.convertValues', true)
 async function applyExport() {
-  const opts = { dpi: exp.dpi, quality: exp.quality, pages: [...exp.pages] }
+  const opts = { dpi: exp.dpi, quality: exp.quality, pages: [...exp.pages], sheetMode: xlSheetMode.value, convertValues: xlConvert.value }
   const fmt = exp.format
   close()
   await commands.exportAs(fmt, opts)
@@ -962,6 +977,7 @@ watch(() => ui.dialog, async d => {
 .fmt span { display: flex; flex-direction: column; }
 .fmt small { color: var(--acro-text-dim); font-size: 11px; }
 .fmt input { accent-color: var(--acro-blue); }
+.xl-opts { display: flex; flex-direction: column; gap: 8px; }
 .keys { width: 100%; border-collapse: collapse; font-size: 13px; }
 .keys td { padding: 5px 6px; border-bottom: 1px solid var(--acro-border); }
 kbd { background: var(--acro-surface); border: 1px solid var(--acro-border); border-radius: 3px; padding: 1px 6px; font-family: inherit; font-size: 12px; white-space: nowrap; }

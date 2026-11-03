@@ -102,6 +102,62 @@ side is ONE worker message, `acro`, dispatched in `worker/acroTools.ts`;
   fresh session logged a 404 console error — enough to fail
   `tools/acro/organize-browser.mjs`'s "no browser runtime errors" check.
 
+### "Exportar a Microsoft Excel": tables rebuilt from words and rules
+The export dialog (and Archivo ▸ Guardar como otro ▸ Excel) writes an .xlsx
+in three steps: the worker's `sheetPage` op (`worker/sheetExtract.ts`) reads
+a page's words with their boxes plus the drawing that makes tables (rules,
+coloured fills, small tick marks), `utils/acro/sheetLayout.ts` rebuilds rows,
+columns and merged cells, and `utils/acro/xlsx.ts` writes SpreadsheetML by
+hand (deflated through `makeZipAsync`). `node tools/pdf-sweep/xlsx-export.mjs
+<in.pdf> <out.xlsx> --dump` runs all of it in node; `xlsx-batch.mjs <dir>
+<manifest...>` + `xlsx-validate.py <dir>` sweep the corpora (562 files, all
+valid workbooks); `node --experimental-strip-types --test
+tools/pdf-sweep/xlsx-export.test.mjs` covers the converter and the layout.
+
+What the drawing looks like, and what each shape means:
+- **A border is drawn four ways**: stroked line or rect, a thin FILLED rect
+  (Excel/Word draw every cell border so), a filled FRAME (outer + inner rect
+  in one path — not a black cell), a 1-px-thick image. All become rules.
+- **White rules are paper.** Excel paints white borders to hide its
+  gridlines; read as lines they put a grid inside every signature box.
+- **A small empty closed square is a checkbox**, written as ☐ / ☒ (ticked by
+  a coloured fill of its size or a mark inside), whether isolated or drawn
+  against a cell border (then its own lines are taken back out of the grid).
+- **A ruled cell holding several columns of text was never given its inner
+  lines** (a box around a whole item list, "VALOR DE VENTA 78,243.32" over
+  "I.G.V 18% 14,083.80"): `subdivide` adds INVISIBLE ones — a row per text
+  line, a column per gutter, interrupted where a line runs across.
+- **A frame round most of the page is decoration**, a diagram's connectors are
+  not a table (dozens of columns, almost all cells empty): both dissolve.
+
+Unruled text: rows by baseline, columns from GUTTERS read off the rows that
+hold the usual number of cells (and again without the first row — a heading is
+often wider than its column), or from a form's underlines, which never move.
+Text is placed by where it STARTS and a figure by where it ENDS.
+
+**One set of columns per sheet** (`Columns`), seeded by the main table (the
+one with the most filled cells). Every other ruled table maps its borders onto
+it by a small DP: moving a border costs its distance, a new column costs every
+main-table cell it would split. A header box over a data table therefore
+shifts a border onto the table's column instead of splitting the description
+column into merged cells down its whole length. For an unruled main table the
+harm is measured on its cells' anchors: a boundary left of a column of
+left-set labels splits nothing. Things side by side on the page (two signature
+boxes, an address beside the tax-number box) share rows in one BAND whose rows
+are the union of theirs. Column widths are the page's geometry.
+
+Values: `cellValue.ts` converts a cell only when the WHOLE cell is one number,
+percentage or date, always with a format that prints it as the PDF did
+(`"S/ "#,##0.00`, `#,##0.00;#,##0.00-` for SAP's trailing minus,
+`dd/mm/yyyy`). The decimal separator is voted per document; identifiers
+(leading zero, nine digits or more: RUC, phones, accounts) stay text. A number
+wider than its column would print `#####`: unruled columns widen, a form's
+columns keep the text.
+
+A scanned page (picture, almost no text) offers OCR first
+(`deps.recognisePage`); pages already recognised export their OCR runs; one
+left as a picture becomes a sheet that says so.
+
 ### Ask where to save BEFORE saving, not after
 Both ways of writing a file out — `showSaveFilePicker` and a programmatic
 `<a download>` click — need **transient user activation**, and that expires about
