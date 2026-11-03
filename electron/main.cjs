@@ -12,6 +12,8 @@
 const { app, BrowserWindow, protocol, shell, dialog, ipcMain, Menu } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
+const os = require('node:os')
+const { spawn } = require('node:child_process')
 
 const SCHEME = 'app'
 const HOST = 'pdf-editor'
@@ -83,6 +85,71 @@ function registerAppProtocol() {
   })
 }
 
+// ===== The "PDF Editor Pro" printer =====
+// A Windows printer like PDF24's: "Imprimir" in any program (SAP, Excel, a
+// browser) makes a PDF and opens it here. The printer is Windows' own
+// "Microsoft Print To PDF" driver on a named-pipe port, installed by the
+// installer (build/installer.nsh, electron/printer/*.ps1); the pipe is served
+// by electron/print-listener.cjs, this executable run as plain Node. Windows
+// HOLDS a job printed while nothing listens and sends it again once the
+// listener is up, so a job is late at worst, never lost.
+const PRINTER_NAME = 'PDF Editor Pro'
+const PRINT_PIPE = 'PDFEditorPro' // PIPE in print-listener.cjs, $PortName in install-printer.ps1
+const LISTENER_FLAG = '--print-listener'
+// The logon entry's name under HKCU\…\Run. build/installer.nsh deletes it on uninstall.
+const LOGIN_ITEM = 'PDF Editor Pro - Impresora'
+// Where the listener keeps the jobs (OUT in print-listener.cjs). A file opened
+// from here is a print job: never saved by the user yet.
+const PRINT_JOBS = path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'PDF Editor Pro', 'Impresiones')
+
+function isPrintJob(filePath) {
+  return path.dirname(path.resolve(filePath)).toLowerCase() === PRINT_JOBS.toLowerCase()
+}
+
+function listenerRunning() {
+  // Listing pipes does not connect to one: connecting would read as a print job.
+  try { return fs.readdirSync('\\\\.\\pipe\\').includes(PRINT_PIPE) } catch { return false }
+}
+
+/** Starts the listener unless one already serves the pipe. */
+function startPrintListener() {
+  if (listenerRunning()) return
+  // asarUnpack puts the script on disk; plain Node does not read the archive.
+  const script = path.join(__dirname, 'print-listener.cjs')
+    .replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`)
+  const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+  // In development the executable is electron.exe, which needs the app first.
+  if (!app.isPackaged) env.PDF_EDITOR_APP_ARGS = JSON.stringify([app.getAppPath()])
+  try {
+    const child = spawn(process.execPath, [script], { detached: true, stdio: 'ignore', windowsHide: true, env })
+    child.on('error', () => { /* the next launch tries again */ })
+    child.unref()
+  } catch { /* the next launch tries again */ }
+}
+
+let printerChecked = false
+/**
+ * Once per run: when the printer is installed, make sure its listener runs now
+ * and at every logon. When it is gone (removed from Windows' settings), drop
+ * the logon entry. Asked of Chromium's printer list, not of PowerShell —
+ * Sophos would block the app from starting PowerShell.
+ */
+function checkPrinter(win) {
+  if (printerChecked || process.platform !== 'win32') return
+  printerChecked = true
+  win.webContents.getPrintersAsync().then(printers => {
+    // An empty list means the spooler could not be asked, not that the printer is gone.
+    if (!printers.length) return
+    const installed = printers.some(p => p.name === PRINTER_NAME)
+    if (app.isPackaged) {
+      app.setLoginItemSettings({ openAtLogin: installed, path: process.execPath, args: [LISTENER_FLAG], name: LOGIN_ITEM })
+    }
+    // A development run's listener would outlive it and keep the pipe, sending
+    // later jobs to a dev server that is gone: opt in with PDF_EDITOR_DEV_PRINTER=1.
+    if (installed && (app.isPackaged || process.env.PDF_EDITOR_DEV_PRINTER)) startPrintListener()
+  }).catch(() => {})
+}
+
 // ===== Windows and the files opened in them =====
 // The editor holds ONE document per page (one engine, one document store), so
 // a PDF opened from Explorer while a window already shows a document must get
@@ -107,7 +174,8 @@ function deliver(state, filePath) {
     if (state.win.isDestroyed()) return
     state.win.webContents.send('desktop:open-file', {
       name: path.basename(filePath),
-      bytes: new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+      bytes: new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
+      printed: isPrintJob(filePath)
     })
   }).catch(err => {
     state.claimed = false
@@ -121,8 +189,47 @@ function focus(win) {
   win.focus()
 }
 
-/** Open a PDF: in an empty window if there is one, otherwise in a new one. */
-function openFile(filePath) {
+/**
+ * Brings a window in front of the program the user is in. A print job reaches
+ * the app from a background process, and Windows does not let such a process
+ * take the foreground: plain focus() left the document behind SAP. A window may
+ * always go topmost, and on leaving topmost it stays above the others — where
+ * PDF24's assistant appears. Toggled in one go the window was not shown yet and
+ * still landed behind, so it stays topmost for a moment. The taskbar button
+ * flashes until the window is clicked.
+ */
+function raise(win) {
+  win.setAlwaysOnTop(true)
+  focus(win)
+  win.moveTop()
+  setTimeout(() => {
+    if (win.isDestroyed()) return
+    win.setAlwaysOnTop(false)
+    if (!win.isFocused()) {
+      win.flashFrame(true)
+      win.once('focus', () => win.flashFrame(false))
+    }
+  }, 1500)
+}
+
+/**
+ * Open a PDF: in an empty window if there is one, otherwise in a new one. A
+ * print job goes first to a window COLLECTING print jobs (its document is
+ * print jobs not saved yet), where it joins the Combinar list instead of
+ * replacing anything — unless `separate` (the list's "open apart" button).
+ */
+function openFile(filePath, { separate = false } = {}) {
+  const printed = isPrintJob(filePath)
+  if (printed && !separate) {
+    const collecting = [...editors.values()].filter(s => !s.win.isDestroyed() && s.ready && s.collecting)
+    const focused = BrowserWindow.getFocusedWindow()
+    const into = collecting.find(s => s.win === focused) || collecting[collecting.length - 1]
+    if (into) {
+      deliver(into, filePath)
+      raise(into.win)
+      return
+    }
+  }
   const free = [...editors.values()].filter(s => !s.win.isDestroyed() && !s.hasDoc && !s.claimed)
   const focused = BrowserWindow.getFocusedWindow()
   const target = free.find(s => s.win === focused) || free[0]
@@ -130,10 +237,11 @@ function openFile(filePath) {
     target.claimed = true
     if (target.ready) deliver(target, filePath)
     else target.pending.push(filePath)
-    focus(target.win)
+    if (printed) raise(target.win)
+    else focus(target.win)
     return
   }
-  const state = createWindow()
+  const state = createWindow({ raise: printed })
   state.claimed = true
   state.pending.push(filePath)
 }
@@ -148,6 +256,7 @@ ipcMain.on('desktop:ready', (e) => {
   // A page that just (re)loaded holds no document, whatever it held before.
   s.ready = true
   s.hasDoc = false
+  s.collecting = false
   while (s.pending.length) deliver(s, s.pending.shift())
 })
 
@@ -160,7 +269,21 @@ ipcMain.on('desktop:has-document', (e, hasDoc) => {
   s.claimed = false
 })
 
-function createWindow() {
+ipcMain.on('desktop:collecting', (e, collecting) => {
+  const s = stateOf(e)
+  if (s) s.collecting = !!collecting
+})
+
+ipcMain.on('desktop:open-print-jobs', (_e, names) => {
+  if (!Array.isArray(names)) return
+  for (const name of names) {
+    // A name, never a path: only files the listener wrote can be opened this way.
+    const file = path.join(PRINT_JOBS, path.basename(String(name)))
+    if (/\.pdf$/i.test(file) && fs.existsSync(file)) openFile(file, { separate: true })
+  }
+})
+
+function createWindow({ raise: raiseOnShow = false } = {}) {
   const others = BrowserWindow.getAllWindows().filter(w => editors.has(w.webContents.id))
   const win = new BrowserWindow({
     width: 1400,
@@ -182,7 +305,7 @@ function createWindow() {
       plugins: true
     }
   })
-  const state ={ win, ready: false, hasDoc: false, claimed: false, pending: [] }
+  const state = { win, ready: false, hasDoc: false, claimed: false, collecting: false, pending: [] }
   const id = win.webContents.id
   editors.set(id, state)
 
@@ -193,7 +316,8 @@ function createWindow() {
     const [x, y] = others[others.length - 1].getPosition()
     win.setPosition(x + 32, y + 32)
   }
-  win.once('ready-to-show', () => win.show())
+  win.once('ready-to-show', () => { if (raiseOnShow) raise(win); else win.show() })
+  win.webContents.once('did-finish-load', () => checkPrinter(win))
 
   const allowed = DEV_URL ? new URL(DEV_URL).origin : ORIGIN
   // Links to the web open in the user's browser; the app's own popups (the
@@ -316,7 +440,13 @@ function setupUpdates() {
 }
 
 // ===== Startup =====
-if (!app.requestSingleInstanceLock()) {
+if (process.argv.includes(LISTENER_FLAG)) {
+  // The logon entry, or the installer: start the printer's listener as plain
+  // Node and leave. Never takes the single-instance lock — a running app would
+  // otherwise receive this launch as a second instance.
+  startPrintListener()
+  app.exit(0)
+} else if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
   // A second launch: from Explorer with files, or from the Start menu without.

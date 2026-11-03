@@ -12464,6 +12464,44 @@ function flattenAnnotationBehind(
  * render at any other resolution straddles the scan's pixels and its edge
  * shows.
  */
+/**
+ * True when the page shows ink over `rect` (top-left page points) that the
+ * image does not hold: dark pixels make up a share of a 72 DPI render of the
+ * page inside the rect, and under a fifth of that share of the image itself.
+ * A render blurs a scan's thin strokes, so a real scan always holds at least
+ * as much dark as the render shows; a few lines baked over it change little.
+ */
+function imageLacksPageInk(pageIndex: number, rgba: Uint8ClampedArray, w: number, h: number, rect: number[]): boolean {
+  const darkShare = (data: ArrayLike<number>, stride: number, n: number, x0: number, y0: number, x1: number, y1: number, rowLen: number) => {
+    let dark = 0, total = 0
+    for (let y = y0; y < y1; y += stride) for (let x = x0; x < x1; x += stride) {
+      const p = (y * rowLen + x) * n
+      total++
+      if (0.2126 * data[p] + 0.7152 * data[p + 1] + 0.0722 * data[p + 2] < 140) dark++
+    }
+    return total ? dark / total : 0
+  }
+  if (!pdfDoc || !mupdf) return false
+  let page: any = null, pix: any = null
+  try {
+    page = pdfDoc.loadPage(pageIndex)
+    pix = page.toPixmap(mupdf.Matrix.identity, mupdf.ColorSpace.DeviceRGB, false, false)
+    const pw = pix.getWidth(), ph = pix.getHeight(), n = pix.getNumberOfComponents()
+    const x0 = Math.max(0, Math.floor(Math.min(rect[0], rect[2]))), x1 = Math.min(pw, Math.ceil(Math.max(rect[0], rect[2])))
+    const y0 = Math.max(0, Math.floor(Math.min(rect[1], rect[3]))), y1 = Math.min(ph, Math.ceil(Math.max(rect[1], rect[3])))
+    if (x1 - x0 < 10 || y1 - y0 < 10) return false
+    const onPage = darkShare(pix.getPixels(), 1, n, x0, y0, x1, y1, pw)
+    if (onPage < 0.003) return false
+    const inImage = darkShare(rgba, Math.max(1, Math.round(Math.min(w, h) / 600)), 4, 0, 0, w, h, w)
+    return inImage < onPage * 0.2
+  } catch (_) {
+    return false
+  } finally {
+    try { pix?.destroy() } catch (_) {}
+    try { page?.destroy() } catch (_) {}
+  }
+}
+
 function getScanImage(pageIndex: number): { width: number; height: number; rgba: Uint8ClampedArray; ctm: Mat6; pageWidth: number; pageHeight: number; name: string } | null {
   if (!pdfDoc || !mupdf) return null
   const size = getPageSize(pageIndex)
@@ -12536,6 +12574,13 @@ function getScanImage(pageIndex: number): { width: number; height: number; rgba:
     const inContent = withSource(src, () => getFullCtmAtOffset(src.stream, best!.doOffset))
     const rot = pageRotationCtm(pageIndex)
     const ctm = rot ? matConcat(inContent, rot) : inContent
+    // The largest image is the scan only if it holds the page's INK. A browser
+    // printed through Microsoft Print to PDF lays a blank white JPEG under the
+    // page's card and draws every letter over it as vector outlines: taken for
+    // the scan, the page read as empty paper, and the patch meant to cover an
+    // edited heading's old words was dropped as "nothing printed here" — the
+    // old words showed through the new ones.
+    if (imageLacksPageInk(pageIndex, rgba, w, h, best.rect)) return null
     return { width: w, height: h, rgba, ctm, pageWidth: size.width, pageHeight: size.height, name: best.name }
   } catch (err) {
     console.warn('[MuPDF Worker] getScanImage failed:', err)

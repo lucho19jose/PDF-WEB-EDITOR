@@ -4,7 +4,10 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('desktop', {
   isDesktop: true,
-  /** Called with { name, bytes } for each PDF opened from Windows. */
+  /**
+   * Called with { name, bytes, printed } for each PDF opened from Windows;
+   * `printed` marks a job from the "PDF Editor Pro" printer.
+   */
   onOpenFile(callback) {
     ipcRenderer.on('desktop:open-file', (_e, file) => callback(file))
   },
@@ -18,5 +21,13 @@ contextBridge.exposeInMainWorld('desktop', {
    */
   setHasDocument(hasDoc) {
     ipcRenderer.send('desktop:has-document', !!hasDoc)
+  },
+  /** This window holds unsaved print jobs: the next job joins its list. */
+  setCollecting(collecting) {
+    ipcRenderer.send('desktop:collecting', !!collecting)
+  },
+  /** Opens print jobs, by file name in the print folder, each in its own window. */
+  openPrintJobs(names) {
+    ipcRenderer.send('desktop:open-print-jobs', Array.isArray(names) ? names.map(String) : [])
   }
 })

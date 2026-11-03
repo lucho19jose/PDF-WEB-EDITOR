@@ -490,7 +490,8 @@ export function useAcroCommands(deps: AcroCommandDeps) {
 
   /** "Combinar archivos": a new document, the files' pages in the order given. */
   let combineInFlight = false
-  async function combine(files: File[], includeOpen = false): Promise<Result> {
+  /** `openAt`: where the open document goes among `files` (0 = first). */
+  async function combine(files: File[], includeOpen = false, openAt = 0): Promise<Result> {
     if (combineInFlight) return { success: false, error: 'Ya hay una combinacion en curso' }
     if (!files.length && !includeOpen) return { success: false, error: 'Agregue archivos para combinar' }
     combineInFlight = true
@@ -499,14 +500,15 @@ export function useAcroCommands(deps: AcroCommandDeps) {
       await settleTransactions()
       return await enqueueOp(async () => {
         const inputs: ArrayBuffer[] = [], names: string[] = []
-        if (includeOpen && docStore.loaded) {
-          inputs.push(await pdfEngine.saveDocument()); names.push(docStore.fileName || 'documento.pdf')
-        }
         for (const file of files) {
           say(`Preparando ${file.name}...`)
           const bytes = await pdfBytesOf(file)
           if (!bytes) return { success: false, error: `No se pudo leer ${file.name}` }
           inputs.push(bytes); names.push(file.name)
+        }
+        if (includeOpen && docStore.loaded) {
+          const at = Math.max(0, Math.min(openAt, inputs.length))
+          inputs.splice(at, 0, await pdfEngine.saveDocument()); names.splice(at, 0, docStore.fileName || 'documento.pdf')
         }
         say(`Combinando ${inputs.length} archivos...`)
         const r = await pdfEngine.acro<Result>('combinePdf', { files: inputs }, inputs)

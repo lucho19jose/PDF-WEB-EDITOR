@@ -15,6 +15,7 @@ files:
   - package.json
   - electron/main.cjs
   - electron/preload.cjs
+  - electron/print-listener.cjs
   - build/icon.png
   - dist/**/*
   # A local `vite build` copies public/_sweep into dist: real documents of the
@@ -29,6 +30,16 @@ files:
   - "!dist/_redirects"
 
 asar: true
+# The printer's listener runs as plain Node (ELECTRON_RUN_AS_NODE), which is
+# given a path on disk rather than one inside the archive.
+asarUnpack:
+  - electron/print-listener.cjs
+
+# The "PDF Editor Pro" printer's setup, run elevated by build/installer.nsh.
+extraResources:
+  - from: electron/printer
+    to: printer
+    filter: ["*.ps1"]
 
 win:
   icon: build/icon.png

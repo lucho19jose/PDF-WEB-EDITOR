@@ -7499,6 +7499,22 @@ class and the band; "Mostrar cuadros delimitadores" outlines only
 `.cimg-hit:not(.paper)` — an outline over each edited figure read as part of
 the edit.
 
+### The largest image is the scan only if it holds the page's ink
+A web page printed through Microsoft Print to PDF (Chrome, and so the "PDF
+Editor Pro" printer) has no text at all: every letter is a vector outline, and
+under the page's card lies a blank white JPEG covering 84% of the sheet.
+`getScanImage` took that JPEG for the scan, the scan analysis read the page as
+empty paper, and `groundFill` answered 'empty' for the patch over an edited
+heading's old tail ("nothing printed here") — the patch was claimed and never
+painted, so after "(huellas físicas)" → "(huellas o casi físicas como asi
+físicas)" the old "físicas)" showed through the new words. `imageLacksPageInk`
+compares dark-pixel shares: a 72 DPI render of the page inside the image's
+rect against the image itself; under a fifth means the image is not the scan
+and the loader reads the page's render. And `inkAwareFallback` keeps the flat
+patches for a run whose box shows no print at all in the raster. Over the OCR
+corpora the verdict changes on two pages only, both text drawn over a
+background picture. The edit is now made on the page's own pixels.
+
 ### Fill & Sign text commits when you leave it, at the size its text needs
 The FreeText box committed only on Ctrl+Enter or its tick. A click elsewhere
 — how Acrobat's Fill & Sign commits — left it open, the next tool's click went
@@ -7641,6 +7657,70 @@ copy, start the build with `--user-data-dir=<scratch>`: the single-instance
 lock is per profile, and without it every launch hands its file to the
 installed app. A document with unsaved changes blocks unload as on the
 web; Electron would simply refuse to close, so `will-prevent-unload` asks.
+
+**The "PDF Editor Pro" printer: Print in any program opens the PDF here**, as
+PDF24's printer does (SAP/Crystal reports were the reason). No driver of our
+own: it is Windows' "Microsoft Print To PDF" driver on a LOCAL PORT that is a
+named pipe, `\\.\pipe\PDFEditorPro` — the arrangement PDF24 uses
+(`\\.\pipe\PDFPrint`). `electron/print-listener.cjs` serves the pipe: one
+connection per job, kept as `%LOCALAPPDATA%\PDF Editor Pro\Impresiones\<title>.pdf`
+(the driver writes the job's document name as /Title, UTF-16 when it has
+accents; kept 7 days) and opened by launching the app's own exe with the file
+— the single-instance lock routes it to an empty window or a new one, raised
+above the program that printed (`raise`: topmost for 1.5 s; a plain focus()
+from a background process leaves it behind) and marked unsaved, so closing
+asks. Measured on this PC, Sophos on: SAP-style named job → window in front in
+~2 s.
+- **The listener is the app's exe run as plain Node** (`ELECTRON_RUN_AS_NODE`,
+  ~22 MB private), from `app.asar.unpacked` (`asarUnpack`). It is started by
+  the logon entry `PDF Editor Pro - Impresora` (`"…exe" --print-listener`,
+  which spawns it and exits — handled BEFORE the single-instance lock, or a
+  running app would get it as a second instance), by every app launch that
+  finds the printer (`getPrintersAsync`, which also sets or drops the logon
+  entry), and by the installer. A second listener exits on EADDRINUSE.
+  Development runs start none unless `PDF_EDITOR_DEV_PRINTER=1`: it would
+  outlive the session and send jobs to a dead Vite server.
+- **Jobs are COLLECTED, as PDF24's assistant does** (an expediente is a
+  check list, a solicitud and a factura printed one after another). A window
+  is `collecting` while its document is print jobs not saved yet
+  (`ui.printSession && isModified`, reported over `desktop:collecting`; any
+  other load or a save ends it). A job goes to a collecting window first and
+  joins the Combinar dialog there (`ui.printInbox` → `drainPrintInbox`, which
+  waits for another open dialog or a running merge) instead of replacing the
+  document; with none, it opens as before. The dialog's open document is now an
+  ordinary row (`OPEN_DOC` stand-in, `combine(files, includeOpen, openAt)`), so
+  the first job printed need not be the first pages; a merge of print jobs keeps
+  collecting. Each job row can be opened apart (`desktop:open-print-jobs`, by
+  file NAME inside the print folder only); Cancel asks before dropping jobs
+  from the list (the files stay in the folder). Verified over CDP: three jobs
+  → one list, reordered with the row buttons → merged in that order, a fourth
+  job joins the merged document, "open apart" gives it its own window.
+- **A job printed while nothing listens is HELD, not lost**: the queue shows
+  "Error, Printing, Retained" and the spooler re-sends it ~8 s after the
+  listener appears (measured).
+- **Installing it needs admin and this installer is per-user**, so only that
+  step is elevated: `build/installer.nsh` asks (when the printer key under
+  `HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers` is missing, readable
+  without admin) and runs `resources\printer\install-printer.ps1` through
+  `ExecShellWait "runas"` — one UAC prompt. Never from the app: Sophos treats
+  the app as a PDF reader and blocks it from starting PowerShell (it already
+  blocked the in-app updater). Uninstall removes it the same way, never during
+  an update (`isUpdated`).
+- **The listener runs from the installed exe**, so electron-builder's
+  app-running check took it for the app ("PDF Editor Pro is running" with no
+  window open) and its file was locked during updates. `customCheckAppRunning`
+  stops processes whose command line holds `print-listener` and whose path is
+  under `$INSTDIR` (the path test keeps the PowerShell running the query from
+  matching itself), then runs the stock check. Overriding the macro means
+  `getProcessInfo.nsh` and `Var pid` must be supplied by `installer.nsh`.
+- **Known limitation:** the pipe is machine-wide, so on a PC with several
+  signed-in users the first one's listener receives everyone's jobs. PDF24
+  avoids it with a SYSTEM service relaying to per-session pipes
+  (`PDFPrint:<user>:<session>`).
+- Building locally, electron-builder failed with EPERM renaming
+  `release\win-unpacked.tmp` (Sophos scanning the unzipped Electron);
+  `npx electron-builder --win --publish never -c.electronDist=node_modules/electron/dist`
+  copies the local Electron instead (it then ships `default_app.asar`, harmless).
 
 **Printing in the app goes out as page images** (`printPageImages` in
 EditorLayout, taken when `window.desktop` exists). Electron's PDF viewer

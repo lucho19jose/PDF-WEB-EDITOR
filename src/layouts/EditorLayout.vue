@@ -130,7 +130,7 @@ import AcroToolOptions from '@/components/acrobat/AcroToolOptions.vue'
 import AcroDialogs from '@/components/acrobat/AcroDialogs.vue'
 import { createAcroShell } from '@/components/acrobat/acroShell'
 import { useAcroCommands } from '@/composables/useAcroCommands'
-import { useUiStore } from '@/stores/ui'
+import { useUiStore, printJobFiles } from '@/stores/ui'
 import { rememberRecent } from '@/utils/acro/recentFiles'
 import { buildReportMailto } from '@/utils/reportProblem'
 import FindBar from '@/components/toolbar/FindBar.vue'
@@ -183,8 +183,29 @@ onMounted(async () => {
   // file double-clicked to launch the app is never loaded into a dead engine.
   if (window.desktop) {
     const desktop = window.desktop
-    desktop.onOpenFile(({ name, bytes }) => {
+    desktop.onOpenFile(({ name, bytes, printed }) => {
+      // A print job reaching a window that holds a document joins the
+      // Combinar list (AcroDialogs), as PDF24's assistant collects jobs, and
+      // never replaces what is open. The main process sends it here only while
+      // this window is collecting (see `collecting` below).
+      if (printed && docStore.loaded) {
+        const file = new File([new Uint8Array(bytes)], name, { type: 'application/pdf' })
+        printJobFiles.add(file)
+        ui.printInbox.push(file)
+        editorStore.setStatus(`${name} — print job added to the list`)
+        desktop.setHasDocument(true)
+        return
+      }
       loadBytes(new Uint8Array(bytes), name)
+        .then(() => {
+          // A job from the "PDF Editor Pro" printer exists only in the app's
+          // print folder until it is saved: open it as unsaved, so closing the
+          // window asks first instead of quietly dropping what was printed.
+          if (!printed || !docStore.loaded || docStore.fileName !== name) return
+          docStore.markModified()
+          ui.printSession = true
+          editorStore.setStatus(`${name} — printed to PDF Editor Pro, not saved yet (${docStore.totalPages} page${docStore.totalPages === 1 ? '' : 's'})`)
+        })
         .catch((e: unknown) => {
           editorStore.setStatus(`Could not open ${name}: ${e instanceof Error ? e.message : String(e)}`)
         })
@@ -195,6 +216,11 @@ onMounted(async () => {
     // A file opened from Explorer goes to a window with no document, or to a
     // new one: the main process has to know which this is.
     watch(() => docStore.loaded, loaded => desktop.setHasDocument(loaded))
+    // Collecting print jobs: the open document is print jobs not saved yet.
+    // Saving ends it — the next job then gets a window of its own.
+    watch(() => docStore.isModified, modified => { if (!modified) ui.printSession = false })
+    watch(() => ui.printSession && docStore.loaded && docStore.isModified,
+      collecting => desktop.setCollecting?.(collecting), { immediate: true })
     desktop.ready()
   }
 })
@@ -1040,6 +1066,9 @@ async function loadBytes(bytes: Uint8Array, name: string) {
   const previous = docStore.pdfBytes ? new Uint8Array(docStore.pdfBytes) : null
   const previousName = docStore.fileName ?? 'document.pdf'
 
+  // Whatever opens now is not (yet) a collection of print jobs; the callers
+  // that open one say so after the load.
+  ui.printSession = false
   historyStore.clear()
   searchStore.clear()
   ocrStore.clear()

@@ -194,6 +194,11 @@ export function inkAwareFallback(pi: PageInk, lines: Map<string, LineInk | null>
     const run = runs.get(item)
     if (!run || run.vertical) continue
     const own = pxRectOf(s, run.inkRect ?? run.rect)
+    // The recogniser READ letters in this box. A raster that shows none there
+    // is not the picture the run was read from (a blank background image taken
+    // for the scan): its "nothing to erase" would drop the patch and leave the
+    // old words under the new ones. Keep the flat patches.
+    if (!showsInk(s, own)) continue
     const rects = ns.map(n => {
       const [rx0, ry0, rx1, ry1] = ops.patches[n].rect
       return pxRectOf(s, { x: Math.min(rx0, rx1), y: Math.min(ry0, ry1), width: Math.abs(rx1 - rx0), height: Math.abs(ry1 - ry0) })
@@ -247,6 +252,19 @@ export function inkAwareFallback(pi: PageInk, lines: Map<string, LineInk | null>
     })
   }
   return { overlays: overlaysOf(s, work, [...boxes.entries()].map(([item, box]) => ({ item, box }))), patches, images, grounded }
+}
+
+/** Whether the raster shows any print in `box`: its luminance spans more than a JPEG's grain. */
+function showsInk(s: ScanRaster, box: { x0: number; y0: number; x1: number; y1: number }): boolean {
+  const lums: number[] = []
+  const step = Math.max(1, Math.round(Math.sqrt((box.x1 - box.x0) * (box.y1 - box.y0) / 20000)))
+  for (let y = box.y0; y < box.y1; y += step) for (let x = box.x0; x < box.x1; x += step) {
+    const p = (y * s.w + x) * 4
+    lums.push(0.2126 * s.data[p] + 0.7152 * s.data[p + 1] + 0.0722 * s.data[p + 2])
+  }
+  if (lums.length < 20) return true
+  lums.sort((a, b) => a - b)
+  return lums[Math.floor(lums.length * 0.97)] - lums[Math.floor(lums.length * 0.03)] >= 14
 }
 
 /** Pixels within `r` (chessboard) of a nonzero one: a separable max over rows, then columns. */

@@ -111,6 +111,15 @@ export const useUiStore = defineStore('ui', () => {
   /** Password protection to apply when the file is next saved. */
   const protection = ref<null | { userPassword: string; ownerPassword: string; permissions: { print: boolean; copy: boolean; modify: boolean; annotate: boolean } }>(null)
 
+  /**
+   * The "PDF Editor Pro" printer (Windows app). `printSession`: the open
+   * document is a print job, or several combined, not saved yet — new jobs
+   * then join it in the Combinar list, as PDF24's assistant collects them.
+   * `printInbox`: jobs that arrived and wait for that list (AcroDialogs).
+   */
+  const printSession = ref(false)
+  const printInbox = ref<File[]>([])
+
   const toolMeta = computed(() => toolInfo(activeTool.value))
 
   function openDialog(d: AcroDialog, args: any = null) {
@@ -132,6 +141,10 @@ export const useUiStore = defineStore('ui', () => {
     view, activeTool, dialog, dialogArgs, leftPaneOpen, leftPanel, rightPaneOpen,
     showBoundingBoxes, autoRecognize, scanConversion, restrictEditing, readMode, organizeThumbWidth, selectedPages, pageOperationBusy,
     signatureImage, initialsImage, notifications, unreadNotifications, protection, toolMeta,
+    printSession, printInbox,
     openDialog, closeDialog, notify
   }
 })
+
+/** Files that are print jobs, by identity: they can be reopened on their own from disk. */
+export const printJobFiles = new WeakSet<File>()

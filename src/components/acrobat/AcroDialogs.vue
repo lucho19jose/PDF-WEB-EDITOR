@@ -238,32 +238,36 @@
   <!-- ═════════════ Combinar archivos ═════════════ -->
   <q-dialog :persistent="combineBusy" :model-value="ui.dialog === 'combine'" @update:model-value="(v: boolean) => !v && !combineBusy && closeIf('combine')">
     <div class="acro-card dlg wide" @dragover.stop.prevent="cfDragOver" @drop.stop.prevent="dropCombine">
-      <div class="acro-card-title">Combinar archivos</div>
+      <div class="acro-card-title">{{ combinePrintJobs ? 'Trabajos de impresión' : 'Combinar archivos' }}</div>
       <div class="acro-card-body">
+        <p v-if="combinePrintJobs" class="cf-hint">Llegaron trabajos de la impresora «PDF Editor Pro». Ordénelos (arrastre o flechas) y pulse Combinar para unirlos en un solo PDF, o abra uno aparte.</p>
         <div class="inline">
           <button class="acro-pill primary pill-sm" :disabled="combineBusy" @click="addCombineFiles"><q-icon name="add" size="16px" /> Agregar archivos</button>
           <label v-if="docStore.loaded" class="acro-check"><input v-model="combineWithOpen" :disabled="combineBusy" type="checkbox" /> Incluir el documento abierto ({{ docStore.fileName }})</label>
         </div>
         <div class="combine-list" :aria-busy="combineBusy">
-          <div v-if="!combineFiles.length && !(combineWithOpen && docStore.loaded)" class="empty">Arrastre archivos PDF o imágenes aquí, o use "Agregar archivos".</div>
-          <div v-if="combineWithOpen && docStore.loaded" class="cf-row fixed">
-            <q-icon name="picture_as_pdf" color="red-5" size="22px" />
-            <span class="cf-name">{{ docStore.fileName }}</span>
-            <span class="cf-meta">{{ docStore.totalPages }} pág. · abierto</span>
-          </div>
-          <div v-for="(f, i) in combineFiles" :key="cfKey(f)" class="cf-row" :class="{ dragging: cfDrag === f, before: cfBefore === i, after: cfBefore === combineFiles.length && i === combineFiles.length - 1 }" :draggable="!combineBusy" @dragstart="cfStart($event, f)" @dragend="cfReset">
-            <q-icon :name="commands.isImage(f) ? 'image' : 'picture_as_pdf'" :color="commands.isImage(f) ? 'teal-4' : 'red-5'" size="22px" />
-            <span class="cf-name">{{ f.name }}</span>
-            <span class="cf-meta">{{ sizeOf(f.size) }}</span>
+          <div v-if="!combineEntries.length" class="empty">Arrastre archivos PDF o imágenes aquí, o use "Agregar archivos".</div>
+          <div v-for="(f, i) in combineEntries" :key="cfKey(f)" class="cf-row" :class="{ dragging: cfDrag === f, before: cfBefore === i, after: cfBefore === combineEntries.length && i === combineEntries.length - 1 }" :draggable="!combineBusy" @dragstart="cfStart($event, f)" @dragend="cfReset">
+            <template v-if="f === OPEN_DOC">
+              <q-icon name="picture_as_pdf" color="red-5" size="22px" />
+              <span class="cf-name">{{ docStore.fileName }}</span>
+              <span class="cf-meta">{{ docStore.totalPages }} pág. · abierto</span>
+            </template>
+            <template v-else>
+              <q-icon :name="commands.isImage(f) ? 'image' : (printJobFiles.has(f) ? 'print' : 'picture_as_pdf')" :color="commands.isImage(f) ? 'teal-4' : 'red-5'" size="22px" />
+              <span class="cf-name">{{ f.name }}</span>
+              <span class="cf-meta">{{ printJobFiles.has(f) ? 'impresión · ' : '' }}{{ sizeOf(f.size) }}</span>
+            </template>
             <button class="row-btn" :disabled="combineBusy || i === 0" title="Subir" @click="cfMove(i, -1)"><q-icon name="arrow_upward" size="16px" /></button>
-            <button class="row-btn" :disabled="combineBusy || i === combineFiles.length - 1" title="Bajar" @click="cfMove(i, 1)"><q-icon name="arrow_downward" size="16px" /></button>
-            <button class="row-btn" :disabled="combineBusy" title="Quitar" @click="combineFiles.splice(i, 1)"><q-icon name="close" size="16px" /></button>
+            <button class="row-btn" :disabled="combineBusy || i === combineEntries.length - 1" title="Bajar" @click="cfMove(i, 1)"><q-icon name="arrow_downward" size="16px" /></button>
+            <button v-if="printJobFiles.has(f) && canOpenSeparately" class="row-btn" :disabled="combineBusy" title="Abrir aparte, en otra ventana" @click="openJobSeparately(i)"><q-icon name="open_in_new" size="16px" /></button>
+            <button class="row-btn" :disabled="combineBusy" title="Quitar" @click="combineEntries.splice(i, 1)"><q-icon name="close" size="16px" /></button>
           </div>
         </div>
       </div>
       <p v-if="combineError" class="combine-error" role="alert">{{ combineError }}</p>
       <div class="acro-card-actions">
-        <button class="acro-pill outline" :disabled="combineBusy" @click="close">Cancelar</button>
+        <button class="acro-pill outline" :disabled="combineBusy" @click="cancelCombine">Cancelar</button>
         <button class="acro-pill primary" :disabled="combineBusy || combineCount < 2" @click="applyCombine">{{ combineBusy ? 'Combinando...' : 'Combinar' }}</button>
       </div>
     </div>
@@ -488,7 +492,7 @@
 import { reactive, ref, computed, watch, inject, nextTick } from 'vue'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
-import { useUiStore } from '@/stores/ui'
+import { useUiStore, printJobFiles } from '@/stores/ui'
 import { hexToRgb01 } from '@/utils/color'
 import { parsePageRange } from '@/composables/useAcroCommands'
 import { persistedRef } from '@/utils/persist'
@@ -660,8 +664,20 @@ async function applyProperties() {
 }
 
 // ═════════════ Combine ═════════════
-const combineFiles = ref<File[]>([])
-const combineWithOpen = ref(false)
+// One list in merge order. The open document is a row like the others,
+// OPEN_DOC standing in for it, so it can be moved anywhere — a print job that
+// arrived first is not necessarily the first page of the expediente.
+const OPEN_DOC = new File([], 'documento-abierto.pdf', { type: 'application/pdf' })
+const combineEntries = ref<File[]>([])
+const combineWithOpen = computed({
+  get: () => docStore.loaded && combineEntries.value.includes(OPEN_DOC),
+  set: (on: boolean) => {
+    const i = combineEntries.value.indexOf(OPEN_DOC)
+    if (on && i < 0) combineEntries.value.unshift(OPEN_DOC)
+    else if (!on && i >= 0) combineEntries.value.splice(i, 1)
+  }
+})
+const combinePrintJobs = computed(() => combineEntries.value.some(f => printJobFiles.has(f)))
 const combineBusy = ref(false)
 const combineError = ref('')
 const cfDrag = ref<File | null>(null)
@@ -669,10 +685,10 @@ const cfBefore = ref<number | null>(null)
 const cfKeys = new WeakMap<File, number>()
 let cfNextKey = 0, combineSession = 0
 function cfKey(file: File) { if (!cfKeys.has(file)) cfKeys.set(file, ++cfNextKey); return cfKeys.get(file)! }
-const combineCount = computed(() => combineFiles.value.length + (combineWithOpen.value && docStore.loaded ? 1 : 0))
+const combineCount = computed(() => combineEntries.value.filter(f => f !== OPEN_DOC || docStore.loaded).length)
 function appendCombineFiles(files: File[]) {
   const supported = files.filter(f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf' || commands.isImage(f))
-  combineFiles.value.push(...supported)
+  combineEntries.value.push(...supported)
   combineError.value = supported.length !== files.length ? 'Solo se admiten archivos PDF e imagenes compatibles' : ''
 }
 async function addCombineFiles() {
@@ -689,7 +705,7 @@ function cfStart(e: DragEvent, f: File) {
 }
 function cfPosition(e: DragEvent) {
   const card = (e.currentTarget as HTMLElement)
-  const rows = Array.from(card.querySelectorAll<HTMLElement>('.cf-row:not(.fixed)'))
+  const rows = Array.from(card.querySelectorAll<HTMLElement>('.cf-row'))
   let lo = 0, hi = rows.length
   while (lo < hi) {
     const mid = (lo + hi) >>> 1, r = rows[mid].getBoundingClientRect()
@@ -709,29 +725,64 @@ function dropCombine(e: DragEvent) {
   const dragged = cfDrag.value
   const token = e.dataTransfer?.getData('application/x-pdf-editor-combine')
   if (dragged && token === String(cfKey(dragged))) {
-    const from = combineFiles.value.indexOf(dragged), before = cfPosition(e)
+    const from = combineEntries.value.indexOf(dragged), before = cfPosition(e)
     if (from >= 0) {
-      combineFiles.value.splice(from, 1)
-      combineFiles.value.splice(before > from ? before - 1 : before, 0, dragged)
+      combineEntries.value.splice(from, 1)
+      combineEntries.value.splice(before > from ? before - 1 : before, 0, dragged)
     }
   }
   cfReset()
 }
 function cfMove(i: number, d: number) {
-  if (combineBusy.value || i+d < 0 || i+d >= combineFiles.value.length) return
-  const [file] = combineFiles.value.splice(i, 1)
-  combineFiles.value.splice(i+d, 0, file)
+  if (combineBusy.value || i+d < 0 || i+d >= combineEntries.value.length) return
+  const [file] = combineEntries.value.splice(i, 1)
+  combineEntries.value.splice(i+d, 0, file)
   cfReset()
 }
 async function applyCombine() {
   if (combineBusy.value || combineCount.value < 2) return
   combineBusy.value = true; combineError.value = ''; cfReset()
   try {
-    const result = await commands.combine([...combineFiles.value], combineWithOpen.value)
-    if (result.success) close()
+    const entries = combineEntries.value.filter(f => f !== OPEN_DOC || docStore.loaded)
+    const openAt = entries.indexOf(OPEN_DOC)
+    // Still collecting afterwards: the result holds print jobs and is not saved,
+    // so the next job joins it rather than opening another window.
+    const fromPrinter = entries.some(f => printJobFiles.has(f)) || (openAt >= 0 && ui.printSession)
+    const result = await commands.combine(entries.filter(f => f !== OPEN_DOC), openAt >= 0, Math.max(0, openAt))
+    if (result.success) { ui.printSession = fromPrinter; close() }
     else combineError.value = result.error || 'No se pudo combinar'
   } finally { combineBusy.value = false }
 }
+
+// ── Print jobs (Windows app): collected here as they arrive ──
+const canOpenSeparately = !!window.desktop?.openPrintJobs
+/** A job reopened in a window of its own, from the copy the listener kept on disk. */
+function openJobSeparately(i: number) {
+  const [f] = combineEntries.value.splice(i, 1)
+  if (f) window.desktop?.openPrintJobs?.([f.name])
+}
+/** Cancel drops the jobs from this list only: they stay in the print folder for a week. */
+async function cancelCombine() {
+  const jobs = combineEntries.value.filter(f => printJobFiles.has(f)).length
+  if (jobs && !(await commands.confirm('Trabajos de impresión',
+    `Se quitarán de la lista ${jobs} trabajo(s) de impresión sin abrirlos. Seguirán una semana en la carpeta Impresiones de PDF Editor Pro.`))) return
+  close()
+}
+/**
+ * Moves arrived jobs into the list: appended when the list is open, or the list
+ * opened with the open document first. Waits while another dialog is open or a
+ * merge runs — a job that lands mid-merge joins the result afterwards.
+ */
+function drainPrintInbox() {
+  if (!ui.printInbox.length || combineBusy.value) return
+  if (ui.dialog === 'combine') {
+    appendCombineFiles(ui.printInbox.splice(0))
+  } else if (!ui.dialog) {
+    ui.openDialog('combine', { printJobs: true })
+  }
+}
+watch(() => ui.printInbox.length, drainPrintInbox)
+watch(() => [ui.dialog, combineBusy.value], () => nextTick(drainPrintInbox))
 
 function sizeOf(b: number) { return b < 1048576 ? `${Math.max(1, Math.round(b / 1024))} KB` : `${(b / 1048576).toFixed(1)} MB` }
 
@@ -905,9 +956,9 @@ watch(() => ui.dialog, async d => {
     if (a.sanitize) meta.Title = meta.Author = meta.Subject = meta.Keywords = ''
   } else if (d === 'combine') {
     combineSession++; cfReset(); combineError.value = ''
-    combineFiles.value = []
+    combineEntries.value = a.files || !docStore.loaded ? [] : [OPEN_DOC]
     appendCombineFiles(a.files ?? [])
-    combineWithOpen.value = a.files ? false : docStore.loaded
+    if (a.printJobs) appendCombineFiles(ui.printInbox.splice(0))
   } else if (d === 'export') {
     if (a.format) exp.format = a.format
   } else if (d === 'link') {
@@ -961,7 +1012,7 @@ watch(() => ui.dialog, async d => {
 .combine-list { margin-top: 14px; min-height: 180px; border: 1px dashed var(--acro-border); border-radius: 4px; padding: 6px; }
 .empty { color: var(--acro-text-dim); padding: 40px 10px; text-align: center; }
 .cf-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 3px; background: var(--acro-surface-2); margin-bottom: 4px; cursor: grab; }
-.cf-row.fixed { cursor: default; background: var(--acro-select); }
+.cf-hint { margin: 0 0 12px; color: var(--acro-text-dim, #b9b9b9); line-height: 1.4; }
 .cf-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cf-meta { color: var(--acro-text-dim); font-size: 12px; }
 .row-btn { border: 0; background: transparent; color: var(--acro-text-dim); cursor: pointer; border-radius: 3px; display: inline-flex; padding: 3px; }
