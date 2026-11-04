@@ -25,6 +25,7 @@
  * measurers read. Nothing on the page changes: this is the raster OCR works
  * on, and the patch and the replacement are still measured on real ink.
  */
+import { makeCanvas } from './canvasFactory'
 
 /** What was found; null when the page has no faint layer. */
 export interface FaintLayer {
@@ -182,9 +183,7 @@ export function withoutFaintLayer(canvas: HTMLCanvasElement): { canvas: HTMLCanv
   const { width: w, height: h } = canvas
   const layer = w && h ? analyseFaintLayer(ctx.getImageData(0, 0, w, h).data, w, h) : null
   if (!layer) return { canvas, ctx, layer: null }
-  const copy = document.createElement('canvas')
-  copy.width = w
-  copy.height = h
+  const copy = makeCanvas(w, h)
   const cctx = copy.getContext('2d', { willReadFrequently: true })!
   cctx.drawImage(canvas, 0, 0)
   whitenAbove(cctx, layer.cutoff)

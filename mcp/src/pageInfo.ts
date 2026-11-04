@@ -21,7 +21,7 @@ export async function kindOf(s: DocumentSession, page: number): Promise<PageKind
 
 /** Text edits on a scan change nothing anyone can see: refuse, and say what to do instead. */
 export function scanRefusal(page: number, why: string): ToolError {
-  return new ToolError(`Page ${page + 1} is a SCANNED page (${why}): the words you see are part of an image, so they cannot be edited as text here. Use open_in_editor to recognise and edit it in PDF Editor Pro (OCR), or annotate it (add_free_text, add_text, add_shape) on top.`)
+  return new ToolError(`Page ${page + 1} is a SCANNED page (${why}): the words you see are part of an image, so text-block tools do not apply. Call recognize_page(${page + 1}) and change its words with edit_scanned_text or replace_text — the edit is made on the scan in its own letters. Never paint a white box over scanned words to retype them.`)
 }
 
 export async function requireTextPage(s: DocumentSession, page: number): Promise<TextBlock[]> {

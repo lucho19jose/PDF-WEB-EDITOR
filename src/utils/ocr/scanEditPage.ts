@@ -341,6 +341,40 @@ export function justifiedMargin(margin: number | null, lines: Iterable<LineInk |
 }
 
 /**
+ * Where a CENTRED line is centred (px), or null. A form's title, a heading
+ * over a clause, "(Art. 1 de la Ley Nº 30424)" under its title: set from its
+ * left edge after an edit, "DECLARACIÓN JURADA DE LICITUD DE LOS FONDOS"
+ * shortened by three words sat off to the left of the box it was centred in.
+ * A line is centred when it is indented on BOTH sides of the text (two ems
+ * at least, and narrower than four fifths of it) and its centre is the
+ * text's centre or the page's, or the centre of an indented neighbour within
+ * three ems — a full paragraph line is centred on the page as well, which is
+ * why both indents are asked.
+ */
+export function centredAt(lines: Iterable<LineInk | null>, li: LineInk, pageW: number): number | null {
+  if (!li.cells.length) return null
+  const all = [...lines].filter((o): o is LineInk => !!o && o.cells.length > 0)
+  const leftOf = (o: LineInk) => Math.min(...o.cells.map(c => c.inkL))
+  const rightOf = (o: LineInk) => Math.max(...o.cells.map(c => c.inkR))
+  const em = li.fit.emPx
+  const starts = all.map(leftOf).sort((a, b) => a - b)
+  const ends = all.map(rightOf).sort((a, b) => a - b)
+  if (starts.length < 3) return null
+  const textL = starts[Math.floor(starts.length * 0.1)]
+  const textR = ends[Math.floor(ends.length * 0.9)]
+  const l = leftOf(li), r = rightOf(li), c = (l + r) / 2
+  const indented = (o: LineInk) => leftOf(o) - textL >= o.fit.emPx * 2 && textR - rightOf(o) >= o.fit.emPx * 2 && rightOf(o) - leftOf(o) < (textR - textL) * 0.8
+  if (!indented(li)) return null
+  const tol = Math.max(em * 1.5, pageW * 0.015)
+  if (Math.abs(c - (textL + textR) / 2) <= tol || Math.abs(c - pageW / 2) <= tol) return c
+  for (const o of all) {
+    if (o === li || !indented(o) || Math.abs(o.fit.y - li.fit.y) > em * 3) continue
+    if (Math.abs((leftOf(o) + rightOf(o)) / 2 - c) <= em) return c
+  }
+  return null
+}
+
+/**
  * Whether a line of figures is one of a COLUMN set flush right: another line
  * of figures near it ends where it ends and starts somewhere else — an
  * amounts column with no rule beside it, "13,000.00" over "0.00" over
@@ -414,7 +448,7 @@ export function planScanEdits(pi: PageInk, lines: Map<string, LineInk | null>, a
       if (!wd) { wd = pl.s.data.slice(); workDom.set(dom, wd) }
       w = wd
     }
-    const res = applyLineEdit(pl, li, atlas, item.text, w, { remove: item.removed, justifyTo: justifyFor(li), limitRight, synth, columnRight: alignedRight(lines.values(), li), pageLines })
+    const res = applyLineEdit(pl, li, atlas, item.text, w, { remove: item.removed, justifyTo: justifyFor(li), limitRight, synth, columnRight: alignedRight(lines.values(), li), centreAt: centredAt(lines.values(), li, s.w), pageLines })
     if (!res.ok) {
       modes[item.id] = `vector (${res.reason})`
       // Per LINE: each line's letter is made in that line's look and looked up

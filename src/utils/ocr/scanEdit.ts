@@ -388,6 +388,8 @@ export interface EditOptions {
   limitRight?: number | null
   /** The line is one of a column of figures set flush right (`alignedRight` in scanEditPage): it keeps its right edge. */
   columnRight?: boolean
+  /** The line is set centred, here (px, `centredAt` in scanEditPage): it keeps its centre when its width changes. */
+  centreAt?: number | null
   /** The page's analysed lines: what the line's own figures are too few to measure, its size's lines measure. */
   pageLines?: LineInk[]
 }
@@ -2185,6 +2187,22 @@ function applyOnPixels(pi: PageInk, li: LineInk, atlas: Atlas, newText: string, 
     newRight += d
     rigid = false
     notes.push('set flush right in its cell')
+  }
+  // A centred line stays centred: the whole line moves by half the width the
+  // edit gained or lost. Only a CLEAN line (no ink the reading misses, no rule
+  // of its own) — its pixels all move together and nothing is left behind.
+  if (!flushRight && opts.centreAt != null && clean && nc.length && !sameCells && sameSpan === null && Math.abs(newRight - oldRight) >= 1) {
+    const newLeft = Math.min(...nc.map(c => c.x))
+    const d = Math.round(opts.centreAt - (newLeft + newRight) / 2)
+    if (Math.abs(d) >= 1) {
+      for (const c of nc) {
+        if (c.kind === 'orig') place(c, c.x + d)
+        else c.x += d
+      }
+      newRight += d
+      rigid = false
+      notes.push('kept centred')
+    }
   }
   // What a respacing moves is the line from its first change on — unless it
   // has to spread into the whole line. A rule or a mark BEFORE the change

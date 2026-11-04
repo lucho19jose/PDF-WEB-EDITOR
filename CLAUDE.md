@@ -7724,24 +7724,60 @@ per open document (at most 3 live; idle ones are suspended and reloaded).
   (`*` = any), else the profile and temp. Saves go to `<name> (editado).pdf`
   unless `overwrite`; writes are temp-file + rename; `save_pdf` to a new path
   retargets the session (Save As).
-- **Scanned pages are refused for text edits** (`src/utils/pageKind.ts`, the
-  same rules the app uses: invisible-vs-visible text, coverage, image area)
-  and pointed at `open_in_editor`, which saves and launches the app exe with
-  the file (the print listener's launch: detached, `stdio: 'ignore'`, no
-  ELECTRON_RUN_AS_NODE). The app gets bytes, not the path; the session notices
-  the file changing on disk (mtime/size) and reloads it when it has no
-  unsaved changes of its own.
+- **Scanned pages are edited ON the scan, as the app does** — not refused,
+  and never "white box + Helvetica": Claude did exactly that to a form's
+  title (a foreign face, a cut through the frame's rule) before this existed.
+  Text-block tools still refuse a scan (`src/utils/pageKind.ts`) and point at
+  `recognize_page` → `edit_scanned_text`; `replace_text` on a scanned page
+  recognises it and finds the phrase across its runs (`replaceAllSpans`), at
+  most 4 scanned pages per whole-document call.
+  - **Recognition** is the app's own pipeline, moved out of `useOCR` into
+    `src/utils/ocr/recognizePipeline.ts` (`recognizeRaster`: faint layer,
+    deskew, watermark pass, `refineLines`, `buildItems`, sideways pass;
+    `useOCR.recognizePage` keeps the state and delegates). Every canvas comes
+    from `canvasFactory.ts` — the DOM in the app, `@napi-rs/canvas` (the copy
+    `ppu-ocv` carries, 1.0.8) in Node. The engine is PaddleOCR on
+    `onnxruntime-node` with the app's models; the sideways pass is off in the
+    server. ~8 s a page on CPU (read 4, scan analysis 2.5, re-read 0.5).
+  - **The edit** mirrors `applyOcrLiveNow` (`mcp/src/ocr/runtime.ts`, `ScanDoc`):
+    the page keeps its PRISTINE content and every edit restores it and
+    re-applies all of the page's edits from the original ink; a page whose
+    content hash moved since the last apply (another tool wrote to it) is
+    adopted. Runs the scan edit refuses are NOT redrawn as vectors: they are
+    put back and reported with the reason. Undo entries carry the scan state
+    (`SessionExtra`); `pageOp` (every tool in pages.ts) and `replaceBytes`
+    drop it, as the app's `forgetOcr` does.
+  - **A centred line stays centred** (`centredAt` in scanEditPage →
+    `EditOptions.centreAt`, shared with the app): indented two ems on both
+    sides and centred on the text, the page or an indented neighbour. Without
+    it a title shortened by three words sat off to the left of its box.
+  - **Packaging:** `dist-mcp/ocr/ocr.mjs` (own Vite build, loaded on first
+    use) beside `dist-mcp/ocr/node_modules` (ppu-paddle-ocr, ppu-ocv with
+    its canvas, opencv-js, onnxruntime-node win32-x64 only, onnxruntime-common)
+    and `assets/paddle`. electron-builder drops a node_modules folder only at
+    the ROOT of a copied folder (`app-builder-lib/out/util/filter.js`), so the
+    nested one ships. dist-mcp is ~165 MB, the .mcpb 83 MB — which is why the
+    installer no longer carries the .mcpb (the dialog links to the release's).
+- `open_in_editor` saves and launches the app exe with the file (the print
+  listener's launch: detached, `stdio: 'ignore'`, no ELECTRON_RUN_AS_NODE).
+  The app gets bytes, not the path; the session notices the file changing on
+  disk (mtime/size) and reloads it when it has no unsaved changes of its own.
 - Shared pure modules extracted for it (re-exported from their old homes):
   `utils/assistant/spanEdits.ts`, `utils/assistant/anchors.ts`,
   `utils/acro/pageRange.ts`, `utils/acro/sheetExport.ts`,
   `utils/acro/stamps.ts`, `utils/pageKind.ts`.
 - Installed app: `resources\mcp\server.mjs`, run as
   `"PDF Editor Pro.exe" server.mjs` with `ELECTRON_RUN_AS_NODE=1`; Ayuda ▸
-  Conectar con Claude (`desktop:mcp-info`, `desktop:reveal-mcpb`) shows the
-  Claude Code command and the Desktop JSON and reveals the .mcpb (reveal,
-  never launch: Sophos blocks the app from starting programs).
-- **Not yet:** OCR and scan editing headless (Paddle in Node is the plan),
-  AcroForm field filling, the hosted connector (Streamable HTTP + OAuth), and
+  Conectar con Claude (`desktop:mcp-info`) shows the Claude Code command and
+  the Desktop JSON, and links to the release's .mcpb (a dev build that has one
+  in release/ reveals it — never launches it: Sophos blocks the app from
+  starting programs). **Writing that JSON by script: never through a shell
+  that eats backslashes** — a Bash `node -e` turned the paths into
+  `C:Program FilesPDF Editor Pro…` and Claude Desktop failed with ENOENT.
+- `node scan-probe`-style checks: `npm run mcp:smoke` covers recognise,
+  replace on a scan, edit with the page's letters, removal, an untouched line
+  rendering pixel-identical, undo/redo, a second edit from the scan.
+- **Not yet:** AcroForm field filling, the hosted connector (Streamable HTTP + OAuth), and
   an in-chat page viewer (MCP App).
 
 ## Windows app (Electron)

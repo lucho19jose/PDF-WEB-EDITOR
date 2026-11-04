@@ -249,12 +249,34 @@ check('disk change reloaded', json(r).pages === 3 && /changed on disk/.test(text
 // open_in_editor (a stand-in exe here)
 r = await call('open_in_editor', { doc_id: doc })
 
-// A scanned page is refused for text edits.
+// A scanned page: no text blocks, but recognised and edited ON the scan.
 r = await call('open_pdf', { path: path.join(WORK, '_scan2.pdf') })
 const scan = json(r).doc_id
 check('scan detected', json(r).scanned_pages !== undefined, JSON.stringify(json(r).scanned_pages))
 r = await call('list_page_text', { doc_id: scan, page: 1 })
-check('scan listing says so', json(r).scanned === true)
+check('scan listing points to recognize_page', json(r).scanned === true && /recognize_page/.test(text(r)))
+r = await call('recognize_page', { doc_id: scan, page: 1 })
+const runs = json(r)?.runs ?? []
+const runOf = (s) => (runs.find(x => x.includes(s)) ?? '').split(' | ')[0]
+check('scan recognised', runs.length >= 8 && !!runOf('Regular sans text'), runs.slice(0, 4).join(' / '))
+// A line nobody edits must come out pixel for pixel the same.
+const untouched = { doc_id: scan, page: 1, dpi: 150, region: { x: 55, y: 315, width: 300, height: 25 } }
+const pngOf = (res) => res.content.find(c => c.type === 'image')?.data
+const before = pngOf(await call('render_page', untouched))
+r = await call('replace_text', { doc_id: scan, page: 1, find: 'Regular sans', replace: 'Normal sans' })
+check('replace_text on a scan draws on the scan', json(r)?.pages?.[0]?.runs_redrawn_on_scan === 1, text(r))
+r = await call('edit_scanned_text', { doc_id: scan, page: 1, edits: [{ ref: runOf('DATA'), text: 'DATOS' }, { ref: runOf('PROCESS'), text: '' }] })
+check('edit_scanned_text: edit with the page\'s own letters, and a removal', json(r)?.drawn?.length === 2, text(r))
+check('untouched line unchanged', pngOf(await call('render_page', untouched)) === before)
+r = await call('get_text', { doc_id: scan, page: 1 })
+check('new words in the text layer', /Normal sans text/.test(text(r)) && /DATOS/.test(text(r)) && !/Regular sans/.test(text(r)), text(r).slice(0, 200))
+await call('undo', { doc_id: scan })
+r = await call('get_text', { doc_id: scan, page: 1 })
+check('undo takes the scan edit back', !/DATOS/.test(text(r)) && /Normal sans/.test(text(r)), text(r).slice(0, 200))
+await call('redo', { doc_id: scan })
+r = await call('edit_scanned_text', { doc_id: scan, page: 1, edits: [{ ref: runOf('Regular sans text'), text: 'Regular sans text, edited twice from the scan.' }] })
+check('second edit of a line redraws from the scan', json(r)?.drawn?.length === 1, text(r))
+await call('edit_scanned_text', { doc_id: scan, page: 1, edits: [{ ref: 'p1r999', text: 'x' }] }, true)
 await call('add_free_text', { doc_id: scan, page: 1, x: 100, y: 100, text: 'Anotación sobre el escaneo' })
 
 const t0 = Date.now()

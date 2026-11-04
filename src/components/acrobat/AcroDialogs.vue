@@ -502,18 +502,24 @@
         <template v-else>
           <div class="claude-step">
             <div class="claude-step-title">Claude Desktop</div>
-            <p class="note">Haga doble clic en la extensión <b>pdf-editor-pro.mcpb</b>: Claude Desktop la instala y le pregunta qué carpetas puede usar.</p>
-            <button class="acro-pill pill-sm" :disabled="!mcp.mcpbExists" @click="revealMcpb">Mostrar la extensión en el Explorador</button>
-            <p class="note">O agregue esto a <code>claude_desktop_config.json</code> (Configuración ▸ Desarrollador ▸ Editar configuración):</p>
+            <p class="note">Agregue esto a <code>claude_desktop_config.json</code> (Configuración ▸ Desarrollador ▸ Editar configuración) y reinicie Claude Desktop:</p>
             <pre class="claude-code">{{ claudeDesktopJson }}</pre>
             <button class="acro-pill outline pill-sm" @click="copyText(claudeDesktopJson, 'Configuración copiada')">Copiar</button>
+            <template v-if="mcp.mcpbExists">
+              <p class="note">O haga doble clic en la extensión <b>pdf-editor-pro.mcpb</b>: Claude Desktop la instala y le pregunta qué carpetas puede usar.</p>
+              <button class="acro-pill pill-sm" @click="revealMcpb">Mostrar la extensión en el Explorador</button>
+            </template>
+            <template v-else>
+              <p class="note">O instale la extensión <b>pdf-editor-pro.mcpb</b> (no necesita esta aplicación) desde <code>{{ MCPB_URL }}</code>.</p>
+              <button class="acro-pill outline pill-sm" @click="copyText(MCPB_URL, 'Enlace copiado')">Copiar el enlace</button>
+            </template>
           </div>
           <div class="claude-step">
             <div class="claude-step-title">Claude Code</div>
             <pre class="claude-code">{{ claudeCodeCmd }}</pre>
             <button class="acro-pill outline pill-sm" @click="copyText(claudeCodeCmd, 'Comando copiado')">Copiar el comando</button>
           </div>
-          <p class="note">Las páginas escaneadas se abren en esta aplicación para reconocer su texto (OCR). Claude guarda junto al original como «(editado)» y solo reemplaza un archivo si usted se lo pide.</p>
+          <p class="note">Claude también edita las páginas escaneadas: reconoce su texto (OCR, en este equipo) y hace el cambio sobre el escaneo, con sus propias letras. Guarda junto al original como «(editado)» y solo reemplaza un archivo si usted se lo pide.</p>
         </template>
       </div>
       <div class="acro-card-actions"><button class="acro-pill primary" @click="close">Cerrar</button></div>
@@ -947,6 +953,8 @@ const shortcuts = [
 // app's own exe in Node mode, so no separate Node install is needed.
 type McpInfo = Awaited<ReturnType<NonNullable<DesktopBridge['mcpInfo']>>>
 const mcp = ref<McpInfo | null>(null)
+/** The Claude Desktop extension, published with every release (not shipped in the installer: the server already is). */
+const MCPB_URL = 'https://github.com/lucho19jose/PDF-WEB-EDITOR/releases/latest/download/pdf-editor-pro.mcpb'
 const claudeDesktopJson = computed(() => mcp.value
   ? JSON.stringify({ mcpServers: { 'pdf-editor-pro': { command: mcp.value.exe, args: [mcp.value.server], env: { ELECTRON_RUN_AS_NODE: '1' } } } }, null, 2)
   : '')

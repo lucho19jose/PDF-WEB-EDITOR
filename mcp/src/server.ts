@@ -21,6 +21,7 @@ import { registerAnnotateTools } from './tools/annotate'
 import { registerPageTools } from './tools/pages'
 import { registerExtraTools } from './tools/extras'
 import { registerExportTools } from './tools/export'
+import { registerScanTools } from './tools/scan'
 
 declare const __APP_VERSION__: string
 
@@ -32,7 +33,7 @@ Workflow:
 3. Edit. To change words use replace_text (handles phrases split across lines; every occurrence unless occurrence:"first"). Use edit_text_block / delete_text / transform_text / restyle_text with references from a listing. References survive edits; refresh with list_page_text if one is reported missing.
 4. Check the result with render_page, then save_pdf. With no path it writes "<name> (editado).pdf" beside the original; the original is replaced only with overwrite:true and when the user asked for it.
 
-Scanned pages: their words are part of an image. Do not try to edit them as text — use open_in_editor so the user can recognise and edit them in PDF Editor Pro (OCR), or write on top with add_free_text / add_text / add_mark.
+Scanned pages: their words are part of an image. To change them call recognize_page (OCR on this computer, a few seconds) and then edit_scanned_text with the run references it returns, or replace_text: the edit is made ON the scan — kept letters stay the scan's pixels, new letters come from the page's own — so the result looks like the original document. NEVER cover scanned words with a white rectangle and new text (add_shape + add_text/add_free_text): that shows a different typeface and cuts through lines and frames. If a run cannot be drawn on the scan, tell the user why and offer open_in_editor. Filling in a form's blanks (writing where nothing was printed) is still add_free_text / add_mark.
 Ask the user before deleting pages, redacting, flattening, or overwriting a file. Every edit can be undone with undo until the document is closed.
 Reply in the user's language; the app's own names for tools are in Spanish (Editar PDF, Organizar páginas, Comentar, Rellenar y firmar, Proteger, Exportar).`
 
@@ -50,6 +51,7 @@ async function main() {
   registerPageTools(reg)
   registerExtraTools(reg)
   registerExportTools(reg)
+  registerScanTools(reg)
 
   // Engine threads keep the process alive: exit when the client goes away,
   // or an orphaned "PDF Editor Pro.exe" stays behind for every session.

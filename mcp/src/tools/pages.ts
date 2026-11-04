@@ -39,7 +39,7 @@ export function registerPageTools(t: Registrar) {
     input: { doc_id: docId, pages, degrees: z.union([z.literal(90), z.literal(-90), z.literal(180)]) }
   }, (args) => t.doc(args, async (s) => {
     const indices = pagesOf(args.pages, s.pageCount, false)
-    const r = await s.mutate(async e => { const x = await e.acro<Res>('rotatePages', { indices, degrees: args.degrees }); return { ok: x.success, value: x } })
+    const r = await s.pageOp(async e => { const x = await e.acro<Res>('rotatePages', { indices, degrees: args.degrees }); return { ok: x.success, value: x } })
     if (!r.success) return fail(`Could not rotate: ${r.error}`)
     structureChanged(s)
     return ok({ rotated: pageRangeLabel(indices), degrees: args.degrees })
@@ -53,7 +53,7 @@ export function registerPageTools(t: Registrar) {
   }, (args) => t.doc(args, async (s) => {
     const indices = pagesOf(args.pages, s.pageCount, false)
     if (indices.length >= s.pageCount) return fail('A document cannot lose all of its pages.')
-    const r = await s.mutate(async e => { const x = await e.acro<Res>('deletePages', { indices }); return { ok: x.success, value: x } })
+    const r = await s.pageOp(async e => { const x = await e.acro<Res>('deletePages', { indices }); return { ok: x.success, value: x } })
     if (!r.success) return fail(`Could not delete: ${r.error}`)
     structureChanged(s)
     return ok({ deleted: pageRangeLabel(indices), pages_now: s.pageCount })
@@ -73,7 +73,7 @@ export function registerPageTools(t: Registrar) {
     const at = rest.filter(i => i < before).length
     const order = [...rest.slice(0, at), ...moving, ...rest.slice(at)]
     if (order.every((v, i) => v === i)) return ok({ note: 'the pages are already there' })
-    const r = await s.mutate(async e => { const x = await e.acro<Res>('rearrange', { order }); return { ok: x.success, value: x } })
+    const r = await s.pageOp(async e => { const x = await e.acro<Res>('rearrange', { order }); return { ok: x.success, value: x } })
     if (!r.success) return fail(`Could not move: ${r.error}`)
     structureChanged(s)
     return ok({ moved: pageRangeLabel(moving), now_at: `${at + 1}${moving.length > 1 ? `-${at + moving.length}` : ''}` })
@@ -87,7 +87,7 @@ export function registerPageTools(t: Registrar) {
     const n = s.pageCount
     const order = (args.order as number[]).map(p => p - 1)
     if (order.length !== n || new Set(order).size !== n || order.some(i => i < 0 || i >= n)) return fail(`order must list each of the ${n} page numbers exactly once (use delete_pages to remove pages).`)
-    const r = await s.mutate(async e => { const x = await e.acro<Res>('rearrange', { order }); return { ok: x.success, value: x } })
+    const r = await s.pageOp(async e => { const x = await e.acro<Res>('rearrange', { order }); return { ok: x.success, value: x } })
     if (!r.success) return fail(`Could not reorder: ${r.error}`)
     structureChanged(s)
     return ok({ reordered: n })
@@ -100,7 +100,7 @@ export function registerPageTools(t: Registrar) {
   }, (args) => t.doc(args, async (s) => {
     const indices = pagesOf(args.pages, s.pageCount, false).sort((a, b) => b - a)
     let error = ''
-    await s.mutate(async e => {
+    await s.pageOp(async e => {
       for (const i of indices) { const x = await e.send<Res>('duplicatePage', { pageIndex: i }); if (!x.success) { error = x.error || 'duplicate failed'; return { ok: false, value: null } } }
       return { ok: true, value: null }
     })
@@ -124,7 +124,7 @@ export function registerPageTools(t: Registrar) {
     if (at < 0 || at > s.pageCount) return fail(`before must be from 1 to ${s.pageCount + 1}`)
     if (args.file_path) {
       const bytes = await sourceBytes(t, resolvePath(args.file_path, 'file_path'), args.from_pages)
-      const r = await s.mutate(async e => { const x = await e.send<Res>('mergePages', { bytes, atIndex: at }); return { ok: x.success, value: x } })
+      const r = await s.pageOp(async e => { const x = await e.send<Res>('mergePages', { bytes, atIndex: at }); return { ok: x.success, value: x } })
       if (!r.success) return fail(`Could not insert: ${r.error}`)
       structureChanged(s)
       return ok({ inserted: r.added, at: at + 1, pages_now: s.pageCount })
@@ -132,7 +132,7 @@ export function registerPageTools(t: Registrar) {
     const count = args.blank_pages ?? 1
     const ref = await pageSize(s, Math.max(0, Math.min(at, s.pageCount) - 1))
     let error = ''
-    await s.mutate(async e => {
+    await s.pageOp(async e => {
       for (let k = 0; k < count; k++) { const x = await e.send<Res>('insertBlankPage', { atIndex: at + k, width: ref.width, height: ref.height }); if (!x.success) { error = x.error || 'insert failed'; return { ok: false, value: null } } }
       return { ok: true, value: null }
     })
@@ -149,7 +149,7 @@ export function registerPageTools(t: Registrar) {
   }, (args) => t.doc(args, async (s) => {
     const indices = pagesOf(args.pages, s.pageCount, false)
     const bytes = await sourceBytes(t, resolvePath(args.file_path, 'file_path'), args.from_pages)
-    const r = await s.mutate(async e => { const x = await e.acro<Res>('replacePages', { indices, bytes }); return { ok: x.success, value: x } })
+    const r = await s.pageOp(async e => { const x = await e.acro<Res>('replacePages', { indices, bytes }); return { ok: x.success, value: x } })
     if (!r.success) return fail(`Could not replace: ${r.error}`)
     structureChanged(s)
     return ok({ replaced: r.replaced, pages_now: s.pageCount })
@@ -190,7 +190,7 @@ export function registerPageTools(t: Registrar) {
     let deleted = false
     if (args.delete_after) {
       if (indices.length >= s.pageCount) return ok({ written, note: 'all pages were extracted, so none were deleted from this document' })
-      const r = await s.mutate(async eng => { const x = await eng.acro<Res>('deletePages', { indices }); return { ok: x.success, value: x } })
+      const r = await s.pageOp(async eng => { const x = await eng.acro<Res>('deletePages', { indices }); return { ok: x.success, value: x } })
       deleted = r.success
       structureChanged(s)
     }
@@ -235,7 +235,7 @@ export function registerPageTools(t: Registrar) {
     const indices = pagesOf(args.pages, s.pageCount)
     const margins = { top: args.top ?? 0, right: args.right ?? 0, bottom: args.bottom ?? 0, left: args.left ?? 0 }
     if (!margins.top && !margins.right && !margins.bottom && !margins.left) return fail('Give at least one margin to crop.')
-    const r = await s.mutate(async e => { const x = await e.acro<Res>('cropPages', { indices, margins }); return { ok: x.success, value: x } })
+    const r = await s.pageOp(async e => { const x = await e.acro<Res>('cropPages', { indices, margins }); return { ok: x.success, value: x } })
     if (!r.success) return fail(`Could not crop: ${r.error}`)
     structureChanged(s)
     return ok({ cropped: pageRangeLabel(indices), margins })

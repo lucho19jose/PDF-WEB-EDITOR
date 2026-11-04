@@ -54,7 +54,7 @@ export function registerReadTools(t: Registrar) {
 
   t.add('list_page_text', {
     title: 'List page text',
-    description: 'The text blocks of a page, each with a reference like "p1b12" and its position (points from the top-left corner), size and font. Use the references with edit_text_block, delete_text, transform_text and restyle_text. A scanned page has no editable text: the result says so.',
+    description: 'The text blocks of a page, each with a reference like "p1b12" and its position (points from the top-left corner), size and font. Use the references with edit_text_block, delete_text, transform_text and restyle_text. A scanned page has no text blocks: the result says so — read and edit its words with recognize_page and edit_scanned_text.',
     input: { doc_id: docId, page },
     readOnly: true
   }, (args) => t.doc(args, async (s) => {
@@ -62,7 +62,7 @@ export function registerReadTools(t: Registrar) {
     const k = await kindOf(s, p)
     s.clearPageAnchors(p, 'block')
     if (k.kind === 'scan') {
-      return ok({ page: p + 1, scanned: true, why: k.reason, note: 'The text on this page is part of a scanned image and cannot be edited as text here. Read it with render_page; recognise and edit it in PDF Editor Pro with open_in_editor, or annotate on top (add_free_text, add_text).' })
+      return ok({ page: p + 1, scanned: true, why: k.reason, note: 'The text on this page is part of a scanned image. Call recognize_page to read its words, then edit_scanned_text (or replace_text) to change them ON the scan in its own letters. Do not cover scanned words with a white box and new text.' })
     }
     const blocks = k.blocks.filter(b => !b.invisible && b.text.trim())
     if (!blocks.length) return ok({ page: p + 1, blocks: 0, note: 'This page has no text.' })
@@ -111,7 +111,7 @@ export function registerReadTools(t: Registrar) {
     }
     const out: Record<string, unknown> = { total_hits: hits.length, matches: matches.slice(0, max) }
     if (matches.length > max) out.note = `${matches.length - max} more blocks not shown`
-    if (scanned.length) out.scanned_pages_with_hits = { pages: scanned, note: 'found in the invisible OCR text of scanned pages: those words are part of an image and cannot be edited as text here (use open_in_editor)' }
+    if (scanned.length) out.scanned_pages_with_hits = { pages: scanned, note: 'found in the invisible OCR text of scanned pages: those words are part of an image — recognize_page and edit_scanned_text (or replace_text) change them on the scan' }
     return ok(out)
   }))
 

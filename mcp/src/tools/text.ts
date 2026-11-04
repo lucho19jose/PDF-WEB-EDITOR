@@ -3,9 +3,10 @@
  * does). The rules are the in-app assistant's, each learned on real files:
  * a phrase can span several extraction blocks (`replaceAllSpans`); "change X
  * to Y" means every occurrence unless the user singled one out; edits on one
- * page go back to front, since a block id is its extraction index; and a
- * scanned page is refused, because invisible OCR text changed is a change
- * nobody can see.
+ * page go back to front, since a block id is its extraction index; and on a
+ * scanned page the words are part of the image, so the phrase is found in the
+ * page's recognised runs and the change drawn on the scan (tools/scan.ts) —
+ * rewriting its invisible OCR layer would be a change nobody can see.
  */
 import { z } from 'zod'
 import type { Registrar } from './registrar'
@@ -15,6 +16,10 @@ import { replaceAllSpans } from '../../../src/utils/assistant/spanEdits'
 import { extractionIndex } from '../../../src/utils/assistant/anchors'
 import { ok, fail, colorOf, pageIndexOf, pagesOf, base14, ToolError } from '../util'
 import { kindOf, pageSize } from '../pageInfo'
+import { replaceOnScan, describeOutcomes } from './scan'
+
+/** Scanned pages a whole-document replace recognises in one call (a few seconds each). */
+const SCAN_PAGES_PER_CALL = 4
 
 const docId = z.string().optional().describe('Document id from open_pdf. Optional when only one document is open.')
 const refs = z.array(z.string()).min(1).describe('Text references from list_page_text or find_text, e.g. ["p1b3","p1b4"]')
@@ -33,7 +38,7 @@ async function blocksOnOnePage(s: DocumentSession, list: string[], tool: string)
 export function registerTextTools(t: Registrar) {
   t.add('replace_text', {
     title: 'Replace text',
-    description: 'Find a phrase and replace it — on one page, or in the whole document when page is omitted. Matching ignores case and line breaks, and a phrase split across lines or table cells is still found. Replaces EVERY occurrence unless occurrence is "first". An empty replacement deletes the phrase. The text keeps its font where the font has the glyphs; otherwise a standard font is substituted (reported). Scanned pages are skipped and listed.',
+    description: 'Find a phrase and replace it — on one page, or in the whole document when page is omitted. Matching ignores case and line breaks, and a phrase split across lines or table cells is still found. Replaces EVERY occurrence unless occurrence is "first". An empty replacement deletes the phrase. The text keeps its font where the font has the glyphs; otherwise a standard font is substituted (reported). On SCANNED pages the page is recognised (OCR) and the change is drawn on the scan in its own letters (see edit_scanned_text); a whole-document replace recognises at most 4 scanned pages per call and lists the rest.',
     input: {
       doc_id: docId,
       find: z.string().min(1).describe('The words to find, as they appear on the page'),
@@ -46,6 +51,7 @@ export function registerTextTools(t: Registrar) {
     const pages = args.page ? [pageIndexOf(args.page, s.pageCount)] : pagesOf('all', s.pageCount)
     const report: Record<string, unknown>[] = []
     const scanned: number[] = []
+    const scanPages: number[] = []
     const notes = new Set<string>()
     let total = 0
     let remaining = max
@@ -54,10 +60,7 @@ export function registerTextTools(t: Registrar) {
         if (remaining <= 0) break
         const k = await kindOf(s, p)
         const blocks = k.blocks.filter(b => !b.invisible && b.text.trim())
-        if (k.kind === 'scan') {
-          if (k.invisibleChars && (k.blocks.some(b => b.invisible && b.text.toLowerCase().includes(args.find.toLowerCase().trim())))) scanned.push(p + 1)
-          continue
-        }
+        if (k.kind === 'scan') { scanPages.push(p); continue }
         const { edits: raw, count } = replaceAllSpans(blocks.map(b => b.text), args.find, args.replace, remaining)
         if (!count) continue
         const edits = raw
@@ -76,13 +79,25 @@ export function registerTextTools(t: Registrar) {
       }
       return { ok: report.some(r => (r.blocks_edited as number) > 0), value: null }
     })
+    // Scanned pages: recognised, and the change drawn on the scan.
+    for (const p of scanPages) {
+      if (remaining <= 0) break
+      scanned.push(p + 1)
+      if (scanned.length > SCAN_PAGES_PER_CALL) continue
+      const r = await replaceOnScan(s, p, args.find, args.replace, remaining)
+      if (!r.count) continue
+      const { drawn, notDrawn } = describeOutcomes(r.outcomes)
+      report.push({ page: p + 1, scanned: true, occurrences: r.count, runs_redrawn_on_scan: drawn.length, ...(notDrawn.length ? { not_drawn: notDrawn } : {}) })
+      if (drawn.length) { total += r.count; remaining -= r.count }
+    }
+    const unchecked = scanned.slice(SCAN_PAGES_PER_CALL)
     if (!report.length) {
-      if (scanned.length) return fail(`"${args.find}" appears only on scanned page(s) ${scanned.join(', ')}, which cannot be edited as text here. Use open_in_editor to edit them in PDF Editor Pro (OCR).`)
-      return fail(`"${args.find}" was not found${args.page ? ` on page ${args.page}` : ''}. Check the exact words with find_text or list_page_text.`)
+      const searched = scanned.slice(0, SCAN_PAGES_PER_CALL)
+      return fail(`"${args.find}" was not found${args.page ? ` on page ${args.page}` : ''}${searched.length ? ` (scanned page(s) ${searched.join(', ')} were recognised and searched)` : ''}. Check the exact words with find_text, list_page_text or recognize_page${unchecked.length ? `; scanned pages ${unchecked.join(', ')} were not searched yet — call replace_text with page for them` : ''}.`)
     }
     const out: Record<string, unknown> = { replaced: args.find, with: args.replace, occurrences: total, pages: report }
     if (notes.size) out.note = [...notes].join('; ')
-    if (scanned.length) out.not_changed_scanned_pages = scanned
+    if (unchecked.length) out.scanned_pages_not_searched = unchecked
     return ok(out)
   }))
 

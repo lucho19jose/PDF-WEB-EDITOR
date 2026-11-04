@@ -29,6 +29,10 @@ export type Anchor =
   | { kind: 'annot'; page: number; type: string; cx: number; cy: number; contents: string }
   | { kind: 'image'; page: number; name: string; cx: number; cy: number }
 
+/** State kept beside the bytes (a scanned page's runs): captured with every undo point and put back with it. */
+export interface SessionExtra { capture(): unknown; restore(v: unknown): void; reset(): void }
+interface UndoEntry { bytes: ArrayBuffer; extra?: unknown }
+
 export class DocumentSession {
   readonly id: string
   /** Where it came from / was last saved, or null for a new document. */
@@ -38,8 +42,12 @@ export class DocumentSession {
   pageCount = 0
   dirty = false
   private engine: EngineClient | null = null
-  private undo: ArrayBuffer[] = []
-  private redo: ArrayBuffer[] = []
+  private undo: UndoEntry[] = []
+  private redo: UndoEntry[] = []
+  /** Scan state (mcp/src/ocr), attached the first time a scanned page is recognised. */
+  extra: SessionExtra | null = null
+  /** Whatever a scan tool attached for this document (its ScanDoc). */
+  scanDoc: unknown = null
   private anchors = new Map<string, Anchor>()
   private chain: Promise<unknown> = Promise.resolve()
   private disk: { mtimeMs: number; size: number } | null = null
@@ -94,6 +102,7 @@ export class DocumentSession {
    */
   async mutate<T>(fn: (e: EngineClient) => Promise<{ ok: boolean; value: T }>): Promise<T> {
     const e = await this.eng()
+    const extra = this.extra?.capture()
     let res: { ok: boolean; value: T }
     try {
       res = await fn(e)
@@ -103,10 +112,11 @@ export class DocumentSession {
     }
     if (!res.ok) {
       await this.restoreEngine()
+      if (extra !== undefined) this.extra!.restore(extra)
       return res.value
     }
     const saved = await e.send<{ bytes: ArrayBuffer }>('saveDocument')
-    this.pushUndo(this.bytes)
+    this.pushUndo({ bytes: this.bytes, extra })
     this.redo = []
     await this.adopt(saved.bytes)
     this.dirty = true
@@ -115,17 +125,30 @@ export class DocumentSession {
 
   /** Replace the whole document (a page merge, an unlock…) as one undoable change. */
   async replaceBytes(bytes: ArrayBuffer): Promise<void> {
-    this.pushUndo(this.bytes)
+    this.pushUndo({ bytes: this.bytes, extra: this.extra?.capture() })
     this.redo = []
     await this.adopt(bytes)
+    this.extra?.reset()
     this.dirty = true
+  }
+
+  /**
+   * A change to the pages themselves (rotate, delete, move, insert, crop):
+   * recognised runs are keyed by page index and measured on the page's
+   * geometry, so they are dropped — as the app's `forgetOcr` does.
+   */
+  async pageOp<T>(fn: (e: EngineClient) => Promise<{ ok: boolean; value: T }>): Promise<T> {
+    const v = await this.mutate(fn)
+    this.extra?.reset()
+    return v
   }
 
   async undoOnce(): Promise<boolean> {
     const prev = this.undo.pop()
     if (!prev) return false
-    this.redo.push(this.bytes)
-    await this.adopt(prev)
+    this.redo.push({ bytes: this.bytes, extra: this.extra?.capture() })
+    await this.adopt(prev.bytes)
+    if (prev.extra !== undefined) this.extra?.restore(prev.extra)
     this.dirty = true
     return true
   }
@@ -133,18 +156,19 @@ export class DocumentSession {
   async redoOnce(): Promise<boolean> {
     const next = this.redo.pop()
     if (!next) return false
-    this.undo.push(this.bytes)
-    await this.adopt(next)
+    this.undo.push({ bytes: this.bytes, extra: this.extra?.capture() })
+    await this.adopt(next.bytes)
+    if (next.extra !== undefined) this.extra?.restore(next.extra)
     this.dirty = true
     return true
   }
 
   get history() { return { undo: this.undo.length, redo: this.redo.length } }
 
-  private pushUndo(b: ArrayBuffer) {
-    this.undo.push(b)
-    let total = this.undo.reduce((n, x) => n + x.byteLength, 0)
-    while (this.undo.length > 1 && total > UNDO_BYTES) total -= this.undo.shift()!.byteLength
+  private pushUndo(entry: UndoEntry) {
+    this.undo.push(entry)
+    let total = this.undo.reduce((n, x) => n + x.bytes.byteLength, 0)
+    while (this.undo.length > 1 && total > UNDO_BYTES) total -= this.undo.shift()!.bytes.byteLength
   }
 
   private async adopt(bytes: ArrayBuffer) {

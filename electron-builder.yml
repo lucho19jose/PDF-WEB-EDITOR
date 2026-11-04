@@ -42,14 +42,13 @@ extraResources:
     filter: ["*.ps1"]
   # The MCP server (npm run mcp:build) Claude runs as `"PDF Editor Pro.exe"
   # resources\mcp\server.mjs` with ELECTRON_RUN_AS_NODE=1. Its mupdf copy is
-  # under vendor/, not node_modules/: electron-builder drops a node_modules
-  # folder from extraResources without a word.
+  # under vendor/: electron-builder drops a node_modules folder at the ROOT of
+  # a copied folder without a word. The OCR runtime's ocr/node_modules is
+  # nested, and kept. The Claude Desktop extension (.mcpb) is not shipped
+  # here: it is published with each release, and the dialog links to it.
   - from: dist-mcp
     to: mcp
     filter: ["**/*", "!**/*.map"]
-  # The same server as a Claude Desktop extension, offered by Ayuda ▸ Conectar con Claude.
-  - from: release/pdf-editor-pro.mcpb
-    to: pdf-editor-pro.mcpb
 
 win:
   icon: build/icon.png

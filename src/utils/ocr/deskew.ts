@@ -1,3 +1,4 @@
+import { makeCanvas } from './canvasFactory'
 import type { OcrBox, OcrLine, OcrRecognition } from './ocrEngine'
 
 /**
@@ -114,9 +115,7 @@ export interface Levelled {
 export function levelCanvas(src: HTMLCanvasElement, degrees: number): Levelled | null {
   const rad = degrees * Math.PI / 180
   const margin = Math.ceil(Math.max(src.width, src.height) * Math.abs(Math.sin(rad)) / 2) + 4
-  const canvas = document.createElement('canvas')
-  canvas.width = src.width + margin * 2
-  canvas.height = src.height + margin * 2
+  const canvas = makeCanvas(src.width + margin * 2, src.height + margin * 2)
   const ctx = canvas.getContext('2d', { willReadFrequently: true })
   if (!ctx) return null
   ctx.fillStyle = '#fff'
