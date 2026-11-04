@@ -9,7 +9,7 @@
 //    COOP/COEP response headers this handler adds (Netlify's _headers and
 //    Apache's .htaccess do the same job on the web).
 
-const { app, BrowserWindow, protocol, shell, dialog, ipcMain, Menu } = require('electron')
+const { app, BrowserWindow, protocol, shell, dialog, ipcMain, Menu, nativeImage } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -307,6 +307,65 @@ ipcMain.on('desktop:reveal-mcpb', () => {
   if (fs.existsSync(mcpb)) shell.showItemInFolder(mcpb)
 })
 
+// ===== Pages dragged out of the app =====
+// Selected pages dragged from a page list onto a folder become a PDF there, as
+// in PDF24. The page builds the file's bytes; here they are written to a
+// temporary folder and handed to Windows' own drag (startDrag), which on
+// Windows returns only once the drag has ended. Electron offers the drop as
+// copy or link, never move, so Explorer always copies. Explorer copies AFTER
+// the drop has returned, possibly on a thread of its own, so a drag's folder is
+// deleted only an hour later — at the next drag, or at the next launch.
+const dragsDir = () => path.join(app.getPath('temp'), 'PDF Editor Pro', 'Arrastres')
+const DRAG_KEEP_MS = 60 * 60 * 1000
+
+function sweepDragFolders() {
+  const root = dragsDir()
+  fs.promises.readdir(root, { withFileTypes: true }).then(entries => Promise.all(entries.map(async (d) => {
+    const dir = path.join(root, d.name)
+    try {
+      const st = await fs.promises.stat(dir)
+      if (Date.now() - st.mtimeMs > DRAG_KEEP_MS) await fs.promises.rm(dir, { recursive: true, force: true })
+    } catch { /* in use, or already gone */ }
+  }))).catch(() => { /* no folder yet */ })
+}
+
+/** A file name Windows accepts: no folders, no reserved characters, ending in .pdf. */
+function dragFileName(name) {
+  let base = path.basename(String(name || '')).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/, '').trim()
+  if (!base) base = 'documento.pdf'
+  if (!/\.pdf$/i.test(base)) base += '.pdf'
+  if (base.length > 150) base = base.slice(0, 146).trimEnd() + '.pdf'
+  return base
+}
+
+let dragIconFallback = null
+function dragIcon(png, scale) {
+  if (png && png.length) {
+    try {
+      const img = nativeImage.createFromBuffer(Buffer.from(png.buffer, png.byteOffset, png.byteLength), { scaleFactor: scale > 0 ? scale : 1 })
+      if (!img.isEmpty()) return img
+    } catch { /* fall back to the app's icon */ }
+  }
+  if (!dragIconFallback) {
+    const icon = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png'))
+    dragIconFallback = icon.isEmpty() ? icon : icon.resize({ width: 48 })
+  }
+  return dragIconFallback
+}
+
+ipcMain.handle('desktop:drag-out', async (e, file) => {
+  const bytes = file && file.bytes
+  if (!bytes || !bytes.byteLength) return false
+  const dir = path.join(dragsDir(), `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
+  const target = path.join(dir, dragFileName(file.name))
+  await fs.promises.mkdir(dir, { recursive: true })
+  await fs.promises.writeFile(target, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength))
+  // Blocks (in a nested message loop) until the drop or Esc.
+  e.sender.startDrag({ file: target, icon: dragIcon(file.icon, Number(file.scale) || 1) })
+  sweepDragFolders()
+  return true
+})
+
 function createWindow({ raise: raiseOnShow = false } = {}) {
   const others = BrowserWindow.getAllWindows().filter(w => editors.has(w.webContents.id))
   const win = new BrowserWindow({
@@ -500,6 +559,7 @@ if (process.argv.includes(LISTENER_FLAG)) {
     if (files.length) for (const f of files) openFile(f)
     else createWindow()
     setupUpdates()
+    sweepDragFolders()
     app.on('activate', () => { if (!editors.size) createWindow() })
   })
 

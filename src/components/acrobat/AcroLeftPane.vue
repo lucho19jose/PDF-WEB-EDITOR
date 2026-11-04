@@ -53,6 +53,7 @@
             draggable="true"
             @click="onClick($event, p)"
             @contextmenu.prevent="onContext(p)"
+            @pointerdown="onPointerDown($event, p)"
             @dragstart="onDragStart($event, p)"
             @dragover.prevent="onDragOver($event, p)"
             @dragleave="dropAt = null"
@@ -97,6 +98,7 @@ import { useUiStore } from '@/stores/ui'
 import { persistedRef } from '@/utils/persist'
 import ThumbImage from './ThumbImage.vue'
 import type { AcroShell } from './acroShell'
+import { canDragOut, dragPagesOut, isOwnFileDrop, takeOwnDrop } from '@/utils/acro/pageDragOut'
 
 const docStore = useDocumentStore()
 const ui = useUiStore()
@@ -136,8 +138,30 @@ watch(() => docStore.currentPage, p => nextTick(() => {
 // ── drag to reorder ──
 const dropAt = ref<number | null>(null)
 let dragging: number[] = []
+/** The pages a drag starting on page `p` carries: the selection when `p` is in it. */
+function dragSet(p: number) { return ui.selectedPages.includes(p - 1) ? [...sel.value] : [p - 1] }
+/** Windows app: start building the file a drag out would drop (see OrganizePages). */
+function onPointerDown(e: PointerEvent, p: number) {
+  if (e.button !== 0 || ui.pageOperationBusy || !canDragOut()) return
+  void commands.pagesFile(dragSet(p))
+}
 function onDragStart(e: DragEvent, p: number) {
-  dragging = ui.selectedPages.includes(p - 1) ? [...ui.selectedPages] : [p - 1]
+  dragging = dragSet(p)
+  if (canDragOut()) {
+    // Windows' file drag: a PDF of these pages where it is dropped; dropped
+    // back on this list, `onDrop` turns it into the reorder.
+    e.preventDefault()
+    const pages = [...dragging]
+    void dragPagesOut({
+      pages,
+      documentId: docStore.documentId,
+      revision: docStore.renderVersion,
+      images: pages.map(i => items.get(i + 1)?.querySelector('img')),
+      getFile: () => commands.pagesFile(pages),
+      onEnd: () => { dragging = []; dropAt.value = null }
+    })
+    return
+  }
   if (e.dataTransfer) { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(p)) }
 }
 function onDragOver(e: DragEvent, p: number) {
@@ -145,9 +169,16 @@ function onDragOver(e: DragEvent, p: number) {
   const r = el.getBoundingClientRect()
   dropAt.value = e.clientY < r.top + r.height / 2 ? p - 1 : p
 }
-async function onDrop() {
+async function onDrop(e: DragEvent) {
   const at = dropAt.value
   dropAt.value = null
+  // Our own page drag (Windows app) dropped back on the list: a reorder.
+  if (isOwnFileDrop(e)) {
+    const own = takeOwnDrop()
+    dragging = []
+    if (at !== null && own && own.documentId === docStore.documentId && own.revision === docStore.renderVersion) await commands.movePages(own.pages, at)
+    return
+  }
   if (at === null || !dragging.length) return
   await commands.movePages(dragging, at)
   dragging = []
@@ -212,7 +243,7 @@ const BookmarkNode: any = defineComponent({
 .panel { width: 210px; display: flex; flex-direction: column; min-height: 0; }
 .panel-head { display: flex; align-items: center; height: 38px; padding: 0 6px 0 12px; font-weight: 700; font-size: 13px; color: var(--acro-text-strong); border-bottom: 1px solid var(--acro-rule); }
 .tool-row { display: flex; gap: 2px; padding: 4px 8px; border-bottom: 1px solid var(--acro-rule); }
-.thumb-list { flex: 1; overflow-y: auto; padding: 12px 0 24px; }
+.thumb-list { flex: 1; overflow-y: auto; padding: 12px 0 24px; user-select: none; }
 .thumb-item { display: flex; flex-direction: column; align-items: center; padding: 6px 0; cursor: pointer; position: relative; }
 .thumb-frame { padding: 4px; border: 2px solid transparent; border-radius: 2px; }
 .thumb-item:hover .thumb-frame { border-color: var(--acro-border-strong); }

@@ -246,6 +246,39 @@ export function useAcroCommands(deps: AcroCommandDeps) {
     }
   }
 
+  /**
+   * The given pages as a PDF of their own, named as Extraer names it: what
+   * dragging pages out of the Windows app hands to Explorer. Built when the
+   * pointer goes down on a thumbnail, so it is usually ready by the time the
+   * drag starts; one entry is kept, keyed by document, revision and pages.
+   * Read inside the op queue: a read landing between an edit's save and its
+   * reload would extract from a document about to be replaced.
+   */
+  let pagesFileCache: { key: string; promise: Promise<{ name: string; bytes: ArrayBuffer } | null>; timer?: ReturnType<typeof setTimeout> } | null = null
+  function pagesFile(indices: number[]): Promise<{ name: string; bytes: ArrayBuffer } | null> {
+    const list = [...new Set(indices)].filter(i => i >= 0 && i < docStore.totalPages).sort((a, b) => a - b)
+    if (!list.length) return Promise.resolve(null)
+    const key = `${docStore.documentId}|${docStore.renderVersion}|${list.join(',')}`
+    if (pagesFileCache?.key === key) return pagesFileCache.promise
+    forgetPagesFile()
+    const promise = (async () => {
+      await deps.bakeOcrEdits()
+      const r = await enqueueOp(() => pdfEngine.acro<Result>('extractPages', { indices: list }))
+      if (!r?.success || !r.bytes) { editorStore.setStatus(`No se pudieron preparar las páginas: ${r?.error || 'error desconocido'}`); return null }
+      let base = baseName().trim() || 'documento'
+      // Deep OneDrive folders come close to Windows' 260-character path limit.
+      if (base.length > 100) base = base.slice(0, 100).trimEnd()
+      return { name: `${base} - ${pageRangeLabel(list)}.pdf`, bytes: r.bytes as ArrayBuffer }
+    })().catch(() => null)
+    // A selection that is never dragged must not hold its bytes for good.
+    pagesFileCache = { key, promise, timer: setTimeout(() => { if (pagesFileCache?.key === key) pagesFileCache = null }, 30_000) }
+    return promise
+  }
+  function forgetPagesFile() {
+    if (pagesFileCache?.timer) clearTimeout(pagesFileCache.timer)
+    pagesFileCache = null
+  }
+
   async function splitDocument(opts: { every?: number; at?: number[] }) {
     await deps.flushOpenEditor()
     await deps.bakeOcrEdits()
@@ -524,7 +557,7 @@ export function useAcroCommands(deps: AcroCommandDeps) {
   return {
     say, change, download, confirm, pdfBytesOf, isImage,
     rotatePages, deletePages, movePages, reverseOrder, duplicatePages, insertBlank, insertFile,
-    replacePages, extractPages, splitDocument,
+    replacePages, extractPages, splitDocument, pagesFile, forgetPagesFile,
     cropPages, headerFooter, watermark, background, removeTagged, hasTagged,
     addRedaction, applyRedactions, addLink, deleteLink, listLinks,
     setMetadata, getMetadata, outline, flatten,

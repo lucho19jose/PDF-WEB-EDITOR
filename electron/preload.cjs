@@ -37,5 +37,17 @@ contextBridge.exposeInMainWorld('desktop', {
   /** Shows the Claude Desktop extension (.mcpb) selected in Explorer. */
   revealMcpb() {
     ipcRenderer.send('desktop:reveal-mcpb')
+  },
+  /**
+   * Pages dragged out of the app: { name, bytes, icon?, scale? } becomes a
+   * file that Windows drags. Resolves once the drag has ended.
+   */
+  dragOut(file) {
+    return ipcRenderer.invoke('desktop:drag-out', {
+      name: String(file?.name || 'documento.pdf'),
+      bytes: file?.bytes,
+      icon: file?.icon,
+      scale: Number(file?.scale) || 1
+    })
   }
 })

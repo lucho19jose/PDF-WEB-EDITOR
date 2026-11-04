@@ -14,6 +14,7 @@
         :draggable="!ui.pageOperationBusy"
         @click.stop="onClick($event, p - 1)"
         @dblclick.stop="openPage(p)"
+        @pointerdown="onPointerDown($event, p - 1)"
         @dragstart="onDragStart($event, p - 1)"
         @dragend="onDragEnd"
         @dragover.prevent.stop="onCellDragOver($event, p - 1)"
@@ -76,6 +77,7 @@ import { useUiStore } from '@/stores/ui'
 import ThumbImage from './ThumbImage.vue'
 import type { AcroShell } from './acroShell'
 import { pageDropPosition } from '@/utils/acro/pageDropPosition'
+import { canDragOut, dragPagesOut, ownDrag, isOwnFileDrop, takeOwnDrop } from '@/utils/acro/pageDragOut'
 
 const docStore = useDocumentStore()
 const ui = useUiStore()
@@ -142,12 +144,38 @@ function positionAt(e: DragEvent) {
   dragCells ??= gridRef.value?.querySelectorAll<HTMLElement>('.cell') ?? null
   return pageDropPosition(dragCells?.length ?? 0, i => dragCells![i].getBoundingClientRect(), e.clientX, e.clientY)
 }
+/** The pages a drag starting on page `i` carries: the selection when `i` is in it. */
+function dragSet(i: number) { return isSel(i) ? sel.value : [i] }
+/**
+ * Windows app: the pointer going down on a page starts building the PDF that
+ * dragging it out would drop, so the file is ready when the drag begins.
+ */
+function onPointerDown(e: PointerEvent, i: number) {
+  if (e.button !== 0 || ui.pageOperationBusy || !canDragOut()) return
+  void commands.pagesFile(dragSet(i))
+}
 function onDragStart(e: DragEvent, i: number) {
   if (ui.pageOperationBusy) { e.preventDefault(); return }
   dragCells = null
   dragRevision = docStore.renderVersion
   if (!isSel(i)) { ui.selectedPages = [i]; anchor = i }
   draggingSet.value = new Set(ui.selectedPages)
+  if (canDragOut()) {
+    // Windows' file drag: dropped on a folder it is a PDF of these pages;
+    // dropped back here, `onDrop` turns it into the reorder.
+    e.preventDefault()
+    const pages = [...sel.value]
+    const cells = gridRef.value?.querySelectorAll<HTMLElement>('.cell')
+    void dragPagesOut({
+      pages,
+      documentId: docStore.documentId,
+      revision: dragRevision,
+      images: pages.map(p => cells?.[p]?.querySelector('img')),
+      getFile: () => commands.pagesFile(pages),
+      onEnd: onDragEnd
+    })
+    return
+  }
   if (e.dataTransfer) {
     e.dataTransfer.effectAllowed = 'move'
     e.dataTransfer.setData('application/x-acro-pages', JSON.stringify({ pages: [...draggingSet.value], revision: dragRevision }))
@@ -159,11 +187,11 @@ function onCellDragOver(e: DragEvent, i: number) {
   if (ui.pageOperationBusy) return
   const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
   dropAt.value = e.clientX < r.left + r.width / 2 ? i : i + 1
-  fileDrop.value = isFileDrag(e)
+  fileDrop.value = isFileDrag(e) && !ownDrag()
 }
 function onAreaDragOver(e: DragEvent) {
   if (ui.pageOperationBusy) return
-  fileDrop.value = isFileDrag(e)
+  fileDrop.value = isFileDrag(e) && !ownDrag()
   // White space is a drop target too; never carry the last cell's position
   // into a gap or the empty area below the grid.
   dropAt.value = positionAt(e)
@@ -174,6 +202,12 @@ async function onDrop(e: DragEvent) {
   const revision = dragRevision
   onDragEnd()
   if (ui.pageOperationBusy) return
+  // Our own page drag (Windows app) dropped back on the grid: a reorder.
+  if (isOwnFileDrop(e)) {
+    const own = takeOwnDrop()
+    if (own && own.documentId === docStore.documentId && own.revision === docStore.renderVersion) await commands.movePages(own.pages, at)
+    return
+  }
   if (isFileDrag(e)) {
     let pos = at
     for (const f of [...e.dataTransfer!.files]) {
@@ -238,7 +272,7 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.organize { position: relative; height: 100%; overflow: auto; background: var(--acro-bar); outline: none; }
+.organize { position: relative; height: 100%; overflow: auto; background: var(--acro-bar); outline: none; user-select: none; }
 .grid { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 28px 16px; padding: 44px 40px 90px; min-height: 100%; }
 .cell { position: relative; padding: 0 10px; }
 .card {

@@ -138,6 +138,7 @@ import FindBar from '@/components/toolbar/FindBar.vue'
 import AssistantPanel from '@/components/assistant/AssistantPanel.vue'
 import { createAssistant } from '@/composables/useAssistant'
 import { isEmbedded, connectFrame, reportState, openInNewTabs, switchTab, desktopApi } from '@/tabs/frameClient'
+import { isOwnFileDrop, takeOwnDrop } from '@/utils/acro/pageDragOut'
 import type { IncomingFile } from '@/tabs/protocol'
 
 const $q = useQuasar()
@@ -2111,6 +2112,9 @@ async function handleDrop(e: DragEvent) {
   // would throw its work away.
   if (e.defaultPrevented) return
   e.preventDefault()
+  // Pages dragged out of a page list (Windows app) and let go over the viewer,
+  // the tab bar or a toolbar: not a file to open — the drag simply ends.
+  if (isOwnFileDrop(e)) { takeOwnDrop(); return }
   if (ui.dialog) return
   const files = [...(e.dataTransfer?.files ?? [])]
   // Several PDFs open as tabs, as Acrobat does; anything else dropped in

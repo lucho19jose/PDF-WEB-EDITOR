@@ -15,6 +15,12 @@ interface DesktopBridge {
   mcpInfo?(): Promise<{ exe: string; server: string; serverExists: boolean; mcpb: string; mcpbExists: boolean; packaged: boolean }>
   /** Shows the Claude Desktop extension (.mcpb) selected in Explorer. */
   revealMcpb?(): void
+  /**
+   * Drags a PDF out of the app as a real file (Explorer, the desktop, a mail):
+   * written to a temporary folder and handed to Windows' drag. Resolves when
+   * the drag ends — dropped anywhere, or cancelled with Esc.
+   */
+  dragOut?(file: { name: string; bytes: Uint8Array; icon?: Uint8Array; scale?: number }): Promise<boolean>
 }
 interface Window {
   desktop?: DesktopBridge

@@ -190,6 +190,37 @@ side is ONE worker message, `acro`, dispatched in `worker/acroTools.ts`;
   Bold and italic do not exist there, so the toolbar offers the three plain
   faces.
 
+### Pages dragged out of the Windows app are a real file
+Selected thumbnails (Organizar páginas, or the left pane's list) dragged onto
+a folder become one PDF of those pages there, named as Extraer names it
+(`<documento> - páginas 1-2.pdf`), as in PDF24. `src/utils/acro/pageDragOut.ts`
+holds the drag; `commands.pagesFile` builds the bytes (the worker's
+`extractPages`, inside the op queue); `desktop:drag-out` in `electron/main.cjs`
+writes them to `%TEMP%\PDF Editor Pro\Arrastres\<unique>\` and calls
+`webContents.startDrag`. The web app has no such drag and keeps the HTML5 one.
+- **In the app EVERY page drag is the OS drag.** Windows' file drag cannot run
+  beside the page's HTML5 drag, so `dragstart` is prevented and the file drag
+  started instead; dropped back on a page list it is recognised as ours and
+  reorders (`movePages`), dropped elsewhere in the window `handleDrop` ignores
+  it (the tab bar would otherwise open it as a tab). Dropped on ANOTHER app
+  window it is just a PDF: it opens, or inserts into that window's grid.
+- **Ours = the record plus the file's name.** The drop event and the IPC reply
+  that ends the drag come on different channels, either first; the record is
+  kept until a drop uses it or 2 s after the end, and a drop is ours only when
+  its single file has our name (sanitised the same way on both sides).
+- **`startDrag` returns only after the drop or Esc** (a nested loop on Windows),
+  and Electron offers copy and link, never move: Explorer always copies. It
+  copies AFTER the drop returns, so a drag's folder is swept an hour later.
+- **The file is built when the pointer goes down** (cached by document,
+  revision and pages), so the drag starts at once. A button released before it
+  is ready abandons the drag; one released in the few milliseconds between
+  that check and `startDrag` drops in place, which `movePages` sees as no move.
+- Measured with real mouse input (SetCursorPos + mouse_event from PowerShell,
+  coordinates from CDP, an Explorer window on the second screen): pages 1–2
+  land as a 2-page file, page 1 dropped after page 3 reorders with nothing
+  inserted, a drop on the tab bar opens nothing, the pointer back over the app
+  starts no phantom drag and a click still selects.
+
 ### "Exportar a Microsoft Excel": tables rebuilt from words and rules
 The export dialog (and Archivo ▸ Guardar como otro ▸ Excel) writes an .xlsx
 in three steps: the worker's `sheetPage` op (`worker/sheetExtract.ts`) reads
