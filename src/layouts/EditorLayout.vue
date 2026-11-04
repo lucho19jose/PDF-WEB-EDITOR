@@ -57,6 +57,7 @@
       ref="openInputRef"
       type="file"
       accept="application/pdf,.pdf"
+      :multiple="tabsOn"
       class="offscreen-file-input"
       @change="onOpenPicked"
     />
@@ -92,7 +93,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, provide, watch, onMounted, onUnmounted } from 'vue'
+import { ref, provide, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { useQuasar } from 'quasar'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore } from '@/stores/editor'
@@ -136,6 +137,8 @@ import { buildReportMailto } from '@/utils/reportProblem'
 import FindBar from '@/components/toolbar/FindBar.vue'
 import AssistantPanel from '@/components/assistant/AssistantPanel.vue'
 import { createAssistant } from '@/composables/useAssistant'
+import { isEmbedded, connectFrame, reportState, openInNewTabs, switchTab, desktopApi } from '@/tabs/frameClient'
+import type { IncomingFile } from '@/tabs/protocol'
 
 const $q = useQuasar()
 const docStore = useDocumentStore()
@@ -147,6 +150,8 @@ const ocr = useOCR()
 const pdfViewer = usePDFViewer()
 const pdfEngine = usePDFEngine()
 const ui = useUiStore()
+// Every comment made here carries the author's name, as Acrobat's do.
+watch(() => ui.authorName, (name) => pdfEngine.setAnnotAuthor(name || ''), { immediate: true })
 
 // Provide composables to the whole tree (header, drawer, page)
 provide('pdfViewer', pdfViewer)
@@ -160,10 +165,16 @@ getMuPDFBridge().onCrash = (reason: string) => {
   editorStore.setStatus(`The PDF engine stopped (${reason}) and was restarted — check the last edit`)
 }
 
+/** This page is one tab of the window (src/tabs), so it can hand files to new tabs. */
+const tabsOn = isEmbedded()
+
 function handleBeforeUnload(e: BeforeUnloadEvent) {
   // The test drivers (public/_sweep) set this: the prompt otherwise blocks
   // every automation call after a hot reload of an edited document.
   if (import.meta.env.DEV && (window as any).__noUnloadPrompt) return
+  // A tab: the host asks for every tab at once (a frame removed from the
+  // page never asks).
+  if (isEmbedded()) return
   if (docStore.isModified) {
     e.preventDefault()
     e.returnValue = ''
@@ -178,52 +189,62 @@ onMounted(async () => {
   document.body.addEventListener('dragover', handleDragOver)
   document.body.addEventListener('drop', handleDrop)
   window.addEventListener('beforeunload', handleBeforeUnload)
-  // The Windows app: PDFs opened from Explorer arrive here. Registered once the
-  // engine is up, and only then is the main process told to send them, so a
-  // file double-clicked to launch the app is never loaded into a dead engine.
-  if (window.desktop) {
+  // Collecting print jobs: the open document is print jobs not saved yet.
+  // Saving ends it — the next job then gets a tab (or window) of its own.
+  watch(() => docStore.isModified, modified => { if (!modified) ui.printSession = false })
+  const collecting = () => ui.printSession && docStore.loaded && docStore.isModified
+  if (isEmbedded()) {
+    // One document tab of the window (src/tabs): the host hands files here,
+    // asks to close, and lists every tab from what each one reports.
+    watch(() => [docStore.loaded, docStore.fileName, docStore.isModified, collecting(), openingInPlace.value > 0] as const,
+      ([loaded, name, modified, coll, opening]) => reportState({ loaded, name, modified, collecting: coll, opening }), { immediate: true })
+    connectFrame({
+      open: receiveFile,
+      close: closeDocument,
+      activated: showDocument => { if (showDocument && docStore.loaded) ui.view = 'document' }
+    })
+  } else if (window.desktop) {
+    // The Windows app without tabs (`?single`): PDFs opened from Explorer
+    // arrive here. Registered once the engine is up, and only then is the main
+    // process told to send them, so a file double-clicked to launch the app is
+    // never loaded into a dead engine.
     const desktop = window.desktop
     desktop.onOpenFile(({ name, bytes, printed }) => {
-      // A print job reaching a window that holds a document joins the
-      // Combinar list (AcroDialogs), as PDF24's assistant collects jobs, and
-      // never replaces what is open. The main process sends it here only while
-      // this window is collecting (see `collecting` below).
-      if (printed && docStore.loaded) {
-        const file = new File([new Uint8Array(bytes)], name, { type: 'application/pdf' })
-        printJobFiles.add(file)
-        ui.printInbox.push(file)
-        editorStore.setStatus(`${name} — print job added to the list`)
-        desktop.setHasDocument(true)
-        return
-      }
-      loadBytes(new Uint8Array(bytes), name)
-        .then(() => {
-          // A job from the "PDF Editor Pro" printer exists only in the app's
-          // print folder until it is saved: open it as unsaved, so closing the
-          // window asks first instead of quietly dropping what was printed.
-          if (!printed || !docStore.loaded || docStore.fileName !== name) return
-          docStore.markModified()
-          ui.printSession = true
-          editorStore.setStatus(`${name} — printed to PDF Editor Pro, not saved yet (${docStore.totalPages} page${docStore.totalPages === 1 ? '' : 's'})`)
-        })
-        .catch((e: unknown) => {
-          editorStore.setStatus(`Could not open ${name}: ${e instanceof Error ? e.message : String(e)}`)
-        })
-        // Report even when nothing changed (a file that would not open), so the
-        // main process stops holding this window for it.
+      // Report even when nothing changed (a file that would not open), so the
+      // main process stops holding this window for it.
+      receiveFile({ name, bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, printed })
         .finally(() => desktop.setHasDocument(docStore.loaded))
     })
-    // A file opened from Explorer goes to a window with no document, or to a
-    // new one: the main process has to know which this is.
     watch(() => docStore.loaded, loaded => desktop.setHasDocument(loaded))
-    // Collecting print jobs: the open document is print jobs not saved yet.
-    // Saving ends it — the next job then gets a window of its own.
-    watch(() => docStore.isModified, modified => { if (!modified) ui.printSession = false })
-    watch(() => ui.printSession && docStore.loaded && docStore.isModified,
-      collecting => desktop.setCollecting?.(collecting), { immediate: true })
+    watch(collecting, c => desktop.setCollecting?.(c), { immediate: true })
     desktop.ready()
   }
 })
+
+/**
+ * A file handed to this page from outside: the Windows app (Explorer, the
+ * "PDF Editor Pro" printer) or the tab host.
+ */
+async function receiveFile({ name, bytes, printed }: IncomingFile): Promise<void> {
+  // A print job reaching a page that holds a document joins the Combinar list
+  // (AcroDialogs), as PDF24's assistant collects jobs, and never replaces what
+  // is open. It is sent here only while this page is collecting.
+  if (printed && docStore.loaded) {
+    const file = new File([new Uint8Array(bytes)], name, { type: 'application/pdf' })
+    printJobFiles.add(file)
+    ui.printInbox.push(file)
+    editorStore.setStatus(`${name} — print job added to the list`)
+    return
+  }
+  await openPdfBytes(new Uint8Array(bytes), name)
+  // A job from the "PDF Editor Pro" printer exists only in the app's print
+  // folder until it is saved: open it as unsaved, so closing asks first
+  // instead of quietly dropping what was printed.
+  if (!printed || !docStore.loaded || docStore.fileName !== name) return
+  docStore.markModified()
+  ui.printSession = true
+  editorStore.setStatus(`${name} — printed to PDF Editor Pro, not saved yet (${docStore.totalPages} page${docStore.totalPages === 1 ? '' : 's'})`)
+}
 onUnmounted(() => {
   printCleanup?.()
   pdfEngine.destroyEngine()
@@ -257,7 +278,7 @@ async function runOcrOnPage(lang = OCR_DEFAULT_LANG) {
       title: 'Esta página ya tiene texto',
       message: `La página ya tiene ${verdict.extractedChars} caracteres de texto real, que se pueden editar directamente. Reconocerla con OCR añadiría encima una segunda copia, deducida de la imagen. ¿Desea reconocerla de todos modos?`,
       ok: { label: 'Reconocer', unelevated: true }, cancel: { label: 'Cancelar', flat: true },
-      persistent: true, dark: true, class: 'acro-dialog'
+      persistent: true, class: 'acro-dialog'
     }).onOk(() => runOcrNow(pageIndex, lang))
     return
   }
@@ -485,7 +506,7 @@ async function runOcrNowInner(pageIndex: number, lang: string) {
           title: '¿Enviar esta página a Mistral?',
           message: 'La imagen de la página se subirá al servicio de OCR de Mistral para leerla. Con los demás motores no se envía nada.',
           ok: { label: 'Enviar', unelevated: true }, cancel: { label: 'Cancelar', flat: true },
-          persistent: true, dark: true, class: 'acro-dialog'
+          persistent: true, class: 'acro-dialog'
         }).onOk(() => resolve(true)).onCancel(() => resolve(false)).onDismiss(() => resolve(false))
       })
       if (!ok) { stopProgress(); editorStore.setStatus('Reconocimiento en la nube cancelado'); return }
@@ -1178,8 +1199,8 @@ function onPickFiles(e: Event) {
  * Acrobat's "Cerrar": offer to save unsaved changes first, then go back to
  * Inicio with nothing open.
  */
-async function closeDocument() {
-  if (!docStore.loaded) return
+async function closeDocument(): Promise<boolean> {
+  if (!docStore.loaded) return true
   await flushOpenEditor()
   if (docStore.isModified) {
     const choice = await new Promise<'save' | 'discard' | 'cancel'>(resolve => {
@@ -1193,10 +1214,10 @@ async function closeDocument() {
         ok: { label: 'Aceptar', unelevated: true }, cancel: { label: 'Cancelar', flat: true }
       }).onOk((v: 'save' | 'discard') => resolve(v)).onCancel(() => resolve('cancel')).onDismiss(() => resolve('cancel'))
     })
-    if (choice === 'cancel') return
+    if (choice === 'cancel') return false
     if (choice === 'save') {
       await saveFile()
-      if (docStore.isModified) return
+      if (docStore.isModified) return false
     }
   }
   historyStore.clear()
@@ -1212,6 +1233,7 @@ async function closeDocument() {
   saveHandle = null
   editorStore.setTool('select')
   editorStore.setStatus('Archivo cerrado')
+  return true
 }
 
 /**
@@ -1260,27 +1282,69 @@ function openFile() {
  * handler chain, or be wired through provide/inject in time.
  */
 async function openPdfFile(file: File) {
+  // A tab holds one document: another file opened here becomes a tab of its own.
+  if (isEmbedded() && (docStore.loaded || openingInPlace.value)) { await openInNewTabs([file]); return }
   try {
     editorStore.setStatus(`Opening ${file.name}...`)
-    const inputBytes = new Uint8Array(await file.arrayBuffer())
-    await settleTransactions()
-    await enqueueOp(async () => {
-      const bytes = await unlockIfNeeded(inputBytes, file.name)
-      if (bytes) await loadBytes(bytes, file.name)
-    })
+    await openPdfBytes(new Uint8Array(await file.arrayBuffer()), file.name)
   } catch (err: any) {
     // A file that cannot be read is not a silent no-op.
     editorStore.setStatus(`Could not open ${file.name}: ${err?.message || err}`)
   }
 }
 
+/** A file is being opened in THIS tab: anything opened meanwhile gets its own. */
+const openingInPlace = ref(0)
+
+/** Open bytes in this page: ask for a password if the file has one, then load. */
+async function openPdfBytes(inputBytes: Uint8Array, name: string) {
+  openingInPlace.value++
+  try {
+    await settleTransactions()
+    await enqueueOp(async () => {
+      const bytes = await unlockIfNeeded(inputBytes, name)
+      if (bytes) await loadBytes(bytes, name)
+    })
+  } catch (err: any) {
+    editorStore.setStatus(`Could not open ${name}: ${err?.message || err}`)
+  } finally {
+    openingInPlace.value--
+  }
+}
+
+/**
+ * Several files at once (a multiple selection, a drop): Acrobat opens each in
+ * a tab. The first takes this tab when it is empty. Without tabs (`?single`)
+ * the page holds one document, so only the first is opened.
+ */
+async function openPdfFiles(files: File[]) {
+  const pdfs = files.filter(f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name))
+  if (!pdfs.length) return
+  if (!isEmbedded()) { await openPdfFile(pdfs[0]); return }
+  if (docStore.loaded || openingInPlace.value) { await openInNewTabs(pdfs); return }
+  const [first, ...rest] = pdfs
+  // Spoken for BEFORE the others are handed over, so the host never takes
+  // this (still empty) tab for one of them, nor recycles it as its spare.
+  openingInPlace.value++
+  try {
+    await nextTick()
+    if (rest.length) await openInNewTabs(rest)
+    editorStore.setStatus(`Opening ${first.name}...`)
+    await openPdfBytes(new Uint8Array(await first.arrayBuffer()), first.name)
+  } catch (err: any) {
+    editorStore.setStatus(`Could not open ${first.name}: ${err?.message || err}`)
+  } finally {
+    openingInPlace.value--
+  }
+}
+
 async function onOpenPicked(e: Event) {
   const input = e.target as HTMLInputElement
-  const file = input.files?.[0]
-  // Cleared straight after the File is captured, so the SAME document can be
+  const files = [...(input.files ?? [])]
+  // Cleared straight after the Files are captured, so the SAME document can be
   // opened again: a file input fires `change` only when the selection changes.
   input.value = ''
-  if (file) await openPdfFile(file)
+  if (files.length) await openPdfFiles(files)
 }
 
 /** Commit whatever the inline editor is holding before the document is read. */
@@ -1515,7 +1579,7 @@ async function printFile() {
   // a document but ignores print() — the iframe loaded, "Print dialog opened"
   // was reported, and no dialog ever appeared. It prints ordinary pages fine,
   // so there the pages go out as images instead.
-  if (window.desktop) {
+  if (desktopApi()) {
     await printPageImages()
     return
   }
@@ -1931,6 +1995,13 @@ function handleKeyDown(e: KeyboardEvent) {
     const k = e.key.toLowerCase()
     if (k === 's' && e.shiftKey) { e.preventDefault(); saveFile({ saveAs: true }); return }
     if (k === 'w') { e.preventDefault(); closeDocument(); return }
+    // Tabs: Ctrl+Tab / Ctrl+PageDown forward, with Shift / PageUp back. A
+    // browser keeps these for its own tabs; the Windows app passes them on.
+    if (isEmbedded() && (e.key === 'Tab' || e.key === 'PageDown' || e.key === 'PageUp')) {
+      e.preventDefault()
+      switchTab(e.key === 'PageUp' || (e.key === 'Tab' && e.shiftKey) ? -1 : 1)
+      return
+    }
     if (k === 'd' && docStore.loaded) { e.preventDefault(); ui.openDialog('properties'); return }
     if (k === 'h' && docStore.loaded) { e.preventDefault(); ui.readMode = !ui.readMode; return }
     if (k === 'l') { e.preventDefault(); acroShell.fullScreen(); return }
@@ -2042,6 +2113,10 @@ async function handleDrop(e: DragEvent) {
   e.preventDefault()
   if (ui.dialog) return
   const files = [...(e.dataTransfer?.files ?? [])]
+  // Several PDFs open as tabs, as Acrobat does; anything else dropped in
+  // numbers (images among them) goes to Combinar, which can take both.
+  const allPdf = files.every(f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name))
+  if (files.length > 1 && allPdf && isEmbedded()) { await openPdfFiles(files); return }
   if (files.length > 1) { ui.openDialog('combine', { files }); return }
   const file = files[0]
   if (file && (file.type === 'application/pdf' || /\.pdf$/i.test(file.name))) {
@@ -2223,7 +2298,7 @@ const assistant = createAssistant({
       title: '¿Enviar el texto de la página a OpenAI?',
       message: 'El asistente envía a OpenAI, con su clave de API, el texto de la página en la que está y sus mensajes. Nada más sale del equipo.',
       ok: { label: 'Enviar', unelevated: true }, cancel: { label: 'Cancelar', flat: true },
-      persistent: true, dark: true, class: 'acro-dialog'
+      persistent: true, class: 'acro-dialog'
     }).onOk(() => resolve(true)).onCancel(() => resolve(false)).onDismiss(() => resolve(false))
   })
 })
@@ -2277,6 +2352,7 @@ watch(() => editorStore.statusMessage, (m, prev) => {
 
 provide('openFile', openFile)
 provide('openPdfFile', openPdfFile)
+provide('openPdfFiles', openPdfFiles)
 provide('mergePdfFile', mergePdfFile)
 provide('saveFile', saveFile)
 provide('printFile', printFile)

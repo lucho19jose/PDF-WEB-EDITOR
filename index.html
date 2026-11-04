@@ -9,9 +9,14 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 
   <!-- Microsoft Clarity (marketing analytics). Not in the Windows app, which
-       is served from app:// and loads nothing cross-origin. -->
+       is served from app:// and loads nothing cross-origin. Once per window,
+       where the editor is drawn: not in the tab host (it draws nothing), and
+       of the tabs only in the first one (src/tabs/host.ts). -->
   <script type="text/javascript">
-    if (location.protocol !== 'app:') (function(c,l,a,r,i,t,y){
+    var pdfQ = new URLSearchParams(location.search);
+    var pdfHost = window.top === window && !pdfQ.has('single');
+    var pdfTrack = location.protocol !== 'app:' && !pdfHost && (window.top === window || pdfQ.get('frame') === 't1');
+    if (pdfTrack) (function(c,l,a,r,i,t,y){
         c[a]=c[a]||function(){(c[a].q=c[a].q||[]).push(arguments)};
         t=l.createElement(r);t.async=1;t.src="https://www.clarity.ms/tag/"+i;
         y=l.getElementsByTagName(r)[0];y.parentNode.insertBefore(t,y);

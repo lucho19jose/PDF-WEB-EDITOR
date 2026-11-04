@@ -29,5 +29,13 @@ contextBridge.exposeInMainWorld('desktop', {
   /** Opens print jobs, by file name in the print folder, each in its own window. */
   openPrintJobs(names) {
     ipcRenderer.send('desktop:open-print-jobs', Array.isArray(names) ? names.map(String) : [])
+  },
+  /** Where the MCP server for Claude is: { exe, server, serverExists, mcpb, mcpbExists, packaged }. */
+  mcpInfo() {
+    return ipcRenderer.invoke('desktop:mcp-info')
+  },
+  /** Shows the Claude Desktop extension (.mcpb) selected in Explorer. */
+  revealMcpb() {
+    ipcRenderer.send('desktop:reveal-mcpb')
   }
 })

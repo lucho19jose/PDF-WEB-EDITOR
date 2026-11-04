@@ -61,7 +61,7 @@ function fingerprints(bytes) {
   return result
 }
 try {
-  await page.goto(process.env.APP_URL||'http://localhost:9000/')
+  await page.goto(process.env.APP_URL||'http://localhost:9000/?single')
   await page.waitForFunction(()=>window.__pdfHooks?.acro)
   await page.evaluate(async()=>{window.__combineDoc=(await import('/src/stores/document.ts')).useDocumentStore()})
   // Drop on Inicio: all files enter the combination instead of just opening the first.

@@ -19,7 +19,8 @@
  *  - A before/after crop sheet (`__fidelity.show()`), because a reader's eye is
  *    what "looks like the scan" is finally judged by.
  *
- * Usage, at http://localhost:9000 (console or chrome-devtools MCP):
+ * Usage, at http://localhost:9000/?single (no document tabs — the driver reads
+ *   this page's stores; console or chrome-devtools MCP):
  *   const f = await import('/_sweep/fidelity-driver.js')
  *   const r = await f.runSuite({ url: '/some-scan.pdf', edits: await f.loadSuite('/_sweep/suites/some-scan.json') })
  *   r.summary                 // one line per edit

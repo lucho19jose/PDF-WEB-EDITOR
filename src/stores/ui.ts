@@ -22,7 +22,7 @@ export type AcroTool =
 export type AcroDialog =
   | 'headerFooter' | 'watermark' | 'background' | 'crop' | 'protect' | 'properties'
   | 'combine' | 'create' | 'export' | 'link' | 'signature' | 'about' | 'shortcuts'
-  | 'split' | 'extract' | 'pageNumbers' | 'unlock' | 'insertPages' | null
+  | 'split' | 'extract' | 'pageNumbers' | 'unlock' | 'insertPages' | 'claude' | null
 
 export type LeftPanel = 'thumbs' | 'bookmarks' | 'attachments' | 'layers'
 
@@ -105,6 +105,8 @@ export const useUiStore = defineStore('ui', () => {
   /** The signature last drawn or typed in Rellenar y firmar, as a PNG data URL. */
   const signatureImage = persistedRef<string>('ui.signature', '')
   const initialsImage = persistedRef<string>('ui.initials', '')
+  /** Who the comments made here are by: Acrobat's author name, written into each new comment. */
+  const authorName = persistedRef<string>('ui.authorName', '')
   /** A messages log for the bell: the status line forgets, this does not. */
   const notifications = ref<{ at: number; text: string }[]>([])
   const unreadNotifications = ref(0)
@@ -140,7 +142,7 @@ export const useUiStore = defineStore('ui', () => {
   return {
     view, activeTool, dialog, dialogArgs, leftPaneOpen, leftPanel, rightPaneOpen,
     showBoundingBoxes, autoRecognize, scanConversion, restrictEditing, readMode, organizeThumbWidth, selectedPages, pageOperationBusy,
-    signatureImage, initialsImage, notifications, unreadNotifications, protection, toolMeta,
+    signatureImage, initialsImage, authorName, notifications, unreadNotifications, protection, toolMeta,
     printSession, printInbox,
     openDialog, closeDialog, notify
   }

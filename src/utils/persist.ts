@@ -1,4 +1,4 @@
-import { ref, watch, type Ref } from 'vue'
+import { ref, watch, getCurrentScope, onScopeDispose, type Ref } from 'vue'
 
 /**
  * A ref that remembers itself in localStorage.
@@ -17,8 +17,20 @@ export function persistedRef<T>(key: string, initial: T): Ref<T> {
     if (raw !== null) start = JSON.parse(raw) as T
   } catch (_) { /* no storage, or unreadable — keep the default */ }
   const r = ref(start) as Ref<T>
+  let written = ''
   watch(r, (v) => {
-    try { localStorage.setItem(storageKey, JSON.stringify(v)) } catch (_) { /* full or refused */ }
+    try {
+      written = JSON.stringify(v)
+      if (localStorage.getItem(storageKey) !== written) localStorage.setItem(storageKey, written)
+    } catch (_) { /* full or refused */ }
   }, { deep: true })
+  // Another tab or window changed it: every open document tab is its own
+  // page (src/tabs), and a setting chosen in one must hold in the others.
+  const onStorage = (e: StorageEvent) => {
+    if (e.key !== storageKey || e.newValue === null || e.newValue === written) return
+    try { r.value = JSON.parse(e.newValue) as T } catch (_) { /* unreadable — keep ours */ }
+  }
+  window.addEventListener('storage', onStorage)
+  if (getCurrentScope()) onScopeDispose(() => window.removeEventListener('storage', onStorage))
   return r
 }

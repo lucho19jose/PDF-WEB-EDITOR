@@ -1,6 +1,7 @@
 import { ref } from 'vue'
 import type { OcrPageResult, OcrTextItem, OcrAlign, ScannedVerdict } from '@/utils/ocr/ocrTypes'
 import { sampleLineColors, samplePatchColor } from '@/utils/ocr/ocrSampling'
+import { judgeScanned as judgeScannedPure } from '@/utils/pageKind'
 import { detectFace, advancesAreUniform, isLightOnDark } from '@/utils/ocr/ocrFontDetect'
 import type { OcrEngine, OcrEngineId, OcrLine, OcrRecognition, OcrWord, OcrBox } from '@/utils/ocr/ocrEngine'
 import { ENGINE_LABELS } from '@/utils/ocr/ocrEngine'
@@ -49,16 +50,9 @@ const OCR_DPI = 220
 /** PDF user space is 72 units to the inch. */
 const PDF_DPI = 72
 
-/**
- * Below this, a page's own text layer is treated as absent.
- *
- * Not zero: a scan often carries a stray character or two — a stamped page
- * number, a producer's watermark — and a page with three characters on it is
- * still a page nobody can edit.
- */
-const SCANNED_TEXT_THRESHOLD = 12
-/** Text covering less of the paper than this is a stamp or a footer, not a text page. */
-const SCANNED_TEXT_COVERAGE = 0.02
+// The scanned-page thresholds (SCANNED_TEXT_THRESHOLD: a scan often carries a
+// stray character or two, so not zero; SCANNED_TEXT_COVERAGE: text covering
+// under 2% of the paper is a stamp or a footer) live in utils/pageKind.
 
 /**
  * The tallest symbol box of a line WITH descenders, as a fraction of the em.
@@ -1042,28 +1036,9 @@ function createOCR() {
     // otherwise a photograph. Counted, they made the page a "text page" and
     // the edit tool showed 34 unreachable blocks instead of recognising it.
     // Text that covers under 2% of the paper is a stamp, a page number or a
-    // footer, whatever its character count.
-    if (extractedChars > SCANNED_TEXT_THRESHOLD && textCoverage !== undefined && textCoverage < SCANNED_TEXT_COVERAGE) {
-      return {
-        scanned: true,
-        extractedChars,
-        reason: `the page's ${extractedChars} characters of text cover only ${(textCoverage * 100).toFixed(1)}% of the paper — a stamp or footer over an image`
-      }
-    }
-    if (extractedChars > SCANNED_TEXT_THRESHOLD) {
-      return {
-        scanned: false,
-        extractedChars,
-        reason: `the page already has ${extractedChars} characters of real text — edit it directly`
-      }
-    }
-    return {
-      scanned: true,
-      extractedChars,
-      reason: extractedChars === 0
-        ? 'the page has no text at all, only an image'
-        : `the page has only ${extractedChars} characters of text, too few to be a text page`
-    }
+    // footer, whatever its character count. The rule lives in utils/pageKind,
+    // shared with the MCP server.
+    return judgeScannedPure(extractedChars, textCoverage)
   }
 
   /**

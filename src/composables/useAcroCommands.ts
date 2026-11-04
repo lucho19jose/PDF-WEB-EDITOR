@@ -5,8 +5,9 @@ import { useUiStore } from '@/stores/ui'
 import { enqueueOp, beginTransaction, settleTransactions } from '@/utils/opQueue'
 import { makeZip } from '@/utils/acro/zip'
 import { buildDocx, type StPage } from '@/utils/acro/docx'
-import { layoutPage, buildSheet } from '@/utils/acro/sheetLayout'
 import { buildXlsx } from '@/utils/acro/xlsx'
+import { isScannedPage, scannedNote, sheetsFor } from '@/utils/acro/sheetExport'
+import { pageRangeLabel } from '@/utils/acro/pageRange'
 import type { SheetPageData, SheetWord } from '@/engine/worker/sheetExtract'
 import { useOcrStore } from '@/stores/ocr'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
@@ -43,12 +44,6 @@ export interface ExportOptions {
   convertValues?: boolean
 }
 
-/** A page that is a picture with (almost) no text on it: a scan. */
-function isScannedPage(d: SheetPageData): boolean {
-  if (d.imageCover < 0.4) return false
-  const textArea = d.words.reduce((a, w) => a + (w.x1 - w.x0) * (w.y1 - w.y0), 0)
-  return textArea < d.width * d.height * 0.015
-}
 
 type Result = { success: boolean; error?: string; [k: string]: any }
 
@@ -391,14 +386,8 @@ export function useAcroCommands(deps: AcroCommandDeps) {
     }
     data = data.map(withOcrWords)
     say('Exportando a Excel: armando las tablas…')
-    const layouts = data.map(d => layoutPage(d))
-    const still = data.filter(d => isScannedPage(d)).map(d => d.pageIndex + 1)
-    const note = (n: number[]) => n.length
-      ? `${n.length === 1 ? 'La página' : 'Las páginas'} ${n.join(', ')} ${n.length === 1 ? 'es una imagen escaneada' : 'son imágenes escaneadas'} sin texto: use «Reconocer texto» (OCR) para exportar su contenido.`
-      : undefined
-    const sheets = opts.sheetMode === 'single'
-      ? [Object.assign(buildSheet(layouts, { name }), { note: note(still) })]
-      : layouts.map((L, k) => Object.assign(buildSheet([L], { name: `Página ${pages[k] + 1}` }), { note: note(still.filter(p => p === pages[k] + 1)) }))
+    const { sheets, still } = sheetsFor(data, pages, name, opts.sheetMode)
+    const note = scannedNote
     const blob = await buildXlsx(sheets, { convertValues: opts.convertValues !== false, title: name })
     download(blob, `${name}.xlsx`)
     if (still.length) say(`Excel listo. ${note(still)}`)
@@ -527,7 +516,7 @@ export function useAcroCommands(deps: AcroCommandDeps) {
 
   function confirm(title: string, message: string): Promise<boolean> {
     return new Promise(resolve => {
-      $q.dialog({ title, message, cancel: { label: 'Cancelar', flat: true }, ok: { label: 'Aceptar', unelevated: true }, persistent: true, dark: true, class: 'acro-dialog' })
+      $q.dialog({ title, message, cancel: { label: 'Cancelar', flat: true }, ok: { label: 'Aceptar', unelevated: true }, persistent: true, class: 'acro-dialog' })
         .onOk(() => resolve(true)).onCancel(() => resolve(false)).onDismiss(() => resolve(false))
     })
   }
@@ -545,27 +534,4 @@ export function useAcroCommands(deps: AcroCommandDeps) {
 
 export type AcroCommands = ReturnType<typeof useAcroCommands>
 
-/** "1-3, 5" for a sorted list of 0-based indices. */
-export function pageRangeLabel(list: number[]): string {
-  const out: string[] = []
-  for (let i = 0; i < list.length; i++) {
-    let j = i
-    while (j + 1 < list.length && list[j + 1] === list[j] + 1) j++
-    out.push(i === j ? `${list[i] + 1}` : `${list[i] + 1}-${list[j] + 1}`)
-    i = j
-  }
-  return out.length === 1 && !out[0].includes('-') ? `página ${out[0]}` : `páginas ${out.join(', ')}`
-}
-
-/** Parse "1-3, 5, 8-" style ranges into 0-based indices. */
-export function parsePageRange(text: string, total: number): number[] {
-  const out = new Set<number>()
-  for (const part of text.split(/[,;]/)) {
-    const m = /^\s*(\d*)\s*(?:-\s*(\d*))?\s*$/.exec(part)
-    if (!m || (!m[1] && !m[2])) continue
-    const a = m[1] ? parseInt(m[1], 10) : 1
-    const b = part.includes('-') ? (m[2] ? parseInt(m[2], 10) : total) : a
-    for (let p = Math.max(1, Math.min(a, b)); p <= Math.min(total, Math.max(a, b)); p++) out.add(p - 1)
-  }
-  return [...out].sort((x, y) => x - y)
-}
+export { pageRangeLabel, parsePageRange } from '@/utils/acro/pageRange'

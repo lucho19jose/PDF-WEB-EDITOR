@@ -119,6 +119,10 @@ const png = await acro('renderImage', { pageIndex: 0, scale: 0.5, format: 'png' 
 check('render png', new Uint8Array(png)[1] === 0x50)
 const jpg = await acro('renderImage', { pageIndex: 0, scale: 0.5, format: 'jpeg', quality: 80 })
 check('render jpeg', new Uint8Array(jpg)[0] === 0xFF)
+const region = new Uint8Array(await acro('renderRegion', { pageIndex: 0, rect: [50, 50, 250, 150], scale: 2, format: 'png' }))
+const rw = (region[16] << 24) | (region[17] << 16) | (region[18] << 8) | region[19]
+const rh = (region[20] << 24) | (region[21] << 16) | (region[22] << 8) | region[23]
+check('render region png, region-sized', region[1] === 0x50 && rw === 400 && rh === 200, `${rw}x${rh}`)
 
 // Protect, then unlock.
 const prot = await acro('saveProtected', { userPassword: 'abc123', permissions: { print: true, copy: false } })

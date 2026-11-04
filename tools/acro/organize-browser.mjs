@@ -43,7 +43,7 @@ const imagesReady = () => page.waitForFunction(() => [...document.querySelectorA
 const text = index => page.evaluate(async i => (await window.__pdfEngine.getPageText(i)).blocks.map(b => b.text).join(' '), index)
 
 try {
-  await page.goto(process.env.APP_URL || 'http://localhost:9000/')
+  await page.goto(process.env.APP_URL || 'http://localhost:9000/?single')
   await page.getByRole('button', { name: /Organizar páginas.*Usar ahora/ }).click()
   await page.locator('.no-doc input[type=file]').setInputFiles(fixture(6))
   await ready()

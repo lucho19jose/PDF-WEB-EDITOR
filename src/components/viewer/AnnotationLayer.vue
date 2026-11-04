@@ -31,6 +31,7 @@
         :style="a.style"
         :title="a.title"
         @mousedown.stop="onAnnotMouseDown($event, a.index)"
+        @dblclick.stop="onAnnotDblClick(a.index)"
       />
       <!-- Resize handles for the selected annotation -->
       <div
@@ -123,22 +124,26 @@
             stroke-linecap="round" stroke-linejoin="round" />
     </svg>
 
-    <!-- FreeText inline editor -->
-    <div v-if="freeTextEditing" class="ft-editor-wrap" :style="freeTextStyle">
+    <!-- The sticky note being written: its icon, until its text is published
+         from the comment list. -->
+    <div v-if="draftOnPage" class="note-draft" :style="draftStyle">
+      <NoteIcon :color="editorStore.highlightColor" size="100%" />
+    </div>
+
+    <!-- A text comment is typed ON the page, in its own face, size and colour,
+         where it will be drawn — Acrobat's "Agregar comentario de texto". No
+         box to fill in, no buttons: a click elsewhere ends it, Esc drops it. -->
+    <div v-if="freeTextEditing" class="ft-editor-wrap" :class="{ reedit: ftEditIndex !== null }" :style="freeTextStyle" @mousedown.stop>
       <textarea
         ref="ftRef"
         v-model="freeTextValue"
         class="ft-editor"
-        placeholder="Type text…"
-        :style="{ color: editorStore.textColor, fontSize: ftFontPx + 'px' }"
+        spellcheck="false"
+        :style="ftTextStyle"
         @keydown.escape.prevent="cancelFreeText"
         @keydown.enter.ctrl.prevent="commitFreeText"
         @blur="onFreeTextBlur"
       />
-      <div class="ft-actions" @mousedown.prevent>
-        <q-btn dense flat size="xs" color="positive" icon="check" @click.stop="commitFreeText" />
-        <q-btn dense flat size="xs" color="negative" icon="close" @click.stop="cancelFreeText" />
-      </div>
     </div>
 
     <!-- Off-screen, NOT display:none: a hidden input is the one some browsers
@@ -155,7 +160,6 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, inject, onMounted, onBeforeUnmount } from 'vue'
-import { useQuasar } from 'quasar'
 import { useDocumentStore } from '@/stores/document'
 import { useEditorStore, MARKUP_TOOLS, type Tool } from '@/stores/editor'
 import { useUiStore } from '@/stores/ui'
@@ -164,20 +168,26 @@ import { useHistoryStore } from '@/stores/history'
 import { useOcrStore } from '@/stores/ocr'
 import type { usePDFEngine } from '@/composables/usePDFEngine'
 import type { AnnotationInfo, ContentImageInfo, Quad, Pt, RectT, MarkupType, ShapeType, TextChar } from '@/engine/types'
-import { hexToRgb01, rgb01ToCss } from '@/utils/color'
+import { hexToRgb01, rgb01ToCss, rgb01ToHex } from '@/utils/color'
 import { enqueueOp, beginTransaction } from '@/utils/opQueue'
 import { rememberImage, copiedImage, IMAGE_CLIPBOARD_MARKER, setImagePasteHandler, type CopiedImage } from '@/utils/acro/imageClipboard'
+import {
+  noteDraft, newDraftId, focusedComment, selectOnPage, editFreeText, editNoteText, request,
+  settleNoteDraft, answered, type NoteDraft
+} from '@/utils/acro/comments'
+import NoteIcon from '@/components/acrobat/NoteIcon.vue'
+import type { AcroShell } from '@/components/acrobat/acroShell'
 
 const props = defineProps<{ pageWidth: number; pageHeight: number; pdfWidth: number; pdfHeight: number }>()
 const emit = defineEmits<{ changed: []; objectPicked: [] }>()
 
-const $q = useQuasar()
 const docStore = useDocumentStore()
 const editorStore = useEditorStore()
 const ocrStore = useOcrStore()
 const historyStore = useHistoryStore()
 const pdfEngine = inject<ReturnType<typeof usePDFEngine>>('pdfEngine')!
 const ui = useUiStore()
+const shell = inject<AcroShell | null>('acroShell', null)
 const syncDocumentEdit = inject<() => Promise<void>>('syncDocumentEdit')
 const pickFiles = inject<(accept: string, multiple: boolean) => Promise<File[]>>('pickFiles', async () => [])
 /** The OCR side's ear for a scan that moved or changed under its recognised runs. */
@@ -307,6 +317,10 @@ const freeTextEditing = ref(false)
 const freeTextValue = ref('')
 const ftRect = ref<RectT>([0, 0, 0, 0])
 const ftRef = ref<HTMLTextAreaElement | null>(null)
+/** The page the open text box belongs to: a page change commits it THERE. */
+let ftPage = 0
+/** The text box being edited again, or null for a new one. */
+const ftEditIndex = ref<number | null>(null)
 const imgInputRef = ref<HTMLInputElement | null>(null)
 /** Page-space Y of the click that started an image insertion. */
 const imageDropY = ref<number | null>(null)
@@ -365,7 +379,7 @@ const scaledAnnots = computed(() => annotations.value.map(a => {
   const isSelected = selectedIndex.value === a.index || multiAnnots.value.has(a.index)
   return {
     index: a.index,
-    title: `${a.type}${a.contents ? ': ' + a.contents : ''}`,
+    title: a.contents ? `${a.author ? a.author + ': ' : ''}${a.contents}` : a.type,
     area,
     style: {
       left: `${r[0] * scaleX.value}px`,
@@ -397,6 +411,8 @@ const annotHandles = computed(() => {
   const a = selectedAnnot.value
   const img = selectedImg.value
   if (!a && !img) return []
+  // A sticky note is an icon of a fixed size, as in Acrobat: moved, never resized.
+  if (a?.type === 'Text') return []
   const r = a ? liveAnnotRect(a) : liveImgRect(img!)
   const x0 = r[0] * scaleX.value, y0 = r[1] * scaleY.value
   const x1 = r[2] * scaleX.value, y1 = r[3] * scaleY.value
@@ -847,17 +863,51 @@ const inkPreviewPoints = computed(() => {
   return drag.value.inkPts.map(p => `${p[0] * scaleX.value},${p[1] * scaleY.value}`).join(' ')
 })
 
+/**
+ * The open text box, exactly where and how big its text will be drawn: the
+ * box it will be committed with (`fitFreeTextRect`, growing as it is typed
+ * into), and the text set on MuPDF's baseline. MuPDF draws a text box's first
+ * baseline 0.8 em below its top, with no padding, and steps lines by 1.2 em
+ * (measured); a browser puts the baseline of a 1.2 em line where the font's
+ * ascent and descent say, a seventh of an em lower for Arial. The editor is
+ * raised by the difference, so the text does not jump when it is committed.
+ */
 const freeTextStyle = computed(() => {
-  // A clicked box shows the size its text will be committed at, growing as
-  // it is typed into (see `fitFreeTextRect`).
-  const r = ftFromClickRef.value ? fitFreeTextRect(ftRect.value, freeTextValue.value || ' ') : ftRect.value
+  const r = fitFreeTextRect(ftRect.value, freeTextValue.value || ' ')
+  const shift = cssBaselineShift(ftFontPx.value, ftCssFamily(editorStore.fontFamily))
   return {
     left: `${r[0] * scaleX.value}px`,
-    top: `${r[1] * scaleY.value}px`,
-    width: `${Math.max(120, (r[2] - r[0]) * scaleX.value)}px`,
-    minHeight: `${Math.max(30, (r[3] - r[1]) * scaleY.value)}px`
+    top: `${r[1] * scaleY.value - shift}px`,
+    width: `${Math.max(8, (r[2] - r[0]) * scaleX.value)}px`,
+    height: `${Math.max(ftFontPx.value * 1.2, (r[3] - r[1]) * scaleY.value)}px`
   }
 })
+const ftTextStyle = computed(() => ({
+  color: editorStore.textColor,
+  caretColor: editorStore.textColor,
+  fontSize: `${ftFontPx.value}px`,
+  lineHeight: `${ftFontPx.value * 1.2}px`,
+  fontFamily: ftCssFamily(editorStore.fontFamily)
+}))
+
+/** The browser's face for the three a text box can be drawn in (Helv, TiRo, Cour). */
+function ftCssFamily(name: string): string {
+  const n = (name || '').toLowerCase()
+  if (n.startsWith('times') || n.startsWith('tiro')) return '"Times New Roman", Times, serif'
+  if (n.startsWith('cour')) return '"Courier New", Courier, monospace'
+  return 'Helvetica, Arial, sans-serif'
+}
+
+/** How far below MuPDF's first baseline (0.8 em) the browser sets it in a 1.2 em line, in px. */
+function cssBaselineShift(px: number, css: string): number {
+  measureCtx ??= document.createElement('canvas').getContext('2d')
+  if (!measureCtx || !px) return 0.147 * px
+  measureCtx.font = `${px}px ${css}`
+  const m = measureCtx.measureText('Hg')
+  const a = m.fontBoundingBoxAscent, d = m.fontBoundingBoxDescent
+  if (!a || !Number.isFinite(a)) return 0.147 * px
+  return (1.2 * px - (a + d)) / 2 + a - 0.8 * px
+}
 
 // --- helpers ---
 function pageCoords(e: MouseEvent): { sx: number; sy: number; px: number; py: number } {
@@ -889,6 +939,9 @@ async function loadAnnotations() {
   if (selectedImgId.value !== null && !imgs.some(i => i.id === selectedImgId.value)) selectedImgId.value = null
   if (multiImgs.value.size) multiImgs.value = new Set([...multiImgs.value].filter(id => imgs.some(i => i.id === id)))
   if (multiAnnots.value.size) multiAnnots.value = new Set([...multiAnnots.value].filter(i => anns.some(a => a.index === i)))
+  // A comment deleted from the list leaves no selection pointing at its old index.
+  if (selectedIndex.value !== null && !anns.some(a => a.index === selectedIndex.value)) selectedIndex.value = null
+  answerCommentRequests()
 }
 let loadScheduled = false
 function scheduleLoadAnnotations() {
@@ -903,7 +956,8 @@ function onCaptureDown(e: MouseEvent) {
   const { sx, sy, px, py } = pageCoords(e)
 
   if (tool === 'image') { imageDropY.value = py; imgInputRef.value?.click(); return }
-  if (tool === 'note') { placeNote(px, py); return }
+  // The click must not take the focus: the note's text box in the list has just been given it.
+  if (tool === 'note') { e.preventDefault(); placeNote(px, py); return }
   if (tool === 'sign') { placeSignature(px, py); return }
 
   drag.value = { tool, startSx: sx, startSy: sy, curSx: sx, curSy: sy, inkPts: [[px, py]], moved: false }
@@ -946,7 +1000,11 @@ async function onCaptureUp() {
 
   // Ignore tiny accidental drags (except draw/note)
   if (d.tool !== 'draw' && (x1 - x0 < 3 && y1 - y0 < 3)) {
-    if (d.tool === 'freetext') { openFreeText([x0, y0, x0 + 180 / scaleX.value, y0 + 40 / scaleY.value], true) }
+    // A click puts the caret where it was made: the first line straddles it.
+    if (d.tool === 'freetext') {
+      const top = Math.max(0, y0 - editorStore.fontSize * 0.6)
+      openFreeText([x0, top, x0 + 30, top + editorStore.fontSize * 1.2], true)
+    }
     return
   }
 
@@ -1053,18 +1111,75 @@ function computeMarkupQuads(rect: RectT, chars: TextChar[]): Quad[] {
   return quads
 }
 
+/**
+ * Acrobat's sticky note: the icon goes where the page was clicked and its text
+ * is written in the comment list, in a card that says "Agregar un
+ * comentario…" and publishes with Publicar. It used to be a modal dialog —
+ * whose text was white on a white card, so nothing typed could be seen — and
+ * once accepted the note's words could be read nowhere: the icon did nothing
+ * when clicked. The tool goes back to Seleccionar after one note, as
+ * Acrobat's does, so the next click on the icon picks the note up.
+ */
+const NOTE_SIZE = 20
+/** A draft just placed, which the tool change that follows must not settle. */
+let placedDraftId = 0
 function placeNote(px: number, py: number) {
-  $q.dialog({
-    title: 'Nota adhesiva',
-    message: 'Texto de la nota:',
-    prompt: { model: '', type: 'textarea' },
-    ok: { label: 'Aceptar', unelevated: true },
-    cancel: { label: 'Cancelar', flat: true },
-    dark: true,
-    class: 'acro-dialog'
-  }).onOk(async (text: string) => {
-    await annotOp('Note added', () => pdfEngine.addStickyNote(docStore.currentPage - 1, px, py, text || '', hexToRgb01(editorStore.highlightColor)))
-  })
+  void settleNoteDraft()
+  const x = Math.max(0, Math.min(props.pdfWidth - NOTE_SIZE, px - NOTE_SIZE / 2))
+  const y = Math.max(0, Math.min(props.pdfHeight - NOTE_SIZE, py - NOTE_SIZE / 2))
+  const draft: NoteDraft = { id: newDraftId(), pageIndex: docStore.currentPage - 1, x, y, color: hexToRgb01(editorStore.highlightColor), text: '' }
+  placedDraftId = draft.id
+  noteDraft.value = draft
+  ui.rightPaneOpen = true
+  editorStore.setTool('select')
+  editorStore.setStatus('Escriba el comentario en el panel de la derecha y pulse Publicar')
+}
+const draftOnPage = computed(() => !!noteDraft.value && noteDraft.value.pageIndex === docStore.currentPage - 1)
+const draftStyle = computed(() => {
+  const d = noteDraft.value
+  if (!d) return {}
+  return { left: `${d.x * scaleX.value}px`, top: `${d.y * scaleY.value}px`, width: `${NOTE_SIZE * scaleX.value}px`, height: `${NOTE_SIZE * scaleY.value}px` }
+})
+
+// ── The page and the comment list select together ──
+const COMMENT_TYPES_EXCLUDED = new Set(['Widget', 'Signature', 'Link', 'Popup'])
+watch(selectedIndex, (i) => {
+  const page = docStore.currentPage - 1
+  const a = i === null ? null : annotations.value.find(x => x.index === i)
+  if (a && !COMMENT_TYPES_EXCLUDED.has(a.type)) focusedComment.value = { page, index: a.index }
+  else if (focusedComment.value?.page === page) focusedComment.value = null
+})
+/** A card asked for its comment: select it once this page's annotations are in. */
+function answerCommentRequests() {
+  const page = docStore.currentPage - 1
+  const sel = selectOnPage.value
+  if (sel && sel.seq > answered.select && sel.page === page && annotations.value.some(a => a.index === sel.index)) {
+    answered.select = sel.seq
+    selectedImgId.value = null
+    clearMultiSelection()
+    selectedIndex.value = sel.index
+    nextTick(() => document.querySelector('.annot-hit.selected')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }))
+  }
+  const ed = editFreeText.value
+  if (ed && ed.seq > answered.freeText && ed.page === page && annotations.value.some(a => a.index === ed.index)) {
+    answered.freeText = ed.seq
+    openFreeTextEdit(ed.index)
+  }
+}
+watch([selectOnPage, editFreeText], answerCommentRequests)
+
+/** A double click edits: a text box on the page, a note in its card. */
+function onAnnotDblClick(index: number) {
+  const a = annotations.value.find(x => x.index === index)
+  if (!a) return
+  if (a.type === 'FreeText') { openFreeTextEdit(index); return }
+  if (a.type === 'Text') {
+    const page = docStore.currentPage - 1
+    if (ui.activeTool !== 'comment') shell?.openTool('comment')
+    ui.rightPaneOpen = true
+    focusedComment.value = { page, index }
+    editNoteText.value = request(page, index)
+  }
 }
 
 // --- Acrobat shell: stamps, form marks, signatures, measurements ---
@@ -1178,18 +1293,40 @@ async function handleObjectAction(action: ObjectAction) {
 onMounted(() => setObjectHandler(handleObjectAction))
 
 // --- FreeText ---
-/** Whether the open box was placed by a click (its size is a default) rather than dragged out. */
+/** Whether the open box was placed by a click (its size follows its text) rather than dragged out. */
 let ftFromClick = false
-const ftFromClickRef = ref(false)
-function openFreeText(rect: RectT, fromClick = false) {
+/** What the box held when it was opened, so an edit that changed nothing writes nothing. */
+let ftOriginal: { text: string; fontName: string; fontSize: number; color: string; rect: RectT } | null = null
+function openFreeText(rect: RectT, fromClick = false, editIndex: number | null = null, text?: string) {
   ftRect.value = rect
   ftFromClick = fromClick
-  ftFromClickRef.value = fromClick
+  ftPage = docStore.currentPage - 1
+  ftEditIndex.value = editIndex
   // The Fill & Sign "date" button opens the box already holding today's date.
-  freeTextValue.value = editorStore.freeTextPreset
+  freeTextValue.value = text ?? editorStore.freeTextPreset
   editorStore.freeTextPreset = ''
+  ftOriginal = editIndex === null ? null : {
+    text: freeTextValue.value, fontName: editorStore.fontFamily, fontSize: editorStore.fontSize, color: editorStore.textColor, rect: [...rect] as RectT
+  }
   freeTextEditing.value = true
-  nextTick(() => ftRef.value?.focus())
+  editorStore.setStatus('Escriba el texto. Un clic fuera del cuadro lo termina; Esc lo descarta')
+  nextTick(() => {
+    const el = ftRef.value
+    if (!el) return
+    el.focus({ preventScroll: true })
+    el.setSelectionRange(el.value.length, el.value.length)
+  })
+}
+/** Edit a text box already on the page, in its own face, size and colour (which the toolbar then shows). */
+function openFreeTextEdit(index: number) {
+  const a = annotations.value.find(x => x.index === index && x.type === 'FreeText')
+  if (!a) return
+  if (freeTextEditing.value) void commitFreeText()
+  if (a.fontSize) editorStore.fontSize = Math.round(a.fontSize * 10) / 10
+  if (a.fontName) editorStore.fontFamily = a.fontName
+  if (a.textColor?.length === 3) editorStore.textColor = rgb01ToHex(a.textColor as [number, number, number])
+  clearObjectSelection()
+  openFreeText([...a.rect] as RectT, true, index, a.contents)
 }
 let measureCtx: CanvasRenderingContext2D | null = null
 /**
@@ -1198,19 +1335,17 @@ let measureCtx: CanvasRenderingContext2D | null = null
  * annotation's rectangle — in the file, not just on screen. Acrobat's Fill &
  * Sign field grows with its text: a clicked box takes the text's width (up to
  * the paper's edge, wrapping only past it), and any box grows downward until
- * its lines fit. A dragged box keeps the width it was given.
+ * its lines fit. A dragged box keeps the width it was given. Measured in the
+ * plain face: MuPDF draws a text box in Helvetica, Times or Courier, never
+ * their bold or italic.
  */
 function fitFreeTextRect(rect: RectT, text: string): RectT {
   measureCtx ??= document.createElement('canvas').getContext('2d')
   const size = editorStore.fontSize
-  const family = editorStore.fontFamily || 'Helvetica'
-  const css = family.startsWith('Times') ? '"Times New Roman", Times, serif' : family.startsWith('Courier') ? '"Courier New", Courier, monospace' : 'Helvetica, Arial, sans-serif'
-  const weight = /Bold/.test(family) ? 'bold ' : ''
-  const style = /Oblique|Italic/.test(family) ? 'italic ' : ''
   const pad = 4
   const lines = text.split('\n')
   const widthOf = (s: string) => measureCtx ? measureCtx.measureText(s).width * 1.08 : s.length * size * 0.6
-  if (measureCtx) measureCtx.font = `${style}${weight}${size}px ${css}`
+  if (measureCtx) measureCtx.font = `${size}px ${ftCssFamily(editorStore.fontFamily)}`
   const room = Math.max(30, props.pdfWidth - rect[0] - 6)
   const w = ftFromClick ? Math.min(room, Math.max(30, Math.max(...lines.map(widthOf)) + pad * 2)) : rect[2] - rect[0]
   const inner = Math.max(10, w - pad * 2)
@@ -1219,26 +1354,75 @@ function fitFreeTextRect(rect: RectT, text: string): RectT {
   return [rect[0], rect[1], rect[0] + w, Math.min(props.pdfHeight, rect[1] + h)]
 }
 async function commitFreeText() {
+  if (!freeTextEditing.value) return
   // Read from the DOM element directly (source of truth) to avoid v-model sync edge cases.
   const text = ftRef.value?.value ?? freeTextValue.value
+  const editIndex = ftEditIndex.value
+  const original = ftOriginal
   freeTextEditing.value = false
-  if (!text.trim()) return
-  const pageIndex = docStore.currentPage - 1
+  ftEditIndex.value = null
+  ftOriginal = null
+  const pageIndex = ftPage
   const rect = fitFreeTextRect([...ftRect.value] as RectT, text)
-  await annotOp('Text box added', () => pdfEngine.addFreeText(pageIndex, rect, text, editorStore.fontSize, hexToRgb01(editorStore.textColor), editorStore.fontFamily))
+  const fontName = editorStore.fontFamily, fontSize = editorStore.fontSize, color = editorStore.textColor
+  if (editIndex !== null) {
+    if (!text.trim()) {
+      await annotOp('Comentario de texto eliminado', () => pdfEngine.deleteAnnotation(pageIndex, editIndex))
+      return
+    }
+    if (original && original.text === text && original.fontName === fontName && original.fontSize === fontSize && original.color === color) {
+      editorStore.setStatus('')
+      return
+    }
+    await annotOp('Comentario de texto actualizado', () => pdfEngine.updateAnnotation(pageIndex, editIndex, {
+      contents: text, rect, fontName, fontSize, textColor: hexToRgb01(color)
+    }))
+    return
+  }
+  if (!text.trim()) { editorStore.setStatus(''); return }
+  await annotOp('Comentario de texto agregado', () => pdfEngine.addFreeText(pageIndex, rect, text, fontSize, hexToRgb01(color), fontName))
 }
-function cancelFreeText() { freeTextEditing.value = false; freeTextValue.value = '' }
+function cancelFreeText() {
+  freeTextEditing.value = false
+  freeTextValue.value = ''
+  ftEditIndex.value = null
+  ftOriginal = null
+}
 /**
- * Leaving the box commits it, as Acrobat's Fill & Sign does. Only Ctrl+Enter
- * and the tick did: a click elsewhere left the text typed and uncommitted,
- * the next tool's click went nowhere, and Save — whose `flushOpenEditor`
- * commits editors by BLURRING them — wrote the file without the text while
- * the screen still showed it. Cancel and commit close the box before it is
- * removed, so the blur its removal fires finds nothing to do.
+ * Leaving the box commits it, as Acrobat does. Only Ctrl+Enter and the tick
+ * did: a click elsewhere left the text typed and uncommitted, the next tool's
+ * click went nowhere, and Save — whose `flushOpenEditor` commits editors by
+ * BLURRING them — wrote the file without the text while the screen still
+ * showed it.
+ *
+ * Except a click in the tool bar or one of its menus: changing the size, the
+ * face or the colour while typing is what that bar is for, and it takes the
+ * focus for a moment. The box keeps going and gets the focus back when the
+ * property lands (the watcher below). A click anywhere else ends it, even
+ * when the box no longer has the focus (`onDocMouseDownFt`).
  */
-function onFreeTextBlur() {
-  if (freeTextEditing.value) void commitFreeText()
+const FT_KEEP = '.ft-editor-wrap, .acro-toolopts, .q-menu'
+let ftKeepClickAt = 0
+function onDocMouseDownFt(e: MouseEvent) {
+  if (!freeTextEditing.value) return
+  const t = e.target as HTMLElement | null
+  if (t?.closest?.(FT_KEEP)) { ftKeepClickAt = Date.now(); return }
+  void commitFreeText()
 }
+function onFreeTextBlur(e: FocusEvent) {
+  const to = e.relatedTarget as HTMLElement | null
+  if (to?.closest?.(FT_KEEP)) return
+  setTimeout(() => {
+    if (!freeTextEditing.value) return
+    // The window lost the focus, not the box: it still holds it inside.
+    if (document.activeElement === ftRef.value) return
+    if (Date.now() - ftKeepClickAt < 500) return
+    void commitFreeText()
+  }, 0)
+}
+watch(() => [editorStore.fontFamily, editorStore.fontSize, editorStore.textColor], () => {
+  if (freeTextEditing.value) nextTick(() => ftRef.value?.focus({ preventScroll: true }))
+})
 
 // --- Image ---
 /** Clearance left between an inserted image and the text it sits between. */
@@ -1700,9 +1884,14 @@ watch(() => editorStore.currentTool, () => {
   selectedIndex.value = null
   selectedImgId.value = null
   clearMultiSelection()
-  cancelFreeText()
+  // Picking another tool ends what was being written, as a click elsewhere does.
+  void commitFreeText()
+  if (noteDraft.value && noteDraft.value.id !== placedDraftId) void settleNoteDraft()
+  placedDraftId = 0
   if (showLayer.value) scheduleLoadAnnotations()
 })
+// Another document: a note half-written for the last one has nowhere to go.
+watch(() => docStore.documentId, () => { noteDraft.value = null; focusedComment.value = null })
 /**
  * Load on MOUNT — same reason as the text overlay.
  *
@@ -1717,14 +1906,17 @@ watch(() => docStore.currentPage, () => {
   // The image ids are per page, so a selection carried across pages points at
   // whatever happens to hold that id on the new one.
   clearObjectSelection()
-  cancelFreeText() // an open freetext editor must not commit onto the NEW page
+  void commitFreeText() // onto the page it was opened on (ftPage), not the new one
   scheduleLoadAnnotations()
 })
 watch(() => docStore.renderVersion, scheduleLoadAnnotations)
 watch(showLayer, (v) => { if (v) scheduleLoadAnnotations() }, { immediate: true })
 
 window.addEventListener('keydown', onKeyDown)
+document.addEventListener('mousedown', onDocMouseDownFt, true)
 onBeforeUnmount(() => {
+  document.removeEventListener('mousedown', onDocMouseDownFt, true)
+  void commitFreeText()
   setObjectHandler(null)
   objectSelection.value = null
   window.removeEventListener('keydown', onKeyDown)
@@ -1801,10 +1993,22 @@ defineExpose({ loadAnnotations, deleteSelected, selectInBand, clearMultiSelectio
 .offscreen-input {
   position: fixed; left: -9999px; top: 0;
 }
-.ft-editor-wrap { position: absolute; z-index: 20; pointer-events: auto; display: flex; flex-direction: column; }
-.ft-editor {
-  width: 100%; border: 1.5px solid #e53935; background: rgba(255,255,255,0.97);
-  padding: 2px 4px; outline: none; resize: both; font-family: Helvetica, Arial, sans-serif; line-height: 1.2;
+/* A text comment typed on the page: no fill, no frame of its own beyond a
+   faint dashed outline marking where the box is (Acrobat draws none at all),
+   so what is seen while typing is what is drawn. Re-editing covers the old
+   drawing with paper, or the two would show through each other. */
+.ft-editor-wrap {
+  position: absolute; z-index: 20; pointer-events: auto;
+  outline: 1px dashed rgba(38, 128, 235, 0.75); outline-offset: 3px;
 }
-.ft-actions { display: flex; justify-content: flex-end; gap: 2px; background: rgba(50,50,50,0.9); border-radius: 0 0 4px 4px; padding: 1px; }
+.ft-editor-wrap.reedit { background: #fff; }
+.ft-editor {
+  display: block; width: 100%; height: 100%; margin: 0; padding: 0; border: 0; outline: none;
+  background: transparent; resize: none; overflow: hidden;
+  white-space: pre-wrap; overflow-wrap: break-word; box-shadow: none;
+}
+.note-draft {
+  position: absolute; z-index: 19; pointer-events: none;
+  outline: 1.5px solid #2680eb; outline-offset: 1px;
+}
 </style>

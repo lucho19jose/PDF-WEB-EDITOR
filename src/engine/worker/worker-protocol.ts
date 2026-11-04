@@ -69,14 +69,14 @@ export type WorkerRequest =
   | { id: number; type: 'debugBtBlocks'; data: { pageIndex: number; maxLen?: number } }
   // --- Annotations ---
   | { id: number; type: 'getAnnotations'; data: { pageIndex: number } }
-  | { id: number; type: 'addTextMarkup'; data: { pageIndex: number; markupType: MarkupType; quads: Quad[]; color: [number, number, number]; opacity?: number } }
-  | { id: number; type: 'addShape'; data: { pageIndex: number; shapeType: ShapeType; rect?: RectT; points?: [Pt, Pt]; color: [number, number, number]; interiorColor?: [number, number, number] | null; width: number; opacity?: number } }
-  | { id: number; type: 'addInk'; data: { pageIndex: number; strokes: Pt[][]; color: [number, number, number]; width: number; opacity?: number } }
-  | { id: number; type: 'addFreeText'; data: { pageIndex: number; rect: RectT; text: string; fontSize: number; color: [number, number, number]; fontName?: string } }
-  | { id: number; type: 'addStickyNote'; data: { pageIndex: number; x: number; y: number; text: string; color: [number, number, number] } }
+  | { id: number; type: 'addTextMarkup'; data: { pageIndex: number; markupType: MarkupType; quads: Quad[]; color: [number, number, number]; opacity?: number; author?: string } }
+  | { id: number; type: 'addShape'; data: { pageIndex: number; shapeType: ShapeType; rect?: RectT; points?: [Pt, Pt]; color: [number, number, number]; interiorColor?: [number, number, number] | null; width: number; opacity?: number; author?: string } }
+  | { id: number; type: 'addInk'; data: { pageIndex: number; strokes: Pt[][]; color: [number, number, number]; width: number; opacity?: number; author?: string } }
+  | { id: number; type: 'addFreeText'; data: { pageIndex: number; rect: RectT; text: string; fontSize: number; color: [number, number, number]; fontName?: string; author?: string } }
+  | { id: number; type: 'addStickyNote'; data: { pageIndex: number; x: number; y: number; text: string; color: [number, number, number]; author?: string } }
   | { id: number; type: 'addImageStamp'; data: { pageIndex: number; rect: RectT; imageBytes: ArrayBuffer } }
   | { id: number; type: 'deleteAnnotation'; data: { pageIndex: number; annotIndex: number } }
-  | { id: number; type: 'updateAnnotation'; data: { pageIndex: number; annotIndex: number; rect?: RectT; color?: [number, number, number]; interiorColor?: [number, number, number] | null; opacity?: number; width?: number; contents?: string } }
+  | { id: number; type: 'updateAnnotation'; data: { pageIndex: number; annotIndex: number; rect?: RectT; color?: [number, number, number]; interiorColor?: [number, number, number] | null; opacity?: number; width?: number; contents?: string; fontName?: string; fontSize?: number; textColor?: [number, number, number] } }
   // --- Page management ---
   | { id: number; type: 'rotatePage'; data: { pageIndex: number; degrees: number } }
   | { id: number; type: 'insertBlankPage'; data: { atIndex: number; width: number; height: number } }

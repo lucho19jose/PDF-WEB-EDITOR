@@ -39,7 +39,7 @@ node tools/pdf-sweep/features.mjs
 
 # 4. experiments — in the browser, with the dev server running
 #    (the driver needs the live worker, so it runs inside the app page)
-#    open http://localhost:9000, then in the console:
+#    open http://localhost:9000/?single (no tabs), then in the console:
 #      await import('/_sweep/driver.js')
 #      window.__manifest = await (await fetch('/_sweep/manifest.json')).json()
 #      window.__results = []

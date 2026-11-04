@@ -486,6 +486,39 @@
       <div class="acro-card-actions"><button class="acro-pill primary" @click="close">Aceptar</button></div>
     </div>
   </q-dialog>
+
+  <!-- ═════════════ Conectar con Claude (the MCP server) ═════════════ -->
+  <q-dialog :model-value="ui.dialog === 'claude'" @update:model-value="(v: boolean) => !v && closeIf('claude')">
+    <div class="acro-card dlg wide">
+      <div class="acro-card-title">Conectar con Claude</div>
+      <div class="acro-card-body">
+        <p>Claude puede usar las herramientas de PDF Editor Pro sobre los PDF de su equipo: reemplazar texto, comentar, firmar, organizar páginas, agregar encabezados y marcas de agua, redactar, proteger y exportar a Word o Excel. Todo se procesa en este equipo.</p>
+        <template v-if="!mcp">
+          <p class="note">Esta función necesita la aplicación de Windows. Descárguela e instálela, y use este mismo menú allí.</p>
+        </template>
+        <template v-else-if="!mcp.serverExists">
+          <p class="note">Esta copia no incluye el servidor para Claude ({{ mcp.server }}). Ejecute <code>npm run mcp:build</code> o instale la versión más reciente.</p>
+        </template>
+        <template v-else>
+          <div class="claude-step">
+            <div class="claude-step-title">Claude Desktop</div>
+            <p class="note">Haga doble clic en la extensión <b>pdf-editor-pro.mcpb</b>: Claude Desktop la instala y le pregunta qué carpetas puede usar.</p>
+            <button class="acro-pill pill-sm" :disabled="!mcp.mcpbExists" @click="revealMcpb">Mostrar la extensión en el Explorador</button>
+            <p class="note">O agregue esto a <code>claude_desktop_config.json</code> (Configuración ▸ Desarrollador ▸ Editar configuración):</p>
+            <pre class="claude-code">{{ claudeDesktopJson }}</pre>
+            <button class="acro-pill outline pill-sm" @click="copyText(claudeDesktopJson, 'Configuración copiada')">Copiar</button>
+          </div>
+          <div class="claude-step">
+            <div class="claude-step-title">Claude Code</div>
+            <pre class="claude-code">{{ claudeCodeCmd }}</pre>
+            <button class="acro-pill outline pill-sm" @click="copyText(claudeCodeCmd, 'Comando copiado')">Copiar el comando</button>
+          </div>
+          <p class="note">Las páginas escaneadas se abren en esta aplicación para reconocer su texto (OCR). Claude guarda junto al original como «(editado)» y solo reemplaza un archivo si usted se lo pide.</p>
+        </template>
+      </div>
+      <div class="acro-card-actions"><button class="acro-pill primary" @click="close">Cerrar</button></div>
+    </div>
+  </q-dialog>
 </template>
 
 <script setup lang="ts">
@@ -496,6 +529,7 @@ import { useUiStore, printJobFiles } from '@/stores/ui'
 import { hexToRgb01 } from '@/utils/color'
 import { parsePageRange } from '@/composables/useAcroCommands'
 import { persistedRef } from '@/utils/persist'
+import { desktopApi } from '@/tabs/frameClient'
 import ColorSwatch from '@/components/toolbar/ColorSwatch.vue'
 import PageRangePicker from './PageRangePicker.vue'
 import SignaturePad from './SignaturePad.vue'
@@ -755,11 +789,11 @@ async function applyCombine() {
 }
 
 // ── Print jobs (Windows app): collected here as they arrive ──
-const canOpenSeparately = !!window.desktop?.openPrintJobs
+const canOpenSeparately = !!desktopApi()?.openPrintJobs
 /** A job reopened in a window of its own, from the copy the listener kept on disk. */
 function openJobSeparately(i: number) {
   const [f] = combineEntries.value.splice(i, 1)
-  if (f) window.desktop?.openPrintJobs?.([f.name])
+  if (f) desktopApi()?.openPrintJobs?.([f.name])
 }
 /** Cancel drops the jobs from this list only: they stay in the print folder for a week. */
 async function cancelCombine() {
@@ -908,9 +942,29 @@ const shortcuts = [
   ['T', 'Agregar texto'], ['H', 'Resaltar'], ['D', 'Dibujar'], ['R / O', 'Rectángulo / óvalo'], ['Supr', 'Eliminar la selección']
 ]
 
+// ═════════════ Conectar con Claude ═════════════
+// The MCP server ships inside the Windows app (resources\mcp) and runs on the
+// app's own exe in Node mode, so no separate Node install is needed.
+type McpInfo = Awaited<ReturnType<NonNullable<DesktopBridge['mcpInfo']>>>
+const mcp = ref<McpInfo | null>(null)
+const claudeDesktopJson = computed(() => mcp.value
+  ? JSON.stringify({ mcpServers: { 'pdf-editor-pro': { command: mcp.value.exe, args: [mcp.value.server], env: { ELECTRON_RUN_AS_NODE: '1' } } } }, null, 2)
+  : '')
+const claudeCodeCmd = computed(() => mcp.value
+  ? `claude mcp add pdf-editor-pro --scope user -e ELECTRON_RUN_AS_NODE=1 -- "${mcp.value.exe}" "${mcp.value.server}"`
+  : '')
+async function loadMcpInfo() {
+  try { mcp.value = (await desktopApi()?.mcpInfo?.()) ?? null } catch (_) { mcp.value = null }
+}
+function revealMcpb() { desktopApi()?.revealMcpb?.() }
+async function copyText(text: string, done: string) {
+  try { await navigator.clipboard.writeText(text); ui.notify(done) } catch (_) { ui.notify('No se pudo copiar: seleccione el texto y cópielo con Ctrl+C') }
+}
+
 // ═════════════ initialise each dialog as it opens ═════════════
 watch(() => ui.dialog, async d => {
   const a = ui.dialogArgs ?? {}
+  if (d === 'claude') { await loadMcpInfo(); return }
   if (!docStore.loaded && !['combine', 'create', 'about', 'shortcuts'].includes(d ?? '')) return
   if (d === 'headerFooter') {
     hf.update = !!a.update; hf.pageNumbers = !!a.pageNumbers
@@ -979,6 +1033,9 @@ watch(() => ui.dialog, async d => {
 <style scoped>
 .dlg { width: 520px; max-width: 94vw; max-height: 92vh; overflow-y: auto; }
 .dlg.wide { width: 860px; }
+.claude-step { margin: 14px 0; padding: 10px 12px; border: 1px solid var(--acro-border, #3a3a3a); border-radius: 6px; }
+.claude-step-title { font-weight: 600; margin-bottom: 4px; }
+.claude-code { background: #1b1b1b; color: #e8e8e8; padding: 8px 10px; border-radius: 4px; font-size: 11.5px; white-space: pre-wrap; word-break: break-all; user-select: text; margin: 6px 0; }
 .cols { display: flex; gap: 24px; }
 .col-form { flex: 1; min-width: 0; }
 .col-preview { width: 210px; flex: none; }

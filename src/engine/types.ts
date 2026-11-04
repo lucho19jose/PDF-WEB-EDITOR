@@ -133,6 +133,12 @@ export interface AnnotationInfo {
   borderWidth: number
   contents: string
   author: string
+  /** When it was last changed (ms since the epoch), or null when the file does not say. */
+  modified?: number | null
+  /** A text box's face (Helvetica, Times-Roman or Courier), size and colour, from its /DA. */
+  fontName?: string
+  fontSize?: number
+  textColor?: number[]
   hasQuadPoints: boolean
 }
 

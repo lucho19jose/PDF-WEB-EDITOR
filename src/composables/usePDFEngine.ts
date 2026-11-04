@@ -400,7 +400,9 @@ export function usePDFEngine() {
   async function deleteAnnotation(pageIndex: number, annotIndex: number): Promise<boolean> {
     return wrap(await bridge.deleteAnnotation(pageIndex, annotIndex), 'deleteAnnotation', pageIndex)
   }
-  async function updateAnnotation(pageIndex: number, annotIndex: number, changes: { rect?: RectT; color?: [number, number, number]; interiorColor?: [number, number, number] | null; opacity?: number; width?: number; contents?: string }): Promise<boolean> {
+  /** Who new comments are by: Acrobat's author name. */
+  function setAnnotAuthor(name: string) { bridge.setAnnotAuthor(name) }
+  async function updateAnnotation(pageIndex: number, annotIndex: number, changes: { rect?: RectT; color?: [number, number, number]; interiorColor?: [number, number, number] | null; opacity?: number; width?: number; contents?: string; fontName?: string; fontSize?: number; textColor?: [number, number, number] }): Promise<boolean> {
     return wrap(await bridge.updateAnnotation(pageIndex, annotIndex, changes), 'updateAnnotation', pageIndex)
   }
 
@@ -638,6 +640,7 @@ export function usePDFEngine() {
     addImageStamp,
     deleteAnnotation,
     updateAnnotation,
+    setAnnotAuthor,
     // page management
     rotatePage,
     flattenAnnotationBehind,

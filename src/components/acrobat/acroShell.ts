@@ -23,7 +23,8 @@ export interface AcroShellDeps {
   redo: () => Promise<void>
   openFind: () => void
   rotatePage: (deg: number) => Promise<void>
-  closeDocument: () => Promise<void>
+  /** Resolves false when the user cancelled (kept the document open). */
+  closeDocument: () => Promise<boolean>
   toggleAssistant: () => void
   reportProblem: () => void
 }

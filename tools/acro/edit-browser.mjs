@@ -43,7 +43,7 @@ async function dragArea(tool,x,y,w,h) {
   await page.mouse.move(box.x+x+w,box.y+y+h,{steps:6}); await page.mouse.up()
 }
 try {
-  await page.goto(process.env.APP_URL || 'http://localhost:9000/')
+  await page.goto(process.env.APP_URL || 'http://localhost:9000/?single')
   await openFixture()
   // Real image selection and browser keyboard clipboard, with repeated pastes.
   await page.locator('.cimg-hit').first().click()

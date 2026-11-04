@@ -404,6 +404,14 @@ export class MuPDFBridge {
 
   // ===== ANNOTATIONS =====
 
+  /**
+   * Who new comments are by (Acrobat's author name). Sent with every comment
+   * created, rather than set once in the worker, so a worker brought back
+   * after a crash still knows it.
+   */
+  private annotAuthor = ''
+  setAnnotAuthor(name: string): void { this.annotAuthor = name.trim() }
+
   async getAnnotations(pageIndex: number): Promise<{ annotations: AnnotationInfo[] }> {
     return this.send('getAnnotations', { pageIndex })
   }
@@ -414,23 +422,23 @@ export class MuPDFBridge {
   }
 
   async addTextMarkup(pageIndex: number, markupType: MarkupType, quads: Quad[], color: [number, number, number], opacity?: number): Promise<{ success: boolean; index?: number; error?: string }> {
-    return this.send('addTextMarkup', { pageIndex, markupType, quads, color, opacity })
+    return this.send('addTextMarkup', { pageIndex, markupType, quads, color, opacity, author: this.annotAuthor })
   }
 
   async addShape(pageIndex: number, shapeType: ShapeType, opts: { rect?: RectT; points?: [Pt, Pt]; color: [number, number, number]; interiorColor?: [number, number, number] | null; width: number; opacity?: number }): Promise<{ success: boolean; index?: number; error?: string }> {
-    return this.send('addShape', { pageIndex, shapeType, ...opts })
+    return this.send('addShape', { pageIndex, shapeType, ...opts, author: this.annotAuthor })
   }
 
   async addInk(pageIndex: number, strokes: Pt[][], color: [number, number, number], width: number, opacity?: number): Promise<{ success: boolean; index?: number; error?: string }> {
-    return this.send('addInk', { pageIndex, strokes, color, width, opacity })
+    return this.send('addInk', { pageIndex, strokes, color, width, opacity, author: this.annotAuthor })
   }
 
   async addFreeText(pageIndex: number, rect: RectT, text: string, fontSize: number, color: [number, number, number], fontName?: string): Promise<{ success: boolean; index?: number; error?: string }> {
-    return this.send('addFreeText', { pageIndex, rect, text, fontSize, color, fontName })
+    return this.send('addFreeText', { pageIndex, rect, text, fontSize, color, fontName, author: this.annotAuthor })
   }
 
   async addStickyNote(pageIndex: number, x: number, y: number, text: string, color: [number, number, number]): Promise<{ success: boolean; index?: number; error?: string }> {
-    return this.send('addStickyNote', { pageIndex, x, y, text, color })
+    return this.send('addStickyNote', { pageIndex, x, y, text, color, author: this.annotAuthor })
   }
 
   async addImageStamp(pageIndex: number, rect: RectT, imageBytes: ArrayBuffer): Promise<{ success: boolean; index?: number; error?: string }> {
@@ -441,7 +449,7 @@ export class MuPDFBridge {
     return this.send('deleteAnnotation', { pageIndex, annotIndex })
   }
 
-  async updateAnnotation(pageIndex: number, annotIndex: number, changes: { rect?: RectT; color?: [number, number, number]; interiorColor?: [number, number, number] | null; opacity?: number; width?: number; contents?: string }): Promise<{ success: boolean; error?: string }> {
+  async updateAnnotation(pageIndex: number, annotIndex: number, changes: { rect?: RectT; color?: [number, number, number]; interiorColor?: [number, number, number] | null; opacity?: number; width?: number; contents?: string; fontName?: string; fontSize?: number; textColor?: [number, number, number] }): Promise<{ success: boolean; error?: string }> {
     return this.send('updateAnnotation', { pageIndex, annotIndex, ...changes })
   }
 

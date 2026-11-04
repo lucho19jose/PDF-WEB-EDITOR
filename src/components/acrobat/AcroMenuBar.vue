@@ -114,7 +114,8 @@ const menus: { label: string; items: Item[] }[] = [
   {
     label: 'Ventana',
     items: [
-      { label: 'Nueva ventana', run: () => window.open(location.href, '_blank') },
+      // The app's root, not this page's own URL: in a tab that is `/?frame=…`.
+      { label: 'Nueva ventana', run: () => window.open(`${location.origin}/`, '_blank') },
       sep,
       { label: 'Inicio', run: () => (ui.view = 'home') },
       { label: 'Herramientas', run: () => (ui.view = 'tools') },
@@ -130,6 +131,7 @@ const menus: { label: string; items: Item[] }[] = [
       { label: 'Métodos abreviados de teclado', run: () => ui.openDialog('shortcuts') },
       sep,
       { label: 'Informar de un problema...', run: shell.reportProblem },
+      { label: 'Conectar con Claude...', icon: 'sym_o_hub', run: () => ui.openDialog('claude') },
       sep,
       { label: 'Acerca de PDF Editor Pro...', run: () => ui.openDialog('about') }
     ]

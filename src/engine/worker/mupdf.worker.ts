@@ -269,31 +269,31 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       case 'addTextMarkup': {
         if (!pdfDoc) throw new Error('No document loaded')
         const d = req.data
-        respond({ id: req.id, type: 'success', data: addTextMarkup(d.pageIndex, d.markupType, d.quads, d.color, d.opacity) })
+        respond({ id: req.id, type: 'success', data: addTextMarkup(d.pageIndex, d.markupType, d.quads, d.color, d.opacity, d.author) })
         break
       }
       case 'addShape': {
         if (!pdfDoc) throw new Error('No document loaded')
         const d = req.data
-        respond({ id: req.id, type: 'success', data: addShape(d.pageIndex, d.shapeType, d.rect, d.points, d.color, d.interiorColor, d.width, d.opacity) })
+        respond({ id: req.id, type: 'success', data: addShape(d.pageIndex, d.shapeType, d.rect, d.points, d.color, d.interiorColor, d.width, d.opacity, d.author) })
         break
       }
       case 'addInk': {
         if (!pdfDoc) throw new Error('No document loaded')
         const d = req.data
-        respond({ id: req.id, type: 'success', data: addInk(d.pageIndex, d.strokes, d.color, d.width, d.opacity) })
+        respond({ id: req.id, type: 'success', data: addInk(d.pageIndex, d.strokes, d.color, d.width, d.opacity, d.author) })
         break
       }
       case 'addFreeText': {
         if (!pdfDoc) throw new Error('No document loaded')
         const d = req.data
-        respond({ id: req.id, type: 'success', data: addFreeText(d.pageIndex, d.rect, d.text, d.fontSize, d.color, d.fontName) })
+        respond({ id: req.id, type: 'success', data: addFreeText(d.pageIndex, d.rect, d.text, d.fontSize, d.color, d.fontName, d.author) })
         break
       }
       case 'addStickyNote': {
         if (!pdfDoc) throw new Error('No document loaded')
         const d = req.data
-        respond({ id: req.id, type: 'success', data: addStickyNote(d.pageIndex, d.x, d.y, d.text, d.color) })
+        respond({ id: req.id, type: 'success', data: addStickyNote(d.pageIndex, d.x, d.y, d.text, d.color, d.author) })
         break
       }
       case 'addImageStamp': {
@@ -11701,6 +11701,8 @@ function listAnnotations(pageIndex: number): any[] {
       borderWidth: safe(() => annot.getBorderWidth(), 1),
       contents: safe(() => annot.getContents(), ''),
       author: safe(() => annot.getAuthor(), ''),
+      modified: annotTime(annot),
+      ...(type === 'FreeText' ? freeTextStyle(annot) : {}),
       hasQuadPoints: safe(() => annot.hasQuadPoints(), false)
     })
   })
@@ -11708,12 +11710,117 @@ function listAnnotations(pageIndex: number): any[] {
   return out
 }
 
+// ===== Comments: author, time, the note's icon, a text box's font =====
+
+/** Acrobat's sticky-note icon is 20 points square. */
+const NOTE_ICON_SIZE = 20
+
+/**
+ * Every comment carries who made it and when, as Acrobat's do: the comment
+ * list shows both, and Acrobat shows ours with them.
+ */
+function stampCommentMeta(annot: any, author: string): void {
+  const now = new Date()
+  if (author) { try { annot.setAuthor(author) } catch (_) {} }
+  try { annot.setCreationDate(now) } catch (_) {}
+  try { annot.setModificationDate(now) } catch (_) {}
+}
+
+/** When a comment was last changed, in ms, or null when the file does not say. */
+function annotTime(annot: any): number | null {
+  for (const get of [() => annot.getModificationDate(), () => annot.getCreationDate()]) {
+    const t = safe<Date | null>(get, null)
+    const ms = t instanceof Date ? t.getTime() : NaN
+    if (Number.isFinite(ms) && ms > 0) return ms
+  }
+  return null
+}
+
+/**
+ * MuPDF writes a text box's appearance in one of three faces only, named by
+ * their AcroForm keys: Helv, TiRo, Cour. Any other name in /DA is drawn in
+ * Helvetica — "Times-Roman" chosen in the toolbar used to come out as
+ * Helvetica.
+ */
+function freeTextFontKey(name: string | undefined): string {
+  const n = (name || '').toLowerCase()
+  if (n.startsWith('tiro') || n.startsWith('times')) return 'TiRo'
+  if (n.startsWith('cour')) return 'Cour'
+  return 'Helv'
+}
+
+/** A text box's face, size and colour, from its /DA. */
+function freeTextStyle(annot: any): { fontName?: string; fontSize?: number; textColor?: number[] } {
+  const da = safe<any>(() => annot.getDefaultAppearance(), null)
+  if (!da) return {}
+  const key = freeTextFontKey(String(da.font || ''))
+  return {
+    fontName: key === 'TiRo' ? 'Times-Roman' : key === 'Cour' ? 'Courier' : 'Helvetica',
+    fontSize: Number(da.size) || undefined,
+    textColor: Array.isArray(da.color) ? colorArr(da.color) : undefined
+  }
+}
+
+/** A sticky note whose icon is ours to draw: Comment, the icon this editor gives its notes. */
+function isOurNote(annot: any): boolean {
+  return safe(() => annot.getType(), '') === 'Text' && safe(() => annot.getIcon(), '') === 'Comment'
+}
+
+const BEZIER_K = 0.5523
+function roundedRectPath(x0: number, y0: number, x1: number, y1: number, r: number): string {
+  const c = r * BEZIER_K, f = (n: number) => +n.toFixed(3)
+  return [
+    `${f(x0 + r)} ${f(y0)} m`, `${f(x1 - r)} ${f(y0)} l`,
+    `${f(x1 - r + c)} ${f(y0)} ${f(x1)} ${f(y0 + r - c)} ${f(x1)} ${f(y0 + r)} c`,
+    `${f(x1)} ${f(y1 - r)} l`, `${f(x1)} ${f(y1 - r + c)} ${f(x1 - r + c)} ${f(y1)} ${f(x1 - r)} ${f(y1)} c`,
+    `${f(x0 + r)} ${f(y1)} l`, `${f(x0 + r - c)} ${f(y1)} ${f(x0)} ${f(y1 - r + c)} ${f(x0)} ${f(y1 - r)} c`,
+    `${f(x0)} ${f(y0 + r)} l`, `${f(x0)} ${f(y0 + r - c)} ${f(x0 + r - c)} ${f(y0)} ${f(x0 + r)} ${f(y0)} c`, 'h'
+  ].join('\n')
+}
+
+/**
+ * Acrobat's sticky-note icon: a rounded square in the note's colour holding a
+ * white speech bubble with two lines. MuPDF's own "Comment" icon is a black
+ * bubble in a square box, its "Note" a box of lines. The same drawing is
+ * `NOTE_ICON_SVG` in the UI (src/utils/acro/comments.ts), for the note being
+ * written before it is published.
+ */
+function noteAppearance(color: number[]): string {
+  const [r, g, b] = color.length >= 3 ? color : [1, 0.82, 0]
+  const d = (v: number) => (v * 0.72).toFixed(3)
+  const bubble = [
+    '6 7 m', '4.4 3.8 l', '9.4 7 l', '14 7 l', '15.105 7 16 7.895 16 9 c', '16 13.5 l',
+    '16 14.605 15.105 15.5 14 15.5 c', '6 15.5 l', '4.895 15.5 4 14.605 4 13.5 c', '4 9 l', '4 7.895 4.895 7 6 7 c'
+  ].join('\n')
+  return [
+    'q', `${r} ${g} ${b} rg ${d(r)} ${d(g)} ${d(b)} RG 0.6 w`, roundedRectPath(0.3, 0.3, 19.7, 19.7, 3), 'B',
+    '1 1 1 RG 1.4 w 1 J 1 j', bubble, 'S', '6.9 12.7 m 13.1 12.7 l S 6.9 10 m 11.4 10 l S', 'Q'
+  ].join('\n')
+}
+
+/** Replace the note's appearance with Acrobat's icon (after every `update()`, which redraws MuPDF's). */
+function writeNoteAppearance(annot: any): void {
+  try {
+    const color = colorArr(safe(() => annot.getColor(), []))
+    const form = pdfDoc.addStream(noteAppearance(color), {
+      Type: pdfDoc.newName('XObject'), Subtype: pdfDoc.newName('Form'),
+      BBox: [0, 0, NOTE_ICON_SIZE, NOTE_ICON_SIZE], Resources: {}
+    })
+    const ap = pdfDoc.newDictionary()
+    ap.put('N', form)
+    annot.getObject().put('AP', ap)
+  } catch (err) {
+    console.warn('[worker] note icon:', err)
+  }
+}
+
 function addTextMarkup(
   pageIndex: number,
   markupType: string,
   quads: number[][],
   color: [number, number, number],
-  opacity = 1
+  opacity = 1,
+  author = ''
 ): { success: boolean; index?: number; error?: string } {
   try {
     const page = pdfDoc.loadPage(pageIndex)
@@ -11721,6 +11828,7 @@ function addTextMarkup(
     annot.setQuadPoints(quads as any)
     annot.setColor(color as any)
     try { annot.setOpacity(opacity) } catch (_) {}
+    stampCommentMeta(annot, author)
     annot.update()
     const index = page.getAnnotations().length - 1
     page.destroy()
@@ -11738,11 +11846,13 @@ function addShape(
   color: [number, number, number],
   interiorColor: [number, number, number] | null | undefined,
   width: number,
-  opacity = 1
+  opacity = 1,
+  author = ''
 ): { success: boolean; index?: number; error?: string } {
   try {
     const page = pdfDoc.loadPage(pageIndex)
     const annot = page.createAnnotation(shapeType as any)
+    stampCommentMeta(annot, author)
 
     if (shapeType === 'Line' && points && points.length === 2) {
       // Line annotations derive their Rect from the endpoints — calling setRect throws.
@@ -11771,11 +11881,13 @@ function addInk(
   strokes: number[][][],
   color: [number, number, number],
   width: number,
-  opacity = 1
+  opacity = 1,
+  author = ''
 ): { success: boolean; index?: number; error?: string } {
   try {
     const page = pdfDoc.loadPage(pageIndex)
     const annot = page.createAnnotation('Ink')
+    stampCommentMeta(annot, author)
     annot.setInkList(strokes as any)
     annot.setColor(color as any)
     try { annot.setBorderWidth(width) } catch (_) {}
@@ -11795,14 +11907,16 @@ function addFreeText(
   text: string,
   fontSize: number,
   color: [number, number, number],
-  fontName = 'Helv'
+  fontName = 'Helv',
+  author = ''
 ): { success: boolean; index?: number; error?: string } {
   try {
     const page = pdfDoc.loadPage(pageIndex)
     const annot = page.createAnnotation('FreeText')
     annot.setRect(rect as any)
     annot.setContents(text)
-    try { annot.setDefaultAppearance(fontName, fontSize, color as any) } catch (_) {}
+    try { annot.setDefaultAppearance(freeTextFontKey(fontName), fontSize, color as any) } catch (_) {}
+    stampCommentMeta(annot, author)
     annot.update()
     const index = page.getAnnotations().length - 1
     page.destroy()
@@ -11817,16 +11931,19 @@ function addStickyNote(
   x: number,
   y: number,
   text: string,
-  color: [number, number, number]
+  color: [number, number, number],
+  author = ''
 ): { success: boolean; index?: number; error?: string } {
   try {
     const page = pdfDoc.loadPage(pageIndex)
     const annot = page.createAnnotation('Text')
-    annot.setRect([x, y, x + 20, y + 20] as any)
+    annot.setRect([x, y, x + NOTE_ICON_SIZE, y + NOTE_ICON_SIZE] as any)
     annot.setContents(text)
     try { annot.setColor(color as any) } catch (_) {}
-    try { annot.setIcon('Note') } catch (_) {}
+    try { annot.setIcon('Comment') } catch (_) {}
+    stampCommentMeta(annot, author)
     annot.update()
+    writeNoteAppearance(annot)
     const index = page.getAnnotations().length - 1
     page.destroy()
     return { success: true, index }
@@ -13155,6 +13272,7 @@ function updateAnnotationAt(d: {
   pageIndex: number; annotIndex: number
   rect?: number[]; color?: [number, number, number]; interiorColor?: [number, number, number] | null
   opacity?: number; width?: number; contents?: string
+  fontName?: string; fontSize?: number; textColor?: [number, number, number]
 }): { success: boolean; error?: string } {
   try {
     const page = pdfDoc.loadPage(d.pageIndex)
@@ -13167,6 +13285,15 @@ function updateAnnotationAt(d: {
     if (d.opacity !== undefined) { try { annot.setOpacity(d.opacity) } catch (_) {} }
     if (d.width !== undefined) { try { annot.setBorderWidth(d.width) } catch (_) {} }
     if (d.contents !== undefined) { try { annot.setContents(d.contents) } catch (_) {} }
+    if (d.fontSize !== undefined || d.fontName !== undefined || d.textColor !== undefined) {
+      const was = freeTextStyle(annot)
+      try {
+        annot.setDefaultAppearance(freeTextFontKey(d.fontName ?? was.fontName ?? 'Helv'), d.fontSize ?? was.fontSize ?? 12, (d.textColor ?? was.textColor ?? [0, 0, 0]) as any)
+      } catch (_) {}
+    }
+    if (d.contents !== undefined || d.fontSize !== undefined || d.fontName !== undefined || d.textColor !== undefined) {
+      try { annot.setModificationDate(new Date()) } catch (_) {}
+    }
     // update() regenerates the appearance with the IDENTITY matrix, and for a
     // rotated Stamp the matrix IS the rotation — moving or resizing the image
     // snapped it back upright. Capture it, let update() do its work, put it
@@ -13185,6 +13312,8 @@ function updateAnnotationAt(d: {
       if (savedMatrix && savedMatrix.some((v, i) => Math.abs(v - [1, 0, 0, 1, 0, 0][i]) > 1e-9)) {
         writeApMatrix(annot, savedMatrix)
       }
+      // update() redraws a note as MuPDF's own square icon.
+      if (isOurNote(annot)) writeNoteAppearance(annot)
     }
     page.destroy()
     return { success: true }

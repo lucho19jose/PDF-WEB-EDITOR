@@ -151,36 +151,42 @@ function checkPrinter(win) {
 }
 
 // ===== Windows and the files opened in them =====
-// The editor holds ONE document per page (one engine, one document store), so
-// a PDF opened from Explorer while a window already shows a document must get
-// a window of its own — loaded into the open one it would replace that
-// document, and lose whatever was unsaved in it. Acrobat with tabs off does
-// the same: one document, one window.
+// A window holds DOCUMENT TABS, as Acrobat does: its top page is the tab host
+// (src/tabs/host.ts), which opens each file it is sent in a tab of its own (or
+// in the shown tab when that one is empty). So a PDF opened from Explorer goes
+// to the focused window, else the last one used; a window is made only when
+// there is none, or for "Nueva ventana".
 //
 // Each editor window's state, keyed by webContents id:
-//   ready   — the page registered its open-file listener (engine is up)
-//   hasDoc  — the page reports a document is loaded
-//   pending — files waiting for `ready`
-//   claimed — a file was routed here and has not loaded yet, so a second file
-//             arriving in the same burst does not take this window too
+//   ready      — the host registered its open-file listener
+//   hasDoc     — some tab holds a document
+//   collecting — some tab's document is print jobs not saved yet
+//   pending    — files waiting for `ready`
 const editors = new Map()
+/** The editor window used last (webContents id): files go there when none is focused. */
+let lastFocused = null
 
 function pdfArgs(argv) {
   return argv.slice(1).filter(a => !a.startsWith('-') && /\.pdf$/i.test(a) && fs.existsSync(a))
 }
 
-function deliver(state, filePath) {
-  fs.promises.readFile(filePath).then(buf => {
+/**
+ * Send a file to a window. One window's files go out IN ORDER: read in
+ * parallel, the smaller file arrived first and Explorer's "uno, dos, tres"
+ * opened as the tabs "dos, uno, tres".
+ */
+function deliver(state, filePath, separate = false) {
+  state.sending = (state.sending || Promise.resolve()).then(() => fs.promises.readFile(filePath).then(buf => {
     if (state.win.isDestroyed()) return
     state.win.webContents.send('desktop:open-file', {
       name: path.basename(filePath),
       bytes: new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
-      printed: isPrintJob(filePath)
+      printed: isPrintJob(filePath),
+      separate
     })
   }).catch(err => {
-    state.claimed = false
     dialog.showErrorBox('PDF Editor Pro', `No se pudo abrir ${filePath}:\n${err.message}`)
-  })
+  }))
 }
 
 function focus(win) {
@@ -213,37 +219,34 @@ function raise(win) {
 }
 
 /**
- * Open a PDF: in an empty window if there is one, otherwise in a new one. A
- * print job goes first to a window COLLECTING print jobs (its document is
- * print jobs not saved yet), where it joins the Combinar list instead of
- * replacing anything — unless `separate` (the list's "open apart" button).
+ * Open a PDF as a tab: in the focused window, else the one used last, else a
+ * new one. A print job goes first to a window COLLECTING print jobs (one of its
+ * tabs is print jobs not saved yet), where it joins that tab's Combinar list —
+ * unless `separate` (the list's "open apart" button, which names its window).
  */
-function openFile(filePath, { separate = false } = {}) {
+function openFile(filePath, { separate = false, into = null } = {}) {
   const printed = isPrintJob(filePath)
-  if (printed && !separate) {
-    const collecting = [...editors.values()].filter(s => !s.win.isDestroyed() && s.ready && s.collecting)
-    const focused = BrowserWindow.getFocusedWindow()
-    const into = collecting.find(s => s.win === focused) || collecting[collecting.length - 1]
-    if (into) {
-      deliver(into, filePath)
-      raise(into.win)
-      return
-    }
-  }
-  const free = [...editors.values()].filter(s => !s.win.isDestroyed() && !s.hasDoc && !s.claimed)
+  const live = [...editors.values()].filter(s => !s.win.isDestroyed())
   const focused = BrowserWindow.getFocusedWindow()
-  const target = free.find(s => s.win === focused) || free[0]
-  if (target) {
-    target.claimed = true
-    if (target.ready) deliver(target, filePath)
-    else target.pending.push(filePath)
-    if (printed) raise(target.win)
-    else focus(target.win)
+  let target = into && !into.win.isDestroyed() ? into : null
+  if (!target && printed && !separate) {
+    const collecting = live.filter(s => s.ready && s.collecting)
+    target = collecting.find(s => s.win === focused) || collecting[collecting.length - 1] || null
+  }
+  if (!target) {
+    target = live.find(s => s.win === focused) ||
+      live.find(s => s.win.webContents.id === lastFocused) ||
+      live[live.length - 1] || null
+  }
+  if (!target) {
+    const state = createWindow({ raise: printed })
+    state.pending.push({ filePath, separate })
     return
   }
-  const state = createWindow({ raise: printed })
-  state.claimed = true
-  state.pending.push(filePath)
+  if (target.ready) deliver(target, filePath, separate)
+  else target.pending.push({ filePath, separate })
+  if (printed) raise(target.win)
+  else focus(target.win)
 }
 
 function stateOf(event) {
@@ -257,16 +260,13 @@ ipcMain.on('desktop:ready', (e) => {
   s.ready = true
   s.hasDoc = false
   s.collecting = false
-  while (s.pending.length) deliver(s, s.pending.shift())
+  while (s.pending.length) { const p = s.pending.shift(); deliver(s, p.filePath, p.separate) }
 })
 
 ipcMain.on('desktop:has-document', (e, hasDoc) => {
   const s = stateOf(e)
   if (!s) return
   s.hasDoc = !!hasDoc
-  // Loaded (or the load failed and the window is still empty): either way the
-  // claim is settled.
-  s.claimed = false
 })
 
 ipcMain.on('desktop:collecting', (e, collecting) => {
@@ -274,13 +274,37 @@ ipcMain.on('desktop:collecting', (e, collecting) => {
   if (s) s.collecting = !!collecting
 })
 
-ipcMain.on('desktop:open-print-jobs', (_e, names) => {
+ipcMain.on('desktop:open-print-jobs', (e, names) => {
   if (!Array.isArray(names)) return
+  const into = stateOf(e) || null
   for (const name of names) {
     // A name, never a path: only files the listener wrote can be opened this way.
     const file = path.join(PRINT_JOBS, path.basename(String(name)))
-    if (/\.pdf$/i.test(file) && fs.existsSync(file)) openFile(file, { separate: true })
+    if (/\.pdf$/i.test(file) && fs.existsSync(file)) openFile(file, { separate: true, into })
   }
+})
+
+// "Conectar con Claude" (Ayuda): where the MCP server and the Claude Desktop
+// extension are, so the dialog can show the command that runs the server on
+// this exe (ELECTRON_RUN_AS_NODE) and reveal the .mcpb for a double-click.
+function mcpPaths() {
+  const base = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..')
+  return {
+    server: app.isPackaged ? path.join(base, 'mcp', 'server.mjs') : path.join(base, 'dist-mcp', 'server.mjs'),
+    mcpb: app.isPackaged ? path.join(base, 'pdf-editor-pro.mcpb') : path.join(base, 'release', 'pdf-editor-pro.mcpb')
+  }
+}
+
+ipcMain.handle('desktop:mcp-info', () => {
+  const { server, mcpb } = mcpPaths()
+  return { exe: process.execPath, server, serverExists: fs.existsSync(server), mcpb, mcpbExists: fs.existsSync(mcpb), packaged: app.isPackaged }
+})
+
+// Explorer, with the extension selected: the user double-clicks it, so the
+// app never launches Claude itself (Sophos blocks the app from starting programs).
+ipcMain.on('desktop:reveal-mcpb', () => {
+  const { mcpb } = mcpPaths()
+  if (fs.existsSync(mcpb)) shell.showItemInFolder(mcpb)
 })
 
 function createWindow({ raise: raiseOnShow = false } = {}) {
@@ -305,9 +329,11 @@ function createWindow({ raise: raiseOnShow = false } = {}) {
       plugins: true
     }
   })
-  const state = { win, ready: false, hasDoc: false, claimed: false, collecting: false, pending: [] }
+  const state = { win, ready: false, hasDoc: false, collecting: false, pending: [] }
   const id = win.webContents.id
   editors.set(id, state)
+  lastFocused = id
+  win.on('focus', () => { lastFocused = id })
 
   // The first window fills the screen; later ones open cascaded over it so it
   // is plain that a new window appeared rather than the document changing.
@@ -323,6 +349,12 @@ function createWindow({ raise: raiseOnShow = false } = {}) {
   // Links to the web open in the user's browser; the app's own popups (the
   // print fallback's "open in new tab", blob: previews) stay in the app.
   win.webContents.setWindowOpenHandler(({ url }) => {
+    // "Nueva ventana": the app's root becomes an editor window of its own, one
+    // the files opened from Explorer can be sent to.
+    if (url.split('#')[0] === `${allowed}/`) {
+      createWindow()
+      return { action: 'deny' }
+    }
     if (/^https?:/i.test(url) && !url.startsWith(allowed)) {
       shell.openExternal(url)
       return { action: 'deny' }
@@ -369,7 +401,10 @@ function createWindow({ raise: raiseOnShow = false } = {}) {
     if (input.type === 'keyDown' && input.key === 'F12') win.webContents.toggleDevTools()
   })
 
-  win.on('closed', () => editors.delete(id))
+  win.on('closed', () => {
+    editors.delete(id)
+    if (lastFocused === id) lastFocused = null
+  })
   win.loadURL(DEV_URL || `${ORIGIN}/`)
   return state
 }

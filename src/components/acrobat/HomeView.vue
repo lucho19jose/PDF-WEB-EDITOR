@@ -78,6 +78,7 @@ import { useDocumentStore } from '@/stores/document'
 import { useUiStore, toolInfo, type AcroTool } from '@/stores/ui'
 import { listRecent, loadRecent, forgetRecent, clearRecent, type RecentFile } from '@/utils/acro/recentFiles'
 import { persistedRef } from '@/utils/persist'
+import { isEmbedded } from '@/tabs/frameClient'
 import AcroIcon from './AcroIcon.vue'
 import type { AcroShell } from './acroShell'
 
@@ -85,6 +86,7 @@ const docStore = useDocumentStore()
 const ui = useUiStore()
 const shell = inject<AcroShell>('acroShell')!
 const openPdfFile = inject<(f: File) => Promise<void>>('openPdfFile')!
+const openPdfFiles = inject<(f: File[]) => Promise<void>>('openPdfFiles')!
 
 const section = ref<'recent' | 'starred'>('recent')
 const files = ref<RecentFile[]>([])
@@ -114,6 +116,8 @@ async function forget(id: string) { await forgetRecent(id); await refresh() }
 async function clearAll() { await clearRecent(); await refresh() }
 async function onDrop(e: DragEvent) {
   const files = Array.from(e.dataTransfer?.files ?? [])
+  // Several PDFs open as tabs (Acrobat's way); a mix with images goes to Combinar.
+  if (files.length > 1 && isEmbedded() && files.every(f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name))) { await openPdfFiles(files); return }
   if (files.length > 1) { ui.openDialog('combine', { files }); return }
   const file = files[0]
   if (file && (file.type === 'application/pdf' || /\.pdf$/i.test(file.name))) await openPdfFile(file)

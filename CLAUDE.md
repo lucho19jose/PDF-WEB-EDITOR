@@ -68,6 +68,51 @@ App.vue
     └── StatusBar.vue (q-footer)
 ```
 
+### Document tabs are iframes
+Acrobat opens every PDF as a tab beside Inicio and Herramientas. The editor is
+built on ONE document per page: one MuPDF worker holding one `pdfDoc`, six Pinia
+stores, the `useOCR()` singleton, the global op queue, and the OCR live-bake
+state in `EditorLayout`. Making all of that multi-document, or snapshotting and
+swapping it on every tab switch, would rewrite the most fragile code in the app.
+So each tab is the WHOLE app in a same-origin `<iframe>` (`/?frame=<id>`), and
+the window's top page is a thin host (`src/tabs/host.ts`: plain DOM, no Vue).
+Each tab keeps its own engine, undo, OCR state and scroll position, and
+switching reloads nothing.
+
+- **The host draws nothing.** Every frame draws the full shell, and its
+  `AcroTabBar` lists the tabs the host broadcasts (`tabList`; its own tab from
+  its live store). Only the active frame is visible; the others are
+  `visibility:hidden` + `inert`, never `display:none`, so their layout keeps its
+  size. Inicio and Herramientas stay per frame (`ui.view`).
+- **`src/main.ts` decides**: top page and no `?single` → the host; otherwise
+  `bootApp.ts`. `src/tabs/frameClient.ts` is the frame side, and every function
+  in it is a no-op when the page is not a tab.
+- **Files**: `openPdfFile` in a tab that already holds a document (or is opening
+  one in place, `openingInPlace`) hands the file to the host as a new tab.
+  Several at once (multiple selection, a drop of PDFs) → the first takes the
+  empty tab, the rest new tabs. A drop mixing images still goes to Combinar.
+- **Two races**, both seen: the host recycled the tab that was dropped on (it
+  was empty, about to load the first file) as its spare and handed it the third
+  file. A tab reports `opening` and marks itself busy BEFORE posting the
+  others, and `frameForFile(exclude)` never hands a tab its own files back.
+- **Closing**: a tab's own × runs `closeDocument()` (which returns whether it
+  closed); another tab's × asks that tab (`requestClose`), shown first when it
+  has unsaved changes so its prompt is seen. A tab whose document closes is
+  removed and its neighbour shown; the LAST tab's frame stays and shows Inicio.
+- **A warm spare frame** is booted 4 s after the first document opens, so a new
+  tab does not wait for the engine to start.
+- **Shortcuts**: Ctrl+Tab / Ctrl+PageDown and back, posted to the host (a
+  browser keeps them for its own tabs; the Windows app passes them on).
+- **Settings reach every tab**: `persistedRef` listens to the `storage` event.
+- **Clarity** runs once per window: not in the host, only in tab `t1`.
+- **Test drivers and anything that reads the page's stores, `window.__pdfHooks`
+  or `#app` use `/?single`** (no tabs, exactly the old page): the
+  `tools/acro/*-browser.mjs` defaults and the `public/_sweep` usage notes say
+  so. In dev the host exposes `window.__tabHost` (`activeWindow()`,
+  `frameOf(id)`).
+- **Costs, accepted**: about 100 MB per open tab, and same-origin frames share
+  one main thread, so an OCR bake in one tab is felt in the others.
+
 ### The Acrobat shell
 The UI copies Acrobat DC's dark theme (colours sampled from it, in
 `src/css/acrobat.scss`). An Acrobat TOOL (Editar PDF, Organizar páginas,
@@ -101,6 +146,49 @@ side is ONE worker message, `acro`, dispatched in `worker/acroTools.ts`;
   `/favicon.ico`, which neither the dev server nor the deploy has, and every
   fresh session logged a 404 console error — enough to fail
   `tools/acro/organize-browser.mjs`'s "no browser runtime errors" check.
+
+### Comments work as Acrobat's: a note is written in the list, a text comment on the page
+- **Sticky note** (`placeNote`): the click puts a draft icon on the page
+  (`noteDraft` in `src/utils/acro/comments.ts`, drawn by `NoteIcon.vue`) and
+  its card in the comment list ("Agregar un comentario…", Publicar /
+  Cancelar, Ctrl+Enter / Esc). The tool goes back to Seleccionar. It used to
+  be a modal `$q.dialog` with `dark: true`: on this light shell that is white
+  text on a white card, so nothing typed could be seen, and once accepted the
+  note's text could be read nowhere. **Never pass `dark: true` to a dialog
+  here.** The click on the page `preventDefault`s, or its focus change
+  takes the focus back from the card's textarea and the typed letters become
+  tool shortcuts.
+- **The list publishes through `shell.commands.change`**, not
+  `inject('syncDocumentEdit')`: that one is provided by PDFViewer, inside the
+  page, below the pane. Injected in the pane it was undefined, and a
+  published note stayed in the engine, unsaved and undrawn.
+- **The note's icon is ours** (`writeNoteAppearance`, icon /Comment): a
+  rounded square in the note's colour with a white speech bubble, as
+  Acrobat draws it. MuPDF's own icons are a box of lines (/Note) or a black
+  bubble in a box (/Comment), and **every `annot.update()` redraws MuPDF's**,
+  so `updateAnnotationAt` writes ours again after it. pdf.js and MuPDF both
+  draw it from /AP; a note has no resize handles.
+- **Author and time**: the bridge sends `ui.authorName` (persisted; "Nombre
+  del autor…" in the list's ⋯ menu, or the field on the draft card) with every
+  comment it creates; the worker sets /T, /CreationDate and /M, and the list
+  shows them. Form fields (signatures included), links and popups are not
+  comments and are not listed: a signed form showed "Signature" ×7.
+- **Page and list select together** (`focusedComment`, `selectOnPage`,
+  `editFreeText`, `editNoteText`; each request answered once, `answered`):
+  a card's click selects the comment on its page, a click on the page selects
+  the card, a double click edits (a note in its card, a text box on the page).
+- **A text comment is typed on the page** in its face, size and colour, with
+  no box beyond a faint dashed outline and no buttons; a click elsewhere
+  commits, Esc drops, and the toolbar (face, size, colour) can be used while
+  typing without ending it (`FT_KEEP`). MuPDF draws a text box's first
+  baseline 0.8 em below its top with 1.2 em lines and no padding (measured),
+  and the editor is raised by where the browser puts its baseline
+  (`cssBaselineShift`, from `fontBoundingBoxAscent`), so the text does not
+  move when it is committed: measured, the same ink rows before and after.
+- **MuPDF's text box knows three faces, by their AcroForm keys**: Helv, TiRo,
+  Cour (`freeTextFontKey`). "Times-Roman" in /DA was drawn in Helvetica.
+  Bold and italic do not exist there, so the toolbar offers the three plain
+  faces.
 
 ### "Exportar a Microsoft Excel": tables rebuilt from words and rules
 The export dialog (and Archivo ▸ Guardar como otro ▸ Excel) writes an .xlsx
@@ -7596,6 +7684,66 @@ What production MUST provide, all of which `public/.htaccess` does for Apache:
   JavaScript. The only network calls are the ones the user opts into
   (Mistral OCR, and the editing assistant's OpenAI calls).
 
+## The MCP server (Claude uses the editor's tools)
+`mcp/` is a local stdio MCP server for Claude Desktop and Claude Code: 55
+tools over PDF files by path (open/save/undo, text listing with `p1b12`
+anchors, replace_text, annotations, stamps, Fill & Sign marks, images, page
+operations, header/footer, watermark, redaction, protection, export to
+Word/Excel/text/HTML/images, `open_in_editor`). It runs the app's OWN worker
+(`src/engine/worker/mupdf.worker.ts`) in a Node `worker_threads` thread, one
+per open document (at most 3 live; idle ones are suspended and reloaded).
+
+- `npm run mcp:build` → `dist-mcp/` (two Vite SSR builds with NO config
+  file and `publicDir: false` — the app's config would copy the 1.5 GB
+  `public/`, `_sweep` documents included) plus `release/pdf-editor-pro.mcpb`
+  (Claude Desktop extension; its tool list is read from the built server).
+  `npm run mcp:smoke [-- --electron | --mcpb]` copies the bundle OUTSIDE the
+  repo and drives every tool through the SDK's stdio client.
+- **mupdf is external and rewritten to `./vendor/mupdf/…`** (`output.paths`);
+  a bare `import('mupdf')` would find the repo's node_modules from inside the
+  repo and hide a broken package. It lives under `vendor/`, not
+  `node_modules/`, because electron-builder silently drops a `node_modules`
+  folder from extraResources.
+- **stdout is JSON-RPC only**: `stdioGuard.ts` (first import of each entry)
+  sends console.log/info/debug to stderr, and threads are created with
+  `{stdout, stderr: true}` piped to stderr. The thread shim serves
+  `fetch('/fonts/…')` from `assets/fonts` and must be in place before the
+  first message (`ensureCjkFontFor` remembers a failed load for good).
+- **Every edit is the app's sequence**: engine op → save → reload, the
+  pre-edit bytes on an undo stack capped by BYTES (signed files grow per
+  incremental save). Calls on one document are serialised (the worker's
+  handler is async and two messages can interleave).
+- **Crash recovery** (`engine/client.ts`, ported from bridge.ts): a lost
+  thread is respawned with the last loaded document; a READ is retried once,
+  an EDIT is not — one tool makes several engine calls, and replaying only
+  the last would silently drop the others. The session reloads its bytes.
+- **Paths are canonicalised** (`fs.realpathSync.native`): Windows names one
+  folder `C:\Users\JOSELU~1` and `C:\Users\Jose Luis Barboza`, and a string
+  containment test refused one against a root given in the other. Allowed
+  folders: `--roots <dir>…` (the .mcpb's user_config), else `PDF_MCP_ROOTS`
+  (`*` = any), else the profile and temp. Saves go to `<name> (editado).pdf`
+  unless `overwrite`; writes are temp-file + rename; `save_pdf` to a new path
+  retargets the session (Save As).
+- **Scanned pages are refused for text edits** (`src/utils/pageKind.ts`, the
+  same rules the app uses: invisible-vs-visible text, coverage, image area)
+  and pointed at `open_in_editor`, which saves and launches the app exe with
+  the file (the print listener's launch: detached, `stdio: 'ignore'`, no
+  ELECTRON_RUN_AS_NODE). The app gets bytes, not the path; the session notices
+  the file changing on disk (mtime/size) and reloads it when it has no
+  unsaved changes of its own.
+- Shared pure modules extracted for it (re-exported from their old homes):
+  `utils/assistant/spanEdits.ts`, `utils/assistant/anchors.ts`,
+  `utils/acro/pageRange.ts`, `utils/acro/sheetExport.ts`,
+  `utils/acro/stamps.ts`, `utils/pageKind.ts`.
+- Installed app: `resources\mcp\server.mjs`, run as
+  `"PDF Editor Pro.exe" server.mjs` with `ELECTRON_RUN_AS_NODE=1`; Ayuda ▸
+  Conectar con Claude (`desktop:mcp-info`, `desktop:reveal-mcpb`) shows the
+  Claude Code command and the Desktop JSON and reveals the .mcpb (reveal,
+  never launch: Sophos blocks the app from starting programs).
+- **Not yet:** OCR and scan editing headless (Paddle in Node is the plan),
+  AcroForm field filling, the hosted connector (Streamable HTTP + OAuth), and
+  an in-chat page viewer (MCP App).
+
 ## Windows app (Electron)
 The same `dist/` build in an Electron window, installed by an NSIS `.exe`
 that GitHub Releases hosts and the app updates itself from.
@@ -7645,18 +7793,19 @@ through `window.desktop.onOpenFile` (preload) and the existing `loadBytes`;
 the listener is registered once the engine is up, and the main process queues
 files until then.
 
-**One document per window.** The page holds one document (one engine, one
-document store), and v2.0.0 loaded every opened PDF into the one window — the
-document already open was replaced, unsaved edits with it. A file now goes to
-a window that reports no document (`desktop.setHasDocument`, watched on
-`docStore.loaded`), preferring the focused one, or to a new cascaded window.
-A window a file was routed to is `claimed` until its load reports back, so
-several files opened at once each get their own. Tested with three files
-and a closed tab: the emptied window is reused. To test beside an installed
-copy, start the build with `--user-data-dir=<scratch>`: the single-instance
-lock is per profile, and without it every launch hands its file to the
-installed app. A document with unsaved changes blocks unload as on the
-web; Electron would simply refuse to close, so `will-prevent-unload` asks.
+**Document tabs: a PDF opened from Explorer becomes a tab** of the focused
+window, else of the one used last (`lastFocused`); a window is made only when
+there is none, or for "Nueva ventana" (`setWindowOpenHandler` turns the app's
+root into `createWindow()`). The window's top page is the tab host (see "Document
+tabs are iframes"), which owns `window.desktop`: the preload runs in the top
+frame only, so a tab reaches the bridge through `desktopApi()`. One window's
+files are delivered IN ORDER (`state.sending`): read in parallel, Explorer's
+"uno, dos, tres" opened as "dos, uno, tres". To test beside an installed copy,
+start the build with `--user-data-dir=<scratch>`: the single-instance lock is
+per profile, and without it every launch hands its file to the installed app.
+Unsaved changes in ANY tab block unload (the host's `beforeunload`), and
+`will-prevent-unload` asks. Measured on the packaged app: five documents plus
+the spare tab, renderer ~600 MB private (about 100 MB a tab), GPU process 450.
 
 **The "PDF Editor Pro" printer: Print in any program opens the PDF here**, as
 PDF24's printer does (SAP/Crystal reports were the reason). No driver of our
@@ -7680,6 +7829,9 @@ asks. Measured on this PC, Sophos on: SAP-style named job → window in front in
   entry), and by the installer. A second listener exits on EADDRINUSE.
   Development runs start none unless `PDF_EDITOR_DEV_PRINTER=1`: it would
   outlive the session and send jobs to a dead Vite server.
+- **Jobs are COLLECTED in a TAB**: the host sends a job to the tab reporting
+  `collecting`, else it opens in a tab of its own; "Abrir aparte" sends
+  `separate` and always gets a new tab of the SAME window.
 - **Jobs are COLLECTED, as PDF24's assistant does** (an expediente is a
   check list, a solicitud and a factura printed one after another). A window
   is `collecting` while its document is print jobs not saved yet

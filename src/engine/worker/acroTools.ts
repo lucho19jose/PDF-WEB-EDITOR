@@ -622,12 +622,19 @@ export function createAcroTools(ctx: AcroContext) {
     try {
       const styles: any[] = []
       const annots = page.getObject().get('Annots')
-      for (let i = 0; i < annots.length; i++) {
+      for (let i = 0; !ctx.isNullObj(annots) && i < annots.length; i++) {
         const a = annots.get(i).resolve()
         if (a.get('Subtype').asName() !== 'Link') continue
-        const border = a.get('Border'), bs = a.get('BS'), color = a.get('C')
-        styles.push({ width: !ctx.isNullObj(bs.get('W')) ? bs.get('W').asNumber() : border.length >= 3 ? border.get(2).asNumber() : 0,
-          color: color.length === 3 ? [0,1,2].map(k => color.get(k).asNumber()) : [0,0,0], dashed: bs.get('S').asName() === 'D' })
+        // A link with no /BS (or no /Border) is common; reading through the
+        // missing dictionary threw and lost the page's whole link list.
+        try {
+          const border = a.get('Border'), bs = a.get('BS'), color = a.get('C')
+          const hasBs = !ctx.isNullObj(bs)
+          styles.push({ width: hasBs && !ctx.isNullObj(bs.get('W')) ? bs.get('W').asNumber() : !ctx.isNullObj(border) && border.length >= 3 ? border.get(2).asNumber() : 0,
+            color: !ctx.isNullObj(color) && color.length === 3 ? [0,1,2].map(k => color.get(k).asNumber()) : [0,0,0], dashed: hasBs && bs.get('S').asName() === 'D' })
+        } catch (_) {
+          styles.push({ width: 0, color: [0, 0, 0], dashed: false })
+        }
       }
       return page.getLinks().map((l: any, index: number) => {
         const uri = l.getURI() as string
@@ -737,6 +744,37 @@ export function createAcroTools(ctx: AcroContext) {
     try {
       const pix = page.toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceRGB, false, true)
       try {
+        const enc = format === 'jpeg' ? pix.asJPEG(quality, false) : pix.asPNG()
+        return (enc as Uint8Array).slice().buffer
+      } finally {
+        pix.destroy()
+      }
+    } finally {
+      page.destroy()
+    }
+  }
+
+  /**
+   * A REGION of a page as an encoded image: `rect` in top-left page points
+   * (the space text-block bboxes use), drawn at `scale` (1 = 72 DPI) with
+   * annotations, as `renderImage` draws them. A zoomed check of one line
+   * costs a few kilobytes where the whole page at that zoom would not fit in
+   * a tool result.
+   */
+  function renderRegion(pageIndex: number, rect: number[], scale: number, format: 'png' | 'jpeg', quality = 90): ArrayBuffer {
+    const mupdf = ctx.mupdf()
+    const page = doc().loadPage(pageIndex)
+    try {
+      const b = page.getBounds()
+      const x0 = Math.max(b[0], Math.min(rect[0], rect[2])), x1 = Math.min(b[2], Math.max(rect[0], rect[2]))
+      const y0 = Math.max(b[1], Math.min(rect[1], rect[3])), y1 = Math.min(b[3], Math.max(rect[1], rect[3]))
+      if (!(x1 > x0 && y1 > y0)) throw new Error('The region lies outside the page')
+      const bbox: [number, number, number, number] = [Math.floor(x0 * scale), Math.floor(y0 * scale), Math.ceil(x1 * scale), Math.ceil(y1 * scale)]
+      const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceRGB, bbox, false)
+      try {
+        pix.clear(255)
+        const dev = new mupdf.DrawDevice(mupdf.Matrix.identity, pix)
+        try { page.run(dev, mupdf.Matrix.scale(scale, scale)); dev.close() } finally { dev.destroy() }
         const enc = format === 'jpeg' ? pix.asJPEG(quality, false) : pix.asPNG()
         return (enc as Uint8Array).slice().buffer
       } finally {
@@ -956,6 +994,7 @@ export function createAcroTools(ctx: AcroContext) {
       case 'exportStructured': return { data: exportStructured() }
       case 'sheetPage': return { data: extractSheetPage(ctx.mupdf(), doc(), a.pageIndex, watermarkTextOf(a.pageIndex)) }
       case 'renderImage': { const b = renderImage(a.pageIndex, a.scale, a.format, a.quality); return { data: b, transfer: [b] } }
+      case 'renderRegion': { const b = renderRegion(a.pageIndex, a.rect, a.scale, a.format, a.quality); return { data: b, transfer: [b] } }
       case 'createPdf': { const r = createPdf(a.images ?? [], a.blank); return { data: r, transfer: r.bytes ? [r.bytes] : [] } }
       case 'combinePdf': { const r = combinePdf(a.files); return { data: r, transfer: r.bytes ? [r.bytes] : [] } }
       case 'flatten': return { data: flatten() }
