@@ -23,7 +23,9 @@
     })(window, document, "clarity", "script", "yekabiqr31");
   </script>
   <!-- Netlify injects a "Powered by Netlify" badge iframe into served pages; keep it off the editor. -->
-  <style>#nl-badge-frame { display: none !important; }</style>
+  <!-- Its HUD script (/.netlify/scripts/hud) names the frame nl-badge-frame or nl-hud-frame
+       by variant; match every name and title it may use. -->
+  <style>iframe[id^="nl-"], iframe[title*="Netlify"] { display: none !important; }</style>
 </head>
 <body>
   <div id="app"></div>
