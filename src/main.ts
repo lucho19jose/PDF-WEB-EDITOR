@@ -30,7 +30,9 @@ async function ensureCurrentBuild(): Promise<boolean> {
     if (!res.ok) return true
     const { build } = await res.json()
     if (!build || build === __BUILD_ID__) return true
-    const key = 'pdfedit.reloadedFor'
+    // Per page: a window's tab frames share its sessionStorage, and the host
+    // reloading first must not stop a stale frame from reloading too.
+    const key = `pdfedit.reloadedFor:${url.searchParams.get('frame') ?? (single ? 'single' : 'top')}`
     if (sessionStorage.getItem(key) === build) return true // tried once already: never loop
     sessionStorage.setItem(key, build)
     url.searchParams.set('_v', build)
