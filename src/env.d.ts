@@ -22,6 +22,9 @@ interface DesktopBridge {
    */
   dragOut?(file: { name: string; bytes: Uint8Array; icon?: Uint8Array; scale?: number }): Promise<boolean>
 }
+/** The build this bundle belongs to (vite.config.ts), compared with /version.json. */
+declare const __BUILD_ID__: string
+
 interface Window {
   desktop?: DesktopBridge
 }

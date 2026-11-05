@@ -12,6 +12,11 @@
 <IfModule mod_headers.c>
   Header always set Cross-Origin-Opener-Policy "same-origin"
   Header always set Cross-Origin-Embedder-Policy "credentialless"
+  # The page and the build stamp are checked with the server on every load,
+  # so a deploy is seen on a plain F5 (src/main.ts also verifies the build).
+  <FilesMatch "^(index.html|version.json)$">
+    Header set Cache-Control "no-cache"
+  </FilesMatch>
   # The models and fonts are large and never change under the same name.
   <FilesMatch "\.(ort|onnx|otf|ttf|gz|wasm|bcmap|pfb|icc)$">
     Header set Cache-Control "public, max-age=31536000, immutable"
