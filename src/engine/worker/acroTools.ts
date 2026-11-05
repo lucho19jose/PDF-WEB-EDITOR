@@ -16,6 +16,7 @@
  */
 
 import { extractSheetPage } from './sheetExtract'
+import { graftPagesWithAnnotations } from './pageGraft'
 
 type Mat6 = [number, number, number, number, number, number]
 
@@ -39,6 +40,8 @@ export interface AcroContext {
   rotatePage: (pageIndex: number, degrees: number) => { success: boolean; error?: string }
   /** `doc().rearrangePages`, keeping the /AcroForm MuPDF's own drops (signatures!). */
   rearrangePages: (order: number[]) => void
+  /** Drop the /AcroForm fields none of whose widgets is on a page any more. */
+  pruneFields: () => void
   measureRunWidth: (text: string, fontSize: number, fontName: string) => { width: number; exact: boolean }
   addTextRunToPage: (pageIndex: number, parts: AcroTextPart[], rotation: number, tag?: string) => { success: boolean; error?: string }
   buildShowOps: (pageObj: any, text: string, fontSize: number, fontName: string) => { ops: string } | { error: string }
@@ -116,13 +119,16 @@ export function createAcroTools(ctx: AcroContext) {
     return { success: true }
   }
 
-  /** Copy the given pages, in this order, into a new document. */
+  /**
+   * Copy the given pages, in this order, into a new document, with their
+   * annotations and signatures (see `graftPagesWithAnnotations`).
+   */
   function extractPages(indices: number[]): { success: boolean; bytes?: ArrayBuffer; error?: string } {
     const list = (indices ?? []).filter(i => i >= 0 && i < count())
     if (!list.length) return { success: false, error: 'No pages selected' }
     const out = new (ctx.mupdf().PDFDocument)()
     try {
-      for (const i of list) out.graftPage(out.countPages(), doc(), i)
+      graftPagesWithAnnotations(out, doc(), list.map(from => ({ from, at: -1 })))
       return { success: true, bytes: save(out) }
     } catch (err) {
       return { success: false, error: errorOf(err) }
@@ -164,10 +170,12 @@ export function createAcroTools(ctx: AcroContext) {
       const n = Math.min(list.length, src.countPages())
       if (!n) return { success: false, error: 'That file has no pages' }
       ctx.invalidateContentSources()
-      for (let k = 0; k < n; k++) {
-        doc().deletePage(list[k])
-        doc().graftPage(list[k], src, k)
-      }
+      // All the pages go first, last to first, so every index still names
+      // the page it did; inserting in ascending order then puts each new
+      // page exactly where the one it replaces was.
+      for (let k = n - 1; k >= 0; k--) doc().deletePage(list[k])
+      graftPagesWithAnnotations(doc(), src, list.slice(0, n).map((at, k) => ({ from: k, at })))
+      ctx.pruneFields() // the replaced pages' widgets left with them
       return { success: true, replaced: n, pageCount: count() }
     } catch (err) {
       return { success: false, error: errorOf(err) }
@@ -897,64 +905,9 @@ export function createAcroTools(ctx: AcroContext) {
           if (source.needsPassword()) throw new Error('El PDF necesita contraseña; desbloquéelo antes de combinar')
           const n = source.countPages()
           if (!n) throw new Error('El archivo no contiene páginas')
-          const map = out.newGraftMap()
-          try {
-            const offset = out.countPages()
-            for (let p = 0; p < n; p++) map.graftPage(-1, source, p)
-            const pageRefs = new Map<number, any>()
-            for (let p = 0; p < n; p++) pageRefs.set(source.findPage(p).asIndirect(), out.findPage(offset + p))
-            const destination = (original: any): any => {
-              if (!original.isArray()) return map.graftObject(original)
-              const arr = out.newArray()
-              for (let i = 0; i < original.length; i++) {
-                const value = original.get(i)
-                arr.push(i === 0 && value.isIndirect() && pageRefs.has(value.asIndirect())
-                  ? pageRefs.get(value.asIndirect()) : map.graftObject(value))
-              }
-              return arr
-            }
-            // graftPage intentionally excludes annotations and page groups.
-            // Copy their appearances without following /P back into the old page tree.
-            const fields = out.newArray()
-            for (let p = 0; p < n; p++) {
-              const from = source.findPage(p), to = out.findPage(offset + p)
-              const group = from.get('Group')
-              if (!group.isNull()) to.put('Group', map.graftObject(group))
-              const annotations = from.get('Annots'), copies = out.newArray()
-              for (let i = 0; i < annotations.length; i++) {
-                const original = annotations.get(i).resolve(), copy = out.newDictionary()
-                original.forEach((value: any, key: string) => {
-                  if (['P', 'Parent', 'Popup', 'IRT', 'Kids'].includes(key)) return
-                  if (key === 'Dest') copy.put(key, destination(value))
-                  else if (key === 'A' && value.get('S').asName() === 'GoTo') {
-                    const action = out.newDictionary()
-                    value.forEach((v: any, k: string) => action.put(k, k === 'D' ? destination(v) : map.graftObject(v)))
-                    copy.put(key, action)
-                  } else copy.put(key, map.graftObject(value))
-                })
-                copy.put('P', to)
-                const isWidget = original.get('Subtype').asName() === 'Widget'
-                if (isWidget) {
-                  for (const key of ['FT', 'T', 'V', 'DV', 'Ff', 'DA', 'Q', 'MaxLen', 'Opt']) {
-                    const value = original.getInheritable(key)
-                    if (!value.isNull()) copy.put(key, map.graftObject(value))
-                  }
-                }
-                const ref = out.addObject(copy)
-                copies.push(ref)
-                if (isWidget) fields.push(ref)
-              }
-              if (copies.length) to.put('Annots', copies)
-            }
-            if (fields.length) {
-              const catalog = out.getTrailer().get('Root')
-              let form = catalog.get('AcroForm')
-              if (form.isNull()) { form = out.newDictionary(); form.put('Fields', out.newArray()); catalog.put('AcroForm', form) }
-              const allFields = form.get('Fields')
-              for (let i = 0; i < fields.length; i++) allFields.push(fields.get(i))
-            }
-          }
-          finally { map.destroy() }
+          // Annotations, form fields and signatures come along, and a field
+          // name another file already uses is renamed rather than merged.
+          graftPagesWithAnnotations(out, source, Array.from({ length: n }, (_, p) => ({ from: p, at: -1 })))
         } finally { source.destroy() }
         fileIndex++
       }

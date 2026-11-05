@@ -1709,6 +1709,41 @@ document leaves both correct instead of cropping one to the other (measured:
 Pages land after the one being viewed, and the thumbnail panel's existing
 drag-to-reorder (`movePage`) is what organises them afterwards.
 
+### A page copied between documents brings its annotations and signatures
+`graftPage` copies contents, resources and boxes and NOTHING else: no /Annots,
+no form fields, no /Group. Intellisign's signatures are /Sig widgets, so a
+signed order inserted into an invoice in Organizar páginas arrived unsigned
+(its note too), and Extraer, Reemplazar, Duplicar, Dividir and the drag-out
+file lost them the same way. Every page copy now goes through
+`graftPagesWithAnnotations` (`worker/pageGraft.ts`); never call `graftPage`
+on its own.
+- **Annotations are copied by hand.** A plain graft of one follows /P to the
+  source page, its /Parent to the page tree, and copies the whole source
+  document. The walk maps a page that is being copied onto its copy and stops
+  at any other page, page tree, catalog (a signature's /Reference /Data names
+  it), or annotation that is not coming along. Inside one document
+  (`dst === src`, Duplicar) such a reference is still valid and is kept.
+- **Links into a page left behind are dropped**, as are popups whose note
+  stays behind. A popup and its note, and a reply's /IRT, point at the copies.
+- **Widgets keep their fields.** The part of each field tree that leads to a
+  copied widget is copied, and its root goes into /AcroForm /Fields. A root
+  name already taken is renamed with "+1", as the tool that assembled the
+  user's earlier expedientes did ("Signature3+1+1"). Two fields with one name
+  are one field to a reader.
+- **Signature values are kept.** The signatures look and list as they did.
+  They cannot verify in an assembled file, as with any merge tool, and a
+  signing service sees them as signed rather than as empty fields to sign
+  into. `SigFlags` gets SignaturesExist.
+- Reemplazar deletes every target page first (last to first), inserts in
+  ascending order, then prunes the fields the deleted widgets left
+  (`pruneFields`).
+
+Measured on the reported files: the 20-page signed expediente inserted after
+an invoice page keeps all 87 signatures and the order's note, drawn pixel for
+pixel as in the source, and the saved file is about the size of its inputs.
+`node --experimental-strip-types --test tools/pdf-sweep/page-graft.test.mjs`
+covers extraction, insertion with clashing names and duplication.
+
 ### An annotation is ALWAYS above page content
 The patch that hides replaced text on a scan was drawn with `addShape('Square')`,
 i.e. as an annotation, and the replacement text with `addText`, i.e. into the

@@ -4,6 +4,7 @@ import type { WorkerRequest, WorkerResponse } from './worker-protocol'
 import { glyphNameToUnicode } from './glyphNames'
 import { readPkcs7Signer } from './pkcs7Signer'
 import { createAcroTools } from './acroTools'
+import { graftPagesWithAnnotations } from './pageGraft'
 import { rasterizeGlyph } from '../../utils/ocr/glyphRaster'
 import * as opentype from 'opentype.js'
 // opentype.js is CJS: the browser bundle gives the namespace itself, the
@@ -577,6 +578,10 @@ const acroTools = createAcroTools({
   getPageSize,
   rotatePage,
   rearrangePages: order => rearrangePagesKeepingForm(order),
+  pruneFields: () => {
+    const form = derefObj(safe(() => pdfDoc.getTrailer().get('Root').get('AcroForm'), null))
+    if (form) pruneFieldsWithoutWidgets(form)
+  },
   measureRunWidth: (text, fontSize, fontName) => measureRunWidth(text, fontSize, fontName),
   addTextRunToPage: (pageIndex, parts, rotation, tag) => addTextRunToPage(pageIndex, parts, rotation, tag),
   buildShowOps: (pageObj, text, fontSize, fontName) => buildShowOps(pageObj, text, fontSize, fontName),
@@ -13354,6 +13359,10 @@ function rotatePage(pageIndex: number, degrees: number): {
  *
  * Each grafted page keeps its own size, so merging an A4 form into a Letter
  * document leaves both correct rather than cropping one to the other.
+ *
+ * The pages come WITH their annotations and form fields — signatures above
+ * all (`graftPagesWithAnnotations`): `graftPage` alone drops /Annots, and a
+ * signed order inserted into an invoice arrived unsigned.
  */
 function mergePages(bytes: ArrayBuffer, atIndex: number): {
   success: boolean; pageCount?: number; added?: number; error?: string } {
@@ -13366,7 +13375,7 @@ function mergePages(bytes: ArrayBuffer, atIndex: number): {
 
     invalidateContentSources() // page indices shift
     const at = Math.max(0, Math.min(atIndex, pdfDoc.countPages()))
-    for (let i = 0; i < n; i++) pdfDoc.graftPage(at + i, src, i)
+    graftPagesWithAnnotations(pdfDoc, src, Array.from({ length: n }, (_, i) => ({ from: i, at: at + i })))
 
     return { success: true, pageCount: pdfDoc.countPages(), added: n }
   } catch (err: any) {
@@ -13676,8 +13685,9 @@ function duplicatePage(pageIndex: number): {
   success: boolean; pageCount?: number; error?: string } {
   invalidateContentSources() // page indices shift
   try {
-    // graftPage(to, srcDoc, srcPage): copy srcPage and insert it at position `to`
-    pdfDoc.graftPage(pageIndex + 1, pdfDoc, pageIndex)
+    // The copy lands after the original, with its own copies of the page's
+    // annotations and fields (a duplicated signature is a field of its own).
+    graftPagesWithAnnotations(pdfDoc, pdfDoc, [{ from: pageIndex, at: pageIndex + 1 }])
     return { success: true, pageCount: pdfDoc.countPages() }
   } catch (err: any) {
     return { success: false, error: err.message || String(err) }
